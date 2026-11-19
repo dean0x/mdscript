@@ -62,7 +62,7 @@ config:
 | `MAX_FRONTMATTER_FLOW_DEPTH` | 1024 levels of flow-collection (`[`/`{`) nesting, checked before the parser scans (bounds libyaml's O(depth²) flow scan) |
 | `MAX_FILE_SIZE` | 10 MiB per source, including strings passed to the string APIs |
 | `MAX_OUTPUT_SIZE` | 50 MiB per evaluation output buffer. The compiler reports the output limit at the first byte that crosses it. |
-| `MAX_COMPILE_MEMORY` | 209,715,200 bytes (four times `MAX_OUTPUT_SIZE`) per compile. One budget counts output buffers by capacity, values that evaluation makes, retained module text and frontmatter trees (the merged trees of `@extends` bases included), kept source-map segments, warnings, messages and the finalize output. Exactly the budget passes. Above it the compile fails with `resource limit exceeded: compile memory exceeds maximum of 209715200 bytes`. §5 "Compile memory budget" names what the budget does not count. |
+| `MAX_COMPILE_MEMORY` | 209,715,200 bytes (four times `MAX_OUTPUT_SIZE`) per compile. One budget counts output buffers by capacity, values that evaluation makes, an estimate of the syntax tree of each module, the compiler's copy of the runtime variables, retained module text and frontmatter trees (the merged trees of `@extends` bases included), kept source-map segments, warnings, messages and the finalize output. Exactly the budget passes. Above it the compile fails with `resource limit exceeded: compile memory exceeds maximum of 209715200 bytes`. §5 "Compile memory budget" names what the budget does not count. |
 | Frontmatter byte allowance | 50 MiB (52,428,800 bytes) per frontmatter parse, or the rest of the compile budget when that is smaller. Each YAML node spends 192 bytes plus its string or key bytes before it is built, so an alias of a long scalar spends the scalar again at each use. The one exception is the bytes of a `!tag`: the parser spends them after it copies the tag. Past 50 MiB the parse fails with `resource limit exceeded: frontmatter YAML expands beyond maximum of 52428800 bytes`; past a smaller rest of the budget, with the compile memory message. Lint and the import scans parse with the 50 MiB allowance. |
 | `MAX_MODULE_COUNT` | 256; counts every distinct module besides the entry, even before its resolution completes. Binding virtual module maps accept at most 257 entries and use their own message above that bound. |
 
@@ -895,16 +895,23 @@ A compile permits at most 16,000,000 function calls across all evaluated modules
 and `@extends` regions. This limit includes built-ins and calls through an alias.
 The next call fails with `mds::resource_limit`. The limit applies to all output modes.
 
-**Compile memory budget (#420).** A compile has one memory budget of 209,715,200 bytes
-(`MAX_COMPILE_MEMORY`, four times the 50 MiB output limit). The budget counts these parts:
+**Compile memory budget (#420, #488).** A compile or a check has one memory budget of
+209,715,200 bytes (`MAX_COMPILE_MEMORY`, four times the 50 MiB output limit). The budget
+counts these parts:
 
 - output buffers, by capacity;
 - values that evaluation makes: call and built-in results, argument copies, computed
   loop iterables, loop and call frames, and rendered interpolations;
 - the text of each module that the compile reads, while that module resolves;
-- the parts that a cached module keeps: its source text, its prompt text, its frontmatter
-  text and tree, its captured scope layers and its source-map fragments. The merged
-  frontmatter tree of an `@extends` base is one of these parts;
+- an estimate of the syntax tree of each module that the compile parses: a cached
+  import, an `@extends` base, the file entry and the string entry ("Syntax tree
+  estimate" below);
+- the compiler's copy of the runtime variables that the caller supplies, once per
+  compile ("Runtime variables" below);
+- the parts that a cached module keeps: its source text, its prompt text, its syntax
+  tree estimate, its frontmatter text and tree, its captured scope layers and its
+  source-map fragments. The merged frontmatter tree of an `@extends` base is one of
+  these parts;
 - kept source-map segments, warnings, messages and the finalize output.
 
 A part that modules share is counted once, for the module that makes it. The compiler
@@ -917,6 +924,48 @@ mode and every surface. Each compile starts a new count, but a reused `ModuleCac
 (Rust API) keeps the count of its cached modules until it is dropped, so a cache that
 lives long eventually refuses calls. Each frontmatter parse in a compile spends its own
 byte allowance from the budget (§4.1).
+
+**Syntax tree estimate.** The estimate of a module is
+`tokens × 832 + expression bytes × 184 + source bytes × 16` bytes (`TREE_PER_TOKEN`,
+`TREE_PER_EXPR_BYTE` and `TREE_PER_TEXT_BYTE`), in checked arithmetic. Expression bytes
+are the text of each directive line and each interpolation. The compiler charges the
+estimate after the lexer and before the parse. Thus the compiler refuses a module whose
+estimate does not fit before it builds the tree. A cached module keeps its estimate
+charged, and the entry holds its estimate until it resolves. A module that a compile
+resolves first as an `@extends` base and then as an import keeps one estimate. The
+estimate counts the tokens during the parse, the syntax tree, and the copy of a
+`@define` or `@block` body that the compiler keeps. Its factors are measured on a
+64-bit host: for each of the 62 source shapes that `crates/mds-core/tests/memory_bound.rs`
+measures, the estimate is at least the peak heap of a compile and at least the bytes
+that a cached module keeps. On wasm32 the estimate is higher than the memory that it
+counts, so a compile there is refused earlier.
+
+The table gives the largest source of each shape for a module compiled alone, with no
+runtime variables, when the budget counts only its estimate and its read text. A larger
+source of the same shape is refused.
+Other parts, such as the output, also take budget, so the real ceiling is a little
+lower. A reused `ModuleCache` fills faster: each module that it caches keeps its
+estimate until the cache is dropped. So the sources of all the modules that it caches
+in its life share about the same ceiling.
+
+| Source shape | One compile | Reused `ModuleCache`, all cached sources |
+|---|---|---|
+| The densest syntax, `\{{a` repeated | 484,330 bytes | 484,610 bytes |
+| `{{a}}` repeated | 952,385 bytes | 956,729 bytes |
+| The densest measured expression shape | 678,735 bytes | 680,939 bytes |
+| Prose with one `{{a}}` in each 80 bytes | 5,229,805 bytes | 5,237,969 bytes |
+| Prose | 10,485,760 bytes: the 10 MiB file cap applies first, and the budget alone admits 12,336,188 | 12,336,188 bytes |
+
+**Runtime variables.** The compiler makes its own copy of the runtime variables that the
+caller supplies. The budget counts that copy once per compile, at the start of the root
+resolution: its table, the name text and each value. The caller's own map is outside the
+budget. A copy that does not fit fails the compile with the compile memory message. The
+count stops at 64 levels of value nesting. YAML and JSON input refuse a deeper value,
+but a `Value` built in Rust can hold one. A runtime variable nested deeper than 64 levels
+thus fails with the compile memory message, not with a depth error. Two copies are not
+counted. On a cache hit at the root of a reused `ModuleCache`, the compiler makes a copy
+and frees it before it returns. On a reused `ModuleCache`, a copy that a cached function
+captures stays alive after its compile, and only the compile that made it counts it.
 
 At the end of a compile, the compiler checks its memory count: no evaluation value stays
 counted, and no counter went below zero. When the check fails, the compile returns
@@ -931,12 +980,12 @@ exit code, as it does for every rebuild error.
 
 The budget does not count these stages:
 
-- the tokens and the syntax tree of each source, and the copy of a `@define` or `@block`
-  body that the compiler keeps. They grow with the source text, which is at most 10 MiB
-  per source. On a 64-bit host they take at most 432 bytes per source byte while a module
-  resolves (the lexer alone at most 56), and a cached module keeps at most 388 bytes per
-  byte of its source until the compile returns;
-- the runtime variables that the caller supplies;
+- the lexer stage of each source: its array of characters (`Vec<char>`), its array of
+  byte offsets (`byte_offsets`) and the tokens that it makes. This stage ends before
+  the compiler charges the syntax tree estimate. It grows with the source text, which is
+  at most 10 MiB per source. On a 64-bit host it holds 14 bytes per source byte for
+  ASCII prose, and at most 56 bytes per source byte for the densest syntax;
+- the caller's own map of runtime variables (the compiler's copy is counted);
 - the line table of a source map;
 - the YAML event buffer of one frontmatter parse, whose input is at most 1 MiB;
 - the conversion of a result into the host types of a binding (napi, WASM, Python);
@@ -948,10 +997,11 @@ A host thus needs memory for the budget, plus these stages, plus the largest all
 that is counted after it is made. On napi, WASM and Python, add the conversion of the
 result. `crates/mds-core/tests/memory_bound.rs` measures the peak heap of compiles that
 reach the budget. It allows each of them at most 8 MiB above the budget, plus one 1 MiB
-output pass for a compile that writes output. For an `@extends` chain of 24 files, each
-with 1 MiB of frontmatter, it also allows 2 MiB per file for the tokens and syntax tree
-of that frontmatter. Its `assert_syntax_tree_peaks` measures the three syntax-tree
-numbers above for the densest syntax, two nodes for each four source bytes.
+output pass for a compile that writes output. A module of the densest syntax whose
+estimate does not fit grows the heap by at most 56 bytes per source byte, because the
+compiler does not build its tree. The test's `assert_syntax_tree_peaks` checks the estimate
+against the 62 source shapes, and the lexer stage against the 56-byte bound for the
+densest syntax, two tokens for each four source bytes.
 
 ### Project Root
 

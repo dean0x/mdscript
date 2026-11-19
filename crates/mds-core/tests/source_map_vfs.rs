@@ -49,8 +49,8 @@
 //! #412 pins that an `@include` of an extending module is source-mapped: each included
 //! byte maps to the chain file that wrote it, exactly as a direct compile of the chain
 //! maps it; output is unchanged; no map is kept for an empty body; the segment-cap
-//! warning is truthful; the sourcesContent ceiling covers the chain's files; and a
-//! diagnostic in a file first registered by the splice names it root-relative.
+//! warning is truthful; and a diagnostic in a file first registered by the splice
+//! names it root-relative.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -2193,76 +2193,127 @@ fn d1_extends_from_string_no_source_sentinel() {
 
 /// Skeleton lines in the many-regions base. Each `{{v}}\n` line is two spliced
 /// regions (an interpolation node and a text node), all owned by the base.
-const MANY_REGIONS_LINES: usize = 262_144;
+const MANY_REGIONS_LINES: usize = 32_768;
+
+/// Bytes of padding that the many-regions base holds in an unused `@define`. The
+/// padding never renders, but it is part of the base's source. The builder before
+/// #416 copied that whole source once per region, so the padding makes each copy
+/// larger; the shared-source builder reads the source once.
+///
+/// The lines and the padding together fit the compile memory budget with a clear
+/// margin. The syntax tree estimate of the base is about 114 MB (832 bytes per
+/// token, 184 per expression byte, 16 per text byte), about 54 percent of the
+/// 209,715,200-byte budget.
+const MANY_REGIONS_PADDING: usize = 3 * 1024 * 1024;
 
 /// The value each many-regions line renders to — a whole output line nothing else
 /// in the chain can produce.
 const MANY_REGIONS_VALUE: &str = "V416";
 
-/// Absolute smoke bound on one compile of the many-regions chain. Calibrated against
-/// the builder before #416, which copied the base's whole source once per region: that
-/// build runs past five times this bound, while the shared-source builder finishes well
-/// inside a fifth of it (debug profile).
-const MANY_REGIONS_BOUND: Duration = Duration::from_secs(10);
+/// Compiles of each kind (maps off, maps on). The test compares the fastest compile of
+/// each kind, and runs the two kinds in turn, so a short pause in a busy test run does
+/// not change the result.
+const MANY_REGIONS_RUNS: usize = 3;
 
-/// #416: a source-mapped compile of a base with very many top-level skeleton
-/// nodes finishes under an absolute bound; the same chain with maps off is the control.
+/// Most time the fastest source-mapped compile may take, as a multiple of the fastest
+/// compile with maps off. The rule: the limit is about the geometric mean of the
+/// highest ratio measured for the shared-source builder and the lowest ratio measured
+/// for the builder before #416, rounded down, in the debug and release profiles. That
+/// gives the two sides about the same margin.
 ///
-/// The compile runs on its own thread and is awaited with `recv_timeout`, so a
-/// quadratic regression fails at the bound instead of hanging the suite.
+/// Measured on an Apple M-series laptop (fastest of 3, maps on / maps off):
+/// - shared-source builder: 1.27 in debug (390 ms / 308 ms), 1.19 in release
+///   (43 ms / 36 ms);
+/// - builder before #416: 20.21 in debug (6.26 s / 310 ms), 151.85 in release
+///   (5.81 s / 38 ms).
+///
+/// The geometric mean of 1.27 and 20.21 is 5.07, so the limit is 5.
+const MANY_REGIONS_MAX_RATIO: u32 = 5;
+
+/// Hang guard on one compile. A quadratic builder fails the ratio check first; this
+/// bound only stops a compile that does not end from blocking the suite.
+const MANY_REGIONS_BOUND: Duration = Duration::from_secs(120);
+
+/// Compile the many-regions chain once on its own thread, check that every base line
+/// is rendered and that only the base owns a region, and return the compile time.
+///
+/// The compile is awaited with `recv_timeout`, so a compile that does not end fails at
+/// the bound instead of hanging the suite.
+fn compile_many_regions(base: &str, source_map: bool) -> Duration {
+    let modules = extends_chain(base, "@extends \"./base.mds\"\n");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let started = Instant::now();
+        let outcome = mds::compile_virtual_with_deps_opts(
+            modules,
+            "child.mds",
+            None,
+            CompileOptions::default().with_source_map(source_map),
+        )
+        .map(|result| {
+            let lines = output_text(result.output)
+                .lines()
+                .filter(|line| *line == MANY_REGIONS_VALUE)
+                .count();
+            (lines, result.source_map.map(|sm| sm.sources))
+        })
+        .map_err(|err| err.to_string());
+        // The receiver is gone only when the bound already failed the test.
+        let _ = tx.send((outcome, started.elapsed()));
+    });
+    let (outcome, elapsed) = match rx.recv_timeout(MANY_REGIONS_BOUND) {
+        Ok(received) => received,
+        Err(RecvTimeoutError::Timeout) => panic!(
+            "source_map={source_map}: {MANY_REGIONS_LINES} skeleton lines did not \
+             compile within {MANY_REGIONS_BOUND:?}"
+        ),
+        Err(RecvTimeoutError::Disconnected) => {
+            panic!("source_map={source_map}: the compile thread panicked")
+        }
+    };
+    eprintln!("source_map={source_map}: {MANY_REGIONS_LINES} skeleton lines in {elapsed:?}");
+    let (lines, sources) = outcome.unwrap_or_else(|err| panic!("source_map={source_map}: {err}"));
+    // Non-vacuity: every line came from the base through `@extends` — the child's
+    // whole body is the directive, so nothing else can render the value.
+    assert_eq!(
+        lines, MANY_REGIONS_LINES,
+        "source_map={source_map}: every base line must be rendered"
+    );
+    let expected_sources = source_map.then(|| vec!["base.mds".to_string()]);
+    assert_eq!(
+        sources, expected_sources,
+        "source_map={source_map}: only the base owns a region"
+    );
+    elapsed
+}
+
+/// #416: a source-mapped compile of a base with very many top-level skeleton nodes
+/// takes at most `MANY_REGIONS_MAX_RATIO` times as long as the same compile with maps
+/// off, the control. The builder before #416 copied the base's whole source once per
+/// region, so its source-mapped compile grows with the region count times the source
+/// size, and fails this check.
 #[test]
 fn extends_many_regions_source_map_is_not_quadratic() {
     let base = format!(
-        "---\nv: {MANY_REGIONS_VALUE}\n---\n{}",
+        "---\nv: {MANY_REGIONS_VALUE}\n---\n@define unused():\n{}\n@end\n{}",
+        " ".repeat(MANY_REGIONS_PADDING),
         "{{v}}\n".repeat(MANY_REGIONS_LINES)
     );
-    for source_map in [false, true] {
-        let modules = extends_chain(&base, "@extends \"./base.mds\"\n");
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let started = Instant::now();
-            let outcome = mds::compile_virtual_with_deps_opts(
-                modules,
-                "child.mds",
-                None,
-                CompileOptions::default().with_source_map(source_map),
-            )
-            .map(|result| {
-                let lines = output_text(result.output)
-                    .lines()
-                    .filter(|line| *line == MANY_REGIONS_VALUE)
-                    .count();
-                (lines, result.source_map.map(|sm| sm.sources))
-            })
-            .map_err(|err| err.to_string());
-            // The receiver is gone only when the bound already failed the test.
-            let _ = tx.send((outcome, started.elapsed()));
-        });
-        let (outcome, elapsed) = match rx.recv_timeout(MANY_REGIONS_BOUND) {
-            Ok(received) => received,
-            Err(RecvTimeoutError::Timeout) => panic!(
-                "source_map={source_map}: {MANY_REGIONS_LINES} skeleton lines did not \
-                 compile within {MANY_REGIONS_BOUND:?}"
-            ),
-            Err(RecvTimeoutError::Disconnected) => {
-                panic!("source_map={source_map}: the compile thread panicked")
-            }
-        };
-        eprintln!("source_map={source_map}: {MANY_REGIONS_LINES} skeleton lines in {elapsed:?}");
-        let (lines, sources) =
-            outcome.unwrap_or_else(|err| panic!("source_map={source_map}: {err}"));
-        // Non-vacuity: every line came from the base through `@extends` — the child's
-        // whole body is the directive, so nothing else can render the value.
-        assert_eq!(
-            lines, MANY_REGIONS_LINES,
-            "source_map={source_map}: every base line must be rendered"
-        );
-        let expected_sources = source_map.then(|| vec!["base.mds".to_string()]);
-        assert_eq!(
-            sources, expected_sources,
-            "source_map={source_map}: only the base owns a region"
-        );
+    let mut fastest_off = Duration::MAX;
+    let mut fastest_on = Duration::MAX;
+    for _ in 0..MANY_REGIONS_RUNS {
+        fastest_off = fastest_off.min(compile_many_regions(&base, false));
+        fastest_on = fastest_on.min(compile_many_regions(&base, true));
     }
+    eprintln!(
+        "fastest: maps off {fastest_off:?}, maps on {fastest_on:?}, ratio {:.2}",
+        fastest_on.as_secs_f64() / fastest_off.as_secs_f64()
+    );
+    assert!(
+        fastest_on <= fastest_off * MANY_REGIONS_MAX_RATIO,
+        "the fastest source-mapped compile ({fastest_on:?}) took more than \
+         {MANY_REGIONS_MAX_RATIO} times the fastest compile with maps off ({fastest_off:?})"
+    );
 }
 
 // ── #412: an @include of an extending module is source-mapped ─────────────────
@@ -2282,10 +2333,6 @@ const CHAIN_MAIN: &str = "@import \"./c.mds\" as c\nMAIN-HEAD\n@include c\nMAIN-
 /// Mirrors the private `limits::MAX_SOURCEMAP_SEGMENTS`. Pinned by the segment-cap
 /// warning, which prints the real value.
 const MAX_SOURCEMAP_SEGMENTS: usize = 1_000_000;
-
-/// Mirrors the private `limits::MAX_SOURCES_CONTENT_BYTES` (= `MAX_OUTPUT_SIZE`).
-/// Pinned by the ceiling warning, which prints the real value.
-const MAX_SOURCES_CONTENT_BYTES: usize = MAX_OUTPUT_SIZE;
 
 /// The #412 chain and its importer as a module set.
 fn chain_modules() -> HashMap<String, String> {
@@ -2664,95 +2711,6 @@ fn segment_cap_in_an_included_module_leaves_its_text_unmapped() {
             referenced_sources(&sm).contains(*module),
             "{row}: under the cap the module is mapped; sources={:?}",
             sm.sources
-        );
-    }
-}
-
-/// Levels of the sourcesContent-ceiling chain, and the unrendered padding each level
-/// carries: six levels pass the ceiling, five would not.
-const CEILING_LEVELS: usize = 6;
-const CEILING_PADDING: usize = 9 * 1024 * 1024;
-const _: () = assert!(CEILING_LEVELS * CEILING_PADDING > MAX_SOURCES_CONTENT_BYTES);
-const _: () = assert!((CEILING_LEVELS - 1) * CEILING_PADDING < MAX_SOURCES_CONTENT_BYTES);
-
-/// A `CEILING_LEVELS`-level chain `l1.mds` ← … ← `l6.mds` and an importer that
-/// includes its leaf. Level `k` renders one block (`bk`) and carries `padding` bytes it
-/// never renders: the root in an unused `@define`, each extending level as blank space
-/// between its directives (an extending template may hold only `@block` overrides and
-/// whitespace).
-fn ceiling_chain(padding: usize) -> HashMap<String, String> {
-    let pad = " ".repeat(padding);
-    let blocks: String = (1..=CEILING_LEVELS)
-        .map(|k| format!("@block b{k}:\nL1-B{k}\n@end\n"))
-        .collect();
-    let mut modules = HashMap::from([
-        (
-            "l1.mds".to_string(),
-            format!("@define unused():\n{pad}\n@end\n{blocks}"),
-        ),
-        (
-            "main.mds".to_string(),
-            format!("@import \"./l{CEILING_LEVELS}.mds\" as m\nMAIN\n@include m\n"),
-        ),
-    ]);
-    for k in 2..=CEILING_LEVELS {
-        modules.insert(
-            format!("l{k}.mds"),
-            format!(
-                "@extends \"./l{}.mds\"\n{pad}\n@block b{k}:\nL{k}-B{k}\n@end\n",
-                k - 1
-            ),
-        );
-    }
-    modules
-}
-
-/// #412: the importer's map now carries the included chain's files, so
-/// the sourcesContent ceiling covers them — the first test of that ceiling. A chain
-/// whose files pass it drops `sourcesContent` from the importer's map with the ceiling
-/// warning and keeps every source and mapping; a small copy of the chain keeps
-/// `sourcesContent` (control).
-#[test]
-fn include_of_extending_chain_over_the_sources_content_ceiling_drops_sources_content() {
-    let all_files: std::collections::BTreeSet<String> = (1..=CEILING_LEVELS)
-        .map(|k| format!("l{k}.mds"))
-        .chain(["main.mds".to_string()])
-        .collect();
-    let opts = CompileOptions::default()
-        .with_source_map(true)
-        .with_include_sources_content(true);
-    for (padding, over) in [(CEILING_PADDING, true), (16, false)] {
-        let modules = ceiling_chain(padding);
-        let total: usize = modules.values().map(String::len).sum();
-        let result = mds::compile_virtual_with_deps_opts(modules, "main.mds", None, opts.clone())
-            .unwrap_or_else(|err| panic!("padding={padding}: {err}"));
-        let expected_warnings = if over {
-            vec![format!(
-                "sourcesContent total size ({total} bytes) exceeds the \
-                 {MAX_SOURCES_CONTENT_BYTES} byte ceiling; sourcesContent will be omitted \
-                 from the source map"
-            )]
-        } else {
-            vec![]
-        };
-        assert_eq!(result.warnings, expected_warnings, "padding={padding}");
-        let text = output_text(result.output);
-        let sm = result.source_map.expect("the importer's map is produced");
-        assert_eq!(
-            sm.sources_content.as_ref().map(Vec::len),
-            (!over).then_some(all_files.len()),
-            "padding={padding}: sourcesContent is kept only under the ceiling"
-        );
-        assert_eq!(
-            referenced_sources(&sm),
-            all_files,
-            "padding={padding}: every chain file must own mapped output"
-        );
-        let rendered: Vec<String> = (1..=CEILING_LEVELS).map(|k| format!("L{k}-B{k}")).collect();
-        assert_eq!(
-            text,
-            format!("MAIN\n{}\n", rendered.join("\n")),
-            "padding={padding}: each level renders its block and none of its padding"
         );
     }
 }

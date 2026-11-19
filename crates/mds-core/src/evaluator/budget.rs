@@ -56,7 +56,7 @@ enum Children<'a> {
     Object(hash_map::Iter<'a, String, Value>),
 }
 
-pub(super) fn table_bytes(capacity: usize, entry: usize) -> Option<usize> {
+pub(crate) fn table_bytes(capacity: usize, entry: usize) -> Option<usize> {
     if capacity == 0 {
         return Some(0);
     }

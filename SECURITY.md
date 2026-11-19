@@ -267,7 +267,7 @@ place each check runs, and the tests that pin them — in `spec.md` §4.6
 | Max iterations per loop | 100,000 | `evaluator.rs` (`MAX_LOOP_ITERATIONS`) |
 | Max total iterations | 1,000,000 per module evaluation | `evaluator.rs` (`MAX_TOTAL_ITERATIONS`) |
 | Max output size | 50 MiB (52,428,800 bytes) per evaluation output buffer. Function results, message content and imported modules can use separate buffers; the compile memory budget below bounds them together. | `limits.rs` (`MAX_OUTPUT_SIZE`) |
-| Max compile memory | 200 MiB (209,715,200 bytes, four output buffers) per compile ([#420](https://github.com/dean0x/mdscript/issues/420)). One budget counts output buffers by capacity, values that evaluation makes, retained module text and frontmatter trees (the merged trees of `@extends` bases included), kept source-map segments, warnings, messages and the finalize output. Exactly the budget passes; above it, `resource limit exceeded: compile memory exceeds maximum of 209715200 bytes`. A reused `ModuleCache` keeps the count of its cached modules until it is dropped. | `limits.rs` (`MAX_COMPILE_MEMORY`), `evaluator/budget.rs` |
+| Max compile memory | 200 MiB (209,715,200 bytes, four output buffers) per compile ([#420](https://github.com/dean0x/mdscript/issues/420), [#488](https://github.com/dean0x/mdscript/issues/488)). One budget counts output buffers by capacity, values that evaluation makes, an estimate of the syntax tree of each module (charged before the parse), the compiler's copy of the runtime variables, retained module text and frontmatter trees (the merged trees of `@extends` bases included), kept source-map segments, warnings, messages and the finalize output. Exactly the budget passes; above it, `resource limit exceeded: compile memory exceeds maximum of 209715200 bytes`. A reused `ModuleCache` keeps the count of its cached modules until it is dropped, so it fills faster. The tree estimate and its ceilings are below the table. | `limits.rs` (`MAX_COMPILE_MEMORY`, `TREE_PER_TOKEN`), `evaluator/budget.rs` |
 | Frontmatter byte allowance | 50 MiB (52,428,800 bytes) per frontmatter parse, or the rest of the compile budget when that is smaller. Each YAML node spends 192 bytes plus its string or key bytes before it is built, so an alias of a long scalar spends the scalar again at each use. The one exception is the bytes of a `!tag`: the parser spends them after it copies the tag. Above it, `resource limit exceeded: frontmatter YAML expands beyond maximum of 52428800 bytes`, or the compile memory message when the rest of the budget set the allowance. | `resolver/frontmatter.rs` (`NODE_YAML`, `Allowance`) |
 | Max warnings | 1,000 | `evaluator.rs` (`MAX_WARNINGS`) |
 | Max import depth | 64 | `resolver.rs` (`MAX_IMPORT_DEPTH`) |
@@ -280,14 +280,48 @@ place each check runs, and the tests that pin them — in `spec.md` §4.6
 | Max dot-path segments | 32 | `limits.rs` (`MAX_DOT_SEGMENTS`) |
 
 These limits apply to the quantities and scopes in the table. They do not bound
-elapsed time. The compile memory budget does not count these stages:
+elapsed time.
 
-- the tokens and the syntax tree of each source, and the copy of a `@define` or
-  `@block` body that the compiler keeps. They grow with the source text, which the
-  10 MiB file cap bounds. On a 64-bit host they take at most 432 bytes per source byte
-  while a module resolves (the lexer alone at most 56), and a cached module keeps at
-  most 388 bytes per byte of its source until the compile returns;
-- the runtime variables that the caller supplies;
+In a compile or a check, the compile memory budget counts an estimate of the syntax tree
+of each module: a cached import, an `@extends` base, the file entry and the string
+entry. The estimate is `tokens × 832 + expression bytes × 184 + source bytes × 16`
+bytes, in checked arithmetic. Expression bytes are the text of each directive line and
+each interpolation. The compiler charges the estimate after the lexer and before the
+parse, so it never builds a tree that does not fit. A cached module keeps its estimate
+charged. A module resolved first as an `@extends` base and then as an import keeps one
+estimate. The factors are measured on a 64-bit host: for each of the 62 shapes in
+`crates/mds-core/tests/memory_bound.rs`, the estimate is at least the compile peak and
+the bytes that a cached module keeps. On wasm32 the estimate is high, so a compile is
+refused earlier. The table gives about the largest source of each shape for a module
+compiled alone, with no runtime variables:
+
+| Source shape | One compile | Reused `ModuleCache`, all cached sources |
+|---|---|---|
+| The densest syntax, `\{{a` repeated | 484,330 bytes | 484,610 bytes |
+| `{{a}}` repeated | 952,385 bytes | 956,729 bytes |
+| The densest measured expression shape | 678,735 bytes | 680,939 bytes |
+| Prose with one `{{a}}` in each 80 bytes | 5,229,805 bytes | 5,237,969 bytes |
+| Prose | 10,485,760 bytes (the 10 MiB file cap applies first; the budget alone admits 12,336,188) | 12,336,188 bytes |
+
+A reused `ModuleCache` fills faster: each module that it caches keeps its estimate until
+the cache is dropped.
+
+The budget also counts the compiler's copy of the runtime variables, once per compile.
+The caller's own map is outside the budget. The count stops at 64 levels of value
+nesting, so a `Value` built in Rust and nested deeper fails with the compile memory
+message. On a cache hit at the root of a reused `ModuleCache`, the compiler makes a copy
+and frees it before it returns, and does not count it. A copy that a cached function
+captures stays alive in a reused cache after its compile, and only the compile that made
+it counts it.
+
+The compile memory budget does not count these stages:
+
+- the lexer stage of each source: its array of characters (`Vec<char>`), its array of
+  byte offsets (`byte_offsets`) and the tokens that it makes. This stage ends before the
+  compiler charges the syntax tree estimate. It grows with the source text, which the
+  10 MiB file cap bounds. On a 64-bit host it holds 14 bytes per source byte for ASCII
+  prose, and at most 56 bytes per source byte for the densest syntax;
+- the caller's own map of runtime variables (the compiler's copy is counted);
 - the line table of a source map;
 - the YAML event buffer of one frontmatter parse, whose input the 1 MiB frontmatter cap
   bounds;
@@ -301,10 +335,11 @@ an existing cap bounds. A host thus needs memory for the budget, plus the stages
 plus the largest of those allocations; on napi, WASM and Python, add the conversion of
 the result. `crates/mds-core/tests/memory_bound.rs` measures the peak heap of compiles
 that reach the budget: it allows each of them at most 8 MiB above the budget, plus one
-1 MiB output pass for a compile that writes output, plus 2 MiB per file for the tokens
-and syntax tree of 1 MiB of frontmatter in each file of a 24-file `@extends` chain. Its
-`assert_syntax_tree_peaks` measures the three syntax-tree numbers above for the densest
-syntax, two nodes for each four source bytes.
+1 MiB output pass for a compile that writes output. A module of the densest syntax whose
+estimate does not fit grows the heap by at most 56 bytes per source byte. The test's
+`assert_syntax_tree_peaks` checks the estimate against the 62 source shapes, and the
+lexer stage against the 56-byte bound for the densest syntax, two tokens for each four
+source bytes.
 
 At the end of a compile, the compiler checks its memory count. A failed check is a
 compiler defect: the compile returns `mds::internal` (`internal compiler error`, no

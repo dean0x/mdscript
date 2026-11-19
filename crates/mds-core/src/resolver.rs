@@ -7,17 +7,18 @@ use std::sync::Arc;
 
 use indexmap::{IndexMap, IndexSet};
 
-use crate::ast::{BlockNode, DefineBlock, ExportDirective, ImportDirective, Node};
+use crate::ast::{BlockNode, DefineBlock, ExportDirective, ImportDirective, Module, Node};
 use crate::error::MdsError;
 use crate::evaluator::budget::{bytes, MemBudget, Part};
 use crate::evaluator::{
     evaluate_messages_seeded, evaluate_seeded, evaluate_with_map_seeded, EvalBudget,
 };
 use crate::fs::{FileSystem, NativeFs, VirtualFs};
-use crate::lexer::tokenize;
+use crate::lexer::{tokenize, Token};
 use crate::limits::{
     MAX_BLOCKS_PER_MODULE, MAX_COMPILE_MEMORY, MAX_DEFINES_PER_MODULE, MAX_FILE_SIZE,
-    MAX_MODULE_COUNT, MAX_SOURCES_CONTENT_BYTES,
+    MAX_MODULE_COUNT, MAX_SOURCES_CONTENT_BYTES, TREE_PER_EXPR_BYTE, TREE_PER_TEXT_BYTE,
+    TREE_PER_TOKEN,
 };
 use crate::parser::parse_with_ctx;
 use crate::scope::{FunctionDef, NamespaceScope, PromptText, Scope, VarLayer};
@@ -227,6 +228,25 @@ const MSG_MODE_SOURCE_MAP_WARNING: &str =
     "source maps are not supported for messages-mode templates (@message blocks); \
      no source map will be generated";
 
+/// The tree estimate of a module: its tokens, its directive and interpolation text
+/// and its source bytes, each times its factor. `None` is a count past the address
+/// space, so the charge fails as a charge over the limit.
+fn tree_bytes(tokens: usize, expr: usize, len: usize) -> Option<usize> {
+    bytes(tokens, TREE_PER_TOKEN)?
+        .checked_add(bytes(expr, TREE_PER_EXPR_BYTE)?)?
+        .checked_add(bytes(len, TREE_PER_TEXT_BYTE)?)
+}
+
+fn tree_estimate(tokens: &[Token], len: usize) -> Option<usize> {
+    let mut expr: usize = 0;
+    for token in tokens {
+        if let Token::Interpolation(text, _) | Token::Directive(text, _) = token {
+            expr = expr.checked_add(text.len())?;
+        }
+    }
+    tree_bytes(tokens.len(), expr, len)
+}
+
 /// Module cache to avoid re-resolving the same file or virtual key.
 ///
 /// Supports multiple filesystem backends via the [`FileSystem`] trait.
@@ -359,8 +379,11 @@ impl ModuleCache {
         Ok(())
     }
 
-    /// Start a new compile budget only at the root of resolution.
-    fn start_resolution(&mut self, key: &str) {
+    /// Start a new compile budget only at the root of resolution. The root then
+    /// charges the compiler's copy of the caller variables once, as buffers: it
+    /// stays out of `retained` and out of every module mark.
+    fn start_resolution(&mut self, key: &str, runtime: &VarLayer) -> Result<usize, MdsError> {
+        let mut layer = Ok(0);
         if self.resolving.is_empty() {
             self.budget = EvalBudget::default();
             self.kept = 0;
@@ -374,25 +397,31 @@ impl ModuleCache {
                     self.budget.mem.charge(Part::Temp, Some(seed)).unwrap();
                 }
             }
+            layer = self.budget.mem.charge(Part::Buffers, runtime.bytes());
         }
         self.resolving.insert(key.to_string());
+        layer
     }
 
-    fn open_module(&mut self, read_bytes: usize) -> (ModuleMark, Result<(), MdsError>) {
+    /// Open the module mark. A refused variable charge skips the read charge.
+    fn open_module(
+        &mut self,
+        layer: Result<usize, MdsError>,
+        read_bytes: usize,
+    ) -> (ModuleMark, Result<(), MdsError>) {
         let mark = ModuleMark {
             temporaries: self.budget.mem.mark(),
             outer_kept: std::mem::take(&mut self.kept),
             #[cfg(test)]
             probe: self.module_probes.len(),
         };
-        let charged = if read_bytes == 0 {
-            Ok(())
-        } else {
-            self.budget
-                .mem
-                .charge(Part::Temp, Some(read_bytes))
-                .map(drop)
-        };
+        let charged = layer.and_then(|_| {
+            if read_bytes == 0 {
+                Ok(0)
+            } else {
+                self.budget.mem.charge(Part::Temp, Some(read_bytes))
+            }
+        });
         #[cfg(test)]
         self.module_probes.push(ModuleProbe {
             buffers_before: self.budget.mem.buffers,
@@ -400,7 +429,7 @@ impl ModuleCache {
             temporaries_open: self.budget.mem.mark(),
             ..ModuleProbe::default()
         });
-        (mark, charged)
+        (mark, charged.map(drop))
     }
 
     fn close_module(&mut self, mark: ModuleMark) -> usize {
@@ -412,12 +441,35 @@ impl ModuleCache {
         std::mem::replace(&mut self.kept, mark.outer_kept)
     }
 
-    /// Steps 1 to 3 of the module order: the root reset, the module mark and
-    /// the read charge. One out-of-line copy serves every resolve function.
+    /// Steps 1 to 3 of the module order: the root reset and the variable charge,
+    /// the module mark and the read charge. One out-of-line copy serves every
+    /// resolve function.
     #[inline(never)]
-    fn begin_module(&mut self, key: &str, read_bytes: usize) -> (ModuleMark, Result<(), MdsError>) {
-        self.start_resolution(key);
-        self.open_module(read_bytes)
+    fn begin_module(
+        &mut self,
+        key: &str,
+        runtime: &VarLayer,
+        read_bytes: usize,
+    ) -> (ModuleMark, Result<(), MdsError>) {
+        let layer = self.start_resolution(key, runtime);
+        self.open_module(layer, read_bytes)
+    }
+
+    /// Tokenize and parse the module source. The tree estimate is charged as a
+    /// temporary between the two steps, so a refused tree is never built. With
+    /// `keep`, the module entry keeps the charge; else it stays a temporary until
+    /// the module closes. The tokens drop here, after the parse.
+    #[inline(never)]
+    fn parse_charged(&mut self, ctx: &ModuleCtx<'_>, keep: bool) -> Result<Module, MdsError> {
+        let tokens = tokenize(ctx.source, ctx.file_str)?;
+        let tree = self
+            .budget
+            .mem
+            .charge(Part::Temp, tree_estimate(&tokens, ctx.source.len()))?;
+        if keep {
+            self.keep(tree);
+        }
+        parse_with_ctx(&tokens, ctx.file_str, ctx.source)
     }
 
     fn charge_kept(&mut self, n: usize) -> Result<(), MdsError> {
@@ -635,11 +687,10 @@ impl ModuleCache {
         // not be served to a standalone-compile caller — that would yield empty output
         // for the base. Fall through to a full compile and upgrade the entry in place,
         // reusing the skeleton's Arcs so existing descendants keep Arc-sharing (A1).
-        if let Some(cached) = self.modules.get(key) {
-            if !cached.is_skeleton {
-                return Ok(Arc::clone(cached));
-            }
-        }
+        let upgrade = match self.modules.get(key) {
+            Some(cached) if !cached.is_skeleton => return Ok(Arc::clone(cached)),
+            cached => cached.is_some(),
+        };
 
         // Step 2: cycle detection — must happen before we push to `resolving`.
         if self.resolving.contains(key) {
@@ -669,7 +720,7 @@ impl ModuleCache {
         // Mark as resolving before recursing into process_module.
         // IndexSet preserves insertion order, so it serves as both the set (O(1) lookup)
         // and the ordered stack (for cycle path reconstruction).
-        let (mark, read) = self.begin_module(key, source.capacity());
+        let (mark, read) = self.begin_module(key, runtime_vars, source.capacity());
         let resolved = read.and_then(|()| {
             let base_dir_owned = self.fs.parent_dir(key);
             let display_owned = crate::source_path::display_path_for(&*self.fs, key);
@@ -681,7 +732,7 @@ impl ModuleCache {
                 runtime_vars,
                 origin: OnceCell::new(),
             };
-            self.process_module(&ctx, is_md, warnings)
+            self.process_module(&ctx, is_md, upgrade, warnings)
         });
         #[cfg(test)]
         let probe = mark.probe;
@@ -787,17 +838,18 @@ impl ModuleCache {
         // root module as well.
         self.check_import_depth()?;
         self.check_module_count(SOURCE_LABEL)?;
-        let (mark, read) = self.begin_module(SOURCE_LABEL, 0);
+        let runtime = runtime_layer(runtime_vars);
+        let (mark, read) = self.begin_module(SOURCE_LABEL, &runtime, 0);
 
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
             file_str: SOURCE_LABEL,
             source,
             base_dir: &canonical_str,
-            runtime_vars: &runtime_layer(runtime_vars),
+            runtime_vars: &runtime,
             origin: OnceCell::new(),
         };
-        let resolved = read.and_then(|()| self.process_module(&ctx, false, warnings));
+        let resolved = read.and_then(|()| self.process_module(&ctx, false, false, warnings));
         self.close_module(mark);
 
         let popped = self.pop_resolving(SOURCE_LABEL);
@@ -898,7 +950,7 @@ impl ModuleCache {
         let is_md = self.fs.is_markdown(key);
         check_module_type(entry, &source)?;
 
-        let (mark, read) = self.begin_module(key, source.capacity());
+        let (mark, read) = self.begin_module(key, runtime_vars, source.capacity());
         let result = read.and_then(|()| {
             let base_dir_owned = self.fs.parent_dir(key);
             let display_owned = crate::source_path::display_path_for(&*self.fs, key);
@@ -936,13 +988,14 @@ impl ModuleCache {
         let canonical_str = self.anchor_base(base_dir)?;
         self.check_import_depth()?;
         self.check_module_count(SOURCE_LABEL)?;
-        let (mark, read) = self.begin_module(SOURCE_LABEL, 0);
+        let runtime = runtime_layer(runtime_vars);
+        let (mark, read) = self.begin_module(SOURCE_LABEL, &runtime, 0);
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
             file_str: SOURCE_LABEL,
             source,
             base_dir: &canonical_str,
-            runtime_vars: &runtime_layer(runtime_vars),
+            runtime_vars: &runtime,
             origin: OnceCell::new(),
         };
         let result = read.and_then(|()| self.process_module_intrinsic(&ctx, false, warnings));
@@ -968,13 +1021,14 @@ impl ModuleCache {
         let canonical_str = self.anchor_base(base_dir)?;
         self.check_import_depth()?;
         self.check_module_count(SOURCE_LABEL)?;
-        let (mark, read) = self.begin_module(SOURCE_LABEL, 0);
+        let runtime = runtime_layer(runtime_vars);
+        let (mark, read) = self.begin_module(SOURCE_LABEL, &runtime, 0);
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
             file_str: SOURCE_LABEL,
             source,
             base_dir: &canonical_str,
-            runtime_vars: &runtime_layer(runtime_vars),
+            runtime_vars: &runtime,
             origin: OnceCell::new(),
         };
         let result =
@@ -1155,8 +1209,8 @@ impl ModuleCache {
         // MapBuilder is allocated for sub-modules (AC-PERF-01).
         self.source_map_mode = opts.source_map;
 
-        let tokens = tokenize(ctx.source, ctx.file_str)?;
-        let module = parse_with_ctx(&tokens, ctx.file_str, ctx.source)?;
+        // The entry holds its tree charge as a temporary until the module closes.
+        let module = self.parse_charged(ctx, false)?;
 
         let raw_frontmatter = module.frontmatter.as_ref().map(|fm| fm.raw.as_str());
 
@@ -1445,15 +1499,17 @@ impl ModuleCache {
     /// `ctx.file_str` is the display path for error messages (may be `SOURCE_LABEL`).
     /// `ctx.base_dir` is the directory used to resolve relative `@import`/`@extends`.
     /// `is_md` controls whether the `type` frontmatter key is treated as a file-type marker.
+    /// `upgrade` is true when the module replaces a cached skeleton entry.
     fn process_module(
         &mut self,
         ctx: &ModuleCtx<'_>,
         is_md: bool,
+        upgrade: bool,
         warnings: &mut Vec<String>,
     ) -> Result<ResolvedModule, MdsError> {
-        // Tokenize and parse
-        let tokens = tokenize(ctx.source, ctx.file_str)?;
-        let module = parse_with_ctx(&tokens, ctx.file_str, ctx.source)?;
+        // The module entry keeps its tree. An upgrade of a cached skeleton keeps the
+        // tree that the skeleton entry counts, so the new tree stays a temporary.
+        let module = self.parse_charged(ctx, !upgrade)?;
 
         // Parse frontmatter YAML once for both scope building and storage. The
         // module entry keeps the tree.
@@ -2023,7 +2079,7 @@ impl ModuleCache {
         let is_md = self.fs.is_markdown(key);
         check_module_type(module, &source).map_err(|err| import_site.attach_type_error(err))?;
 
-        let (mark, read) = self.begin_module(key, source.capacity());
+        let (mark, read) = self.begin_module(key, runtime_vars, source.capacity());
         let resolved = read.and_then(|()| {
             let base_dir_owned = self.fs.parent_dir(key);
             let display_owned = crate::source_path::display_path_for(&*self.fs, key);
@@ -2151,8 +2207,8 @@ impl ModuleCache {
         is_md: bool,
         warnings: &mut Vec<String>,
     ) -> Result<ResolvedModule, MdsError> {
-        let tokens = tokenize(ctx.source, ctx.file_str)?;
-        let module = parse_with_ctx(&tokens, ctx.file_str, ctx.source)?;
+        // The skeleton entry keeps its tree.
+        let module = self.parse_charged(ctx, true)?;
 
         let raw_frontmatter = self.copy_raw_frontmatter(&module)?;
         // own_fm_values: this module's raw frontmatter (not yet merged with ancestors).

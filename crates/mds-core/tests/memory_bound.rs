@@ -11,12 +11,15 @@ const CAP_PASS: usize = MIB + 1;
 const SLACK: usize = 8 * MIB;
 /// Peak heap bytes per source byte on a 64-bit host while one module with dense syntax
 /// resolves: its tokens, its syntax tree and the copy of a function or block body. The
-/// compile memory budget does not count them; spec.md and SECURITY.md give this number.
+/// compile memory budget counts them through the tree estimate, which it charges after
+/// the lexer and before the parse.
 const TREE_PEAK_PER_BYTE: usize = 432;
 /// The peak while the lexer runs: its tokens and its arrays of characters and offsets.
+/// This stage ends before the tree estimate is charged, so the compile memory budget
+/// does not count it; spec.md and SECURITY.md give this number.
 const LEXER_PEAK_PER_BYTE: usize = 56;
 /// Heap bytes per source byte that a cached module with a dense function body keeps
-/// until the compile returns.
+/// until the compile returns. The module keeps its tree estimate charged for them.
 const TREE_KEPT_PER_BYTE: usize = 388;
 
 /// Live heap bytes, and the high-water mark since `peak_growth` last reset it.
@@ -98,6 +101,68 @@ fn test_count(source: &str) -> usize {
         .lines()
         .filter(|line| line.trim() == "#[test]")
         .count()
+}
+
+/// The value of the `usize` constant `name` in `source`, the text of limits.rs.
+fn const_value(source: &str, name: &str) -> Option<usize> {
+    let prefix = format!("pub(crate) const {name}: usize = ");
+    let value = source.lines().find_map(|line| line.strip_prefix(&prefix))?;
+    value.strip_suffix(';')?.replace('_', "").parse().ok()
+}
+
+/// The tree estimate factors per token, per expression byte and per source byte. The
+/// test reads them from the text of limits.rs, so they can not drift from the
+/// constants that the compile charges.
+fn tree_factors() -> (usize, usize, usize) {
+    let limits = include_str!("../src/limits.rs");
+    let factor = |name| const_value(limits, name).unwrap_or_else(|| panic!("{name}"));
+    (
+        factor("TREE_PER_TOKEN"),
+        factor("TREE_PER_EXPR_BYTE"),
+        factor("TREE_PER_TEXT_BYTE"),
+    )
+}
+
+/// The lexer's token count and expression bytes for the shapes of this test (ASCII
+/// or wide prose, no code fence). A frontmatter block is three tokens. A line that
+/// starts with `@` is one token, and its text without the newline is expression bytes.
+/// `\{{` is one token. `{{x}}` is one token, and its trimmed inner text is expression
+/// bytes. Each other run of text is one token. A test in `resolver_tests.rs` checks
+/// these rules against the lexer.
+fn token_stats(source: &str) -> (usize, usize) {
+    let mut rest = source;
+    let mut tokens = 0;
+    if let Some(body) = source.strip_prefix("---\n") {
+        let close = body.find("\n---\n").expect("closed frontmatter") + 1;
+        rest = &body[close + "---\n".len()..];
+        tokens = 3;
+    }
+    let (mut expr, mut in_text, mut i) = (0, false, 0);
+    while i < rest.len() {
+        let tail = &rest[i..];
+        if (i == 0 || rest.as_bytes()[i - 1] == b'\n') && tail.starts_with('@') {
+            let line = tail.find('\n').unwrap_or(tail.len());
+            (tokens, expr, in_text, i) = (tokens + 1, expr + line, false, i + line + 1);
+        } else if tail.starts_with("\\{{") {
+            (tokens, in_text, i) = (tokens + 1, false, i + 3);
+        } else if let Some(inner) = tail.strip_prefix("{{") {
+            let close = inner.find("}}").expect("closed interpolation");
+            expr += inner[..close].trim().len();
+            (tokens, in_text, i) = (tokens + 1, false, i + close + 4);
+        } else {
+            tokens += usize::from(!in_text);
+            let width = tail.chars().next().map_or(1, char::len_utf8);
+            (in_text, i) = (true, i + width);
+        }
+    }
+    (tokens, expr)
+}
+
+/// The tree estimate that a compile charges for `source`.
+fn tree_estimate(source: &str) -> usize {
+    let (k_tok, k_expr, k_text) = tree_factors();
+    let (tokens, expr) = token_stats(source);
+    k_tok * tokens + k_expr * expr + k_text * source.len()
 }
 
 fn compile_measured(source: String) -> (Result<CompileResult, MdsError>, usize) {
@@ -530,18 +595,16 @@ fn import_peak(count: usize) -> (Result<CompileResult, MdsError>, usize) {
     let mut modules = HashMap::new();
     for i in 0..count {
         root.push_str(&format!("@import \"./part{i}.mds\" as part{i}\n"));
-        let unused = "p".repeat(MIB);
+        let unused = "p".repeat(MIB / 16);
         modules.insert(
             format!("part{i}.mds"),
             format!("@define unused():\n{unused}\n@end\n{{{{chunk}}}}"),
         );
     }
     modules.insert("main.mds".to_owned(), root + "root");
-    // Five prompts take 197.5 MiB. Their origins take more than 5 MiB.
-    let vars = HashMap::from([(
-        "chunk".to_owned(),
-        Value::String("x".repeat(39 * MIB + MIB / 2)),
-    )]);
+    // Five prompts and the compiler's copy of `chunk` take 198 MiB. The origins and
+    // tree estimates of five imports take more than 5 MiB.
+    let vars = HashMap::from([("chunk".to_owned(), Value::String("x".repeat(33 * MIB)))]);
     peak_growth(|| mds::compile_virtual(modules, "main.mds", Some(vars)))
 }
 
@@ -602,7 +665,7 @@ fn assert_alias_frontmatter_shares_one_limit() {
 
 /// An `@extends` chain of 24 files. Each file adds a distinct key with a scalar of
 /// `len` bytes, so each base keeps the merged tree of itself and every file above it.
-fn extends_chain_peak(len: usize) -> (Result<CompileResult, MdsError>, usize) {
+fn extends_chain(len: usize) -> HashMap<String, String> {
     let value = "a".repeat(len);
     let mut modules = HashMap::from([(
         "f0.mds".to_owned(),
@@ -614,6 +677,11 @@ fn extends_chain_peak(len: usize) -> (Result<CompileResult, MdsError>, usize) {
             format!("---\nk{i}: {value}\n---\n@extends \"./f{}.mds\"\n", i - 1),
         );
     }
+    modules
+}
+
+fn extends_chain_peak(len: usize) -> (Result<CompileResult, MdsError>, usize) {
+    let modules = extends_chain(len);
     peak_growth(|| mds::compile_virtual(modules, "f23.mds", None))
 }
 
@@ -623,13 +691,20 @@ fn assert_extends_chain_trees_share_one_limit() {
     assert!(output.starts_with("---\nk0: a\nk1: a\n"), "{output}");
     assert!(output.ends_with("k23: a\n---\nok\n"), "{output}");
 
-    // The merged trees of the bases take about 276 MiB.
-    let (result, peak) = extends_chain_peak(MIB - 8);
+    // The merged trees of the bases take about 69 MiB. The tree estimates of the 24
+    // files take less than half the budget, so the merged trees pass the budget.
+    let len = MIB / 4;
+    let trees: usize = extends_chain(len).values().map(|s| tree_estimate(s)).sum();
+    assert!(trees < 100 * MIB, "tree estimates: {trees} B");
+    let (result, peak) = extends_chain_peak(len);
     let growth = peak.saturating_sub(baseline);
-    eprintln!("extends chain heap (B): control={baseline}, peak={peak}, growth={growth}");
-    // Each file still open holds two uncharged copies of its frontmatter text: its
-    // tokens and its syntax tree, which are excluded stages.
-    let limit = 200 * MIB + 24 * 2 * MIB + SLACK;
+    eprintln!(
+        "extends chain heap (B): control={baseline}, peak={peak}, growth={growth}, \
+         tree estimates={trees}"
+    );
+    // The tokens of each file drop after its parse, and the tree estimate counts its
+    // syntax tree, so only the lexer of one file is outside the budget.
+    let limit = 200 * MIB + SLACK;
     assert!(
         growth <= limit,
         "extends chain adds {growth} B (limit: {limit} B)"
@@ -650,15 +725,17 @@ fn mapped_corner(extra: usize) -> (Result<CompileResult, MdsError>, usize) {
         root.push_str(&format!(
             "@import \"./part{i}.mds\" as part{i}\n@include part{i}\n"
         ));
-        let unused = "p".repeat(9 * MIB + 3 * MIB / 4);
+        let unused = "p".repeat(5 * MIB / 8);
         modules.insert(
             format!("part{i}.mds"),
             format!("@define unused():\n{unused}\n@end\nx\n"),
         );
     }
     modules.insert("main.mds".to_owned(), root + "{{body}}");
-    // About 49 MiB retained sources, 50 MiB output, 50 MiB sourcesContent, 3.125 MiB
-    // CR table, and about 6 MiB of root source, frontmatter, prefix and growth charges.
+    // About 3.1 MiB retained sources and 50 MiB of their tree estimates, the 50 MiB
+    // compiler copy of `body`, 50 MiB output, 4.1 MiB sourcesContent, 3.125 MiB CR
+    // table, and about 22 MiB of root source, root tree estimate, frontmatter, prefix
+    // and growth charges.
     let body = "b".repeat(50 * MIB - 5 * "x\n".len() - 2 + extra) + "\rc";
     let vars = HashMap::from([("body".to_owned(), Value::String(body))]);
     let opts = CompileOptions::default()
@@ -679,7 +756,10 @@ fn assert_mapped_max_output_with_frontmatter() {
         .unwrap();
     assert_eq!(sources.len(), 6);
     let source_bytes: usize = sources.iter().map(String::len).sum();
-    assert!((49 * MIB..=50 * MIB).contains(&source_bytes));
+    assert!(
+        (4 * MIB..=5 * MIB).contains(&source_bytes),
+        "{source_bytes} B"
+    );
     let output = control.into_markdown().unwrap();
     assert_eq!(output.len(), 51 * MIB + 8);
     assert!(output.starts_with("---\nlabel: a"));
@@ -700,6 +780,74 @@ fn assert_mapped_max_output_with_frontmatter() {
         over_peak <= peak + MIB,
         "the refused corner grows {over_peak} B (control: {peak} B)"
     );
+}
+
+fn assert_compile_memory_error(result: Result<CompileResult, MdsError>, what: &str) {
+    let error = result.expect_err(what).serialize();
+    assert_eq!(error.code, "mds::resource_limit", "{what}");
+    assert_eq!(
+        error.message, "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes",
+        "{what}"
+    );
+}
+
+/// A module whose tree estimate passes the budget is refused after the lexer and
+/// before the parse, so its tree is never built.
+fn assert_refused_tree_is_never_built() {
+    // `\{{a` is two tokens per four bytes.
+    let past = "\\{{a".repeat(1 << 17);
+    let estimate = tree_estimate(&past);
+    assert!(estimate > 200 * MIB, "estimate: {estimate} B");
+    let (result, peak) = compile_measured(past.clone());
+    let bound = LEXER_PEAK_PER_BYTE * past.len();
+    eprintln!(
+        "refused tree heap (B): source={}, estimate={estimate}, peak={peak}, bound={bound}",
+        past.len()
+    );
+    assert_compile_memory_error(result, "tree estimate past the budget");
+    assert!(peak <= bound, "the refused module grows {peak} B");
+
+    // Control: about half the source fits the budget, so its tree is built.
+    let (result, control) = compile_measured("\\{{a".repeat((1 << 16) + 1));
+    eprintln!("admitted tree heap (B): peak={control}");
+    assert!(result.is_ok());
+    assert!(control > bound, "the admitted module grows {control} B");
+}
+
+/// Cached imports that keep their trees reach the budget, and the import that passes
+/// it is refused before its tree is built. The estimate of each cached module is at
+/// least the bytes that the module keeps, so the peak stays within the budget plus
+/// the slack.
+fn assert_cached_trees_share_one_limit() {
+    let budget = 200 * MIB;
+    let line = format!("{}\n", "a".repeat(79));
+    let dense = format!("@define f():\n{}\n@end\n", "\\{{a".repeat((1 << 14) + 1));
+    let prose = line.repeat((1 << 20) / line.len());
+    for (label, part) in [("dense", dense), ("prose", prose)] {
+        let estimate = tree_estimate(&part);
+        // Each import also keeps its source text in its origin, and its prompt text.
+        let fits = budget / (estimate + 2 * part.len()) - 1;
+        let past = budget / estimate + 1;
+        let (control, control_peak) = imports_measured(&part, fits);
+        assert!(control.is_ok(), "{label}: {fits} imports");
+        let (result, peak) = imports_measured(&part, past);
+        eprintln!(
+            "cached tree heap (B): {label}: estimate={estimate}, {fits} imports \
+             peak={control_peak}, {past} imports peak={peak}"
+        );
+        assert_compile_memory_error(result, label);
+        // The allocator counts each cached module: each keeps a copy of its source.
+        assert!(
+            control_peak >= fits * part.len(),
+            "{label}: {control_peak} B"
+        );
+        assert!(peak >= control_peak, "{label}: {peak} B");
+        assert!(
+            peak <= budget + SLACK,
+            "{label}: {past} imports grow {peak} B (limit: {} B)",
+            budget + SLACK
+        );
+    }
 }
 
 fn imports_measured(part: &str, count: usize) -> (Result<CompileResult, MdsError>, usize) {
@@ -788,6 +936,210 @@ fn assert_syntax_tree_peaks() {
         kept <= TREE_KEPT_PER_BYTE * function.len(),
         "a cached module keeps {kept} B"
     );
+
+    // The tree estimate (`tree_estimate`) is at least the peak and the kept bytes of
+    // each shape. The prose shapes set the text factor, the `\{{a` shapes the token
+    // factor and the expression shapes the expression factor. Shapes whose estimate
+    // would take more than a third of the budget repeat fewer times, so that three
+    // cached imports of each still fit. Each count stays just past a power of two.
+    let falsy = "---\na: ''\n---\n";
+    let n = (1 << 14) + 1;
+    let quarter = (1 << 12) + 1;
+    let line = format!("{}\n", "a".repeat(79));
+    let mut text = line.repeat((1 << 20) / line.len() + 1);
+    text.truncate((1 << 20) + 1);
+    // 2^18 + 1 characters of four bytes each: the lexer holds one character per four bytes.
+    let wide = char::from_u32(0x1F600)
+        .unwrap()
+        .to_string()
+        .repeat((1 << 18) + 1);
+    let params = |count: usize| {
+        (0..count)
+            .map(|i| format!("p{i}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let callee = |count: usize| format!("{falsy}@define f({}):\n@end\n", params(count));
+    let call = |count: usize| format!("{{{{f({})}}}}", vec!["a"; count].join(","));
+    let path = |segments: usize, count: usize| {
+        let levels = segments - 1;
+        let interpolation = format!("{{{{{}}}}}", vec!["a"; segments].join("."));
+        let (open, close) = ("{a: ".repeat(levels), "}".repeat(levels));
+        (
+            format!("---\na: {open}x{close}\n---\n"),
+            interpolation.repeat(count),
+        )
+    };
+    let mixed = ["a&&a"; 8].join("||");
+    // Nine `||` operands fill 9 of 16 slots, and each `&&` pair fills 2 of 4 slots.
+    let mixed9 = format!("{}||a||a", ["a&&a"; 7].join("||"));
+    let condition = |test: &str| format!("@if {test}:\n@end\n").repeat(quarter);
+    let nesting = |test: &str, count: usize| {
+        let open = format!("@if {test}:\n").repeat(63);
+        format!("{open}{}", "@end\n".repeat(63)).repeat(count)
+    };
+    let elseifs = |test: &str| {
+        let branches = format!("@elseif {test}:\n").repeat(256);
+        format!("@if a:\n{branches}@end\n").repeat(17)
+    };
+    let nested_call = format!("{{{{{}a{}}}}}", "f(".repeat(64), ")".repeat(64));
+    let prose_unit = format!("{}{{{{a}}}}", "a".repeat(75));
+    let identity = format!("{falsy}@define f(p):\n{{{{p}}}}\n@end\n");
+    let (path2_frontmatter, path2) = path(2, n);
+    let (path32_frontmatter, path32) = path(32, quarter);
+    // (label, prefix, body): each expression body is measured at the top level, in an
+    // uncalled `@define` and in a `@block`. A module keeps a second copy of those bodies.
+    let expressions = [
+        ("nested @if blocks", falsy.to_owned(), nesting("a", 87)),
+        (
+            "nested @if, && and ||",
+            falsy.to_owned(),
+            nesting(&mixed, 65),
+        ),
+        (
+            "nested @if, 9 || operands",
+            falsy.to_owned(),
+            nesting(&mixed9, 65),
+        ),
+        ("{{a}}", falsy.to_owned(), "{{a}}".repeat(n)),
+        ("call, 1 argument", callee(1), call(1).repeat(n)),
+        ("call, 5 arguments", callee(5), call(5).repeat(n)),
+        ("call, 513 arguments", callee(513), call(513).repeat(65)),
+        ("dotted path, 2 segments", path2_frontmatter, path2),
+        ("dotted path, 32 segments", path32_frontmatter, path32),
+        (
+            "16 operands, &&",
+            falsy.to_owned(),
+            condition(&["a"; 16].join("&&")),
+        ),
+        (
+            "16 operands, ||",
+            falsy.to_owned(),
+            condition(&["a"; 16].join("||")),
+        ),
+        (
+            "16 operands, && and ||",
+            falsy.to_owned(),
+            condition(&mixed),
+        ),
+        (
+            "16 operands, 9 || operands",
+            falsy.to_owned(),
+            condition(&mixed9),
+        ),
+        ("256 @elseif branches", falsy.to_owned(), elseifs("a")),
+        (
+            "256 @elseif branches, && and ||",
+            falsy.to_owned(),
+            elseifs(&mixed),
+        ),
+        (
+            "256 @elseif branches, 9 || operands",
+            falsy.to_owned(),
+            elseifs(&mixed9),
+        ),
+        (
+            "nested calls, 64 levels",
+            identity,
+            nested_call.repeat((1 << 10) + 1),
+        ),
+        (
+            "prose, one {{a}} per 80 bytes",
+            falsy.to_owned(),
+            prose_unit.repeat((1 << 13) + 1),
+        ),
+    ];
+    // (label, expression shape, source)
+    let mut shapes = vec![
+        ("prose text".to_owned(), false, text.clone()),
+        (
+            "prose in @define".to_owned(),
+            false,
+            format!("@define f():\n{text}\n@end\n"),
+        ),
+        (
+            "prose in @block".to_owned(),
+            false,
+            format!("@block b:\n{text}\n@end\n"),
+        ),
+        ("prose, 4-byte characters".to_owned(), false, wide),
+        ("dense text".to_owned(), false, dense.clone()),
+        ("dense in @define".to_owned(), false, function.clone()),
+        ("dense in @block".to_owned(), false, block.clone()),
+        (
+            "@define in @block".to_owned(),
+            false,
+            format!("@block b:\n{function}@end\n"),
+        ),
+    ];
+    for (label, prefix, body) in expressions {
+        let in_define = format!("{prefix}@define g():\n{body}\n@end\n");
+        let in_block = format!("{prefix}@block g:\n{body}\n@end\n");
+        shapes.push((label.to_owned(), true, format!("{prefix}{body}")));
+        shapes.push((format!("{label}, in @define"), true, in_define));
+        shapes.push((format!("{label}, in @block"), true, in_block));
+    }
+
+    // One compile charges the estimate and the read text (one byte per source byte)
+    // together before the parse; the source file cap also applies. A reused cache keeps
+    // the estimate and the prompt text of each cached module for its whole life. The
+    // largest source in bytes is floor(budget * len / (estimate + charge per unit)).
+    let budget = 200 * MIB;
+    let ceilings = |est: usize, len: usize, output: usize| {
+        let scaled = |per_unit: usize| (budget as u128 * len as u128 / per_unit as u128) as usize;
+        (scaled(est + len).min(10 * MIB), scaled(est + output))
+    };
+    let mut lowest = (usize::MAX, String::new());
+    let mut least_margin = (usize::MAX, String::new());
+    for (label, expression, source) in shapes {
+        let (tokens, expr) = token_stats(&source);
+        let est = tree_estimate(&source);
+        let (result, entry) = compile_measured(source.clone());
+        let output = match result {
+            Ok(result) => result.into_markdown().unwrap().len(),
+            Err(error) => panic!("{label}: {error}"),
+        };
+        let peaks = [1, 2, 3].map(|count| {
+            let (result, peak) = imports_measured(&source, count);
+            assert!(result.is_ok(), "{label}: {count} imports");
+            peak
+        });
+        let kept = peaks[2].saturating_sub(peaks[1]);
+        let need = entry.max(peaks[0]).max(kept);
+        eprintln!(
+            "tree estimate: {label}: source={}, tokens={tokens}, expression={expr}, \
+             output={output}, entry peak={entry}, import peak={}, kept={kept}, \
+             estimate={est}, margin={}",
+            source.len(),
+            peaks[0],
+            est as i64 - need as i64
+        );
+        assert!(est >= need, "{label}: estimate {est} B, measure {need} B");
+        least_margin = least_margin.min((est - need, label.clone()));
+        if expression {
+            lowest = lowest.min((ceilings(est, source.len(), output).0, label));
+        }
+    }
+    eprintln!(
+        "tree estimate: least margin {} B ({})",
+        least_margin.0, least_margin.1
+    );
+    let (k_tok, k_expr, k_text) = tree_factors();
+    let units = [
+        ("dense \\{{a", 2, 0, 4, 3),
+        ("{{a}} with a = ''", 1, 1, 5, 0),
+        ("prose", 0, 0, 1, 1),
+        ("prose, one {{a}} per 80 bytes", 2, 1, 80, 75),
+    ];
+    for (label, tokens, expr, len, output) in units {
+        let est = k_tok * tokens + k_expr * expr + k_text * len;
+        let (one, life) = ceilings(est, len, output);
+        eprintln!("ceiling: {label}: one compile={one}, reused cache life={life}");
+    }
+    eprintln!(
+        "ceiling: lowest expression shape: {} at {} B (one compile)",
+        lowest.1, lowest.0
+    );
 }
 
 #[test]
@@ -798,6 +1150,12 @@ fn compile_peak_heap_stays_within_each_bound() {
         test_count(&format!("{source}\n#[test]\nfn extra() {{}}\n")),
         2
     );
+    // The factor reader finds a planted constant, and only that name.
+    let planted = "pub(crate) const PLANTED: usize = 1_024;\n";
+    assert_eq!(const_value(planted, "PLANTED"), Some(1024));
+    assert_eq!(const_value(planted, "OTHER"), None);
+    let (k_tok, k_expr, k_text) = tree_factors();
+    assert!(k_tok > 0 && k_expr > 0 && k_text > 0);
 
     // Supply the text through a variable to stay below the source file cap.
     let modules = HashMap::from([("main.mds".to_string(), "{{body}}".to_string())]);
@@ -843,5 +1201,7 @@ fn compile_peak_heap_stays_within_each_bound() {
     assert_imported_prompts_share_one_limit();
     assert_alias_frontmatter_shares_one_limit();
     assert_extends_chain_trees_share_one_limit();
+    assert_refused_tree_is_never_built();
+    assert_cached_trees_share_one_limit();
     assert_syntax_tree_peaks();
 }

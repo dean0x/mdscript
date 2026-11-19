@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::ast::{DefineBlock, Param};
+use crate::evaluator::budget::{table_bytes, value_bytes};
 use crate::limits::MAX_DEFINES_PER_MODULE;
 use crate::sourcemap::Origin;
 use crate::value::Value;
@@ -215,16 +216,26 @@ pub(crate) fn captured_entry_count(scope: &Scope) -> usize {
     frozen + scope.pending_functions.len() + scope.pending_namespaces.len()
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct VarLayer(HashMap<String, Slot>);
+/// One layer of variables, with its byte count while that count is known.
+#[derive(Debug)]
+pub(crate) struct VarLayer(HashMap<String, Slot>, Option<usize>);
+
+impl Default for VarLayer {
+    fn default() -> Self {
+        Self(HashMap::new(), Some(0))
+    }
+}
 
 impl VarLayer {
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
+    /// Insert a variable. The layer then has no byte count, so it can not pass
+    /// a charge.
     pub(crate) fn insert(&mut self, name: String, root: Arc<Value>) {
         self.0.insert(name, Slot::from_root(root));
+        self.1 = None;
     }
 
     pub(crate) fn contains_key(&self, name: &str) -> bool {
@@ -238,15 +249,33 @@ impl VarLayer {
     fn len(&self) -> usize {
         self.0.len()
     }
+
+    /// The bytes of the layer: its table, the name text and each value tree,
+    /// counted when the layer was collected. An empty layer counts 0. `None` is
+    /// a layer changed by `insert`, a value past the depth or step bound, or a
+    /// count past the address space.
+    pub(crate) fn bytes(&self) -> Option<usize> {
+        self.1
+    }
 }
 
 impl FromIterator<(String, Arc<Value>)> for VarLayer {
+    /// Collect the layer and count its bytes in the same pass.
     fn from_iter<T: IntoIterator<Item = (String, Arc<Value>)>>(iter: T) -> Self {
-        Self(
-            iter.into_iter()
-                .map(|(name, root)| (name, Slot::from_root(root)))
-                .collect(),
-        )
+        let mut bytes = Some(0);
+        let vars: HashMap<_, _> = iter
+            .into_iter()
+            .map(|(name, root)| {
+                bytes = bytes.and_then(|n: usize| {
+                    n.checked_add(name.capacity())?
+                        .checked_add(value_bytes(&root)?)
+                });
+                (name, Slot::from_root(root))
+            })
+            .collect();
+        let table = table_bytes(vars.capacity(), size_of::<(String, Slot)>());
+        let bytes = bytes.and_then(|n| n.checked_add(table?));
+        Self(vars, bytes)
     }
 }
 
