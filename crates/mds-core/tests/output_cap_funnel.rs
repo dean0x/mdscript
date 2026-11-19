@@ -13,9 +13,20 @@
 //!   `upper()`/`lower()`/`join()` message from `builtin_output_too_large` in `builtins.rs`;
 //! * `push_capped` is defined once, and every output accumulator calls it the expected
 //!   number of times with no raw append (`push_str`, `push`, `+=`, …) left in its body.
+//! * The compile-memory message and the frontmatter allowance message each appear
+//!   only in their constructors.
+//! * The listed files do not contain the four cfg key names `target_arch`,
+//!   `target_family`, `target_os` and `target_pointer_width`. Other cfg forms stay
+//!   allowed: `cfg(unix)`, `cfg(windows)`, `cfg(not(windows))` and the other target
+//!   keys, such as `target_env`. `cfg(not(windows))` is true on wasm32, so this check
+//!   does not prove that the listed code is the same on each target.
+//! * The budget module code does not use `RefCell` or these panic tokens: `panic`,
+//!   `unreachable`, `todo`, `unimplemented`, `unwrap`, `expect` and the assert macros.
+//!   The check does not find other code that can panic, such as an index.
 //!
-//! Scope: `crates/mds-core/src/**`, excluding `*_tests.rs` files and `#[cfg(test)]`
-//! items. Comments never count; string literals count only for the message check.
+//! The message and append checks scan `crates/mds-core/src/**`. They skip `*_tests.rs`,
+//! `#[cfg(test)]` items, and comments. Only the message checks scan string literals.
+//! The architecture check scans the listed files as text. The budget module check scans code.
 
 use std::path::{Path, PathBuf};
 
@@ -25,9 +36,45 @@ const MESSAGE: &str = "\"output exceeds maximum size";
 /// The same text unanchored: the `builtins.rs` messages carry it mid-literal.
 const MESSAGE_UNANCHORED: &str = "output exceeds maximum size";
 
-/// The one file allowed to hold the message, and the constructor that must hold it.
+const BUDGET_MESSAGE: &str = "\"compile memory exceeds maximum of ";
+const BUDGET_CONSTRUCTOR: &str = "fn compile_memory_exceeded(";
+
+const ALLOWANCE_MESSAGE: &str = "\"frontmatter YAML expands beyond maximum of ";
+const ALLOWANCE_CONSTRUCTOR: &str = "fn frontmatter_expansion_exceeded(";
+
+/// The file and constructors that build the messages.
 const CHOKE_POINT: &str = "error.rs";
-const CONSTRUCTOR: &str = "fn output_size_exceeded(";
+const MESSAGES: &[(&str, &str)] = &[
+    (MESSAGE, "fn output_size_exceeded("),
+    (BUDGET_MESSAGE, BUDGET_CONSTRUCTOR),
+    (ALLOWANCE_MESSAGE, ALLOWANCE_CONSTRUCTOR),
+];
+
+const BUDGET_SOURCE: &str = "evaluator/budget.rs";
+const ARCH_INDEPENDENT: &[&str] = &[
+    "evaluator.rs",
+    "resolver.rs",
+    "builtins.rs",
+    "sourcemap.rs",
+    "lib.rs",
+    "scope.rs",
+    "value.rs",
+    "limits.rs",
+    "resolver/frontmatter.rs",
+    "resolver/inheritance.rs",
+    BUDGET_SOURCE,
+];
+
+/// The four cfg key names that the listed files must not contain. `cfg(unix)`,
+/// `cfg(windows)` and `cfg(not(windows))` stay allowed. `lib.rs` uses `cfg(windows)`
+/// and `cfg(not(windows))` for host paths, and `cfg(not(windows))` is true on wasm32.
+/// The other target keys, such as `target_env` and `target_vendor`, also stay allowed.
+const TARGET_KEYS: &[&str] = &[
+    "target_arch",
+    "target_family",
+    "target_os",
+    "target_pointer_width",
+];
 
 /// The capped append helper.
 const HELPER_DEF: &str = "fn push_capped(";
@@ -67,8 +114,7 @@ fn output_cap_is_funnelled_through_one_helper_and_one_constructor() {
         files.len()
     );
 
-    let mut violations: Vec<String> = Vec::new();
-    let mut choke_point_hits = 0usize;
+    let mut message_totals = [0; MESSAGES.len()];
     let mut unanchored_elsewhere = 0usize;
     let mut helper_defs = 0usize;
 
@@ -88,27 +134,11 @@ fn output_cap_is_funnelled_through_one_helper_and_one_constructor() {
 
         helper_defs += code.matches(HELPER_DEF).count();
 
-        let hits: Vec<usize> = code_and_strings
-            .match_indices(MESSAGE)
-            .map(|(at, _)| at)
-            .collect();
-        if name == CHOKE_POINT {
-            choke_point_hits += hits.len();
-            if hits.is_empty() {
-                continue;
-            }
-            let body = function_range(&code, CONSTRUCTOR, &name);
-            for at in &hits {
-                assert!(
-                    body.contains(at),
-                    "{name}: the output-cap message must be built inside \
-                     `MdsError::output_size_exceeded`, found one outside it"
-                );
-            }
-        } else {
-            for _ in &hits {
-                violations.push(format!("  {name}: contains the output-cap message"));
-            }
+        for ((message, constructor), total) in MESSAGES.iter().zip(&mut message_totals) {
+            *total += message_hits(&name, &code, &code_and_strings, message, constructor)
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+        if name != CHOKE_POINT {
             unanchored_elsewhere += code_and_strings.matches(MESSAGE_UNANCHORED).count();
         }
     }
@@ -116,24 +146,18 @@ fn output_cap_is_funnelled_through_one_helper_and_one_constructor() {
     // Non-vacuity: the scanner finds the message where it must live, and the anchor —
     // not a blind matcher — is what excludes the built-in messages, which carry the
     // same words mid-literal.
-    assert_eq!(
-        choke_point_hits, 1,
-        "non-vacuity: `{CHOKE_POINT}` must build the output-cap message exactly once"
-    );
+    for ((message, constructor), total) in MESSAGES.iter().zip(message_totals) {
+        assert_eq!(
+            total, 1,
+            "`{CHOKE_POINT}` must build `{message}` exactly once in `{constructor}`"
+        );
+    }
     assert!(
         unanchored_elsewhere >= 2,
         "non-vacuity: the unanchored match must find the `replace()` message and the shared \
          `upper()`/`lower()`/`join()` message from `builtin_output_too_large` in `builtins.rs` \
          (found {unanchored_elsewhere})"
     );
-    assert!(
-        violations.is_empty(),
-        "output-cap message outside `MdsError::output_size_exceeded` ({} found):\n{}\n\n\
-         Build the error with `MdsError::output_size_exceeded()` instead.",
-        violations.len(),
-        violations.join("\n")
-    );
-
     assert_eq!(helper_defs, 1, "`push_capped` must be defined exactly once");
 
     for (file, anchor, calls) in ACCUMULATORS {
@@ -155,6 +179,147 @@ fn output_cap_is_funnelled_through_one_helper_and_one_constructor() {
                  append goes through `push_capped`, which checks the cap first"
             );
         }
+    }
+}
+
+fn message_hits(
+    name: &str,
+    code: &str,
+    code_and_strings: &str,
+    message: &str,
+    constructor: &str,
+) -> Result<usize, String> {
+    let mut hits = code_and_strings.match_indices(message).peekable();
+    if hits.peek().is_none() {
+        return Ok(0);
+    }
+    let misplaced = || format!("{name}: build `{message}` only in `{constructor}`");
+    if name != CHOKE_POINT {
+        return Err(misplaced());
+    }
+    let body = function_range(code, constructor, name);
+    hits.try_fold(0, |total, (at, _)| {
+        if body.contains(&at) {
+            Ok(total + 1)
+        } else {
+            Err(misplaced())
+        }
+    })
+}
+
+fn check_budget_source(name: &str, raw: &str) -> Result<(), String> {
+    if let Some(key) = TARGET_KEYS.iter().find(|key| raw.contains(**key)) {
+        return Err(format!("{name}: do not use `{key}`"));
+    }
+    if name == BUDGET_SOURCE {
+        let code = mask(raw, true);
+        let forbidden = code
+            .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .find(|token| {
+                matches!(
+                    *token,
+                    "assert"
+                        | "assert_eq"
+                        | "assert_ne"
+                        | "debug_assert"
+                        | "debug_assert_eq"
+                        | "debug_assert_ne"
+                        | "expect"
+                        | "unwrap"
+                        | "panic"
+                        | "unreachable"
+                        | "todo"
+                        | "unimplemented"
+                        | "RefCell"
+                )
+            });
+        if let Some(token) = forbidden {
+            return Err(format!("{name}: do not use `{token}`"));
+        }
+    }
+    Ok(())
+}
+
+/// Check each listed file, with its text from `read`.
+fn check_listed_sources(read: impl Fn(&str) -> String) -> Result<(), String> {
+    ARCH_INDEPENDENT
+        .iter()
+        .try_for_each(|name| check_budget_source(name, &read(name)))
+}
+
+#[test]
+fn budget_rules_apply_to_each_source_file() {
+    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    check_listed_sources(|name| {
+        std::fs::read_to_string(src_dir.join(name)).expect("source must be readable")
+    })
+    .unwrap_or_else(|error| panic!("{error}"));
+}
+
+#[test]
+fn budget_gates_reject_planted_text() {
+    for (message, constructor, limit) in [
+        (BUDGET_MESSAGE, BUDGET_CONSTRUCTOR, "209715200"),
+        (ALLOWANCE_MESSAGE, ALLOWANCE_CONSTRUCTOR, "52428800"),
+    ] {
+        let literal = format!("{message}{limit} bytes\"");
+        let valid = format!("{constructor}) -> &'static str {{ {literal} }}");
+        let extra = format!("fn other() -> &'static str {{ {literal} }}");
+        let at = |name: &str, raw: &str| {
+            message_hits(
+                name,
+                &mask(raw, true),
+                &mask(raw, false),
+                message,
+                constructor,
+            )
+        };
+        // Control: the literal inside its constructor passes.
+        assert_eq!(at(CHOKE_POINT, &valid), Ok(1));
+        for (name, raw) in [
+            ("resolver/frontmatter.rs", extra.clone()),
+            (CHOKE_POINT, format!("{valid}\n{extra}")),
+        ] {
+            assert_eq!(
+                at(name, &raw),
+                Err(format!("{name}: build `{message}` only in `{constructor}`"))
+            );
+        }
+    }
+    for (key, value) in TARGET_KEYS.iter().zip(["wasm32", "wasm", "unknown", "32"]) {
+        assert_eq!(
+            check_budget_source(
+                "evaluator.rs",
+                &format!("#[cfg({key} = \"{value}\")] fn charge() {{}}")
+            ),
+            Err(format!("evaluator.rs: do not use `{key}`"))
+        );
+    }
+    // Control: the host-path cfg forms stay allowed. `cfg(not(windows))` is true on
+    // wasm32.
+    for form in ["unix", "windows", "not(windows)"] {
+        assert_eq!(
+            check_budget_source("lib.rs", &format!("#[cfg({form})] fn native() {{}}")),
+            Ok(())
+        );
+    }
+    // The file list reaches `limits.rs`.
+    let planted = |name: &str| {
+        if name == "limits.rs" {
+            "#[cfg(target_pointer_width = \"32\")] pub(crate) const MAX: usize = 1;".into()
+        } else {
+            String::new()
+        }
+    };
+    assert_eq!(
+        check_listed_sources(planted),
+        Err("limits.rs: do not use `target_pointer_width`".into())
+    );
+    for token in ["assert", "unreachable", "todo", "unimplemented"] {
+        assert_eq!(
+            check_budget_source(BUDGET_SOURCE, &format!("fn charge() {{ {token}!(); }}")),
+            Err(format!("evaluator/budget.rs: do not use `{token}`"))
+        );
     }
 }
 

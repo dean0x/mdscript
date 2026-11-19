@@ -282,6 +282,8 @@ impl From<Value> for Slot {
 }
 
 impl Slot {
+    pub(crate) const PROJECTION_BYTES: usize = size_of::<PathNode>() + 2 * size_of::<usize>();
+
     fn from_root(root: Arc<Value>) -> Self {
         Self { root, path: None }
     }
@@ -308,20 +310,28 @@ impl Slot {
         let Some(head) = self.path.as_deref() else {
             return Some(&self.root);
         };
-        let mut steps = Vec::with_capacity(head.depth);
-        steps.extend(
-            std::iter::successors(Some(head), |node| node.parent.as_deref())
-                .take(head.depth)
-                .map(|node| &node.step),
-        );
+        let mut steps = [None; crate::value::MAX_VALUE_DEPTH];
+        let steps = steps.get_mut(..head.depth)?;
+        for (entry, node) in steps
+            .iter_mut()
+            .zip(std::iter::successors(Some(head), |node| {
+                node.parent.as_deref()
+            }))
+        {
+            *entry = Some(&node.step);
+        }
         steps
-            .into_iter()
+            .iter()
             .rev()
-            .try_fold(self.root.as_ref(), |value, step| match (value, step) {
-                (Value::Array(items), PathStep::Index(i)) => items.get(*i),
-                (Value::Object(fields), PathStep::Key(key)) => fields.get(key),
+            .try_fold(self.root.as_ref(), |value, step| match (value, *step) {
+                (Value::Array(items), Some(PathStep::Index(i))) => items.get(*i),
+                (Value::Object(fields), Some(PathStep::Key(key))) => fields.get(key),
                 _ => None,
             })
+    }
+
+    pub(crate) fn copies_on_take(&self) -> bool {
+        self.path.is_some() || Arc::strong_count(&self.root) > 1
     }
 
     pub(crate) fn into_value(self) -> Option<Value> {
@@ -676,6 +686,37 @@ mod tests {
 
     pub(super) fn note_builtin_probe() {
         BUILTIN_PROBES.with(|count| count.set(count.get() + 1));
+    }
+
+    /// A path of `levels` steps into a value that holds `leaf` under `levels` arrays.
+    fn path_to_leaf(levels: usize, leaf: &Value) -> Slot {
+        let mut value = leaf.clone();
+        for _ in 0..levels {
+            value = Value::Array(vec![value]);
+        }
+        let mut slot = Slot::from(value);
+        for _ in 0..levels {
+            slot = slot.project(PathStep::Index(0));
+        }
+        slot
+    }
+
+    #[test]
+    fn a_path_as_deep_as_the_value_depth_cap_reaches_its_leaf() {
+        // A path into a value from YAML or JSON conversion has at most
+        // `MAX_VALUE_DEPTH` steps. Path lookup uses a fixed table of that size.
+        let leaf = Value::String("leaf".into());
+        let slot = path_to_leaf(crate::value::MAX_VALUE_DEPTH, &leaf);
+        assert_eq!(slot.get(), Some(&leaf));
+    }
+
+    #[test]
+    fn a_path_one_step_past_the_value_depth_cap_finds_no_value() {
+        // A value built in Rust can nest deeper than YAML or JSON conversion allows.
+        // The leaf exists, but the fixed table has no room for the extra step.
+        let leaf = Value::String("leaf".into());
+        let slot = path_to_leaf(crate::value::MAX_VALUE_DEPTH + 1, &leaf);
+        assert_eq!(slot.get(), None);
     }
 
     #[test]

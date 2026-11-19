@@ -917,6 +917,22 @@ impl MapBuilder {
         self.sources.iter().map(|origin| origin.source.len()).sum()
     }
 
+    pub(crate) fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub(crate) fn segments_bytes(&self) -> usize {
+        self.segments.capacity() * size_of::<RawSegment>()
+    }
+
+    pub(crate) fn source_labels_bytes(&self, base_bytes: usize) -> Option<usize> {
+        // A relative label can add a "../" for each base component.
+        let extra = base_bytes.checked_mul(3)?.checked_mul(self.sources.len())?;
+        self.sources.iter().try_fold(extra, |total, origin| {
+            total.checked_add(map_source_label(&origin.file).len().max(6))
+        })
+    }
+
     /// Push a new segment, capping at [`crate::limits::MAX_SOURCEMAP_SEGMENTS`].
     ///
     /// Segments beyond the cap are silently dropped so compilation succeeds

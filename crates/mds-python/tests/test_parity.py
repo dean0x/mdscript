@@ -150,6 +150,110 @@ def test_par3_error_code_parity_with_napi(code: str, thunk) -> None:  # type: ig
     assert ei.value.code == code
 
 
+# ── PAR7: compile memory limits on Python and the live CLI ──────────────────────
+#
+# Python and the CLI compile the same files. The test compares the two surfaces with
+# each other, then pins the result: a golden for each surface cannot show that they
+# differ. The mds_cli fixture fails in CI when the CLI is missing.
+
+MIB = 1024 * 1024
+# A frontmatter scalar of 1 MiB, with its key and newline.
+SCALAR = "a" * (MIB - len("x: \n"))
+FRONTMATTER = f"---\nx: {SCALAR}\n---\n"
+
+
+def nested_function_source(depth: int) -> str:
+    """Functions f1 to f<depth>. Each body has 49 lines of the scalar, then the length
+    of the next function's result. The root prints the length of f1()."""
+    lines = "{{x}}\n" * 49
+    functions = "".join(
+        f"@define f{i}():\n{lines}"
+        + (f"{{{{length(f{i + 1}())}}}}\n" if i < depth else "")
+        + "@end\n"
+        for i in range(1, depth + 1)
+    )
+    return f"{FRONTMATTER}{functions}{{{{length(f1())}}}}\n"
+
+
+def over_allowance_source() -> str:
+    """66 aliases expand an 800 KB scalar past the 50 MiB frontmatter parse allowance."""
+    aliases = ", ".join(["*a"] * 66)
+    return f"---\na: &a {'x' * 800_000}\nb: [{aliases}]\n---\nHi\n"
+
+
+def resource_limit(message: str) -> dict[str, object]:
+    return {
+        "code": "mds::resource_limit",
+        "message": f"resource limit exceeded: {message}",
+        "help": None,
+        "span": None,
+    }
+
+
+def cli_error(stderr: str) -> dict[str, object]:
+    """The error of a CLI report that has no help and no source excerpt.
+
+    The report has the code, a blank line, then the message. The message wraps at the
+    terminal width, and each of its lines has two spaces, one frame mark and one space.
+    A help line or a source excerpt does not have this shape, so it fails here.
+    """
+    code, blank, *frame = stderr.rstrip("\n").split("\n")
+    assert blank == "" and frame, stderr
+    assert all(line[:2] == "  " and line[3:4] == " " for line in frame), stderr
+    message = " ".join(line[4:] for line in frame)
+    return {"code": code, "message": message, "help": None, "span": None}
+
+
+def test_par7_live_cli_memory_limit_parity(
+    mds_cli: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    # The inner body loses its last newline. The outer body ends in that length.
+    lines = 49 * (len(SCALAR) + 1)
+    cases: list[tuple[str, str, int, dict[str, object]]] = [
+        (
+            "depth-2.mds",
+            nested_function_source(2),
+            0,
+            {"output": f"{FRONTMATTER}{lines + len(str(lines - 1))}\n"},
+        ),
+        (
+            "depth-5.mds",
+            nested_function_source(5),
+            3,
+            resource_limit("compile memory exceeds maximum of 209715200 bytes"),
+        ),
+        (
+            "frontmatter.mds",
+            over_allowance_source(),
+            3,
+            resource_limit("frontmatter YAML expands beyond maximum of 52428800 bytes"),
+        ),
+    ]
+    py: list[dict[str, object]] = []
+    cli: list[dict[str, object]] = []
+    exits: list[int] = []
+    for name, source, _, _ in cases:
+        path = tmp_path / name
+        # write_bytes: the CLI reads the same LF bytes on every OS.
+        path.write_bytes(source.encode("utf-8"))
+        try:
+            py.append({"output": m.compile_file(path).output})
+        except m.MdsError as err:
+            py.append(
+                {"code": err.code, "message": err.message, "help": err.help, "span": err.span}
+            )
+        proc = subprocess.run(
+            [str(mds_cli), "build", str(path), "-o", "-"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        exits.append(proc.returncode)
+        cli.append({"output": proc.stdout} if proc.returncode == 0 else cli_error(proc.stderr))
+    assert (py, cli) == (cli, [expected for *_, expected in cases])
+    assert exits == [exit_code for _, _, exit_code, _ in cases]
+
+
 # ── PAR4 / PAR5: lint canonical-JSON byte-parity (AC-API-06) ─────────────────────
 #
 # LINT_GOLDENS are captured from the Rust core serializer and checked in.

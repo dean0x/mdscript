@@ -52,6 +52,7 @@
 //! - 2: any error-severity finding OR analysis failure (parse/resolve/IO/config-load)
 //!   OR usage error
 //! - 3: ResourceLimit
+//! - 101: internal compiler error
 //!
 //! With `--fix`, residual post-fix findings determine the exit code.
 //!
@@ -244,8 +245,7 @@ pub(crate) fn run_lint(args: LintArgs) -> i32 {
 }
 
 /// [`run_lint`] through `sink`: a lint-specific exit code, or the exit of a setup failure,
-/// which the sink shows — as for an analysis failure, 3 for a resource limit (a `--vars`
-/// file over the size cap, #309) and 2 for any other error.
+/// which the sink shows. Setup and analysis failures use the same exit codes.
 fn lint_through(args: LintArgs, sink: &mut impl ResultSink) -> i32 {
     match do_lint(args, sink) {
         Ok(code) => code,
@@ -586,15 +586,9 @@ fn result_exit_code(result: &mds::LintResult) -> i32 {
     }
 }
 
-/// Compute exit code for an `MdsError` from the lint pipeline.
-///
-/// - 3: ResourceLimit
-/// - 2: everything else (parse, resolve, IO, usage, etc.)
+/// Use the same exit code for this error in a single-input or directory run.
 fn mds_error_exit_code(err: &MdsError) -> i32 {
-    match err {
-        MdsError::ResourceLimit { .. } => 3,
-        _ => 2,
-    }
+    failure_tally(err).exit_code()
 }
 
 // ── Fix pipeline ──────────────────────────────────────────────────────────────
@@ -848,6 +842,7 @@ enum FileTally {
     WarnOnly = 1,
     Error = 2,
     ResourceLimit = 3,
+    Internal = crate::output::PANIC_EXIT as isize,
 }
 
 impl FileTally {
@@ -864,13 +859,12 @@ fn tally_from_result(result: &mds::LintResult) -> FileTally {
     }
 }
 
-/// The tally of an input refused before it had findings — its source read or `mds::lint`:
-/// resource-limited for `mds::resource_limit`, "with errors" for any other refusal.
+/// Classify a source read or analysis failure.
 fn failure_tally(e: &MdsError) -> FileTally {
-    if matches!(e, MdsError::ResourceLimit { .. }) {
-        FileTally::ResourceLimit
-    } else {
-        FileTally::Error
+    match e {
+        MdsError::ResourceLimit { .. } => FileTally::ResourceLimit,
+        MdsError::Internal => FileTally::Internal,
+        _ => FileTally::Error,
     }
 }
 
@@ -929,7 +923,7 @@ impl DirSummary {
         match verdict.tally {
             FileTally::Clean => self.clean_count += 1,
             FileTally::WarnOnly => self.warn_file_count += 1,
-            FileTally::Error => self.error_file_count += 1,
+            FileTally::Error | FileTally::Internal => self.error_file_count += 1,
             FileTally::ResourceLimit => self.limit_file_count += 1,
         }
         self.verdict = self.verdict.merge(verdict);
@@ -2775,6 +2769,70 @@ mod tests {
             pending.exit_code(),
             1,
             "control: a preview that would fix a clean file exits 1"
+        );
+    }
+
+    #[test]
+    fn lint_analysis_failure_exits_101_for_an_internal_error() {
+        let mut sink = Recorder::default();
+        assert_eq!(
+            super::analysis_failed(&mut sink, &MdsError::Internal, None),
+            101
+        );
+        assert_eq!(sink.calls, ["analysis failure"]);
+    }
+
+    #[test]
+    fn lint_batch_keeps_the_internal_exit_code_after_the_next_file() {
+        let root = Path::new("templates");
+        let first = root.join("a.mds");
+        let next = root.join("b.mds");
+        let error = MdsError::Internal;
+        let reports = [
+            (
+                &first,
+                "a.mds",
+                Outcome::Failed {
+                    tally: super::failure_tally(&error),
+                    error,
+                },
+            ),
+            (
+                &next,
+                "b.mds",
+                Outcome::Reported {
+                    findings: LintResult::new(vec![]),
+                    text: None,
+                },
+            ),
+        ];
+        let mut sink = Recorder::default();
+        let summary =
+            reports
+                .into_iter()
+                .fold(DirSummary::default(), |summary, (path, key, outcome)| {
+                    let report = FileReport {
+                        input: LintSource::DirEntry { root, path, key },
+                        capped: None,
+                        outcome,
+                    };
+                    summary.count(render(report, &mut sink).verdict)
+                });
+        assert_eq!(
+            sink.calls,
+            [
+                "failed (mds::internal) a.mds",
+                "findings (0) b.mds",
+                "clean b.mds"
+            ]
+        );
+        assert_eq!(
+            (
+                summary.error_file_count,
+                summary.clean_count,
+                summary.exit_code()
+            ),
+            (1, 1, 101)
         );
     }
 

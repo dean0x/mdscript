@@ -9,23 +9,27 @@ use indexmap::{IndexMap, IndexSet};
 
 use crate::ast::{BlockNode, DefineBlock, ExportDirective, ImportDirective, Node};
 use crate::error::MdsError;
+use crate::evaluator::budget::{bytes, MemBudget, Part};
 use crate::evaluator::{
     evaluate_messages_seeded, evaluate_seeded, evaluate_with_map_seeded, EvalBudget,
 };
 use crate::fs::{FileSystem, NativeFs, VirtualFs};
 use crate::lexer::tokenize;
 use crate::limits::{
-    MAX_BLOCKS_PER_MODULE, MAX_DEFINES_PER_MODULE, MAX_FILE_SIZE, MAX_MODULE_COUNT,
+    MAX_BLOCKS_PER_MODULE, MAX_COMPILE_MEMORY, MAX_DEFINES_PER_MODULE, MAX_FILE_SIZE,
+    MAX_MODULE_COUNT, MAX_SOURCES_CONTENT_BYTES,
 };
 use crate::parser::parse_with_ctx;
 use crate::scope::{FunctionDef, NamespaceScope, PromptText, Scope, VarLayer};
 // Import Origin from sourcemap.rs to avoid a scope→resolver import cycle.
 pub(crate) use crate::sourcemap::Origin;
-use crate::sourcemap::SourceIndex;
+use crate::sourcemap::{CompileOptions, MapBuilder, SourceIndex};
 use crate::validator;
 use crate::value::Value;
 
-use frontmatter::{build_scope_from_merged_mapping, deep_merge_yaml};
+use frontmatter::{
+    build_scope_from_merged_mapping, deep_merge_yaml, parse_frontmatter_yaml_with, Allowance,
+};
 pub(crate) use frontmatter::{
     parse_frontmatter_imports, parse_frontmatter_imports_from_yaml, parse_frontmatter_yaml,
     FrontmatterImport,
@@ -144,6 +148,8 @@ pub struct ResolvedModule {
     pub(crate) skeleton_origin: Origin,
     /// Parsed YAML frontmatter mapping. Reserved-key splitting deferred to future refactor.
     pub(crate) frontmatter_values: Option<serde_yaml_ng::Mapping>,
+    /// The bytes charged for `frontmatter_values`, part of this entry's kept bytes.
+    pub(crate) frontmatter_bytes: usize,
     /// `true` when this entry was produced by `process_module_skeleton` (resolved as an
     /// `@extends` base: collect-only, NO standalone validate/evaluate, `prompt_body = None`).
     ///
@@ -187,6 +193,7 @@ impl Clone for ResolvedModule {
             effective_blocks: self.effective_blocks.clone(),
             skeleton_origin: self.skeleton_origin.clone(),
             frontmatter_values: self.frontmatter_values.clone(),
+            frontmatter_bytes: self.frontmatter_bytes,
             is_skeleton: self.is_skeleton,
         }
     }
@@ -244,8 +251,33 @@ pub struct ModuleCache {
     /// for sub-modules (AC-PERF-01).
     source_map_mode: bool,
     budget: EvalBudget,
+    retained: usize,
+    kept: usize,
+    #[cfg(test)]
+    module_probes: Vec<ModuleProbe>,
     #[cfg(test)]
     function_call_seed: usize,
+    #[cfg(test)]
+    temporaries_seed: usize,
+    #[cfg(test)]
+    retained_transfer_seed: usize,
+}
+
+struct ModuleMark {
+    temporaries: usize,
+    outer_kept: usize,
+    #[cfg(test)]
+    probe: usize,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ModuleProbe {
+    buffers_before: usize,
+    buffers_after_insert: Option<usize>,
+    temporaries_before: usize,
+    temporaries_open: usize,
+    temporaries_closed: usize,
 }
 
 impl std::fmt::Debug for ModuleCache {
@@ -267,31 +299,14 @@ impl ModuleCache {
 
     /// Create a `ModuleCache` backed by the native OS filesystem.
     pub fn native() -> Self {
-        Self {
-            fs: Box::new(NativeFs::new()),
-            modules: IndexMap::new(),
-            resolving: IndexSet::new(),
-            source_map_mode: false,
-            budget: EvalBudget::default(),
-            #[cfg(test)]
-            function_call_seed: 0,
-        }
+        Self::with_fs(Box::new(NativeFs::new()))
     }
 
     /// Create a `ModuleCache` backed by an in-memory virtual filesystem.
     ///
-    /// Useful for testing and WASM environments where OS filesystem access
-    /// is unavailable.
+    /// Useful for testing and WASM environments where OS access is unavailable.
     pub fn virtual_fs(modules: HashMap<String, String>) -> Self {
-        Self {
-            fs: Box::new(VirtualFs::new(modules)),
-            modules: IndexMap::new(),
-            resolving: IndexSet::new(),
-            source_map_mode: false,
-            budget: EvalBudget::default(),
-            #[cfg(test)]
-            function_call_seed: 0,
-        }
+        Self::with_fs(Box::new(VirtualFs::new(modules)))
     }
 
     /// Create a `ModuleCache` with a custom [`FileSystem`] implementation.
@@ -302,8 +317,16 @@ impl ModuleCache {
             resolving: IndexSet::new(),
             source_map_mode: false,
             budget: EvalBudget::default(),
+            retained: 0,
+            kept: 0,
+            #[cfg(test)]
+            module_probes: Vec::new(),
             #[cfg(test)]
             function_call_seed: 0,
+            #[cfg(test)]
+            temporaries_seed: 0,
+            #[cfg(test)]
+            retained_transfer_seed: 0,
         }
     }
 
@@ -340,10 +363,110 @@ impl ModuleCache {
     fn start_resolution(&mut self, key: &str) {
         if self.resolving.is_empty() {
             self.budget = EvalBudget::default();
+            self.kept = 0;
+            self.commit_retained(0);
             #[cfg(test)]
-            self.budget.seed_function_calls(self.function_call_seed);
+            {
+                self.module_probes.clear();
+                self.budget.seed_function_calls(self.function_call_seed);
+                let seed = self.temporaries_seed + usize::from(key == tests::TEMPORARIES_SEED_KEY);
+                if seed != 0 {
+                    self.budget.mem.charge(Part::Temp, Some(seed)).unwrap();
+                }
+            }
         }
         self.resolving.insert(key.to_string());
+    }
+
+    fn open_module(&mut self, read_bytes: usize) -> (ModuleMark, Result<(), MdsError>) {
+        let mark = ModuleMark {
+            temporaries: self.budget.mem.mark(),
+            outer_kept: std::mem::take(&mut self.kept),
+            #[cfg(test)]
+            probe: self.module_probes.len(),
+        };
+        let charged = if read_bytes == 0 {
+            Ok(())
+        } else {
+            self.budget
+                .mem
+                .charge(Part::Temp, Some(read_bytes))
+                .map(drop)
+        };
+        #[cfg(test)]
+        self.module_probes.push(ModuleProbe {
+            buffers_before: self.budget.mem.buffers,
+            temporaries_before: mark.temporaries,
+            temporaries_open: self.budget.mem.mark(),
+            ..ModuleProbe::default()
+        });
+        (mark, charged)
+    }
+
+    fn close_module(&mut self, mark: ModuleMark) -> usize {
+        self.budget.mem.release_to(mark.temporaries);
+        #[cfg(test)]
+        {
+            self.module_probes[mark.probe].temporaries_closed = self.budget.mem.mark();
+        }
+        std::mem::replace(&mut self.kept, mark.outer_kept)
+    }
+
+    /// Steps 1 to 3 of the module order: the root reset, the module mark and
+    /// the read charge. One out-of-line copy serves every resolve function.
+    #[inline(never)]
+    fn begin_module(&mut self, key: &str, read_bytes: usize) -> (ModuleMark, Result<(), MdsError>) {
+        self.start_resolution(key);
+        self.open_module(read_bytes)
+    }
+
+    fn charge_kept(&mut self, n: usize) -> Result<(), MdsError> {
+        self.budget.mem.charge(Part::Buffers, Some(n))?;
+        // The kept sum is part of buffers, which charge already checked.
+        self.kept += n;
+        Ok(())
+    }
+
+    /// Move `n` bytes charged as a temporary to the kept sum, because the module
+    /// entry keeps the value they count.
+    fn keep(&mut self, n: usize) {
+        self.budget.mem.transfer(Part::Temp, Part::Buffers, n);
+        self.kept += n;
+    }
+
+    fn commit_retained(&mut self, kept: usize) {
+        let (Some(buffers), Some(retained @ ..=MAX_COMPILE_MEMORY)) = (
+            self.budget.mem.buffers.checked_sub(kept),
+            self.retained.checked_add(kept),
+        ) else {
+            self.budget.mem.underflow = true;
+            return;
+        };
+        self.budget.mem.buffers = buffers;
+        self.retained = retained;
+        self.budget.mem.headroom = MAX_COMPILE_MEMORY - retained;
+    }
+
+    fn retain_module(&mut self, key: &str, module: &Arc<ResolvedModule>, kept: usize) {
+        // Do not publish an entry from a failed counter check.
+        if self.budget.mem.underflow || (self.resolving.is_empty() && self.budget.mem.mark() != 0) {
+            return;
+        }
+        self.commit_retained(kept);
+        if !self.budget.mem.underflow {
+            self.modules.insert(key.to_string(), Arc::clone(module));
+        }
+    }
+
+    fn copy_raw_frontmatter(
+        &mut self,
+        module: &crate::ast::Module,
+    ) -> Result<Option<String>, MdsError> {
+        let Some(fm) = &module.frontmatter else {
+            return Ok(None);
+        };
+        self.charge_kept(fm.raw.len())?;
+        Ok(Some(fm.raw.clone()))
     }
 
     /// Guard against excessively deep import chains.
@@ -546,26 +669,27 @@ impl ModuleCache {
         // Mark as resolving before recursing into process_module.
         // IndexSet preserves insertion order, so it serves as both the set (O(1) lookup)
         // and the ordered stack (for cycle path reconstruction).
-        self.start_resolution(key);
+        let (mark, read) = self.begin_module(key, source.capacity());
+        let resolved = read.and_then(|()| {
+            let base_dir_owned = self.fs.parent_dir(key);
+            let display_owned = crate::source_path::display_path_for(&*self.fs, key);
+            let ctx = ModuleCtx {
+                key,
+                file_str: &display_owned,
+                source: &source,
+                base_dir: &base_dir_owned,
+                runtime_vars,
+                origin: OnceCell::new(),
+            };
+            self.process_module(&ctx, is_md, warnings)
+        });
+        #[cfg(test)]
+        let probe = mark.probe;
+        let kept = self.close_module(mark);
 
-        let base_dir_owned = self.fs.parent_dir(key);
-        let display_owned = crate::source_path::display_path_for(&*self.fs, key);
-        let ctx = ModuleCtx {
-            key,
-            file_str: &display_owned,
-            source: &source,
-            base_dir: &base_dir_owned,
-            runtime_vars,
-            origin: OnceCell::new(),
-        };
-        let resolved = self.process_module(&ctx, is_md, warnings);
-
-        // Unmark regardless of success or failure. resolve/unmark is strictly LIFO
-        // (we always remove the last element we inserted), so pop() is O(1).
-        // Safety-critical LIFO invariant: a mismatched pop would silently corrupt
-        // cycle-detection state and allow unbounded recursion.
-        let popped = self.resolving.pop();
-        let mut resolved = Self::check_lifo_pop(resolved, popped, key)?;
+        let popped = self.pop_resolving(key);
+        let mut resolved = resolved?;
+        popped?;
 
         // A1 upgrade: if a skeleton entry was previously cached for this key, reuse its
         // Arc-shared skeleton/blocks/origin so descendants that already Arc::clone'd them
@@ -579,11 +703,16 @@ impl ModuleCache {
             }
         }
 
-        // Wrap in Arc, store in cache, and return a clone of the Arc (O(1)).
-        let key_owned = key.to_string();
         let arc = Arc::new(resolved);
-        self.modules.insert(key_owned, Arc::clone(&arc));
+        #[cfg(test)]
+        let kept = kept + self.retained_transfer_seed;
+        self.retain_module(key, &arc, kept);
+        #[cfg(test)]
+        {
+            self.module_probes[probe].buffers_after_insert = Some(self.budget.mem.buffers);
+        }
 
+        self.finish_root()?;
         Ok(arc)
     }
 
@@ -658,7 +787,7 @@ impl ModuleCache {
         // root module as well.
         self.check_import_depth()?;
         self.check_module_count(SOURCE_LABEL)?;
-        self.start_resolution(SOURCE_LABEL);
+        let (mark, read) = self.begin_module(SOURCE_LABEL, 0);
 
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
@@ -668,10 +797,14 @@ impl ModuleCache {
             runtime_vars: &runtime_layer(runtime_vars),
             origin: OnceCell::new(),
         };
-        let resolved = self.process_module(&ctx, false, warnings);
+        let resolved = read.and_then(|()| self.process_module(&ctx, false, warnings));
+        self.close_module(mark);
 
-        let popped = self.resolving.pop();
-        Self::check_lifo_pop(resolved, popped, SOURCE_LABEL).map(Arc::new)
+        let popped = self.pop_resolving(SOURCE_LABEL);
+        let resolved = resolved?;
+        popped?;
+        self.finish_root()?;
+        Ok(Arc::new(resolved))
     }
 
     /// Resolve a virtual-filesystem entry by key, dispatching on output shape.
@@ -765,22 +898,27 @@ impl ModuleCache {
         let is_md = self.fs.is_markdown(key);
         check_module_type(entry, &source)?;
 
-        self.start_resolution(key);
+        let (mark, read) = self.begin_module(key, source.capacity());
+        let result = read.and_then(|()| {
+            let base_dir_owned = self.fs.parent_dir(key);
+            let display_owned = crate::source_path::display_path_for(&*self.fs, key);
+            let ctx = ModuleCtx {
+                key,
+                file_str: &display_owned,
+                source: &source,
+                base_dir: &base_dir_owned,
+                runtime_vars,
+                origin: OnceCell::new(),
+            };
+            self.process_module_intrinsic_opts(&ctx, is_md, opts, warnings)
+        });
+        self.close_module(mark);
 
-        let base_dir_owned = self.fs.parent_dir(key);
-        let display_owned = crate::source_path::display_path_for(&*self.fs, key);
-        let ctx = ModuleCtx {
-            key,
-            file_str: &display_owned,
-            source: &source,
-            base_dir: &base_dir_owned,
-            runtime_vars,
-            origin: OnceCell::new(),
-        };
-        let result = self.process_module_intrinsic_opts(&ctx, is_md, opts, warnings);
-
-        let popped = self.resolving.pop();
-        Self::check_lifo_pop(result, popped, key).map(|result| (result, source))
+        let popped = self.pop_resolving(key);
+        let result = result?;
+        popped?;
+        self.finish_root()?;
+        Ok((result, source))
     }
 
     /// Resolve a module from an in-memory source string, dispatching on output shape.
@@ -798,7 +936,7 @@ impl ModuleCache {
         let canonical_str = self.anchor_base(base_dir)?;
         self.check_import_depth()?;
         self.check_module_count(SOURCE_LABEL)?;
-        self.start_resolution(SOURCE_LABEL);
+        let (mark, read) = self.begin_module(SOURCE_LABEL, 0);
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
             file_str: SOURCE_LABEL,
@@ -807,9 +945,13 @@ impl ModuleCache {
             runtime_vars: &runtime_layer(runtime_vars),
             origin: OnceCell::new(),
         };
-        let result = self.process_module_intrinsic(&ctx, false, warnings);
-        let popped = self.resolving.pop();
-        Self::check_lifo_pop(result, popped, SOURCE_LABEL)
+        let result = read.and_then(|()| self.process_module_intrinsic(&ctx, false, warnings));
+        self.close_module(mark);
+        let popped = self.pop_resolving(SOURCE_LABEL);
+        let result = result?;
+        popped?;
+        self.finish_root()?;
+        Ok(result)
     }
 
     /// Like [`Self::resolve_source_intrinsic`] but accepts [`crate::CompileOptions`] and
@@ -826,7 +968,7 @@ impl ModuleCache {
         let canonical_str = self.anchor_base(base_dir)?;
         self.check_import_depth()?;
         self.check_module_count(SOURCE_LABEL)?;
-        self.start_resolution(SOURCE_LABEL);
+        let (mark, read) = self.begin_module(SOURCE_LABEL, 0);
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
             file_str: SOURCE_LABEL,
@@ -835,9 +977,14 @@ impl ModuleCache {
             runtime_vars: &runtime_layer(runtime_vars),
             origin: OnceCell::new(),
         };
-        let result = self.process_module_intrinsic_opts(&ctx, false, opts, warnings);
-        let popped = self.resolving.pop();
-        Self::check_lifo_pop(result, popped, SOURCE_LABEL)
+        let result =
+            read.and_then(|()| self.process_module_intrinsic_opts(&ctx, false, opts, warnings));
+        self.close_module(mark);
+        let popped = self.pop_resolving(SOURCE_LABEL);
+        let result = result?;
+        popped?;
+        self.finish_root()?;
+        Ok(result)
     }
 
     /// Evaluate spliced `@extends` regions in order, accumulating their output and,
@@ -1011,13 +1158,20 @@ impl ModuleCache {
         let tokens = tokenize(ctx.source, ctx.file_str)?;
         let module = parse_with_ctx(&tokens, ctx.file_str, ctx.source)?;
 
-        let raw_frontmatter = module.frontmatter.as_ref().map(|fm| fm.raw.clone());
+        let raw_frontmatter = module.frontmatter.as_ref().map(|fm| fm.raw.as_str());
 
         // ── Extends branch ────────────────────────────────────────────────────
         if let Some(ext) = module.extends.clone() {
-            let frontmatter_values = parse_frontmatter_mapping(module.frontmatter.as_ref())?;
-            let components =
-                self.resolve_extends_components(&module, &ext, ctx, &frontmatter_values, warnings)?;
+            let (frontmatter_values, frontmatter_bytes) =
+                parse_frontmatter_mapping(module.frontmatter.as_ref(), &mut self.budget.mem)?;
+            let components = self.resolve_extends_components(
+                &module,
+                &ext,
+                ctx,
+                &frontmatter_values,
+                frontmatter_bytes,
+                warnings,
+            )?;
 
             {
                 let mut scope = components.scope.clone();
@@ -1069,20 +1223,30 @@ impl ModuleCache {
                 warnings,
                 self.budget.start_module(),
             )?;
-            // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
-            let map_out = builder.and_then(|b| apply_map_degradation(b, opts, warnings));
-            return Ok(self.finalize_markdown(
+            return self.finalize_markdown(
                 body_raw,
                 merged_frontmatter.as_deref(),
-                map_out,
+                builder.map(|b| (b, 0)),
                 ctx.base_dir,
                 opts,
-            ));
+                warnings,
+            );
         }
 
         // ── Standalone path ───────────────────────────────────────────────────
-        let (mut scope, fm_imports) =
-            build_scope_from_frontmatter(module.frontmatter.as_ref(), is_md, ctx.runtime_vars)?;
+        // The parsed tree is dropped once the scope layer is built from it.
+        let (mut scope, fm_imports) = {
+            let (mapping, spent) =
+                parse_frontmatter_mapping(module.frontmatter.as_ref(), &mut self.budget.mem)?;
+            build_scope_from_frontmatter(
+                module.frontmatter.as_ref(),
+                mapping.as_ref(),
+                spent,
+                is_md,
+                ctx.runtime_vars,
+                &mut self.budget.mem,
+            )?
+        };
 
         self.resolve_frontmatter_imports(&fm_imports, &mut scope, ctx, warnings)?;
 
@@ -1120,10 +1284,16 @@ impl ModuleCache {
         }
 
         let mut body_raw = String::new();
-        let map_out = if opts.source_map {
+        let builder = if opts.source_map {
             // The builder's seed (current source 0) is ctx.key / ctx.file_str / ctx.source;
             // evaluate_with_map derives display/source from builder (issue #58 / R3).
-            let builder = crate::sourcemap::MapBuilder::new(ctx.origin().clone());
+            let (origin, map_origin_bytes) = match ctx.origin.get() {
+                Some(origin) => (origin.clone(), 0),
+                // A map-only origin is part of optional map work. It is at most one
+                // capped source copy; charge it with the live segments at finalize.
+                None => (ctx.make_origin(), ctx.origin_bytes()),
+            };
+            let builder = MapBuilder::new(origin);
             let returned = evaluate_with_map_seeded(
                 &module.body,
                 &mut scope,
@@ -1132,8 +1302,7 @@ impl ModuleCache {
                 self.budget.start_module(),
                 &mut body_raw,
             )?;
-            // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
-            apply_map_degradation(returned, opts, warnings)
+            Some((returned, map_origin_bytes))
         } else {
             evaluate_seeded(
                 &module.body,
@@ -1147,26 +1316,72 @@ impl ModuleCache {
             None
         };
 
-        Ok(self.finalize_markdown(
+        self.finalize_markdown(
             body_raw,
-            raw_frontmatter.as_deref(),
-            map_out,
+            raw_frontmatter,
+            builder,
             ctx.base_dir,
             opts,
-        ))
+            warnings,
+        )
     }
 
     fn finalize_markdown(
-        &self,
+        &mut self,
         body_raw: String,
         frontmatter: Option<&str>,
-        map_out: Option<crate::sourcemap::MapBuilder>,
+        builder: Option<(MapBuilder, usize)>,
         base_dir: &str,
-        opts: &crate::sourcemap::CompileOptions,
-    ) -> (crate::CompiledOutput, Option<crate::sourcemap::SourceMap>) {
-        let pending_map = map_out.map(|b| b.finalize_points(&body_raw));
+        opts: &CompileOptions,
+        warnings: &mut Vec<String>,
+    ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
+        let mem = &mut self.budget.mem;
+        let mark = mem.mark();
+        if let Some(raw) = frontmatter {
+            mem.charge(
+                Part::Temp,
+                bytes(raw.len(), 2).and_then(|n| n.checked_add(9)),
+            )?;
+        }
         let prefix = crate::frontmatter_prefix(frontmatter);
         let fm_prefix_len = prefix.as_ref().map_or(0, String::len);
+        // Reserve the output's charge before optional map work can use headroom.
+        // The empty body takes the prefix as-is, without a final newline reserve.
+        let growth = fm_prefix_len + usize::from(!body_raw.trim_end().is_empty());
+        mem.charge(Part::Buffers, Some(growth))?;
+        let charged_capacity = body_raw.capacity() + growth;
+
+        let pending_map = builder.and_then(|(mut builder, map_origin_bytes)| {
+            let total_src_bytes = builder.sources_content_bytes();
+            let label_base_bytes = opts
+                .source_map_base
+                .as_ref()
+                .map_or(0, |base| base.as_os_str().len());
+            let prefix_lines = prefix.as_deref().map_or(0, count_newlines);
+            if !builder.segments_dropped
+                && !charge_finalize(
+                    mem,
+                    &builder,
+                    &body_raw,
+                    FinalizeCosts {
+                        content: if opts.include_sources_content
+                            && total_src_bytes <= MAX_SOURCES_CONTENT_BYTES
+                        {
+                            total_src_bytes
+                        } else {
+                            0
+                        },
+                        map_origin_bytes,
+                        prefix_lines,
+                        label_base_bytes,
+                    },
+                )
+            {
+                builder.segments_dropped = true;
+            }
+            apply_map_degradation(builder, total_src_bytes, opts, warnings)
+                .map(|b| b.finalize_points(&body_raw))
+        });
         let mut body = crate::clean_output_owned(body_raw, fm_prefix_len);
         if let Some(prefix) = prefix {
             if body.is_empty() {
@@ -1175,8 +1390,14 @@ impl ModuleCache {
                 body.insert_str(0, &prefix);
             }
         }
+        if body.capacity() > charged_capacity {
+            mem.charge(Part::Buffers, Some(body.capacity() - charged_capacity))?;
+        } else {
+            mem.release_buffers(charged_capacity - body.capacity());
+        }
 
         let source_map = pending_map.map(|map| map.finish(&body, fm_prefix_len, None));
+        mem.release_to(mark);
         self.anchor_root_for_source_map(base_dir);
         // Relativize every source label before the caller receives the map.
         let source_map = source_map.map(|mut sm| {
@@ -1188,19 +1409,16 @@ impl ModuleCache {
             }
             sm
         });
-        (crate::CompiledOutput::Markdown(body), source_map)
+        Ok((crate::CompiledOutput::Markdown(body), source_map))
     }
 
-    /// Assert the LIFO pop invariant after `process_module`.
-    ///
-    /// On double-fault (module error + LIFO violation), prefer the module error
-    /// (user-facing root cause) over the LIFO violation (internal compiler bug).
-    fn check_lifo_pop<T>(
-        module_result: Result<T, MdsError>,
-        popped: Option<String>,
-        expected: &str,
-    ) -> Result<T, MdsError> {
-        let lifo_result = if popped.as_deref() == Some(expected) {
+    // Call even on error. Only propagate the pop error if the module result is Ok.
+    fn pop_resolving(&mut self, key: &str) -> Result<(), MdsError> {
+        Self::check_lifo_pop(self.resolving.pop(), key)
+    }
+
+    fn check_lifo_pop(popped: Option<String>, expected: &str) -> Result<(), MdsError> {
+        if popped.as_deref() == Some(expected) {
             Ok(())
         } else {
             Err(MdsError::syntax(format!(
@@ -1208,12 +1426,18 @@ impl ModuleCache {
                  (expected {expected}, got {got}) — this is a compiler bug, please report it",
                 got = popped.as_deref().unwrap_or("<empty>"),
             )))
-        };
-        match (module_result, lifo_result) {
-            (Err(module_err), _) => Err(module_err),
-            (Ok(_), Err(lifo_err)) => Err(lifo_err),
-            (Ok(resolved), Ok(())) => Ok(resolved),
         }
+    }
+
+    // Call after a successful resolution. The thread check is defense in depth.
+    fn finish_root(&self) -> Result<(), MdsError> {
+        if self.resolving.is_empty()
+            && (self.budget.mem.mark() != 0 || self.budget.mem.underflow)
+            && !std::thread::panicking()
+        {
+            return Err(MdsError::internal());
+        }
+        Ok(())
     }
 
     /// Common module processing: tokenize, parse, build scope, evaluate.
@@ -1231,22 +1455,36 @@ impl ModuleCache {
         let tokens = tokenize(ctx.source, ctx.file_str)?;
         let module = parse_with_ctx(&tokens, ctx.file_str, ctx.source)?;
 
-        // Capture raw frontmatter before build_scope_from_frontmatter borrows the module.
-        let raw_frontmatter = module.frontmatter.as_ref().map(|fm| fm.raw.clone());
-
-        // Parse frontmatter YAML once for both scope building and storage.
-        let frontmatter_values = parse_frontmatter_mapping(module.frontmatter.as_ref())?;
+        // Parse frontmatter YAML once for both scope building and storage. The
+        // module entry keeps the tree.
+        let (frontmatter_values, frontmatter_bytes) =
+            parse_frontmatter_mapping(module.frontmatter.as_ref(), &mut self.budget.mem)?;
+        self.keep(frontmatter_bytes);
 
         // Branch: child template (@extends) vs. standalone module.
         if let Some(ext) = module.extends.clone() {
-            return self.process_module_extends(module, ext, ctx, frontmatter_values, warnings);
+            return self.process_module_extends(
+                module,
+                ext,
+                ctx,
+                frontmatter_values,
+                frontmatter_bytes,
+                warnings,
+            );
         }
 
         // ── Standalone (non-extending) path ──────────────────────────────────
+        let raw_frontmatter = self.copy_raw_frontmatter(&module)?;
 
         // Build scope from frontmatter + runtime vars; extract any frontmatter imports.
-        let (mut scope, fm_imports) =
-            build_scope_from_frontmatter(module.frontmatter.as_ref(), is_md, ctx.runtime_vars)?;
+        let (mut scope, fm_imports) = build_scope_from_frontmatter(
+            module.frontmatter.as_ref(),
+            frontmatter_values.as_ref(),
+            frontmatter_bytes,
+            is_md,
+            ctx.runtime_vars,
+            &mut self.budget.mem,
+        )?;
 
         // Resolve frontmatter imports BEFORE body imports (per spec: frontmatter imports
         // resolve before body imports; a duplicate alias is a compile error — legacy
@@ -1260,6 +1498,10 @@ impl ModuleCache {
             explicit_exports,
             block_names,
         } = self.collect_definitions_and_imports(&module.body, &mut scope, ctx, warnings)?;
+        // A function can capture the scope layer, so the entry keeps the layer too.
+        if !functions.is_empty() {
+            self.keep(frontmatter_bytes);
+        }
 
         // Validate that all named exports refer to defined functions or "prompt"
         validate_exports(&explicit_exports, &functions)?;
@@ -1271,7 +1513,7 @@ impl ModuleCache {
         // `ResolvedModule::is_exported` applies).
         let prompt_exported = is_visible_export(has_explicit_exports, &explicit_exports, "prompt");
 
-        let origin = ctx.origin();
+        let origin = ctx.origin(self)?;
 
         // Evaluate the body to get prompt text (and optionally a FragmentMap).
         //
@@ -1305,7 +1547,7 @@ impl ModuleCache {
             None
         };
         let (prompt_body, prompt_map) =
-            prompt_body_and_map(body_raw, builder, ctx.file_str, warnings);
+            self.prompt_body_and_map(body_raw, builder, ctx.file_str, warnings);
 
         // Build effective_blocks first so module.body can be moved into the Arc below.
         let effective_blocks = seed_effective_blocks(&module.body, &block_names, origin);
@@ -1332,6 +1574,7 @@ impl ModuleCache {
             effective_blocks,
             skeleton_origin: origin.clone(),
             frontmatter_values,
+            frontmatter_bytes,
             is_skeleton: false,
         })
     }
@@ -1360,10 +1603,11 @@ impl ModuleCache {
         &mut self,
         base: &ResolvedModule,
         child_fm: &Option<serde_yaml_ng::Mapping>,
+        child_fm_bytes: usize,
         base_key: &str,
         ctx: &ModuleCtx<'_>,
         warnings: &mut Vec<String>,
-    ) -> Result<(Scope, serde_yaml_ng::Mapping), MdsError> {
+    ) -> Result<(Scope, serde_yaml_ng::Mapping, usize), MdsError> {
         // 3d-i: Extract frontmatter imports from BOTH base and child BEFORE the deep merge.
         //
         // Base imports resolve relative to the BASE file's directory (base_base_dir, derived
@@ -1387,16 +1631,16 @@ impl ModuleCache {
             .unwrap_or_default();
 
         // 3d-ii: Deep-merge base and child frontmatter value Mappings.
-        // Empty mapping used when either side has no frontmatter.
         // Reserved keys (imports, type, extends) are excluded by deep_merge_yaml.
         // Precedence: base < child (child overrides base on collision).
-        let empty_mapping = serde_yaml_ng::Mapping::new();
-        let base_mapping = base.frontmatter_values.as_ref().unwrap_or(&empty_mapping);
-        let child_mapping = child_fm.as_ref().unwrap_or(&empty_mapping);
-        let merged_mapping = deep_merge_yaml(base_mapping, child_mapping, 0)?;
+        // The merged mapping is a temporary.
+        let (merged_mapping, charge) = self.merge_frontmatter(base, child_fm, child_fm_bytes)?;
 
         // 3d-iii: Build scope from the merged mapping. Runtime vars applied LAST
-        // (base < child < runtime, F7, decision #3).
+        // (base < child < runtime, F7, decision #3). The layer is charged with the
+        // merge charge as a temporary first. It stays a temporary: an extending child
+        // has only @block overrides, so no function of its own can capture the layer.
+        self.budget.mem.charge(Part::Temp, Some(charge))?;
         let mut scope = build_scope_from_merged_mapping(&merged_mapping, ctx.runtime_vars)?;
 
         // 3d-iv: Resolve base frontmatter imports against base_key (frontmatter-first ordering,
@@ -1431,7 +1675,80 @@ impl ModuleCache {
             scope.set_function(name, Arc::clone(func));
         }
 
-        Ok((scope, merged_mapping))
+        Ok((scope, merged_mapping, charge))
+    }
+
+    /// Deep-merge the frontmatter tree of `base` with the child's tree. Every merge
+    /// in the resolver goes through here. The bytes of both trees are charged as a
+    /// temporary before the merge: they bound the merged tree, whose sub-mappings
+    /// are part of the result. Returns the merged tree and that charge.
+    fn merge_frontmatter(
+        &mut self,
+        base: &ResolvedModule,
+        child: &Option<serde_yaml_ng::Mapping>,
+        child_bytes: usize,
+    ) -> Result<(serde_yaml_ng::Mapping, usize), MdsError> {
+        let charge = self
+            .budget
+            .mem
+            .charge(Part::Temp, base.frontmatter_bytes.checked_add(child_bytes))?;
+        // An empty mapping stands in for a side with no frontmatter.
+        let empty = serde_yaml_ng::Mapping::new();
+        let merged = deep_merge_yaml(
+            base.frontmatter_values.as_ref().unwrap_or(&empty),
+            child.as_ref().unwrap_or(&empty),
+            0,
+        )?;
+        Ok((merged, charge))
+    }
+
+    /// Serialize a deep-merged frontmatter `Mapping` for `frontmatter_prefix`, by
+    /// reference.
+    ///
+    /// Return `Ok(None)` for an empty mapping. Otherwise return the canonical YAML
+    /// representation with a final newline and no fences.
+    ///
+    /// `charge` is the merge charge of the mapping. Four text bytes per charged byte,
+    /// plus one for the newline, bound the text: an escaped control byte takes four.
+    /// The bound is charged as a temporary before the text is allocated. A text past
+    /// the bound grows once, and that growth is charged after it. The entry keeps the
+    /// text, so its charge moves to the kept bytes at the text capacity.
+    ///
+    /// Used by `resolve_extends_components` for the `@extends` deep-merged FM output (#154).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(MdsError::YamlError)` if YAML serialization of the merged mapping fails.
+    /// This is not expected for well-formed mappings produced by `deep_merge_yaml`, but the
+    /// failure MUST propagate as a compile error rather than silently dropping the emitted
+    /// frontmatter fence from the output (no swallowed errors at boundaries).
+    fn serialize_merged_frontmatter(
+        &mut self,
+        mapping: &serde_yaml_ng::Mapping,
+        charge: usize,
+    ) -> Result<Option<String>, MdsError> {
+        if mapping.is_empty() {
+            return Ok(None);
+        }
+        let bound = self
+            .budget
+            .mem
+            .charge(Part::Temp, bytes(charge, 4).and_then(|n| n.checked_add(1)))?;
+        let mut yaml = Vec::with_capacity(bound);
+        serde_yaml_ng::to_writer(&mut yaml, mapping)
+            .map_err(|e| MdsError::yaml_error(e.to_string()))?;
+        // The serializer writes UTF-8 only.
+        let mut text = String::from_utf8(yaml).map_err(|_| MdsError::internal())?;
+        text.truncate(text.trim_end().len());
+        if text.is_empty() {
+            return Ok(None);
+        }
+        text.push('\n');
+        self.budget
+            .mem
+            .charge(Part::Temp, text.capacity().checked_sub(bound))?;
+        self.keep(text.capacity());
+        Ok(Some(text))
     }
 
     /// Shared extends-pipeline: steps 3a-3d are identical for the text-cached and
@@ -1458,6 +1775,7 @@ impl ModuleCache {
         ext: &crate::ast::ExtendsDirective,
         ctx: &ModuleCtx<'_>,
         frontmatter_values: &Option<serde_yaml_ng::Mapping>,
+        frontmatter_bytes: usize,
         warnings: &mut Vec<String>,
     ) -> Result<ExtendsComponents, MdsError> {
         // ── Step 3a: validate and resolve the base in skeleton mode ──────────
@@ -1492,7 +1810,8 @@ impl ModuleCache {
 
         // ── Step 3c: build effective_blocks from base, applying child overrides ──
         // Clone base's map first (diamond-inheritance safe — never mutate cached base).
-        let effective_blocks = apply_block_overrides(&base.effective_blocks, &module.body, ctx)?;
+        let effective_blocks =
+            apply_block_overrides(&base.effective_blocks, &module.body, ctx, self)?;
 
         // effective_skeleton is the root ancestor's body (Arc::clone — O(1), no deep-copy, P1).
         let effective_skeleton = Arc::clone(&base.effective_skeleton);
@@ -1506,9 +1825,15 @@ impl ModuleCache {
         // exclusion, array wholesale replace, both sets of FM imports resolved per-file).
         // The merged_mapping is also returned so we can serialize it for the output
         // frontmatter (#154: @extends emits deep-merged frontmatter).
-        let (mut scope, merged_mapping) =
-            self.build_merged_extends_scope(&base, frontmatter_values, &base_key, ctx, warnings)?;
-        let merged_frontmatter = serialize_merged_frontmatter(&merged_mapping)?;
+        let (mut scope, merged_mapping, charge) = self.build_merged_extends_scope(
+            &base,
+            frontmatter_values,
+            frontmatter_bytes,
+            &base_key,
+            ctx,
+            warnings,
+        )?;
+        let merged_frontmatter = self.serialize_merged_frontmatter(&merged_mapping, charge)?;
 
         // Collect child's own definitions from its body (currently zero @define after
         // child-only-blocks check, but structurally correct).
@@ -1581,10 +1906,17 @@ impl ModuleCache {
         ext: crate::ast::ExtendsDirective,
         ctx: &ModuleCtx<'_>,
         frontmatter_values: Option<serde_yaml_ng::Mapping>,
+        frontmatter_bytes: usize,
         warnings: &mut Vec<String>,
     ) -> Result<ResolvedModule, MdsError> {
-        let components =
-            self.resolve_extends_components(&module, &ext, ctx, &frontmatter_values, warnings)?;
+        let components = self.resolve_extends_components(
+            &module,
+            &ext,
+            ctx,
+            &frontmatter_values,
+            frontmatter_bytes,
+            warnings,
+        )?;
 
         // ── Step 3e: validate + evaluate the spliced regions ──────────────────
         // Validate per-region so each region's offsets are checked against the correct
@@ -1625,7 +1957,7 @@ impl ModuleCache {
             self.budget.start_module(),
         )?;
         let (prompt_body, prompt_map) =
-            prompt_body_and_map(body_raw, builder, ctx.file_str, warnings);
+            self.prompt_body_and_map(body_raw, builder, ctx.file_str, warnings);
 
         let namespace = ResolvedModule::build_namespace(
             &functions,
@@ -1648,6 +1980,7 @@ impl ModuleCache {
             effective_blocks,
             skeleton_origin,
             frontmatter_values,
+            frontmatter_bytes,
             is_skeleton: false,
         })
     }
@@ -1690,25 +2023,34 @@ impl ModuleCache {
         let is_md = self.fs.is_markdown(key);
         check_module_type(module, &source).map_err(|err| import_site.attach_type_error(err))?;
 
-        self.start_resolution(key);
+        let (mark, read) = self.begin_module(key, source.capacity());
+        let resolved = read.and_then(|()| {
+            let base_dir_owned = self.fs.parent_dir(key);
+            let display_owned = crate::source_path::display_path_for(&*self.fs, key);
+            let ctx = ModuleCtx {
+                key,
+                file_str: &display_owned,
+                source: &source,
+                base_dir: &base_dir_owned,
+                runtime_vars,
+                origin: OnceCell::new(),
+            };
+            self.process_module_skeleton(&ctx, is_md, warnings)
+        });
+        #[cfg(test)]
+        let probe = mark.probe;
+        let kept = self.close_module(mark);
 
-        let base_dir_owned = self.fs.parent_dir(key);
-        let display_owned = crate::source_path::display_path_for(&*self.fs, key);
-        let ctx = ModuleCtx {
-            key,
-            file_str: &display_owned,
-            source: &source,
-            base_dir: &base_dir_owned,
-            runtime_vars,
-            origin: OnceCell::new(),
-        };
-        let resolved = self.process_module_skeleton(&ctx, is_md, warnings);
-
-        let popped = self.resolving.pop();
-        let resolved = Self::check_lifo_pop(resolved, popped, key)?;
+        let popped = self.pop_resolving(key);
+        let resolved = resolved?;
+        popped?;
 
         let arc = Arc::new(resolved);
-        self.modules.insert(key.to_string(), Arc::clone(&arc));
+        self.retain_module(key, &arc, kept);
+        #[cfg(test)]
+        {
+            self.module_probes[probe].buffers_after_insert = Some(self.budget.mem.buffers);
+        }
         Ok(arc)
     }
 
@@ -1733,6 +2075,7 @@ impl ModuleCache {
         &mut self,
         ext: &crate::ast::ExtendsDirective,
         own_fm: &Option<serde_yaml_ng::Mapping>,
+        own_fm_bytes: usize,
         module_body: &[Node],
         ctx: &ModuleCtx<'_>,
         warnings: &mut Vec<String>,
@@ -1742,6 +2085,7 @@ impl ModuleCache {
             IndexMap<String, EffectiveBlock>,
             Origin,
             Option<serde_yaml_ng::Mapping>,
+            usize,
         ),
         MdsError,
     > {
@@ -1767,7 +2111,8 @@ impl ModuleCache {
         // Child-only-blocks check for this intermediate base (3b).
         check_child_only_blocks(module_body, ctx)?;
 
-        let eff_blocks = apply_block_overrides(&grandparent.effective_blocks, module_body, ctx)?;
+        let eff_blocks =
+            apply_block_overrides(&grandparent.effective_blocks, module_body, ctx, self)?;
 
         // skeleton_origin Arc::clone'd from grandparent — the root base's source bytes
         // ride down the chain so the leaf's validate_extends_components can attribute
@@ -1778,14 +2123,13 @@ impl ModuleCache {
         // Phase 3: transitive FM merge: grandparent.frontmatter_values < own_fm_values.
         // This produces the accumulated FM for this intermediate base, so a leaf
         // descending from it gets the full transitive chain without re-traversing.
-        let empty = serde_yaml_ng::Mapping::new();
-        let gp_fm = grandparent.frontmatter_values.as_ref().unwrap_or(&empty);
-        let own_fm_ref = own_fm.as_ref().unwrap_or(&empty);
-        let merged_fm = deep_merge_yaml(gp_fm, own_fm_ref, 0)?;
-        let accumulated_fm = if merged_fm.is_empty() {
-            None
+        // The entry keeps the merged tree with its merge charge; the own tree stays
+        // a temporary.
+        let (merged_fm, charge) = self.merge_frontmatter(&grandparent, own_fm, own_fm_bytes)?;
+        let (accumulated_fm, accumulated_bytes) = if merged_fm.is_empty() {
+            (None, 0)
         } else {
-            Some(merged_fm)
+            (Some(merged_fm), charge)
         };
 
         Ok((
@@ -1793,6 +2137,7 @@ impl ModuleCache {
             eff_blocks,
             skel_origin,
             accumulated_fm,
+            accumulated_bytes,
         ))
     }
 
@@ -1809,13 +2154,20 @@ impl ModuleCache {
         let tokens = tokenize(ctx.source, ctx.file_str)?;
         let module = parse_with_ctx(&tokens, ctx.file_str, ctx.source)?;
 
-        let raw_frontmatter = module.frontmatter.as_ref().map(|fm| fm.raw.clone());
+        let raw_frontmatter = self.copy_raw_frontmatter(&module)?;
         // own_fm_values: this module's raw frontmatter (not yet merged with ancestors).
-        let own_fm_values = parse_frontmatter_mapping(module.frontmatter.as_ref())?;
+        let (own_fm_values, own_fm_bytes) =
+            parse_frontmatter_mapping(module.frontmatter.as_ref(), &mut self.budget.mem)?;
 
         // Build scope for @define closure capture (base functions must be available).
-        let (mut scope, fm_imports) =
-            build_scope_from_frontmatter(module.frontmatter.as_ref(), is_md, ctx.runtime_vars)?;
+        let (mut scope, fm_imports) = build_scope_from_frontmatter(
+            module.frontmatter.as_ref(),
+            own_fm_values.as_ref(),
+            own_fm_bytes,
+            is_md,
+            ctx.runtime_vars,
+            &mut self.budget.mem,
+        )?;
         self.resolve_frontmatter_imports(&fm_imports, &mut scope, ctx, warnings)?;
 
         let CollectedDefs {
@@ -1824,6 +2176,10 @@ impl ModuleCache {
             explicit_exports,
             block_names,
         } = self.collect_definitions_and_imports(&module.body, &mut scope, ctx, warnings)?;
+        // A function can capture the scope layer, so the entry keeps the layer too.
+        if !functions.is_empty() {
+            self.keep(own_fm_bytes);
+        }
 
         // Multi-level chain (A←B←C): B may itself extend A.
         // B's effective_skeleton = A's effective_skeleton (Arc::clone, O(1) fold).
@@ -1832,18 +2188,38 @@ impl ModuleCache {
         //
         // Phase 3: B's frontmatter_values must be the transitive deep-merge of A's accumulated FM
         // with B's own FM (A < B), so that when C later merges against B, it gets A+B+C.
-        let (effective_skeleton, effective_blocks, skeleton_origin, frontmatter_values) =
-            if let Some(ext) = module.extends.as_ref() {
-                self.resolve_intermediate_base(ext, &own_fm_values, &module.body, ctx, warnings)?
-            } else {
-                // Root base: own body is the skeleton; blocks seeded from own @block declarations.
-                let root_origin = ctx.origin().clone();
-                // Seed blocks first so module.body can be moved into the Arc (no element clones, P1).
-                let eff_blocks = seed_effective_blocks(&module.body, &block_names, &root_origin);
-                let eff_skeleton: Arc<[Node]> = Arc::from(module.body);
-                // Root base: frontmatter_values is its own raw FM (no ancestors).
-                (eff_skeleton, eff_blocks, root_origin, own_fm_values)
-            };
+        let (
+            effective_skeleton,
+            effective_blocks,
+            skeleton_origin,
+            frontmatter_values,
+            frontmatter_bytes,
+        ) = if let Some(ext) = module.extends.as_ref() {
+            self.resolve_intermediate_base(
+                ext,
+                &own_fm_values,
+                own_fm_bytes,
+                &module.body,
+                ctx,
+                warnings,
+            )?
+        } else {
+            // Root base: own body is the skeleton; blocks seeded from own @block declarations.
+            let root_origin = ctx.origin(self)?.clone();
+            // Seed blocks first so module.body can be moved into the Arc (no element clones, P1).
+            let eff_blocks = seed_effective_blocks(&module.body, &block_names, &root_origin);
+            let eff_skeleton: Arc<[Node]> = Arc::from(module.body);
+            // Root base: frontmatter_values is its own raw FM (no ancestors).
+            (
+                eff_skeleton,
+                eff_blocks,
+                root_origin,
+                own_fm_values,
+                own_fm_bytes,
+            )
+        };
+        // The entry keeps its frontmatter tree.
+        self.keep(frontmatter_bytes);
 
         // Skeleton entries have no evaluated text or fragment map.
         let prompt_body: Option<PromptText> = None;
@@ -1870,6 +2246,7 @@ impl ModuleCache {
             effective_blocks,
             skeleton_origin,
             frontmatter_values,
+            frontmatter_bytes,
             is_skeleton: true,
         })
     }
@@ -1897,7 +2274,7 @@ impl ModuleCache {
         for node in body {
             count_module_defines(node, &mut define_count)?;
             match node {
-                Node::Define(def) => collect_define(def, &mut defs, scope, ctx)?,
+                Node::Define(def) => collect_define(def, &mut defs, scope, ctx, self)?,
                 Node::Import(import) => self.resolve_import(import, scope, ctx, warnings)?,
                 Node::Export(export) => self.collect_export(export, &mut defs, ctx, warnings)?,
                 Node::Block(block) => {
@@ -2353,12 +2730,28 @@ impl ImportSite<'_> {
 }
 
 impl ModuleCtx<'_> {
-    fn origin(&self) -> &Origin {
-        self.origin.get_or_init(|| Origin {
+    #[inline(never)]
+    fn origin(&self, cache: &mut ModuleCache) -> Result<&Origin, MdsError> {
+        if self.origin.get().is_none() {
+            cache.charge_kept(self.origin_bytes())?;
+        }
+        Ok(self.origin.get_or_init(|| self.make_origin()))
+    }
+
+    fn origin_bytes(&self) -> usize {
+        self.source
+            .len()
+            .saturating_add(self.key.len())
+            .saturating_add(self.file_str.len())
+            .saturating_add(6 * size_of::<usize>())
+    }
+
+    fn make_origin(&self) -> Origin {
+        Origin {
             file: Arc::from(self.key),
             display: Arc::from(self.file_str),
             source: Arc::from(self.source),
-        })
+        }
     }
 
     fn import_site(&self, offset: usize) -> ImportSite<'_> {
@@ -2448,25 +2841,79 @@ fn fragment_map_from(
     body.map(|_| Arc::new(builder.into_fragment()))
 }
 
-/// The `(prompt_body, prompt_map)` `ResolvedModule` fields, from a module's evaluated
-/// body and — when source maps are on for it — the builder that recorded it.
-///
-/// Shared by both module paths (`process_module`, `process_module_extends`): an empty
-/// body clears to `None` either way, and the map is kept only when [`fragment_map_from`]
-/// finds one worth splicing.
-fn prompt_body_and_map(
-    body_raw: String,
-    builder: Option<crate::sourcemap::MapBuilder>,
-    display: &str,
-    warnings: &mut Vec<String>,
-) -> (
-    Option<PromptText>,
-    Option<Arc<crate::sourcemap::FragmentMap>>,
-) {
-    let prompt_body = (!body_raw.trim().is_empty()).then(|| PromptText::from(body_raw));
-    let prompt_map =
-        builder.and_then(|b| fragment_map_from(b, prompt_body.as_deref(), display, warnings));
-    (prompt_body, prompt_map)
+impl ModuleCache {
+    fn prompt_body_and_map(
+        &mut self,
+        body_raw: String,
+        builder: Option<MapBuilder>,
+        display: &str,
+        warnings: &mut Vec<String>,
+    ) -> (
+        Option<PromptText>,
+        Option<Arc<crate::sourcemap::FragmentMap>>,
+    ) {
+        let capacity = body_raw.capacity();
+        let prompt_body = if body_raw.trim().is_empty() {
+            self.budget
+                .mem
+                .transfer(Part::Buffers, Part::Temp, capacity);
+            None
+        } else {
+            // Evaluation charged this capacity before its allocation.
+            self.kept += capacity;
+            Some(PromptText::from(body_raw))
+        };
+        let prompt_map = builder.and_then(|mut builder| {
+            if prompt_body.is_some()
+                && !builder.segments_dropped
+                && self.charge_kept(builder.segments_bytes()).is_err()
+            {
+                builder.segments_dropped = true;
+            }
+            fragment_map_from(builder, prompt_body.as_deref(), display, warnings)
+        });
+        (prompt_body, prompt_map)
+    }
+}
+
+struct FinalizeCosts {
+    content: usize,
+    map_origin_bytes: usize,
+    prefix_lines: usize,
+    label_base_bytes: usize,
+}
+
+fn count_newlines(text: &str) -> usize {
+    text.bytes().filter(|&byte| byte == b'\n').count()
+}
+
+fn charge_finalize(
+    mem: &mut MemBudget,
+    builder: &MapBuilder,
+    body: &str,
+    costs: FinalizeCosts,
+) -> bool {
+    let n = builder.segment_count() + count_newlines(body);
+    let points = bytes(n, 36);
+    // Points (16 B), resolved points (20 B), and the sampled CR table.
+    let work = points
+        .and_then(|n| n.checked_add(4 * (body.len() / 64 + 1)))
+        .and_then(|n| n.checked_add(builder.segments_bytes()))
+        .and_then(|n| n.checked_add(costs.map_origin_bytes));
+    // A frontmatter line can also add a semicolon before the first point.
+    let output = points
+        .and_then(|n| n.checked_add(bytes(costs.prefix_lines, 2)?))
+        .and_then(|n| n.checked_add(costs.content))
+        .and_then(|n| n.checked_add(builder.source_labels_bytes(costs.label_base_bytes)?));
+    let mark = mem.mark();
+    if mem.charge(Part::Temp, work).is_err() {
+        return false;
+    }
+    if mem.charge(Part::Buffers, output).is_err() {
+        mem.release_to(mark);
+        return false;
+    }
+    true
 }
 
 /// Apply AC-PERF-03 and AC-SEC-04 degradation checks to a completed builder.
@@ -2477,8 +2924,9 @@ fn prompt_body_and_map(
 ///   `no_sources_content` so [`crate::sourcemap::PendingMap::finish`] omits the array.
 /// - Caller opt-out: `!opts.include_sources_content` also sets the flag.
 fn apply_map_degradation(
-    mut builder: crate::sourcemap::MapBuilder,
-    opts: &crate::sourcemap::CompileOptions,
+    mut builder: MapBuilder,
+    total_src_bytes: usize,
+    opts: &CompileOptions,
     warnings: &mut Vec<String>,
 ) -> Option<crate::sourcemap::MapBuilder> {
     if builder.segments_dropped {
@@ -2489,8 +2937,7 @@ fn apply_map_degradation(
         ));
         return None;
     }
-    let total_src_bytes = builder.sources_content_bytes();
-    if total_src_bytes > crate::limits::MAX_SOURCES_CONTENT_BYTES {
+    if total_src_bytes > MAX_SOURCES_CONTENT_BYTES {
         warnings.push(format!(
             "sourcesContent total size ({} bytes) exceeds the {} byte ceiling; \
              sourcesContent will be omitted from the source map",
@@ -2588,6 +3035,7 @@ fn collect_define(
     defs: &mut CollectedDefs,
     scope: &mut Scope,
     ctx: &ModuleCtx<'_>,
+    cache: &mut ModuleCache,
 ) -> Result<(), MdsError> {
     if defs.functions.contains_key(&def.name) || defs.block_names.contains(&def.name) {
         return Err(MdsError::name_collision_at(
@@ -2601,7 +3049,7 @@ fn collect_define(
     let mut func = FunctionDef::from(def);
     // Freeze the definition site before inserting this function into scope.
     func.captured = scope.capture()?;
-    func.origin = Some(ctx.origin().clone());
+    func.origin = Some(ctx.origin(cache)?.clone());
     // Wrap in Arc for cheap storage and O(1) scope insertion.
     let arc = Arc::new(func);
     defs.functions.insert(def.name.clone(), Arc::clone(&arc));
@@ -2664,13 +3112,19 @@ fn runtime_layer(vars: &HashMap<String, Value>) -> Arc<VarLayer> {
     )
 }
 
-/// Build a scope with runtime variables above frontmatter variables.
+/// Build a scope with runtime variables above frontmatter variables, from the
+/// module's one parsed `mapping`. `spent` is the bytes its parse spent: the layer
+/// is charged with them as a temporary before the conversion, because the
+/// converted values are never larger than their tree.
 /// A Markdown file uses `type` as a file marker, not a variable.
 /// Return `imports` separately for MDS files. Plain Markdown keeps it as a variable.
 fn build_scope_from_frontmatter(
     frontmatter: Option<&crate::ast::Frontmatter>,
+    mapping: Option<&serde_yaml_ng::Mapping>,
+    spent: usize,
     is_md: bool,
     runtime_vars: &Arc<VarLayer>,
+    mem: &mut MemBudget,
 ) -> Result<(Scope, Vec<FrontmatterImport>), MdsError> {
     let mut frontmatter_vars = VarLayer::new();
     let mut fm_imports: Vec<FrontmatterImport> = Vec::new();
@@ -2680,34 +3134,23 @@ fn build_scope_from_frontmatter(
     // parsing and the runtime_vars guard below.
     let is_mds = !is_md || frontmatter.is_some_and(|fm| has_type_mds_frontmatter_raw(&fm.raw));
 
-    if let Some(fm) = frontmatter {
-        // Parse YAML once to avoid double-parsing (bounded — #162).
-        let yaml = parse_frontmatter_yaml(&fm.raw)?;
-
-        if let serde_yaml_ng::Value::Mapping(map) = yaml {
-            for (key, val) in map {
-                let serde_yaml_ng::Value::String(key_str) = key else {
-                    continue;
-                };
-                if key_str == "type" && is_md {
-                    // Skip the 'type' meta-field for .md files (it's a file-type marker)
-                    continue;
-                }
-                if key_str == "imports" {
-                    if is_mds {
-                        // Parse as structured import declarations, not a scope variable
-                        fm_imports = parse_frontmatter_imports_from_yaml(&val)?;
-                    } else {
-                        // Plain .md: treat `imports` as a regular variable
-                        let value = Value::from_yaml(val)?;
-                        frontmatter_vars.insert(key_str, Arc::new(value));
-                    }
-                    continue;
-                }
-                let value = Value::from_yaml(val)?;
-                frontmatter_vars.insert(key_str, Arc::new(value));
-            }
+    mem.charge(Part::Temp, Some(spent))?;
+    for (key, val) in mapping.into_iter().flatten() {
+        let serde_yaml_ng::Value::String(key_str) = key else {
+            continue;
+        };
+        if key_str == "type" && is_md {
+            // Skip the 'type' meta-field for .md files (it's a file-type marker)
+            continue;
         }
+        if key_str == "imports" && is_mds {
+            // Parse as structured import declarations, not a scope variable.
+            // Plain .md keeps `imports` as a regular variable.
+            fm_imports = parse_frontmatter_imports_from_yaml(val)?;
+            continue;
+        }
+        let value = Value::from_yaml_ref(val)?;
+        frontmatter_vars.insert(key_str.clone(), Arc::new(value));
     }
 
     if is_mds && runtime_vars.contains_key("imports") {
@@ -3049,53 +3492,26 @@ fn attach_frontmatter_index(err: MdsError, i: usize) -> MdsError {
     }
 }
 
-// ── Template inheritance helpers ──────────────────────────────────────────────
-
-/// Serialize a deep-merged frontmatter `Mapping` for `frontmatter_prefix`.
+/// Parse the frontmatter YAML of a module into a `serde_yaml_ng::Mapping`, once per
+/// module, and return it with the bytes the parse spent.
 ///
-/// Return `Ok(None)` for an empty mapping. Otherwise return the canonical YAML
-/// representation with a final newline and no fences.
-///
-/// Used by `resolve_extends_components` for the `@extends` deep-merged FM output (#154).
-///
-/// # Errors
-///
-/// Returns `Err(MdsError::YamlError)` if YAML serialization of the merged mapping fails.
-/// This is not expected for well-formed mappings produced by `deep_merge_yaml`, but the
-/// failure MUST propagate as a compile error rather than silently dropping the emitted
-/// frontmatter fence from the output (no swallowed errors at boundaries).
-fn serialize_merged_frontmatter(
-    mapping: &serde_yaml_ng::Mapping,
-) -> Result<Option<String>, MdsError> {
-    if mapping.is_empty() {
-        return Ok(None);
-    }
-    let yaml = serde_yaml_ng::to_string(&serde_yaml_ng::Value::Mapping(mapping.clone()))
-        .map_err(|e| MdsError::yaml_error(e.to_string()))?;
-    let trimmed = yaml.trim_end();
-    if trimmed.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(format!("{trimmed}\n")))
-    }
-}
-
-/// Parse the frontmatter YAML into a `serde_yaml_ng::Mapping` for storage.
-///
-/// Returns `None` when there is no frontmatter or when the YAML is not a mapping.
-/// Called once per module to avoid double-parsing.
+/// The byte allowance is the smaller of the rest of the budget and `MAX_OUTPUT_SIZE`.
+/// The spent bytes stay charged as a temporary; a caller that keeps the tree moves
+/// them to the module's kept bytes. The mapping is `None` when there is no
+/// frontmatter or when the YAML is not a mapping.
 fn parse_frontmatter_mapping(
     frontmatter: Option<&crate::ast::Frontmatter>,
-) -> Result<Option<serde_yaml_ng::Mapping>, MdsError> {
+    mem: &mut MemBudget,
+) -> Result<(Option<serde_yaml_ng::Mapping>, usize), MdsError> {
     let Some(fm) = frontmatter else {
-        return Ok(None);
+        return Ok((None, 0));
     };
-    let yaml = parse_frontmatter_yaml(&fm.raw)?;
-    if let serde_yaml_ng::Value::Mapping(map) = yaml {
-        Ok(Some(map))
-    } else {
-        Ok(None)
-    }
+    let (yaml, spent) = parse_frontmatter_yaml_with(&fm.raw, Allowance::in_compile(mem))?;
+    mem.charge(Part::Temp, Some(spent))?;
+    let serde_yaml_ng::Value::Mapping(map) = yaml else {
+        return Ok((None, spent));
+    };
+    Ok((Some(map), spent))
 }
 
 /// Returns the byte count from `offset` to just before the next `\n` (or

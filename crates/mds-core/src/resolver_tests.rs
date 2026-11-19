@@ -737,7 +737,15 @@ fn scope_layer_precedence_keeps_imports_reserved_only_for_mds() {
     let source = "{{imports}}";
     let tokens = tokenize(source, "plain.md").unwrap();
     let module = parse_with_ctx(&tokens, "plain.md", source).unwrap();
-    let (mut plain, _) = build_scope_from_frontmatter(None, true, &runtime_layer(&vars)).unwrap();
+    let (mut plain, _) = build_scope_from_frontmatter(
+        None,
+        None,
+        0,
+        true,
+        &runtime_layer(&vars),
+        &mut MemBudget::default(),
+    )
+    .unwrap();
     assert_eq!(
         evaluate(
             &module.body,
@@ -763,7 +771,9 @@ fn scope_layer_precedence_keeps_imports_reserved_only_for_mds() {
 fn runtime_layer_is_shared_by_module_scopes() {
     let vars = HashMap::from([("x".into(), Value::String("runtime".into()))]);
     let vars = runtime_layer(&vars);
-    let (first, _) = build_scope_from_frontmatter(None, false, &vars).unwrap();
+    let (first, _) =
+        build_scope_from_frontmatter(None, None, 0, false, &vars, &mut MemBudget::default())
+            .unwrap();
     let inherited = build_scope_from_merged_mapping(&serde_yaml_ng::Mapping::new(), &vars).unwrap();
     assert!(Arc::ptr_eq(
         first.get_slot("x").unwrap().root(),
@@ -3901,7 +3911,7 @@ fn source_label_appears_in_string_source_diagnostics() {
 // ── Adversarial YAML-injection: core-level twin (#154) ───────────────────────
 //
 // These tests exercise the resolver's `raw_frontmatter` serialization path
-// (serialize_merged_frontmatter / serde_yaml_ng::to_string) to verify that values
+// (serialize_merged_frontmatter / serde_yaml_ng::to_writer) to verify that values
 // containing fence-like sequences, YAML document-end markers, or block-scalar
 // `type: mds` lines cannot escape the emitted frontmatter block and smuggle
 // additional top-level keys into the compiled output.
@@ -5468,4 +5478,661 @@ fn not_mds_entry_and_frontmatter_imports_keep_no_span() {
         assert!(err.serialize().span.is_none());
         assert!(err.source_name().is_none());
     }
+}
+
+fn limit_cache_headroom(cache: &mut ModuleCache, headroom: usize) {
+    let prior = MAX_COMPILE_MEMORY - headroom;
+    cache.budget.mem.charge(Part::Buffers, Some(prior)).unwrap();
+    cache.commit_retained(prior);
+}
+
+#[test]
+fn cached_module_moves_its_text_tree_and_fragment_to_retained() {
+    let key = "part.mds";
+    let raw = "label: value\n";
+    let body = "body\n";
+    let source = format!("---\n{raw}---\n{body}");
+    let mut cache = virtual_cache(&[(key, &source)]);
+    cache.source_map_mode = true;
+    let resolved = cache
+        .resolve_key(key, &Default::default(), &mut vec![])
+        .unwrap();
+    assert_eq!(resolved.raw_frontmatter.as_deref(), Some(raw));
+    assert_eq!(resolved.prompt_body.as_deref(), Some(body));
+    assert_eq!(
+        resolved.frontmatter_values.as_ref().unwrap()["label"],
+        "value"
+    );
+    let vars = Arc::default();
+    let ctx = extends_ctx(&source, &vars);
+    let mut builder = MapBuilder::new(ctx.make_origin());
+    builder.push_segment(0, 0, body.len() as u32);
+    assert!(resolved.prompt_map.is_some());
+    let origin_bytes = source.len() + 2 * key.len() + 6 * size_of::<usize>();
+    // The entry keeps its parsed tree. The module defines no function, so it does
+    // not keep its scope layer.
+    let tree = parse_frontmatter_yaml_with(raw, Allowance::in_compile(&MemBudget::default()))
+        .unwrap()
+        .1;
+    assert_eq!(resolved.frontmatter_bytes, tree);
+    assert_eq!(
+        cache.retained,
+        origin_bytes + raw.len() + body.len() + builder.segments_bytes() + tree
+    );
+    assert_eq!(
+        cache.budget.mem.headroom,
+        MAX_COMPILE_MEMORY - cache.retained
+    );
+    assert_eq!(cache.budget.mem.buffers, 0);
+}
+
+#[test]
+fn cached_modules_count_across_resolve_calls() {
+    let files = [("one.mds", "one\n"), ("two.mds", "two\n")];
+    let run =
+        |cache: &mut ModuleCache, key| cache.resolve_key(key, &Default::default(), &mut vec![]);
+    let cost = 2 * ("one\n".len() + "one.mds".len()) + 6 * size_of::<usize>();
+    let mut reused = virtual_cache(&files);
+    limit_cache_headroom(&mut reused, 2 * cost - 1);
+    run(&mut reused, "one.mds").unwrap();
+    let error = run(&mut reused, "two.mds").unwrap_err().serialize();
+    assert_eq!(error.code, "mds::resource_limit");
+    assert_eq!(
+        error.message,
+        "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
+    );
+    assert!(error.span.is_none());
+    assert!(error.help.is_none());
+    assert_eq!(reused.dependencies(), ["one.mds"]);
+    assert!(reused.resolving.is_empty());
+    let mut fresh = virtual_cache(&files);
+    limit_cache_headroom(&mut fresh, 2 * cost - 1);
+    assert_eq!(
+        run(&mut fresh, "two.mds").unwrap().prompt_body.as_deref(),
+        Some("two\n")
+    );
+}
+
+#[test]
+fn fragment_refusal_keeps_prompt_and_uses_existing_warning() {
+    let files = [("part.mds", "body\n")];
+    let mut control = virtual_cache(&files);
+    control.source_map_mode = true;
+    let key = "part.mds";
+    let control_part = control
+        .resolve_key(key, &Default::default(), &mut vec![])
+        .unwrap();
+    assert!(control_part.prompt_map.is_some());
+
+    let mut tight = virtual_cache(&files);
+    tight.source_map_mode = true;
+    // Leave enough for the read and all retained text, but not the fragment.
+    let text = "body\n".len();
+    limit_cache_headroom(
+        &mut tight,
+        3 * text + 2 * key.len() + 6 * size_of::<usize>(),
+    );
+    let mut warnings = vec![];
+    let part = tight
+        .resolve_key(key, &Default::default(), &mut warnings)
+        .unwrap();
+    assert_eq!(
+        part.prompt_body.as_deref(),
+        control_part.prompt_body.as_deref()
+    );
+    assert!(part.prompt_map.is_none());
+    assert_eq!(warnings, ["source map segment cap (1000000 segments) exceeded in imported module 'part.mds'; text included from it is left unmapped in the source map"]);
+    assert_eq!(tight.budget.mem.buffers, 0);
+}
+
+struct PaddedReads(VirtualFs);
+
+impl FileSystem for PaddedReads {
+    fn resolve_entry(&self, path: &str) -> Result<String, MdsError> {
+        self.0.resolve_entry(path)
+    }
+
+    fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError> {
+        self.0.normalize_in_dir(dir, relative)
+    }
+
+    fn parent_dir(&self, key: &str) -> String {
+        self.0.parent_dir(key)
+    }
+
+    fn read(&self, key: &str) -> Result<String, MdsError> {
+        let source = self.0.read(key)?;
+        let mut padded = String::with_capacity(128);
+        padded.push_str(&source);
+        Ok(padded)
+    }
+
+    fn is_markdown(&self, key: &str) -> bool {
+        self.0.is_markdown(key)
+    }
+}
+
+#[test]
+fn module_reads_release_to_parent_and_inserts_keep_only_warnings() {
+    let files = [
+        (
+            "main.mds",
+            "@import \"./a.mds\" as a\n@import \"./b.mds\" as b\n@include b\n",
+        ),
+        (
+            "a.mds",
+            "@import \"./empty.mds\" as empty\n@include empty\n",
+        ),
+        ("b.mds", "body\n"),
+        ("empty.mds", "   \n"),
+    ];
+    let fs = VirtualFs::new(
+        files
+            .map(|(key, src)| (key.to_owned(), src.to_owned()))
+            .into(),
+    );
+    let mut cache = ModuleCache::with_fs(Box::new(PaddedReads(fs)));
+    let mut warnings = vec![];
+    let (output, _) = cache
+        .resolve_virtual_intrinsic_opts(
+            "main.mds",
+            &Default::default(),
+            &CompileOptions::default(),
+            &mut warnings,
+        )
+        .unwrap();
+    assert_eq!(output, crate::CompiledOutput::Markdown("body\n".to_owned()));
+    assert_eq!(warnings.len(), 1);
+    let [root, a, empty, b] = cache.module_probes.as_slice() else {
+        panic!("four modules")
+    };
+    for (probe, outer) in [(root, 0), (a, 128), (empty, 256), (b, 128)] {
+        assert_eq!(probe.temporaries_before, outer);
+        assert_eq!(probe.temporaries_open, outer + 128);
+        assert_eq!(probe.temporaries_closed, outer);
+    }
+    assert_eq!(
+        a.buffers_after_insert,
+        Some(a.buffers_before + warnings[0].len())
+    );
+    for probe in [empty, b] {
+        assert_eq!(probe.buffers_after_insert, Some(probe.buffers_before));
+    }
+    assert_eq!(cache.budget.mem.mark(), 0);
+}
+
+#[test]
+fn refused_root_read_releases_the_module_mark() {
+    let fs = VirtualFs::new(HashMap::from([("main.mds".to_owned(), "body".to_owned())]));
+    let mut cache = ModuleCache::with_fs(Box::new(PaddedReads(fs)));
+    limit_cache_headroom(&mut cache, 127);
+    let vars = Default::default();
+    let mut warnings = vec![];
+    let error = cache
+        .resolve_virtual_intrinsic("main.mds", &vars, &mut warnings)
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
+    );
+    assert!(cache.resolving.is_empty());
+    assert_eq!(cache.budget.mem.mark(), 0);
+    assert_eq!(
+        cache
+            .resolve_source_intrinsic("body", "", &vars, &mut warnings)
+            .unwrap(),
+        crate::CompiledOutput::Markdown("body\n".to_owned())
+    );
+}
+
+#[test]
+fn skeleton_upgrade_adds_to_the_old_retained_charge() {
+    let files = [
+        ("base.mds", "body\n"),
+        ("child.mds", "@extends \"./base.mds\"\n"),
+    ];
+    let mut cache = virtual_cache(&files);
+    let vars = Default::default();
+    let mut warnings = vec![];
+    cache
+        .resolve_key("child.mds", &vars, &mut warnings)
+        .unwrap();
+    assert!(cache.modules["base.mds"].is_skeleton);
+    let before = cache.retained;
+    let upgraded = cache.resolve_key("base.mds", &vars, &mut warnings).unwrap();
+    assert_eq!(upgraded.prompt_body.as_deref(), Some("body\n"));
+    let mut fresh = virtual_cache(&files);
+    fresh.resolve_key("base.mds", &vars, &mut warnings).unwrap();
+    assert_eq!(cache.retained, before + fresh.retained);
+}
+
+#[test]
+fn finalize_refusal_keeps_output_and_releases_map_work() {
+    let mut cache = virtual_cache(&[]);
+    let source = "body\n";
+    let opts = CompileOptions::default()
+        .with_source_map(true)
+        .with_include_sources_content(true);
+    let compile = |cache: &mut ModuleCache, opts: &CompileOptions, warnings: &mut Vec<String>| {
+        cache
+            .resolve_source_intrinsic_opts(source, "", &Default::default(), opts, warnings)
+            .unwrap()
+    };
+    let (_, control_map) = compile(&mut cache, &opts, &mut vec![]);
+    assert_eq!(
+        control_map.unwrap().sources_content,
+        Some(vec![source.to_owned()])
+    );
+    let (plain, _) = compile(&mut cache, &CompileOptions::default(), &mut vec![]);
+    // Enough to charge the work arrays and body, but not the retained map.
+    limit_cache_headroom(&mut cache, 230);
+    let mut warnings = vec![];
+    let (tight, dropped) = compile(&mut cache, &opts, &mut warnings);
+    assert_eq!(tight, plain);
+    assert!(dropped.is_none());
+    assert_eq!(
+        warnings,
+        ["source map segment cap (1000000 segments) exceeded; no source map will be generated"]
+    );
+    assert_eq!(cache.budget.mem.mark(), 0);
+    assert_eq!(cache.budget.mem.buffers, source.len());
+
+    // The failed map reservation must restore the parent's live bytes immediately.
+    let vars = Arc::default();
+    let ctx = extends_ctx(source, &vars);
+    let mut builder = MapBuilder::new(ctx.make_origin());
+    builder.push_segment(0, 0, source.len() as u32);
+    let mem = &mut cache.budget.mem;
+    mem.charge(Part::Temp, Some(3)).unwrap();
+    let before = *mem;
+    let costs = FinalizeCosts {
+        content: source.len(),
+        map_origin_bytes: ctx.origin_bytes(),
+        prefix_lines: 0,
+        label_base_bytes: 0,
+    };
+    assert!(!charge_finalize(mem, &builder, source, costs));
+    assert_eq!(*mem, before);
+}
+
+#[test]
+fn final_output_charges_prefix_and_growth_before_the_reserve() {
+    let cases = [
+        "body".to_owned(),
+        "body".to_owned() + &" ".repeat(50),
+        " ".repeat(50),
+    ];
+    let raw = "label: value\n";
+    // The parsed frontmatter and its scope layer stay charged while the module runs.
+    let spent = parse_frontmatter_yaml_with(raw, Allowance::in_compile(&MemBudget::default()))
+        .unwrap()
+        .1;
+    for body in cases {
+        let growth = raw.len() + 8 + usize::from(!body.trim_end().is_empty());
+        let needed = body.len() + 2 * raw.len() + 9 + growth + 2 * spent;
+        let source = format!("---\n{raw}---\n{body}");
+        let compile = |headroom| {
+            let mut cache = virtual_cache(&[]);
+            limit_cache_headroom(&mut cache, headroom);
+            cache
+                .resolve_source_intrinsic_opts(
+                    &source,
+                    "",
+                    &Default::default(),
+                    &Default::default(),
+                    &mut vec![],
+                )
+                .map(|output| (output, cache.budget.mem))
+        };
+        let (output, mem) = compile(needed).unwrap();
+        let crate::CompiledOutput::Markdown(output) = output.0 else {
+            panic!("markdown output")
+        };
+        assert_eq!(
+            output,
+            format!(
+                "---\n{raw}---\n{}",
+                if body.trim_end().is_empty() {
+                    ""
+                } else {
+                    "body\n"
+                }
+            )
+        );
+        assert_eq!(mem.buffers, output.capacity());
+        assert_eq!(mem.mark(), 0);
+        assert_eq!(
+            compile(needed - 1).unwrap_err().to_string(),
+            "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
+        );
+        assert_eq!(
+            compile(body.len() + 2 * raw.len() + 8)
+                .unwrap_err()
+                .to_string(),
+            "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
+        );
+    }
+}
+
+#[test]
+fn only_commit_retained_updates_cache_headroom() {
+    fn writes(source: &str, field: &str) -> usize {
+        source
+            .match_indices(field)
+            .filter(|(pos, _)| {
+                let tail = &source[pos + field.len()..];
+                let first = tail.as_bytes().first().copied();
+                (tail.starts_with('=') && !tail.starts_with("=="))
+                    || (first.is_some_and(|byte| b"+-*/%&|^".contains(&byte))
+                        && tail.as_bytes().get(1) == Some(&b'='))
+            })
+            .count()
+    }
+
+    fn code(source: &str) -> String {
+        source
+            .lines()
+            .flat_map(|line| {
+                line.split_once("//")
+                    .map_or(line, |(code, _)| code)
+                    .split_whitespace()
+            })
+            .collect()
+    }
+
+    fn valid(resolver: &str, evaluator: &str) -> bool {
+        let resolver = code(resolver);
+        let evaluator = code(evaluator);
+        let Some((_, commit)) = resolver.split_once("fncommit_retained(") else {
+            return false;
+        };
+        let body = commit.split("}fn").next().unwrap_or_default();
+        [".retained", ".headroom"].iter().all(|field| {
+            writes(&resolver, field) == 1
+                && writes(body, field) == 1
+                && writes(&evaluator, field) == 0
+        }) && !evaluator.contains("ModuleCache")
+            && !evaluator.contains(".resolve_")
+    }
+
+    let resolver = include_str!("resolver.rs");
+    let evaluator = concat!(
+        include_str!("evaluator.rs"),
+        include_str!("evaluator/budget.rs")
+    );
+    assert!(valid(resolver, evaluator));
+    assert!(!valid(
+        &format!("{resolver}\nself.retained = 0;"),
+        evaluator
+    ));
+    assert!(!valid(&format!("{resolver}\nmem.headroom = 0;"), evaluator));
+    assert!(!valid(
+        resolver,
+        &format!("{evaluator}\nmem.headroom -= 1;")
+    ));
+    assert!(!valid(
+        resolver,
+        &format!("{evaluator}\nuse crate::resolver::ModuleCache;")
+    ));
+    assert!(!valid(
+        resolver,
+        &format!("{evaluator}\ncache.resolve_by_key(key);")
+    ));
+}
+
+pub(super) const TEMPORARIES_SEED_KEY: &str = "root-with-live-temporaries.mds";
+
+fn assert_internal(error: MdsError) {
+    let record = error.serialize();
+    assert_eq!(record.code, "mds::internal");
+    assert_eq!(record.message, "internal compiler error");
+    assert_eq!(record.help, None);
+    assert_eq!(record.span, None);
+    assert_eq!(error.source_name(), None);
+}
+
+#[test]
+fn resolve_source_refuses_to_return_output_with_live_temporaries() {
+    let mut cache = virtual_cache(&[]);
+    cache.temporaries_seed = 1;
+    let result = cache.resolve_source("Body", "", &HashMap::new(), &mut vec![]);
+    assert_eq!(cache.budget.mem.mark(), 1);
+    assert_internal(result.unwrap_err());
+}
+
+#[test]
+fn compile_virtual_refuses_to_return_output_with_live_temporaries() {
+    let modules = HashMap::from([(TEMPORARIES_SEED_KEY.into(), "Body".into())]);
+    assert_internal(crate::compile_virtual(modules, TEMPORARIES_SEED_KEY, None).unwrap_err());
+}
+
+#[test]
+fn finish_preserves_the_first_error_even_with_live_temporaries() {
+    let mut cache = virtual_cache(&[]);
+    let mut resolve = |seed| {
+        cache.temporaries_seed = seed;
+        cache
+            .resolve_source("{{missing}}", "", &HashMap::new(), &mut vec![])
+            .unwrap_err()
+            .serialize()
+    };
+    let original = resolve(0);
+    assert_eq!(original.code, "mds::undefined_var");
+    assert_eq!(resolve(1), original);
+    assert_eq!(cache.budget.mem.mark(), 1);
+}
+
+#[test]
+fn resolve_key_does_not_cache_output_when_temporaries_remain() {
+    let key = "part.mds";
+    let mut cache = virtual_cache(&[(key, "Body")]);
+    cache.temporaries_seed = 1;
+    assert_internal(
+        cache
+            .resolve_key(key, &HashMap::new(), &mut vec![])
+            .unwrap_err(),
+    );
+    assert!(cache.dependencies().is_empty());
+    cache.temporaries_seed = 0;
+    assert!(cache.resolve_key(key, &HashMap::new(), &mut vec![]).is_ok());
+}
+
+#[test]
+fn resolve_key_refuses_an_incomplete_retained_transfer() {
+    let key = "part.mds";
+    let mut cache = virtual_cache(&[(key, "Body")]);
+    cache.retained_transfer_seed = 1;
+    let result = cache.resolve_key(key, &HashMap::new(), &mut vec![]);
+    assert_eq!(cache.budget.mem.mark(), 0);
+    assert_eq!(cache.retained, 0);
+    assert!(cache.budget.mem.buffers > 0);
+    assert_internal(result.unwrap_err());
+    assert!(cache.dependencies().is_empty());
+    cache.retained_transfer_seed = 0;
+    cache
+        .resolve_key(key, &HashMap::new(), &mut vec![])
+        .unwrap();
+    assert!(cache.retained > 0);
+}
+
+#[test]
+fn resolution_funnel_has_one_pop_and_five_finish_calls() {
+    fn valid(source: &str) -> bool {
+        let body = |name| {
+            let (_, rest) = source.split_once(&format!("fn {name}("))?;
+            let (body, _) = rest.split_once("\n    }")?;
+            Some(body)
+        };
+        let Some(pop) = body("pop_resolving") else {
+            return false;
+        };
+        let bodies = [Some(pop), body("finish_root"), body("commit_retained")];
+        let code = |text: &str| {
+            text.lines()
+                .flat_map(|line| {
+                    line.split("//")
+                        .next()
+                        .unwrap_or_default()
+                        .split_whitespace()
+                })
+                .collect::<String>()
+        };
+        let all = code(source);
+        all.matches(".resolving.pop(").count() == 1
+            && code(pop).contains(".resolving.pop(")
+            && all.matches(".finish_root(").count() == 5
+            && all.matches("fnfinish_root(").count() == 1
+            && bodies.into_iter().all(|body| {
+                body.is_some_and(|body| {
+                    body.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                        .all(|token| {
+                            !matches!(token, "expect" | "unwrap" | "panic" | "RefCell")
+                                && !token.starts_with("assert")
+                                && !token.starts_with("debug_assert")
+                        })
+                })
+            })
+    }
+
+    let source = include_str!("resolver.rs");
+    assert!(valid(source));
+    assert!(!valid(&format!("{source}\nself.resolving . pop ();")));
+    assert!(!valid(&format!("{source}\nself.finish_root()?;")));
+    let with_assert = source.replacen(
+        "self.resolving.pop()",
+        "{ assert!(false); self.resolving.pop() }",
+        1,
+    );
+    assert!(!valid(&with_assert));
+}
+
+/// Parse `yaml` as a compile parse does. Returns the mapping and its spent bytes.
+fn parsed_mapping(yaml: &str) -> (serde_yaml_ng::Mapping, usize) {
+    let (tree, spent) =
+        parse_frontmatter_yaml_with(yaml, Allowance::in_compile(&MemBudget::default())).unwrap();
+    let serde_yaml_ng::Value::Mapping(mapping) = tree else {
+        panic!("expected a mapping");
+    };
+    (mapping, spent)
+}
+
+#[test]
+fn merged_frontmatter_text_matches_the_text_of_a_cloned_value() {
+    let (mapping, spent) = parsed_mapping(concat!(
+        "name: \"a: b\"\n",
+        "nested:\n  list: [1, two, \"3\", ~]\n  text: \"line one\\nline two\"\n",
+        "quote: \"it's\"\n",
+        "control: \"\\x01\\t\\u0085\\u2028\"\n",
+    ));
+    let cloned = serde_yaml_ng::to_string(&serde_yaml_ng::Value::Mapping(mapping.clone())).unwrap();
+    let mut cache = virtual_cache(&[]);
+    let text = cache
+        .serialize_merged_frontmatter(&mapping, spent)
+        .unwrap()
+        .unwrap();
+    assert_eq!(text, format!("{}\n", cloned.trim_end()));
+    // The text is kept at its capacity, and no temporary remains.
+    assert_eq!(cache.budget.mem.buffers, text.capacity());
+    assert_eq!(cache.kept, text.capacity());
+    assert_eq!(cache.budget.mem.mark(), 0);
+}
+
+#[test]
+fn a_control_character_scalar_serializes_within_its_charge() {
+    // Each control byte serializes as a four-byte escape.
+    let (mapping, spent) = parsed_mapping(&format!("k: \"{}\"\n", "\\x01".repeat(100_000)));
+    let mut cache = virtual_cache(&[]);
+    let text = cache
+        .serialize_merged_frontmatter(&mapping, spent)
+        .unwrap()
+        .unwrap();
+    assert!(text.len() > 3 * spent, "{} B", text.len());
+    // The bound sized the text, so the text did not grow past it.
+    assert_eq!(text.capacity(), 4 * spent + 1);
+}
+
+#[test]
+fn a_frontmatter_merge_charges_both_trees_first() {
+    let mut cache = virtual_cache(&[("base.mds", "---\na: 1\n---\nBase\n")]);
+    let base = cache
+        .resolve_key("base.mds", &HashMap::new(), &mut vec![])
+        .unwrap();
+    let (child, child_bytes) = parsed_mapping("b: 2\n");
+    let child = Some(child);
+    let charge = base.frontmatter_bytes + child_bytes;
+    let (merged, charged) = cache.merge_frontmatter(&base, &child, child_bytes).unwrap();
+    assert_eq!((merged.len(), charged), (2, charge));
+    assert_eq!(cache.budget.mem.mark(), charge);
+    // With one byte less left than both trees take, the merge is refused.
+    let left = cache.budget.mem.headroom - cache.budget.mem.buffers - charge;
+    cache
+        .budget
+        .mem
+        .charge(Part::Buffers, Some(left - charge + 1))
+        .unwrap();
+    assert_eq!(
+        cache
+            .merge_frontmatter(&base, &child, child_bytes)
+            .unwrap_err()
+            .to_string(),
+        "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
+    );
+}
+
+#[test]
+fn every_frontmatter_merge_goes_through_the_charged_helper() {
+    fn calls(code: &str) -> usize {
+        code.lines()
+            .map(|line| {
+                line.split("//")
+                    .next()
+                    .unwrap_or_default()
+                    .matches("deep_merge_yaml(")
+                    .count()
+            })
+            .sum()
+    }
+    fn valid(resolver: &str, frontmatter: &str) -> bool {
+        let helper = resolver
+            .split_once("fn merge_frontmatter(")
+            .and_then(|(_, rest)| rest.split_once("\n    }"));
+        // Outside its tests, frontmatter.rs holds the definition and its recursion.
+        let production = frontmatter.split_once("\n#[cfg(test)]\nmod tests {");
+        calls(resolver) == 1
+            && helper.is_some_and(|(body, _)| calls(body) == 1)
+            && production.is_some_and(|(code, _)| calls(code) == 2)
+    }
+
+    let resolver = include_str!("resolver.rs");
+    let frontmatter = include_str!("resolver/frontmatter.rs");
+    assert!(valid(resolver, frontmatter));
+    let planted = "let merged = deep_merge_yaml(&base, &child, 0)?;";
+    assert!(!valid(&format!("{resolver}\n{planted}"), frontmatter));
+    assert!(!valid(resolver, &format!("{planted}\n{frontmatter}")));
+}
+
+#[test]
+fn the_extends_scope_layer_is_charged_with_the_merge_charge() {
+    let mut cache = virtual_cache(&[("base.mds", "---\na: 1\n---\nBase\n")]);
+    let base = cache
+        .resolve_key("base.mds", &HashMap::new(), &mut vec![])
+        .unwrap();
+    let (child, child_bytes) = parsed_mapping("b: 2\n");
+    let vars = Arc::default();
+    let ctx = extends_ctx("", &vars);
+    let (scope, merged, charge) = cache
+        .build_merged_extends_scope(
+            &base,
+            &Some(child),
+            child_bytes,
+            "base.mds",
+            &ctx,
+            &mut vec![],
+        )
+        .unwrap();
+    assert_eq!(merged.len(), 2);
+    assert!(scope.get_slot("b").is_some());
+    // The merged mapping and the scope layer each hold the merge charge.
+    assert_eq!(charge, base.frontmatter_bytes + child_bytes);
+    assert_eq!(cache.budget.mem.mark(), 2 * charge);
 }

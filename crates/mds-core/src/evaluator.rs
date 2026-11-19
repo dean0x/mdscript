@@ -1,15 +1,23 @@
 use std::borrow::Cow;
+use std::fmt;
 use std::sync::Arc;
+
+pub(crate) mod budget;
+use budget::{
+    bytes, display_len, format_exact, format_len, render_value, table_bytes, value_bytes,
+    MemBudget, Part, NODE, VALUE_ROOT,
+};
 
 use crate::arity::check_arity;
 use crate::ast::{
     render_signature, required_param_count, Arg, BlockNode, Condition, Expr, ForBlock, IfBlock,
     IncludeDirective, MessageBlock, Node,
 };
+use crate::builtins::{Bound, BuiltinMeta};
 use crate::error::MdsError;
 use crate::limits::{
-    MAX_DOT_SEGMENTS, MAX_ELSEIF_BRANCHES, MAX_MESSAGES_TOTAL_SIZE, MAX_MESSAGE_COUNT,
-    MAX_OUTPUT_SIZE, MAX_TOTAL_FUNCTION_CALLS,
+    MAX_ARRAY_ELEMENTS, MAX_DOT_SEGMENTS, MAX_ELSEIF_BRANCHES, MAX_MESSAGES_TOTAL_SIZE,
+    MAX_MESSAGE_COUNT, MAX_OUTPUT_SIZE, MAX_TOTAL_FUNCTION_CALLS,
 };
 use crate::scope::{FunctionDef, PathStep, PromptText, Scope, Slot};
 use crate::value::Value;
@@ -26,6 +34,19 @@ const MAX_TOTAL_ITERATIONS: usize = 1_000_000;
 
 /// Maximum number of accumulated warnings before further warnings are silently dropped.
 const MAX_WARNINGS: usize = 1_000;
+const FRAME_ENTRY: usize = 2 * size_of::<(String, Slot)>() + 2;
+const _: () = assert!(FRAME_ENTRY >= 2 * size_of::<(String, Slot)>() + 2);
+
+/// The bytes of one frame entry: its name, the slot pair and the bound value.
+fn entry_bytes(name: &str, bound_value: Option<usize>) -> Option<usize> {
+    name.len()
+        .checked_add(FRAME_ENTRY)?
+        .checked_add(bound_value?)
+}
+
+fn charge_literal(mem: &mut MemBudget, len: usize) -> Result<usize, MdsError> {
+    mem.charge(Part::Temp, VALUE_ROOT.checked_add(len))
+}
 
 /// Cumulative resource budgets for evaluation.
 ///
@@ -40,6 +61,7 @@ pub(crate) struct EvalBudget {
     /// growth is caught before a giant `Vec` is built.
     message_bytes: usize,
     function_calls: usize,
+    pub(crate) mem: MemBudget,
 }
 
 impl EvalBudget {
@@ -275,150 +297,151 @@ fn evaluate_nodes(
     let saved_cursor = ctx.map.as_ref().map_or(0, |map| map.cursor);
 
     for node in nodes {
-        let abs_out = saved_cursor + (out.len() - start_len) as u32;
-        let slot;
-        let rendered;
-        let included;
-        // Child bodies append to `out` directly. Leaf text uses one capped append.
-        let piece = match node {
-            Node::Text(t) => {
-                if let Some(ref mut map) = ctx.map {
-                    if map.suppress == 0 {
-                        // Enforced in release builds too (#220): `cursor` is the absolute
-                        // output position every following segment is computed from, so a
-                        // desynchronised cursor mis-attributes the whole rest of the map
-                        // in silence — a source map that points at the wrong bytes is
-                        // worse than no source map. Only a defect in the arms that
-                        // re-anchor the cursor can trip it; no template input can.
-                        // Cost: one u32 compare per node, only while a source map is
-                        // being recorded.
-                        assert_eq!(
-                            map.cursor, abs_out,
-                            "source-map cursor desynchronised from the output length at \
+        let mark = ctx.budget.mem.mark();
+        let result = (|| -> Result<(), MdsError> {
+            let abs_out = saved_cursor + (out.len() - start_len) as u32;
+            let slot;
+            let rendered;
+            let included;
+            // Child bodies append to `out` directly. Leaf text uses one capped append.
+            let piece = match node {
+                Node::Text(t) => {
+                    if let Some(ref mut map) = ctx.map {
+                        if map.suppress == 0 {
+                            // Enforced in release builds too (#220): `cursor` is the absolute
+                            // output position every following segment is computed from, so a
+                            // desynchronised cursor mis-attributes the whole rest of the map
+                            // in silence — a source map that points at the wrong bytes is
+                            // worse than no source map. Only a defect in the arms that
+                            // re-anchor the cursor can trip it; no template input can.
+                            // Cost: one u32 compare per node, only while a source map is
+                            // being recorded.
+                            assert_eq!(
+                                map.cursor, abs_out,
+                                "source-map cursor desynchronised from the output length at \
                              a Text node: every following segment would map to the wrong \
                              output offset"
-                        );
-                        map.push_segment(abs_out, t.offset as u32, t.text.len() as u32);
+                            );
+                            map.push_segment(abs_out, t.offset as u32, t.text.len() as u32);
+                        }
                     }
+                    Some(t.text.as_str())
                 }
-                Some(t.text.as_str())
-            }
-            Node::EscapedBrace { offset } => {
-                if let Some(ref mut map) = ctx.map {
-                    if map.suppress == 0 {
-                        // Enforced in release too (#220); see the Text arm above.
-                        assert_eq!(
-                            map.cursor, abs_out,
-                            "source-map cursor desynchronised from the output length at \
+                Node::EscapedBrace { offset } => {
+                    if let Some(ref mut map) = ctx.map {
+                        if map.suppress == 0 {
+                            // Enforced in release too (#220); see the Text arm above.
+                            assert_eq!(
+                                map.cursor, abs_out,
+                                "source-map cursor desynchronised from the output length at \
                              an EscapedBrace node: every following segment would map to \
                              the wrong output offset"
-                        );
-                        // Source span: `\{{` is 3 source bytes (backslash + two braces).
-                        map.push_segment(abs_out, *offset as u32, 3);
+                            );
+                            // Source span: `\{{` is 3 source bytes (backslash + two braces).
+                            map.push_segment(abs_out, *offset as u32, 3);
+                        }
                     }
+                    Some("{{")
                 }
-                Some("{{")
-            }
-            Node::Interpolation(interp) => {
-                // S8: reset ownership flag before each call so arg-evaluation
-                // side-effects from nested S8 calls don't corrupt the outer arm.
-                ctx.fn_body_owned = false;
-                if let Some(ref mut map) = ctx.map {
-                    if map.suppress == 0 {
-                        // Assert cursor invariant before anchoring.  On the S8 path,
-                        // invoke_function will read this anchor as the body's base
-                        // output position.
-                        // Enforced in release too (#220); see the Text arm above.
-                        assert_eq!(
-                            map.cursor, abs_out,
-                            "source-map cursor desynchronised from the output length at \
+                Node::Interpolation(interp) => {
+                    // S8: reset ownership flag before each call so arg-evaluation
+                    // side-effects from nested S8 calls don't corrupt the outer arm.
+                    ctx.fn_body_owned = false;
+                    if let Some(ref mut map) = ctx.map {
+                        if map.suppress == 0 {
+                            // Assert cursor invariant before anchoring.  On the S8 path,
+                            // invoke_function will read this anchor as the body's base
+                            // output position.
+                            // Enforced in release too (#220); see the Text arm above.
+                            assert_eq!(
+                                map.cursor, abs_out,
+                                "source-map cursor desynchronised from the output length at \
                              an Interpolation node: every following segment would map to \
                              the wrong output offset"
-                        );
+                            );
+                        }
+                        // Always anchor cursor so inner evaluate_nodes invocations
+                        // (invoke_function / S8 body descent) start from the correct
+                        // absolute position.
+                        map.cursor = abs_out;
                     }
-                    // Always anchor cursor so inner evaluate_nodes invocations
-                    // (invoke_function / S8 body descent) start from the correct
-                    // absolute position.
-                    map.cursor = abs_out;
-                }
-                slot = evaluate_expr(&interp.expr, scope, ctx)?;
-                rendered = render_expr(&interp.expr, &slot)?;
-                if let Some(ref mut map) = ctx.map {
-                    if map.suppress == 0 && !ctx.fn_body_owned {
-                        // S3 path: body was suppressed; record the call-site span.
-                        // On the S8 path, invoke_function already pushed fine-grained
-                        // body segments attributed to the definition file — skip here.
-                        map.push_segment(abs_out, interp.offset as u32, interp.len as u32);
+                    slot = evaluate_expr(&interp.expr, scope, ctx)?;
+                    rendered = render_expr(&interp.expr, &slot, &mut ctx.budget.mem)?;
+                    if let Some(ref mut map) = ctx.map {
+                        if map.suppress == 0 && !ctx.fn_body_owned {
+                            // S3 path: body was suppressed; record the call-site span.
+                            // On the S8 path, invoke_function already pushed fine-grained
+                            // body segments attributed to the definition file — skip here.
+                            map.push_segment(abs_out, interp.offset as u32, interp.len as u32);
+                        }
                     }
+                    Some(rendered.as_ref())
                 }
-                Some(rendered.as_ref())
-            }
-            Node::If(block) => {
-                if let Some(ref mut map) = ctx.map {
-                    map.cursor = abs_out;
+                Node::If(block) => {
+                    if let Some(ref mut map) = ctx.map {
+                        map.cursor = abs_out;
+                    }
+                    evaluate_if(block, scope, ctx, out)?;
+                    None
                 }
-                evaluate_if(block, scope, ctx, out)?;
-                None
-            }
-            Node::For(block) => {
-                if let Some(ref mut map) = ctx.map {
-                    map.cursor = abs_out;
+                Node::For(block) => {
+                    if let Some(ref mut map) = ctx.map {
+                        map.cursor = abs_out;
+                    }
+                    evaluate_for(block, scope, ctx, out)?;
+                    None
                 }
-                evaluate_for(block, scope, ctx, out)?;
-                None
-            }
-            Node::Define(_) => {
-                // Handled by resolver with full lexical capture; no output.
-                continue;
-            }
-            Node::Import(_) | Node::Export(_) => {
-                // Handled by resolver, skip during evaluation.
-                continue;
-            }
-            Node::Include(inc) => {
-                if let Some(ref mut map) = ctx.map {
-                    map.cursor = abs_out;
+                Node::Define(_) | Node::Import(_) | Node::Export(_) => {
+                    // The resolver handles these directives.
+                    return Ok(());
                 }
-                included = evaluate_include(inc, scope, ctx)?;
-                included.as_deref()
-            }
-            Node::Message(block) => {
-                // Text mode: render the body inline, ignoring the role marker.
-                // This maintains full backward compatibility — @message blocks are
-                // transparent when compiling to plain text.
-                if let Some(ref mut map) = ctx.map {
-                    map.cursor = abs_out;
+                Node::Include(inc) => {
+                    if let Some(ref mut map) = ctx.map {
+                        map.cursor = abs_out;
+                    }
+                    included = evaluate_include(inc, scope, ctx)?;
+                    included.as_deref()
                 }
-                evaluate_nodes(&block.body, scope, ctx, out)?;
-                None
-            }
-            Node::Block(block) => {
-                // Standalone mode: render the block's default body inline.
-                // The block markers are invisible in text output — @block is a
-                // transparent wrapper in non-extending files. An `@extends` chain
-                // never reaches this arm: the resolver evaluates each block's
-                // effective body (base default or child override) as its own region.
-                if let Some(ref mut map) = ctx.map {
-                    map.cursor = abs_out;
+                Node::Message(block) => {
+                    // Text mode: render the body inline, ignoring the role marker.
+                    // This maintains full backward compatibility — @message blocks are
+                    // transparent when compiling to plain text.
+                    if let Some(ref mut map) = ctx.map {
+                        map.cursor = abs_out;
+                    }
+                    evaluate_nodes(&block.body, scope, ctx, out)?;
+                    None
                 }
-                evaluate_block(block, scope, ctx, out)?;
-                None
+                Node::Block(block) => {
+                    // Standalone mode: render the block's default body inline.
+                    // The block markers are invisible in text output — @block is a
+                    // transparent wrapper in non-extending files. An `@extends` chain
+                    // never reaches this arm: the resolver evaluates each block's
+                    // effective body (base default or child override) as its own region.
+                    if let Some(ref mut map) = ctx.map {
+                        map.cursor = abs_out;
+                    }
+                    evaluate_block(block, scope, ctx, out)?;
+                    None
+                }
+            };
+            if let Some(piece) = piece {
+                push_capped(out, piece, &mut ctx.budget.mem)?;
             }
-        };
-        if let Some(piece) = piece {
-            push_capped(out, piece)?;
-        }
-        // Re-anchor after the node, including after an empty child body.
-        if let Some(ref mut map) = ctx.map {
-            map.cursor = saved_cursor + (out.len() - start_len) as u32;
-        }
+            // Re-anchor after the node, including after an empty child body.
+            if let Some(ref mut map) = ctx.map {
+                map.cursor = saved_cursor + (out.len() - start_len) as u32;
+            }
+            Ok(())
+        })();
+        ctx.budget.mem.release_to(mark);
+        result?;
     }
 
     Ok(())
 }
 
-/// Append `add` to the output buffer `out`, or fail with the output-cap error and
-/// leave `out` unchanged.
+/// Append `add` to `out` after the size and memory checks pass.
 ///
 /// Every output accumulator appends through this (#415), so `MAX_OUTPUT_SIZE` is
 /// checked before the bytes land: a loop crossing the cap stops on the crossing pass
@@ -426,9 +449,8 @@ fn evaluate_nodes(
 /// `push_str`, but never reserves past the cap, so capacity is bounded too — plain
 /// doubling would take a buffer to about twice the cap.
 ///
-/// The cap bounds each buffer, not a compile's total memory. Function bodies,
-/// message content and imported modules use separate buffers.
-pub(crate) fn push_capped(out: &mut String, add: &str) -> Result<(), MdsError> {
+/// The memory budget also counts the capacity of each live output buffer.
+fn push_capped(out: &mut String, add: &str, mem: &mut MemBudget) -> Result<(), MdsError> {
     let needed = out
         .len()
         .checked_add(add.len())
@@ -441,7 +463,11 @@ pub(crate) fn push_capped(out: &mut String, add: &str) -> Result<(), MdsError> {
             .saturating_mul(2)
             .max(needed)
             .min(MAX_OUTPUT_SIZE);
+        mem.charge(Part::Buffers, Some(target - out.capacity()))?;
         out.reserve_exact(target - out.len());
+        if out.capacity() > target {
+            mem.charge(Part::Buffers, Some(out.capacity() - target))?;
+        }
     }
     out.push_str(add);
     Ok(())
@@ -474,7 +500,12 @@ fn invalid_projection() -> MdsError {
 }
 
 /// Resolve each field against the root slot. An empty path returns the slot itself.
-fn resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Slot, MdsError> {
+fn resolve_dot_path(
+    root: &str,
+    fields: &[String],
+    scope: &Scope,
+    mem: &mut MemBudget,
+) -> Result<Slot, MdsError> {
     if fields.len() > MAX_DOT_SEGMENTS {
         return Err(MdsError::syntax(format!(
             "dot path exceeds maximum segment count of {MAX_DOT_SEGMENTS}"
@@ -491,6 +522,7 @@ fn resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Slot
         };
         match current.get().ok_or_else(invalid_projection)? {
             Value::Object(map) if map.contains_key(field) => {
+                mem.charge(Part::Temp, Slot::PROJECTION_BYTES.checked_add(field.len()))?;
                 current = current.project(PathStep::Key(field.clone()));
             }
             Value::Object(_) => {
@@ -531,17 +563,21 @@ fn evaluate_expr(expr: &Expr, scope: &mut Scope, ctx: &mut EvalContext) -> Resul
                     "'{object}' is an imported module, not a variable — to call a function use {{{object}.func()}}"
                 )));
             }
-            resolve_dot_path(object, fields, scope)
+            resolve_dot_path(object, fields, scope, &mut ctx.budget.mem)
         }
-        Expr::StringLiteral(s) => Ok(Value::String(s.clone()).into()),
-        Expr::NumberLiteral(n) => Ok(Value::Number(*n).into()),
-        Expr::BooleanLiteral(b) => Ok(Value::Boolean(*b).into()),
-        Expr::NullLiteral => Ok(Value::Null.into()),
+        literal => {
+            charge_literal(&mut ctx.budget.mem, literal_text_len(literal))?;
+            literal_expr_to_value(literal).map(Slot::from)
+        }
     }
 }
 
 /// Render an evaluated expression. Borrow strings and reject direct object interpolation.
-fn render_expr<'a>(expr: &Expr, slot: &'a Slot) -> Result<Cow<'a, str>, MdsError> {
+fn render_expr<'a>(
+    expr: &Expr,
+    slot: &'a Slot,
+    mem: &mut MemBudget,
+) -> Result<Cow<'a, str>, MdsError> {
     let value = slot.get().ok_or_else(invalid_projection)?;
     match value {
         Value::String(text) => Ok(Cow::Borrowed(text)),
@@ -559,7 +595,10 @@ fn render_expr<'a>(expr: &Expr, slot: &'a Slot) -> Result<Cow<'a, str>, MdsError
             };
             Err(MdsError::syntax(hint))
         }
-        _ => Ok(Cow::Owned(value.to_string())),
+        _ => {
+            let len = mem.charge(Part::Temp, display_len(value))?;
+            render_value(value, len).map(Cow::Owned)
+        }
     }
 }
 
@@ -574,18 +613,33 @@ fn resolve_args(
             "argument expression depth exceeds {MAX_CALL_DEPTH}"
         )));
     }
+    ctx.budget
+        .mem
+        .charge(Part::Temp, bytes(args.len(), size_of::<Slot>()))?;
     args.iter()
-        .map(|arg| match arg {
-            Arg::StringLiteral(s) => Ok(Value::String(s.clone()).into()),
-            Arg::NumberLiteral(n) => Ok(Value::Number(*n).into()),
-            Arg::BooleanLiteral(b) => Ok(Value::Boolean(*b).into()),
-            Arg::NullLiteral => Ok(Value::Null.into()),
-            Arg::Var(name) => resolve_var(name, scope),
-            Arg::Call {
-                name,
-                args: inner_args,
-            } => call_function(name, inner_args, scope, ctx, depth + 1),
-            Arg::MemberAccess { object, fields } => resolve_dot_path(object, fields, scope),
+        .map(|arg| {
+            let literal_len = match arg {
+                Arg::StringLiteral(s) => s.len(),
+                Arg::NumberLiteral(_) | Arg::BooleanLiteral(_) | Arg::NullLiteral => 0,
+                Arg::Var(name) => return resolve_var(name, scope),
+                Arg::Call {
+                    name,
+                    args: inner_args,
+                } => return call_function(name, inner_args, scope, ctx, depth + 1),
+                Arg::MemberAccess { object, fields } => {
+                    return resolve_dot_path(object, fields, scope, &mut ctx.budget.mem)
+                }
+            };
+            // One charge for every literal, before its value is built.
+            charge_literal(&mut ctx.budget.mem, literal_len)?;
+            Ok(match arg {
+                Arg::StringLiteral(s) => Value::String(s.clone()),
+                Arg::NumberLiteral(n) => Value::Number(*n),
+                Arg::BooleanLiteral(b) => Value::Boolean(*b),
+                // Only literals reach this match; the other arms returned above.
+                _ => Value::Null,
+            }
+            .into())
         })
         .collect()
 }
@@ -633,6 +687,13 @@ pub(crate) fn literal_expr_to_value(expr: &Expr) -> Result<Value, MdsError> {
     }
 }
 
+fn literal_text_len(expr: &Expr) -> usize {
+    match expr {
+        Expr::StringLiteral(s) => s.len(),
+        _ => 0,
+    }
+}
+
 fn check_function_arity(
     func: &FunctionDef,
     call_key: &str,
@@ -673,19 +734,34 @@ fn invoke_function(
     }
     check_function_arity(func, call_key, args.len())?;
     ctx.budget.charge_function_call()?;
+    let mark = ctx.budget.mem.mark();
+    ctx.budget.mem.charge(Part::Temp, Some(call_key.len()))?;
+    let mut body = String::new();
     scope.push_call(func);
-    let result = evaluate_function_body(func, call_key, args, scope, ctx);
-    prefer_first_error(result, scope.pop())
+    let result = evaluate_function_body(func, call_key, args, scope, ctx, &mut body);
+    let result = prefer_first_error(result, scope.pop());
+    ctx.budget.mem.release_to(mark);
+    if result.is_ok() {
+        ctx.budget
+            .mem
+            .transfer(Part::Buffers, Part::Temp, body.capacity());
+    } else {
+        ctx.budget.mem.release_buffers(body.capacity());
+    }
+    result.map(|()| body)
 }
 
 fn bind_call_params(
     params: &[crate::ast::Param],
     args: &[Slot],
     scope: &mut Scope,
+    mem: &mut MemBudget,
 ) -> Result<(), MdsError> {
     // Bind params index-by-index; fill missing optional params with their defaults.
     for (i, param) in params.iter().enumerate() {
         let slot = if let Some(arg) = args.get(i) {
+            // The slot shares the argument already live in the caller's mark.
+            mem.charge(Part::Temp, entry_bytes(&param.name, Some(0)))?;
             arg.clone()
         } else {
             // Required params were already checked above; this arm only fires for
@@ -696,6 +772,13 @@ fn bind_call_params(
                     param.name
                 ))
             })?;
+            mem.charge(
+                Part::Temp,
+                entry_bytes(
+                    &param.name,
+                    VALUE_ROOT.checked_add(literal_text_len(default)),
+                ),
+            )?;
             literal_expr_to_value(default)?.into()
         };
         scope.set_slot(&param.name, slot);
@@ -709,8 +792,9 @@ fn evaluate_function_body(
     args: &[Slot],
     scope: &mut Scope,
     ctx: &mut EvalContext,
-) -> Result<String, MdsError> {
-    bind_call_params(&func.params, args, scope)?;
+    raw_body: &mut String,
+) -> Result<(), MdsError> {
+    bind_call_params(&func.params, args, scope, &mut ctx.budget.mem)?;
 
     // B1 (applies PF-012): swap body_origin to the function's defining file so
     // build_type_mismatch inside the body attributes spans to the correct source.
@@ -718,7 +802,6 @@ fn evaluate_function_body(
     // (LIFO-correct for nested cross-file define chains: A calls B calls C →
     // C's origin is innermost, A's is restored when C's call returns, etc.).
     let prev_body_origin = std::mem::replace(&mut ctx.body_origin, func.origin.clone());
-    let mut raw_body = String::new();
 
     // S8 path: fine-grained function body source attribution.
     //
@@ -765,7 +848,7 @@ fn evaluate_function_body(
             };
 
         ctx.call_stack.push(call_key.to_string());
-        let body_result = evaluate_nodes(&func.body, scope, ctx, &mut raw_body);
+        let body_result = evaluate_nodes(&func.body, scope, ctx, raw_body);
         let popped = ctx.call_stack.pop();
 
         // Restore source attribution for the outer scope.
@@ -790,7 +873,7 @@ fn evaluate_function_body(
         // MAX_OUTPUT_SIZE (50 MB) so try_from always succeeds in practice;
         // u32::MAX fallback causes rebase_trim to drop all segments (safe degradation).
         let untrimmed_len = u32::try_from(raw_body.len()).unwrap_or(u32::MAX);
-        let (lead, trail) = trim_body(&mut raw_body);
+        let (lead, trail) = trim_body(raw_body, &mut ctx.budget.mem);
         let lead = u32::try_from(lead).unwrap_or(u32::MAX);
         let trail = u32::try_from(trail).unwrap_or(u32::MAX);
         let trimmed_len = u32::try_from(raw_body.len()).unwrap_or(u32::MAX);
@@ -813,7 +896,7 @@ fn evaluate_function_body(
         // Signal to the Interpolation arm: body owns the segments.
         ctx.fn_body_owned = true;
 
-        Ok(raw_body)
+        Ok(())
     } else {
         // S3 path: suppress source-map recording inside function bodies.
         // The call site (the Interpolation node) is recorded as a single point
@@ -822,9 +905,8 @@ fn evaluate_function_body(
             map.suppress += 1;
         }
         ctx.call_stack.push(call_key.to_string());
-        let result = evaluate_nodes(&func.body, scope, ctx, &mut raw_body).map(|()| {
-            trim_body(&mut raw_body);
-            raw_body
+        let result = evaluate_nodes(&func.body, scope, ctx, raw_body).map(|()| {
+            trim_body(raw_body, &mut ctx.budget.mem);
         });
         // Safety-critical LIFO invariant: call_stack tracks recursion detection.
         // A mismatched pop would silently corrupt recursion state and allow
@@ -848,7 +930,7 @@ fn evaluate_function_body(
 }
 
 /// Trim the buffer and return the original leading and trailing byte counts.
-fn trim_body(body: &mut String) -> (usize, usize) {
+fn trim_body(body: &mut String, mem: &mut MemBudget) -> (usize, usize) {
     let lead = body.len() - body.trim_start().len();
     let end = body.trim_end().len();
     let trail = body.len() - end;
@@ -856,8 +938,10 @@ fn trim_body(body: &mut String) -> (usize, usize) {
     // The two edges overlap if the entire body is whitespace.
     drop(body.drain(..lead.min(end)));
     // Do not keep a large allocation for a small result after the trim.
-    if body.capacity() > 2 * body.len() {
+    let capacity = body.capacity();
+    if capacity > 2 * body.len() {
         body.shrink_to_fit();
+        mem.release_buffers(capacity - body.capacity());
     }
     (lead, trail)
 }
@@ -873,7 +957,7 @@ fn call_function(
     if let Some(func) = scope.get_function(name).cloned() {
         check_function_arity(&func, name, args.len())?;
         let args = resolve_args(args, scope, ctx, depth)?;
-        return invoke_function(&func, name, &args, scope, ctx).map(|s| Value::String(s).into());
+        return invoke_with_args(&func, name, &args, scope, ctx);
     }
     // Fall back to built-ins.
     if let Some(meta) = crate::builtins::get_builtin(name) {
@@ -889,19 +973,124 @@ fn call_function(
                 None, // built-in signatures live in docs, not the error message
             ));
         }
-        // Call the handler directly using the meta reference we already hold,
-        // avoiding a second linear scan through BUILTINS that call_builtin
-        // would perform internally.
-        let values = resolve_args(args, scope, ctx, depth)?
-            .into_iter()
-            .map(|slot| slot.into_value().ok_or_else(invalid_projection))
-            .collect::<Result<Vec<_>, _>>()?;
-        ctx.budget.charge_function_call()?;
-        return (meta.handler)(&values).map(Slot::from);
+        return invoke_builtin(meta, args, scope, ctx, depth);
     }
     // An argument error still takes priority when the callee does not exist.
     resolve_args(args, scope, ctx, depth)?;
     Err(MdsError::undefined_fn(name))
+}
+
+fn invoke_with_args(
+    func: &Arc<FunctionDef>,
+    call_key: &str,
+    args: &[Slot],
+    scope: &mut Scope,
+    ctx: &mut EvalContext,
+) -> Result<Slot, MdsError> {
+    ctx.budget.mem.charge(Part::Temp, Some(VALUE_ROOT))?;
+    invoke_function(func, call_key, args, scope, ctx).map(|s| Value::String(s).into())
+}
+
+fn invoke_builtin(
+    meta: &BuiltinMeta,
+    args: &[Arg],
+    scope: &mut Scope,
+    ctx: &mut EvalContext,
+    depth: usize,
+) -> Result<Slot, MdsError> {
+    let mark = ctx.budget.mem.mark();
+    let result = (|| {
+        let slots = resolve_args(args, scope, ctx, depth)?;
+        ctx.budget
+            .mem
+            .charge(Part::Temp, bytes(slots.len(), NODE))?;
+        let mut values = Vec::with_capacity(slots.len());
+        let mut input_bytes = 0;
+        for slot in slots {
+            let copies = slot.copies_on_take();
+            if copies || (values.is_empty() && matches!(meta.bound, Bound::Input)) {
+                let value = slot.get().ok_or_else(invalid_projection)?;
+                let size = value_bytes(value).ok_or_else(MdsError::compile_memory_exceeded)?;
+                if values.is_empty() {
+                    input_bytes = size;
+                }
+                if copies {
+                    ctx.budget.mem.charge(Part::Temp, Some(size))?;
+                }
+            }
+            values.push(slot.into_value().ok_or_else(invalid_projection)?);
+        }
+        ctx.budget.charge_function_call()?;
+        let bound = builtin_bound(meta, &values, input_bytes);
+        if let Some(n) = bound {
+            ctx.budget.mem.charge(Part::Temp, n)?;
+        }
+        (meta.handler)(&values).map(|value| (value, bound.flatten()))
+    })();
+    ctx.budget.mem.release_to(mark);
+    let (value, bound) = result?;
+    let size = if matches!(meta.bound, Bound::Input) {
+        value_bytes(&value)
+    } else {
+        bound
+    };
+    ctx.budget.mem.charge(Part::Temp, size)?;
+    Ok(value.into())
+}
+
+/// The charge before one built-in call. `None` charges nothing. `Some(None)`
+/// is a count past the address space, which the charge refuses.
+fn builtin_bound(
+    meta: &BuiltinMeta,
+    values: &[Value],
+    input_bytes: usize,
+) -> Option<Option<usize>> {
+    Some(match meta.bound {
+        Bound::Scalar => Some(VALUE_ROOT),
+        // Capped counts return None above their cap. Invalid arguments keep the
+        // handler's diagnostic; no result buffer is allocated on that path.
+        Bound::Exact(count) => count(values)?.checked_add(VALUE_ROOT),
+        Bound::Input => input_builtin_bound(meta.name, values.first(), input_bytes),
+        Bound::Split => split_bound(values),
+    })
+}
+
+fn input_builtin_bound(name: &str, value: Option<&Value>, input_bytes: usize) -> Option<usize> {
+    let array = value.and_then(Value::as_array);
+    let count = array.map_or(0, |items| items.len());
+    let bound = bytes(input_bytes, 2)?.checked_add(bytes(count, 32)?)?;
+    if name == "unique" {
+        if let Some(items) = array {
+            // Numeric formatting can be longer than the in-memory value. Count
+            // each key's bytes plus the entire seen table before it is built.
+            let keys = items.iter().try_fold(0usize, |sum, item| {
+                let key_len = match item {
+                    Value::Number(n) => crate::builtins::number_key_len(*n)?,
+                    _ => display_len(item)?.checked_add(5)?,
+                };
+                sum.checked_add(key_len)
+            })?;
+            let table = table_bytes(count, size_of::<String>())?;
+            return Some(bound.max(input_bytes.checked_add(keys)?.checked_add(table)?));
+        }
+    }
+    Some(bound)
+}
+
+fn split_bound(values: &[Value]) -> Option<usize> {
+    let [Value::String(s), Value::String(sep)] = values else {
+        return Some(0);
+    };
+    let Some(parts) = s.len().checked_div(sep.len()) else {
+        return Some(0);
+    };
+    let capacity = parts
+        .saturating_add(1)
+        .clamp(64, MAX_ARRAY_ELEMENTS)
+        .next_power_of_two();
+    VALUE_ROOT
+        .checked_add(s.len())?
+        .checked_add(bytes(capacity, NODE)?)
 }
 
 fn call_qualified_function(
@@ -911,7 +1100,17 @@ fn call_qualified_function(
     scope: &mut Scope,
     ctx: &mut EvalContext,
 ) -> Result<Slot, MdsError> {
-    let qualified_name = format!("{namespace}.{name}");
+    let len = ctx.budget.mem.charge(
+        Part::Temp,
+        namespace
+            .len()
+            .checked_add(1)
+            .and_then(|n| n.checked_add(name.len())),
+    )?;
+    let mut qualified_name = String::with_capacity(len);
+    qualified_name.push_str(namespace);
+    qualified_name.push('.');
+    qualified_name.push_str(name);
     let callee = scope
         .get_namespace(namespace)
         .ok_or_else(|| MdsError::undefined_var(namespace))
@@ -926,7 +1125,7 @@ fn call_qualified_function(
     }
     // Defer a lookup error until after the arguments have been evaluated.
     let args = resolve_args(args, scope, ctx, 0)?;
-    invoke_function(&callee?, &qualified_name, &args, scope, ctx).map(|s| Value::String(s).into())
+    invoke_with_args(&callee?, &qualified_name, &args, scope, ctx)
 }
 
 /// Compare two runtime `Value` instances for strict same-type equality.
@@ -935,23 +1134,15 @@ fn call_qualified_function(
 /// for cross-type comparisons (caller must surface a `TypeMismatch` error).
 /// `NaN == NaN` is `Some(false)` (IEEE 754 via Rust's `f64 ==`).
 ///
-/// Arrays and objects use structural (deep) equality: `Value` derives `PartialEq`,
-/// so this is a recursive element-wise comparison. Note that the condition grammar
-/// currently cannot express container literals on the RHS, so same-type container
-/// comparisons are only reachable at the unit-test level today — these arms guard
-/// future grammar extensions and ensure the contract is correct: same-type always
-/// compares structurally, only cross-type is an error.
+/// Same-type values compare through the derived `PartialEq` of `Value`, the one
+/// equality path. Arrays and objects use structural (deep) equality: a recursive
+/// element-wise comparison. Note that the condition grammar currently cannot
+/// express container literals on the RHS, so same-type container comparisons are
+/// only reachable at the unit-test level today. The contract still holds for
+/// them: same-type always compares structurally, only cross-type is an error.
 fn values_equal_same_type(lhs: &Value, rhs: &Value) -> Option<bool> {
-    match (lhs, rhs) {
-        (Value::String(a), Value::String(b)) => Some(a == b),
-        (Value::Number(a), Value::Number(b)) => Some(a == b),
-        (Value::Boolean(a), Value::Boolean(b)) => Some(a == b),
-        (Value::Null, Value::Null) => Some(true),
-        (Value::Array(a), Value::Array(b)) => Some(a == b),
-        (Value::Object(a), Value::Object(b)) => Some(a == b),
-        // Cross-type: signal TypeMismatch to the caller.
-        _ => None,
-    }
+    // Cross-type: `None` signals TypeMismatch to the caller.
+    (std::mem::discriminant(lhs) == std::mem::discriminant(rhs)).then(|| lhs == rhs)
 }
 
 /// Build a `TypeMismatch` error, with or without a source span.
@@ -1018,7 +1209,8 @@ fn evaluate_condition(
     ctx: &mut EvalContext,
     anchor: Option<usize>,
 ) -> Result<bool, MdsError> {
-    match condition {
+    let mark = ctx.budget.mem.mark();
+    let result = (|| match condition {
         Condition::Truthy(expr) | Condition::Not(expr) => {
             let slot = evaluate_expr(expr, scope, ctx)?;
             let truthy = slot.get().ok_or_else(invalid_projection)?.is_truthy();
@@ -1070,7 +1262,9 @@ fn evaluate_condition(
             }
             Ok(false)
         }
-    }
+    })();
+    ctx.budget.mem.release_to(mark);
+    result
 }
 
 fn evaluate_if(
@@ -1130,87 +1324,113 @@ fn drive_for<F>(
 where
     F: FnMut(&mut Scope, &mut EvalContext) -> Result<(), MdsError>,
 {
-    let slot = evaluate_expr(&block.iterable, scope, ctx)?;
-    let iterable = slot.get().ok_or_else(invalid_projection)?;
+    let mark = ctx.budget.mem.mark();
+    let result = (|| {
+        let slot = evaluate_expr(&block.iterable, scope, ctx)?;
+        let iterable = slot.get().ok_or_else(invalid_projection)?;
 
-    if let Some(ref key_var) = block.key_var {
-        // Key-value iteration: @for key, value in obj:
-        let map = match iterable {
-            Value::Object(m) => m,
-            _ => {
-                return Err(MdsError::syntax(format!(
-                    "key-value iteration requires an object, but got {}",
-                    iterable.type_name()
+        if let Some(ref key_var) = block.key_var {
+            // Key-value iteration: @for key, value in obj:
+            let map = match iterable {
+                Value::Object(m) => m,
+                _ => {
+                    return Err(MdsError::syntax(format!(
+                        "key-value iteration requires an object, but got {}",
+                        iterable.type_name()
+                    )));
+                }
+            };
+
+            if map.len() > MAX_LOOP_ITERATIONS {
+                return Err(MdsError::resource_limit(format!(
+                    "object has {} entries, exceeding maximum loop iteration limit of {}",
+                    map.len(),
+                    MAX_LOOP_ITERATIONS
                 )));
             }
-        };
 
-        if map.len() > MAX_LOOP_ITERATIONS {
+            // Sort keys alphabetically for deterministic output.
+            // SAFE to use unstable sort: `map` comes from `Value::Object` (a HashMap) —
+            // keys are unique by construction so no two elements compare equal (tie-free).
+            ctx.budget
+                .mem
+                .charge(Part::Temp, bytes(map.len(), size_of::<&String>()))?;
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort_unstable();
+
+            for key in keys {
+                ctx.budget.iterations += 1;
+                if ctx.budget.iterations > MAX_TOTAL_ITERATIONS {
+                    return Err(MdsError::resource_limit(format!(
+                    "total loop iterations exceeded maximum of {} across all loops in this compilation",
+                    MAX_TOTAL_ITERATIONS
+                )));
+                }
+                let pass = ctx.budget.mem.mark();
+                // One charge for the key entry and the value entry of the pass.
+                let entries = entry_bytes(key_var, VALUE_ROOT.checked_add(key.len()))
+                    .zip(entry_bytes(
+                        &block.var,
+                        Slot::PROJECTION_BYTES.checked_add(key.len()),
+                    ))
+                    .and_then(|(key_entry, value_entry)| key_entry.checked_add(value_entry));
+                ctx.budget.mem.charge(Part::Temp, entries)?;
+                scope.push();
+                scope.set_var(key_var, Value::String(key.clone()));
+                scope.set_slot(&block.var, slot.project(PathStep::Key(key.clone())));
+                let result = body(scope, ctx);
+                let result = prefer_first_error(result, scope.pop());
+                ctx.budget.mem.release_to(pass);
+                result?;
+            }
+            return Ok(());
+        }
+
+        // Standard array iteration: @for item in iterable:
+        // Objects are rejected here with a hint to use key-value syntax.
+        if let Value::Object(_) = iterable {
+            return Err(MdsError::syntax(
+                "to iterate over an object's entries, use `@for key, value in obj:` syntax",
+            ));
+        }
+
+        let array = iterable
+            .as_array()
+            .ok_or_else(|| MdsError::type_error(iterable.type_name()))?;
+
+        // Check length before any pass creates a projection.
+        if array.len() > MAX_LOOP_ITERATIONS {
             return Err(MdsError::resource_limit(format!(
-                "object has {} entries, exceeding maximum loop iteration limit of {}",
-                map.len(),
+                "array has {} elements, exceeding maximum loop iteration limit of {}",
+                array.len(),
                 MAX_LOOP_ITERATIONS
             )));
         }
 
-        // Sort keys alphabetically for deterministic output.
-        // SAFE to use unstable sort: `map` comes from `Value::Object` (a HashMap) —
-        // keys are unique by construction so no two elements compare equal (tie-free).
-        let mut keys: Vec<_> = map.keys().collect();
-        keys.sort_unstable();
-
-        for key in keys {
+        for i in 0..array.len() {
             ctx.budget.iterations += 1;
             if ctx.budget.iterations > MAX_TOTAL_ITERATIONS {
                 return Err(MdsError::resource_limit(format!(
-                    "total loop iterations exceeded maximum of {} across all loops in this compilation",
-                    MAX_TOTAL_ITERATIONS
-                )));
-            }
-            scope.push();
-            scope.set_var(key_var, Value::String(key.clone()));
-            scope.set_slot(&block.var, slot.project(PathStep::Key(key.clone())));
-            let result = body(scope, ctx);
-            prefer_first_error(result, scope.pop())?;
-        }
-        return Ok(());
-    }
-
-    // Standard array iteration: @for item in iterable:
-    // Objects are rejected here with a hint to use key-value syntax.
-    if let Value::Object(_) = iterable {
-        return Err(MdsError::syntax(
-            "to iterate over an object's entries, use `@for key, value in obj:` syntax",
-        ));
-    }
-
-    let array = iterable
-        .as_array()
-        .ok_or_else(|| MdsError::type_error(iterable.type_name()))?;
-
-    // Check length before any pass creates a projection.
-    if array.len() > MAX_LOOP_ITERATIONS {
-        return Err(MdsError::resource_limit(format!(
-            "array has {} elements, exceeding maximum loop iteration limit of {}",
-            array.len(),
-            MAX_LOOP_ITERATIONS
-        )));
-    }
-
-    for i in 0..array.len() {
-        ctx.budget.iterations += 1;
-        if ctx.budget.iterations > MAX_TOTAL_ITERATIONS {
-            return Err(MdsError::resource_limit(format!(
                 "total loop iterations exceeded maximum of {} across all loops in this compilation",
                 MAX_TOTAL_ITERATIONS
             )));
+            }
+            let pass = ctx.budget.mem.mark();
+            ctx.budget.mem.charge(
+                Part::Temp,
+                entry_bytes(&block.var, Some(Slot::PROJECTION_BYTES)),
+            )?;
+            scope.push();
+            scope.set_slot(&block.var, slot.project(PathStep::Index(i)));
+            let result = body(scope, ctx);
+            let result = prefer_first_error(result, scope.pop());
+            ctx.budget.mem.release_to(pass);
+            result?;
         }
-        scope.push();
-        scope.set_slot(&block.var, slot.project(PathStep::Index(i)));
-        let result = body(scope, ctx);
-        prefer_first_error(result, scope.pop())?;
-    }
-    Ok(())
+        Ok(())
+    })();
+    ctx.budget.mem.release_to(mark);
+    result
 }
 
 fn evaluate_for(
@@ -1222,6 +1442,17 @@ fn evaluate_for(
     drive_for(block, scope, ctx, |scope, ctx| {
         evaluate_nodes(&block.body, scope, ctx, out)
     })
+}
+
+// Warning text is formatted first. Its capacity is at most one allocation
+// proportional to the capped alias, plus the fixed diagnostic text.
+fn push_warning(ctx: &mut EvalContext, args: fmt::Arguments<'_>) -> Result<(), MdsError> {
+    let message = format_exact(format_len(args), args)?;
+    ctx.budget
+        .mem
+        .charge(Part::Buffers, Some(message.capacity()))?;
+    ctx.warnings.push(message);
+    Ok(())
 }
 
 fn evaluate_include(
@@ -1239,23 +1470,28 @@ fn evaluate_include(
             if ctx.warnings.len() < MAX_WARNINGS {
                 // Untrusted identifier from template source — WIRE (spec 7.5).
                 let safe_alias = crate::lint::sanitize_control_chars_wire(&inc.alias);
-                let msg = if ns.prompt_suppressed_by_exports {
+                if ns.prompt_suppressed_by_exports {
                     // WARN-B: module has body text but @export list excludes "prompt".
-                    format!(
-                        "warning: @include of '{safe_alias}' produced empty output \
+                    push_warning(
+                        ctx,
+                        format_args!(
+                            "warning: @include of '{safe_alias}' produced empty output \
                          — module has body text, but its explicit @export list does not export \
                          'prompt'; add `@export prompt` to the module, or call its functions \
                          directly: {{{{{safe_alias}.fn()}}}}"
-                    )
+                        ),
+                    )?;
                 } else {
                     // WARN-A: module has no body text at all.
-                    format!(
-                        "warning: @include of '{safe_alias}' produced empty output \
+                    push_warning(
+                        ctx,
+                        format_args!(
+                            "warning: @include of '{safe_alias}' produced empty output \
                          — module has no body text; to use the module's functions, call them \
                          directly: {{{{{safe_alias}.fn()}}}}"
-                    )
-                };
-                ctx.warnings.push(msg);
+                        ),
+                    )?;
+                }
             }
             return Ok(None);
         }
@@ -1386,10 +1622,13 @@ fn collect_messages_strict(
                 // @include in messages mode is not meaningful — warn.
                 if ctx.warnings.len() < MAX_WARNINGS {
                     // Untrusted identifier from template source — WIRE (spec 7.5).
-                    ctx.warnings.push(format!(
-                        "warning: @include '{}' inside messages mode is ignored",
-                        crate::lint::sanitize_control_chars_wire(&inc.alias)
-                    ));
+                    push_warning(
+                        ctx,
+                        format_args!(
+                            "warning: @include '{}' inside messages mode is ignored",
+                            crate::lint::sanitize_control_chars_wire(&inc.alias)
+                        ),
+                    )?;
                 }
             }
             Node::Block(block) => {
@@ -1410,63 +1649,82 @@ fn collect_single_message(
     ctx: &mut EvalContext,
     out: &mut Vec<EvalMessage>,
 ) -> Result<(), MdsError> {
-    // Evaluate the role expression to a string.
-    let role_slot = evaluate_expr(&block.role, scope, ctx)?;
-    let role_value = role_slot.get().ok_or_else(invalid_projection)?;
-    let Value::String(role) = role_value else {
-        return Err(MdsError::type_error(format!(
-            "@message role must evaluate to a string, but got {}",
-            role_value.type_name()
-        )));
-    };
-    // Mirror the parse-time empty-role rejection on the dynamic path: a variable
-    // or expression that evaluates to "" or whitespace-only must also be rejected.
-    if role.trim().is_empty() {
-        return Err(MdsError::type_error(
-            "@message role must evaluate to a non-empty string",
-        ));
-    }
+    let mark = ctx.budget.mem.mark();
+    let result = (|| {
+        // Evaluate the role expression to a string.
+        let role_slot = evaluate_expr(&block.role, scope, ctx)?;
+        let role_value = role_slot.get().ok_or_else(invalid_projection)?;
+        let Value::String(role) = role_value else {
+            return Err(MdsError::type_error(format!(
+                "@message role must evaluate to a string, but got {}",
+                role_value.type_name()
+            )));
+        };
+        // Mirror the parse-time empty-role rejection on the dynamic path: a variable
+        // or expression that evaluates to "" or whitespace-only must also be rejected.
+        if role.trim().is_empty() {
+            return Err(MdsError::type_error(
+                "@message role must evaluate to a non-empty string",
+            ));
+        }
 
-    // Evaluate the body as plain text and trim surrounding whitespace.
-    // NOTE: this path uses only `.trim()`, NOT `clean_output` — `\r` characters
-    // and blank-line runs inside a @message body survive verbatim into the
-    // compiled JSON output. `mds fmt` relies on this: `raw_content_spans` in
-    // `formatter.rs` marks @message and @define bodies as raw content to prevent
-    // R1 (`\r` strip) and R3 (blank-line-run cap) from silently changing compiled
-    // output. Adding a `clean_output` call here would break the formatter's
-    // safety model without any corresponding formatter change.
-    let mut content = String::new();
-    evaluate_nodes(&block.body, scope, ctx, &mut content)?;
-    trim_body(&mut content);
+        // Evaluate the body as plain text and trim surrounding whitespace.
+        // NOTE: this path uses only `.trim()`, NOT `clean_output` — `\r` characters
+        // and blank-line runs inside a @message body survive verbatim into the
+        // compiled JSON output. `mds fmt` relies on this: `raw_content_spans` in
+        // `formatter.rs` marks @message and @define bodies as raw content to prevent
+        // R1 (`\r` strip) and R3 (blank-line-run cap) from silently changing compiled
+        // output. Adding a `clean_output` call here would break the formatter's
+        // safety model without any corresponding formatter change.
+        let mut content = String::new();
+        if let Err(error) = evaluate_nodes(&block.body, scope, ctx, &mut content) {
+            ctx.budget.mem.release_buffers(content.capacity());
+            return Err(error);
+        }
+        trim_body(&mut content, &mut ctx.budget.mem);
+        ctx.budget
+            .mem
+            .transfer(Part::Buffers, Part::Temp, content.capacity());
 
-    // Skip empty messages.
-    if content.is_empty() {
-        return Ok(());
-    }
+        // Skip empty messages.
+        if content.is_empty() {
+            return Ok(());
+        }
 
-    if out.len() >= MAX_MESSAGE_COUNT {
-        return Err(MdsError::resource_limit(format!(
-            "message count exceeded maximum of {}",
-            MAX_MESSAGE_COUNT
-        )));
-    }
+        if out.len() >= MAX_MESSAGE_COUNT {
+            return Err(MdsError::resource_limit(format!(
+                "message count exceeded maximum of {}",
+                MAX_MESSAGE_COUNT
+            )));
+        }
 
-    // Incremental cumulative-size check (AC-6.3): cap the aggregate content bytes
-    // across all messages at MAX_MESSAGES_TOTAL_SIZE (50 MB) — the same ceiling a
-    // single text-mode output has.  Checked before pushing so a runaway is caught early.
-    ctx.budget.message_bytes = ctx.budget.message_bytes.saturating_add(content.len());
-    if ctx.budget.message_bytes > MAX_MESSAGES_TOTAL_SIZE {
-        return Err(MdsError::resource_limit(format!(
-            "total message content exceeds maximum cumulative size of {} bytes",
-            MAX_MESSAGES_TOTAL_SIZE
-        )));
-    }
+        // Incremental cumulative-size check (AC-6.3): cap the aggregate content bytes
+        // across all messages at MAX_MESSAGES_TOTAL_SIZE (50 MB) — the same ceiling a
+        // single text-mode output has.  Checked before pushing so a runaway is caught early.
+        ctx.budget.message_bytes = ctx.budget.message_bytes.saturating_add(content.len());
+        if ctx.budget.message_bytes > MAX_MESSAGES_TOTAL_SIZE {
+            return Err(MdsError::resource_limit(format!(
+                "total message content exceeds maximum cumulative size of {} bytes",
+                MAX_MESSAGES_TOTAL_SIZE
+            )));
+        }
 
-    let Some(Value::String(role)) = role_slot.into_value() else {
-        return Err(invalid_projection());
-    };
-    out.push(EvalMessage { role, content });
-    Ok(())
+        // Count the kept role before a copy or move. A computed role stays charged
+        // as a temporary until this message mark ends.
+        ctx.budget
+            .mem
+            .charge(Part::Buffers, Some(role.capacity()))?;
+        let Some(Value::String(role)) = role_slot.into_value() else {
+            return Err(invalid_projection());
+        };
+        ctx.budget
+            .mem
+            .transfer(Part::Temp, Part::Buffers, content.capacity());
+        out.push(EvalMessage { role, content });
+        Ok(())
+    })();
+    ctx.budget.mem.release_to(mark);
+    result
 }
 
 fn collect_messages_from_if(
@@ -1537,6 +1795,490 @@ mod tests {
             source: "",
             body_origin: None,
         }
+    }
+
+    fn seed_headroom(ctx: &mut EvalContext<'_>, available: usize) {
+        ctx.budget
+            .mem
+            .charge(
+                Part::Buffers,
+                Some(crate::limits::MAX_COMPILE_MEMORY - available),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn join_keeps_its_type_error_when_the_result_would_not_fit() {
+        let mut scope = Scope::new();
+        scope.set_var(
+            "items",
+            Value::Array(vec![Value::String("x".repeat(256)), Value::Number(1.0)]),
+        );
+        let args = [
+            Arg::Var("items".into()),
+            Arg::StringLiteral("/".repeat(2048)),
+        ];
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        seed_headroom(&mut ctx, 4096);
+        let before = ctx.budget.mem;
+        let err = call_function("join", &args, &mut scope, &mut ctx, 0).unwrap_err();
+        assert_eq!(err.serialize().code, "mds::builtin");
+        assert!(err.to_string().contains("found number in array"));
+        assert_eq!(ctx.budget.mem, before);
+        scope.set_var(
+            "items",
+            Value::Array(vec![
+                Value::String("x".repeat(256)),
+                Value::String("ok".into()),
+            ]),
+        );
+        let err = call_function("join", &args, &mut scope, &mut ctx, 0).unwrap_err();
+        assert_eq!(
+            err.serialize(),
+            MdsError::compile_memory_exceeded().serialize()
+        );
+        assert_eq!(ctx.budget.mem, before);
+    }
+
+    #[test]
+    fn loop_frames_release_each_key_copy() {
+        let mut scope = Scope::new();
+        scope.set_var(
+            "entries",
+            Value::Object(
+                (0..MAX_LOOP_ITERATIONS)
+                    .map(|i| (i.to_string(), Value::Null))
+                    .collect(),
+            ),
+        );
+        let mut block = test_loop(Expr::Var("entries".into()));
+        block.key_var = Some("key".into());
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        seed_headroom(&mut ctx, MAX_LOOP_ITERATIONS * size_of::<&String>() + 512);
+        let before = ctx.budget.mem;
+        let mut passes = 0;
+        drive_for(&block, &mut scope, &mut ctx, |_, _| {
+            passes += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(passes, MAX_LOOP_ITERATIONS);
+        assert_eq!(ctx.budget.mem, before);
+    }
+
+    #[test]
+    fn warning_charge_keeps_only_text_that_fits() {
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        let long = "a".repeat(256);
+        seed_headroom(&mut ctx, 128);
+        let before = ctx.budget.mem;
+        let err = push_warning(&mut ctx, format_args!("warning: {long}")).unwrap_err();
+        assert_eq!(
+            err.serialize(),
+            MdsError::compile_memory_exceeded().serialize()
+        );
+        assert!(ctx.warnings.is_empty());
+        assert_eq!(ctx.budget.mem, before);
+        push_warning(&mut ctx, format_args!("warning: a")).unwrap();
+        assert_eq!(*ctx.warnings, ["warning: a"]);
+    }
+
+    /// Run `run` with one byte less than `need` of headroom, then with exactly `need`.
+    /// The short run must refuse with the budget error and leave the budget as it
+    /// was, so every scope mark on its path is released on the error path. The exact
+    /// run must not release more than it charged. Return the result of the exact run,
+    /// and the temporaries and buffers it left charged.
+    fn charge_boundary<T>(
+        need: usize,
+        mut run: impl FnMut(&mut EvalContext<'_>) -> Result<T, MdsError>,
+    ) -> (Result<T, MdsError>, [usize; 2]) {
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        seed_headroom(&mut ctx, need - 1);
+        let before = ctx.budget.mem;
+        let short = run(&mut ctx).err().map(|error| error.serialize());
+        assert_eq!(short, Some(MdsError::compile_memory_exceeded().serialize()));
+        assert_eq!(ctx.budget.mem, before, "the refusal must release its marks");
+        drop(ctx);
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        seed_headroom(&mut ctx, need);
+        let before = ctx.budget.mem;
+        let result = run(&mut ctx);
+        // A release of more than the charge keeps the counters, so only the latch shows it.
+        assert!(
+            !ctx.budget.mem.underflow,
+            "the exact run must not underflow a counter"
+        );
+        let held = [
+            ctx.budget.mem.mark() - before.mark(),
+            ctx.budget.mem.buffers - before.buffers,
+        ];
+        (result, held)
+    }
+
+    fn interpolation(expr: Expr) -> Node {
+        Node::Interpolation(Interpolation {
+            expr,
+            offset: 0,
+            len: 0,
+        })
+    }
+
+    fn function(params: Vec<Param>, body: Vec<Node>) -> Arc<FunctionDef> {
+        Arc::new(FunctionDef {
+            params,
+            body,
+            captured: crate::scope::CapturedScope::default(),
+            origin: None,
+        })
+    }
+
+    #[test]
+    fn a_call_frame_entry_charges_its_parameter_name() {
+        let name = "p".repeat(4096);
+        let func = function(vec![Param::required(name.as_str())], Vec::new());
+        // The call key, then the entry: its name and the slot pair.
+        let need = "f".len() + name.len() + FRAME_ENTRY;
+        let (result, held) = charge_boundary(need, |ctx| {
+            invoke_function(&func, "f", &[Value::Null.into()], &mut Scope::new(), ctx)
+        });
+        assert_eq!(result.unwrap(), "");
+        assert_eq!(held, [0, 0]);
+    }
+
+    #[test]
+    fn a_call_frame_entry_charges_its_default_literal() {
+        let default = "d".repeat(4096);
+        let param = Param {
+            name: "p".into(),
+            default: Some(Expr::StringLiteral(default.clone())),
+        };
+        let func = function(vec![param], Vec::new());
+        // The call key, then the entry: its name, the slot pair and the default value.
+        let need = "f".len() + "p".len() + FRAME_ENTRY + VALUE_ROOT + default.len();
+        let (result, held) = charge_boundary(need, |ctx| {
+            invoke_function(&func, "f", &[], &mut Scope::new(), ctx)
+        });
+        assert_eq!(result.unwrap(), "");
+        assert_eq!(held, [0, 0]);
+    }
+
+    #[test]
+    fn a_loop_frame_entry_charges_its_variable_name() {
+        let mut block = test_loop(Expr::Var("items".into()));
+        block.var = "v".repeat(4096);
+        // One pass entry at a time: its name, the slot pair and the projection.
+        let need = block.var.len() + FRAME_ENTRY + Slot::PROJECTION_BYTES;
+        let mut passes = 0;
+        let (result, held) = charge_boundary(need, |ctx| {
+            let mut scope = Scope::new();
+            scope.set_var("items", Value::Array(vec![Value::Null; 2]));
+            drive_for(&block, &mut scope, ctx, |_, _| {
+                passes += 1;
+                Ok(())
+            })
+        });
+        result.unwrap();
+        assert_eq!(passes, 2);
+        assert_eq!(held, [0, 0]);
+    }
+
+    #[test]
+    fn a_key_value_frame_charges_the_key_and_both_names() {
+        let key = "k".repeat(4096);
+        let mut block = test_loop(Expr::Var("entries".into()));
+        block.var = "v".repeat(1024);
+        block.key_var = Some("n".repeat(2048));
+        // The sorted key list, then the key entry (with its key copy) and the value
+        // entry (with the key in its projection).
+        let key_entry = 2048 + FRAME_ENTRY + VALUE_ROOT + key.len();
+        let value_entry = block.var.len() + FRAME_ENTRY + Slot::PROJECTION_BYTES + key.len();
+        let need = size_of::<&String>() + key_entry + value_entry;
+        let (result, held) = charge_boundary(need, |ctx| {
+            let mut scope = Scope::new();
+            let entries = std::collections::HashMap::from([(key.clone(), Value::Null)]);
+            scope.set_var("entries", Value::Object(entries));
+            drive_for(&block, &mut scope, ctx, |_, _| Ok(()))
+        });
+        result.unwrap();
+        assert_eq!(held, [0, 0]);
+    }
+
+    #[test]
+    fn a_shared_builtin_argument_is_charged_the_size_of_its_copy() {
+        let items = Value::Array(vec![Value::String("x".repeat(64)); 1000]);
+        let copy = value_bytes(&items).unwrap();
+        // The argument slot, the value list, the copy and the scalar bound.
+        let need = size_of::<Slot>() + NODE + copy + VALUE_ROOT;
+        let (result, held) = charge_boundary(need, |ctx| {
+            let mut scope = Scope::new();
+            scope.set_var("items", items.clone());
+            call_function("length", &[Arg::Var("items".into())], &mut scope, ctx, 0)
+        });
+        assert_eq!(result.unwrap().get(), Some(&Value::Number(1000.0)));
+        // Only the scalar result stays charged.
+        assert_eq!(held, [VALUE_ROOT, 0]);
+    }
+
+    #[test]
+    fn a_builtin_argument_held_once_moves_without_a_charge() {
+        let body = "t".repeat(4096);
+        let func = function(Vec::new(), vec![text(&body)]);
+        let call = Arg::Call {
+            name: "f".into(),
+            args: Vec::new(),
+        };
+        // The argument slot, the result of `f()` (its value and its buffer), the value
+        // list and the scalar bound. A copy of the result would add its bytes again.
+        let need = size_of::<Slot>() + VALUE_ROOT + body.len() + NODE + VALUE_ROOT;
+        let (result, held) = charge_boundary(need, |ctx| {
+            let mut scope = Scope::new();
+            scope.set_function("f", Arc::clone(&func));
+            call_function("length", std::slice::from_ref(&call), &mut scope, ctx, 0)
+        });
+        assert_eq!(result.unwrap().get(), Some(&Value::Number(4096.0)));
+        // The moved argument is released with the call; only the scalar result stays.
+        assert_eq!(held, [VALUE_ROOT, 0]);
+    }
+
+    #[test]
+    fn a_message_role_is_charged_before_it_is_kept() {
+        let role = "r".repeat(4096);
+        let block = MessageBlock {
+            role: Expr::Var("role".into()),
+            body: vec![text("b")],
+            offset: 0,
+        };
+        // The one-byte content, then the kept role.
+        let need = 1 + role.len();
+        let (result, held) = charge_boundary(need, |ctx| {
+            let mut scope = Scope::new();
+            scope.set_var("role", Value::String(role.clone()));
+            let mut out = Vec::new();
+            collect_single_message(&block, &mut scope, ctx, &mut out).map(|()| out)
+        });
+        let message = EvalMessage {
+            role: role.clone(),
+            content: "b".into(),
+        };
+        assert_eq!(result.unwrap(), [message]);
+        assert_eq!(held, [0, need]);
+    }
+
+    #[test]
+    fn an_argument_list_is_charged_before_it_is_built() {
+        let node = interpolation(Expr::Call {
+            name: "missing".into(),
+            args: vec![Arg::Var("x".into()); 64],
+        });
+        let need = 64 * size_of::<Slot>();
+        let (result, held) = charge_boundary(need, |ctx| {
+            let mut scope = Scope::new();
+            scope.set_var("x", Value::Null);
+            evaluate_nodes(
+                std::slice::from_ref(&node),
+                &mut scope,
+                ctx,
+                &mut String::new(),
+            )
+        });
+        assert_eq!(
+            result.unwrap_err().serialize(),
+            MdsError::undefined_fn("missing").serialize()
+        );
+        assert_eq!(held, [0, 0]);
+    }
+
+    #[test]
+    fn a_literal_is_charged_before_its_value_is_built() {
+        let literal = "l".repeat(4096);
+        // An argument literal: the argument slot, then the literal value.
+        let node = interpolation(Expr::Call {
+            name: "missing".into(),
+            args: vec![Arg::StringLiteral(literal.clone())],
+        });
+        let need = size_of::<Slot>() + VALUE_ROOT + literal.len();
+        let (result, held) = charge_boundary(need, |ctx| {
+            evaluate_nodes(
+                std::slice::from_ref(&node),
+                &mut Scope::new(),
+                ctx,
+                &mut String::new(),
+            )
+        });
+        assert_eq!(
+            result.unwrap_err().serialize(),
+            MdsError::undefined_fn("missing").serialize()
+        );
+        assert_eq!(held, [0, 0]);
+        // An expression literal in a condition.
+        let condition = Condition::Truthy(Expr::StringLiteral(literal.clone()));
+        let (result, held) = charge_boundary(VALUE_ROOT + literal.len(), |ctx| {
+            evaluate_condition(&condition, &mut Scope::new(), ctx, None)
+        });
+        assert!(result.unwrap());
+        assert_eq!(held, [0, 0]);
+    }
+
+    #[test]
+    fn a_call_key_is_charged_before_the_call() {
+        let name = "f".repeat(4096);
+        let func = function(Vec::new(), Vec::new());
+        let node = interpolation(Expr::Call {
+            name: name.clone(),
+            args: Vec::new(),
+        });
+        // The result value, then the call key.
+        let need = VALUE_ROOT + name.len();
+        let (result, held) = charge_boundary(need, |ctx| {
+            let mut scope = Scope::new();
+            scope.set_function(&name, Arc::clone(&func));
+            let mut out = String::new();
+            evaluate_nodes(std::slice::from_ref(&node), &mut scope, ctx, &mut out).map(|()| out)
+        });
+        assert_eq!(result.unwrap(), "");
+        assert_eq!(held, [0, 0]);
+    }
+
+    #[test]
+    fn a_qualified_name_is_charged_before_it_is_built() {
+        let namespace = "n".repeat(4096);
+        let node = interpolation(Expr::QualifiedCall {
+            namespace: namespace.clone(),
+            name: "f".into(),
+            args: Vec::new(),
+        });
+        let need = namespace.len() + ".f".len();
+        let (result, held) = charge_boundary(need, |ctx| {
+            evaluate_nodes(
+                std::slice::from_ref(&node),
+                &mut Scope::new(),
+                ctx,
+                &mut String::new(),
+            )
+        });
+        assert_eq!(
+            result.unwrap_err().serialize(),
+            MdsError::undefined_var(&namespace).serialize()
+        );
+        assert_eq!(held, [0, 0]);
+    }
+
+    #[test]
+    fn sorted_loop_keys_are_charged_before_they_are_collected() {
+        const KEYS: usize = 1000;
+        let mut block = test_loop(Expr::Var("entries".into()));
+        block.key_var = Some("k".into());
+        // The key list, then one pass: its key entry and its value entry, each with
+        // a four-byte key.
+        let pass = ("k".len() + FRAME_ENTRY + VALUE_ROOT + 4)
+            + ("item".len() + FRAME_ENTRY + Slot::PROJECTION_BYTES + 4);
+        let need = KEYS * size_of::<&String>() + pass;
+        let mut passes = 0;
+        let (result, held) = charge_boundary(need, |ctx| {
+            let mut scope = Scope::new();
+            let entries = (0..KEYS).map(|i| (format!("{i:04}"), Value::Null));
+            scope.set_var("entries", Value::Object(entries.collect()));
+            drive_for(&block, &mut scope, ctx, |_, _| {
+                passes += 1;
+                Ok(())
+            })
+        });
+        result.unwrap();
+        assert_eq!(passes, KEYS);
+        assert_eq!(held, [0, 0]);
+    }
+
+    #[test]
+    fn a_non_string_interpolation_is_charged_before_it_is_rendered() {
+        let value = Value::Array(vec![Value::Number(0.5); 500]);
+        let rendered = value.to_string();
+        let node = interpolation(Expr::Var("value".into()));
+        let (result, held) = charge_boundary(rendered.len(), |ctx| {
+            let mut scope = Scope::new();
+            scope.set_var("value", value.clone());
+            // The output buffer already has room, so only the rendered text is charged.
+            let mut out = String::with_capacity(rendered.len());
+            evaluate_nodes(std::slice::from_ref(&node), &mut scope, ctx, &mut out).map(|()| out)
+        });
+        assert_eq!(result.unwrap(), rendered);
+        assert_eq!(held, [0, 0]);
+    }
+
+    /// Evaluate `@include` of an alias with no prompt in a loop of three passes, with
+    /// `available` bytes of headroom. Return the result, the warnings and the bytes
+    /// the warnings left charged as buffers.
+    fn include_warnings_in_a_loop(
+        alias: &str,
+        available: usize,
+    ) -> (Result<(), MdsError>, Vec<String>, usize) {
+        let mut scope = Scope::new();
+        scope.set_var("items", Value::Array(vec![Value::Null; 3]));
+        scope.set_namespace(
+            alias,
+            crate::scope::NamespaceScope {
+                functions: std::collections::HashMap::new(),
+                prompt_body: None,
+                prompt_map: None,
+                prompt_suppressed_by_exports: false,
+            },
+        );
+        let mut block = test_loop(Expr::Var("items".into()));
+        block.body = vec![Node::Include(IncludeDirective {
+            alias: alias.into(),
+            offset: 0,
+        })];
+        let mut warnings = Vec::new();
+        let mut ctx = test_context(&mut warnings);
+        seed_headroom(&mut ctx, available);
+        let before = ctx.budget.mem;
+        let result = evaluate_nodes(
+            &[Node::For(block)],
+            &mut scope,
+            &mut ctx,
+            &mut String::new(),
+        );
+        assert!(
+            !ctx.budget.mem.underflow,
+            "the loop must not underflow a counter"
+        );
+        assert_eq!(ctx.budget.mem.mark(), before.mark());
+        let charged = ctx.budget.mem.buffers - before.buffers;
+        drop(ctx);
+        (result, warnings, charged)
+    }
+
+    #[test]
+    fn include_warnings_in_a_loop_are_charged_as_they_are_kept() {
+        let long = "a".repeat(8192);
+        let (result, full, charged) =
+            include_warnings_in_a_loop(&long, crate::limits::MAX_COMPILE_MEMORY);
+        result.unwrap();
+        assert_eq!(full.len(), 3);
+        assert_eq!(charged, full.iter().map(String::capacity).sum::<usize>());
+        let warning = full[0].capacity();
+        assert!(warning > 2 * long.len());
+        // Room for three long warnings and one pass entry, less one byte: the third
+        // warning is refused, and the two before it stay.
+        let pass = "item".len() + FRAME_ENTRY + Slot::PROJECTION_BYTES;
+        let available = 3 * warning + pass - 1;
+        let (result, kept, charged) = include_warnings_in_a_loop(&long, available);
+        assert_eq!(
+            result.unwrap_err().serialize(),
+            MdsError::compile_memory_exceeded().serialize()
+        );
+        assert_eq!(kept, full[..2]);
+        assert_eq!(charged, 2 * warning);
+        // Control: short-alias warnings fit in the same room and keep their text.
+        let (result, short, _) = include_warnings_in_a_loop("b", available);
+        result.unwrap();
+        let text = "warning: @include of 'b' produced empty output — module has no body \
+                    text; to use the module's functions, call them directly: {{b.fn()}}";
+        assert_eq!(short, [text; 3]);
     }
 
     fn test_loop(iterable: Expr) -> ForBlock {
@@ -1644,6 +2386,7 @@ mod tests {
             &[Param::required("whole"), Param::required("part")],
             &resolved,
             &mut scope,
+            &mut MemBudget::default(),
         )
         .unwrap();
         let config = scope.get_slot("cfg").unwrap();
@@ -1699,7 +2442,7 @@ mod tests {
         for expr in [Expr::Var("broken".into()), member("broken", "field")] {
             assert_eq!(
                 evaluate_expr(&expr, &mut scope, &mut ctx)
-                    .and_then(|slot| render_expr(&expr, &slot).map(drop))
+                    .and_then(|slot| render_expr(&expr, &slot, &mut ctx.budget.mem).map(drop))
                     .unwrap_err()
                     .to_string(),
                 expected
@@ -2388,9 +3131,10 @@ mod tests {
     #[test]
     fn push_capped_growth_never_reserves_past_the_cap() {
         let mut out = String::new();
+        let mut mem = MemBudget::default();
         let chunk = "a".repeat(1024 * 1024);
         for pass in 1..=MAX_OUTPUT_SIZE / chunk.len() {
-            push_capped(&mut out, &chunk).expect("appends up to the cap must succeed");
+            push_capped(&mut out, &chunk, &mut mem).expect("appends up to the cap must succeed");
             assert!(
                 out.capacity() >= out.len() && out.capacity() <= MAX_OUTPUT_SIZE,
                 "pass {pass}: capacity {} must lie between the length {} and the cap",
@@ -2408,12 +3152,13 @@ mod tests {
     #[test]
     fn push_capped_refuses_past_the_cap_and_leaves_the_buffer_unchanged() {
         let mut out = String::new();
-        push_capped(&mut out, &"a".repeat(MAX_OUTPUT_SIZE - 1)).expect("under the cap");
-        push_capped(&mut out, "b").expect("exactly the cap is allowed");
-        push_capped(&mut out, "").expect("an empty append at the cap is allowed");
+        let mut mem = MemBudget::default();
+        push_capped(&mut out, &"a".repeat(MAX_OUTPUT_SIZE - 1), &mut mem).expect("under the cap");
+        push_capped(&mut out, "b", &mut mem).expect("exactly the cap is allowed");
+        push_capped(&mut out, "", &mut mem).expect("an empty append at the cap is allowed");
         assert_eq!(out.len(), MAX_OUTPUT_SIZE);
 
-        let err = push_capped(&mut out, "c").expect_err("one byte past the cap");
+        let err = push_capped(&mut out, "c", &mut mem).expect_err("one byte past the cap");
         assert_eq!(err.to_string(), output_cap_message());
         assert!(
             out.len() == MAX_OUTPUT_SIZE && out.ends_with('b'),
@@ -3530,7 +4275,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_messages_seeded_threads_both_budgets_across_calls() {
+    fn evaluate_messages_seeded_threads_budgets_across_calls() {
         let body = parse_body("@for i in items:\n@message user:\nhi\n@end\n@end\n");
         let mut warnings = vec![];
 
@@ -3554,11 +4299,18 @@ mod tests {
                 content: "hi".to_string()
             }]
         );
+        let mut mem = MemBudget::default();
+        mem.charge(
+            Part::Buffers,
+            Some(out[0].content.capacity() + out[0].role.capacity()),
+        )
+        .unwrap();
         assert_eq!(
             budget,
             EvalBudget {
                 iterations: 1,
                 message_bytes: 2,
+                mem,
                 ..EvalBudget::default()
             }
         );
@@ -3581,6 +4333,7 @@ mod tests {
         )
         .expect("the last message under the cap must be collected");
         assert_eq!(budget.message_bytes, MAX_MESSAGES_TOTAL_SIZE);
+        let spent = budget.mem;
         assert_limit(
             evaluate_messages_seeded(
                 &body,
@@ -3594,6 +4347,10 @@ mod tests {
             MESSAGE_BYTES_LIMIT_MSG,
         );
         assert_eq!(out.len(), 1, "the tripping message is never collected");
+        assert_eq!(
+            budget.mem, spent,
+            "the refused message releases its capacity"
+        );
 
         // Iterations: the messages path spends from the same iteration budget.
         let mut budget = EvalBudget {

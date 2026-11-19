@@ -3,7 +3,7 @@ use std::sync::Arc;
 use miette::{Diagnostic, SourceSpan};
 use thiserror::Error;
 
-use crate::limits::MAX_OUTPUT_SIZE;
+use crate::limits::{MAX_COMPILE_MEMORY, MAX_OUTPUT_SIZE};
 use crate::lint::{named_source_for_render, sanitize_control_chars, sanitize_control_chars_wire};
 
 // ── Serializable error types ──────────────────────────────────────────────────
@@ -568,6 +568,11 @@ pub enum MdsError {
         help("this indicates a bug in `mds fmt` itself; please file an issue")
     )]
     FormatterInvariant { message: String },
+
+    /// The compiler found an inconsistent memory count.
+    #[error("internal compiler error")]
+    #[diagnostic(code(mds::internal))]
+    Internal,
 }
 
 /// The module-count refusal shared by the resolver and binding input guards.
@@ -579,6 +584,12 @@ pub fn module_count_exceeded() -> MdsError {
 }
 
 impl MdsError {
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn internal() -> Self {
+        Self::Internal
+    }
+
     pub(crate) fn syntax(message: impl Into<String>) -> Self {
         MdsError::Syntax {
             message: message.into(),
@@ -953,6 +964,23 @@ impl MdsError {
         ))
     }
 
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn compile_memory_exceeded() -> Self {
+        Self::resource_limit(format!(
+            "compile memory exceeds maximum of {MAX_COMPILE_MEMORY} bytes"
+        ))
+    }
+
+    /// A frontmatter parse expanded past its `MAX_OUTPUT_SIZE` byte allowance.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn frontmatter_expansion_exceeded() -> Self {
+        Self::resource_limit(format!(
+            "frontmatter YAML expands beyond maximum of {MAX_OUTPUT_SIZE} bytes"
+        ))
+    }
+
     /// Upgrade a spanless `Syntax` error with a span; no-op for other variants or if
     /// the error already carries a span (B2 — spanless syntax-error upgrades at call sites
     /// that hold the directive offset but cannot thread it into the low-level helper).
@@ -1134,7 +1162,8 @@ impl MdsError {
             | MdsError::VarConflict { .. }
             | MdsError::ExpectedMarkdown
             | MdsError::ExpectedMessages
-            | MdsError::FormatterInvariant { .. } => None,
+            | MdsError::FormatterInvariant { .. }
+            | MdsError::Internal => None,
         };
 
         SerializedError {
@@ -1227,7 +1256,8 @@ impl MdsError {
             | MdsError::VarConflict { .. }
             | MdsError::ExpectedMarkdown
             | MdsError::ExpectedMessages
-            | MdsError::FormatterInvariant { .. } => None,
+            | MdsError::FormatterInvariant { .. }
+            | MdsError::Internal => None,
         };
         src.map(|ns| ns.name())
     }

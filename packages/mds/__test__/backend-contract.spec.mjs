@@ -219,6 +219,47 @@ test('native and WASM compileFile agree at 255–259 total modules in flat and n
   }
 });
 
+test('native and WASM compileFile agree on the compile memory limit and the frontmatter allowance', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mds-memory-parity-'));
+  try {
+    await writeFile(path.join(root, '.mdsroot'), '');
+    // A frontmatter scalar of 1 MiB, with its key and newline.
+    const x = 'a'.repeat(1024 * 1024 - 'x: \n'.length);
+    const frontmatter = `---\nx: ${x}\n---\n`;
+    // Functions f1 to fD: each body has 49 lines of x, then the length of the next call.
+    const nested = (depth) => frontmatter + Array.from({ length: depth }, (_, i) => {
+      const next = i + 1 < depth ? `{{length(f${i + 2}())}}\n` : '';
+      return `@define f${i + 1}():\n${'{{x}}\n'.repeat(49)}${next}@end\n`;
+    }).join('') + '{{length(f1())}}\n';
+    // 66 aliases expand an 800 KB scalar past the 50 MiB parse allowance.
+    const aliases = Array.from({ length: 66 }, () => '*a').join(', ');
+    const overAllowance = `---\na: &a ${'x'.repeat(800_000)}\nb: [${aliases}]\n---\nHi\n`;
+    // The inner body loses its last newline. The outer body ends in that length.
+    const lines = 49 * (x.length + 1);
+    const limit = (message) => ({
+      code: 'mds::resource_limit', message: `resource limit exceeded: ${message}`, help: null, span: null,
+    });
+    const cases = [
+      ['depth-2.mds', nested(2), { output: `${frontmatter}${lines + String(lines - 1).length}\n` }],
+      ['depth-5.mds', nested(5), limit('compile memory exceeds maximum of 209715200 bytes')],
+      ['frontmatter.mds', overAllowance, limit('frontmatter YAML expands beyond maximum of 52428800 bytes')],
+    ];
+    const files = [];
+    for (const [name, source] of cases) {
+      files.push(path.join(root, name));
+      await writeFile(files.at(-1), source);
+    }
+    // The helper forces each public backend and fails if that backend is absent.
+    const native = await compileFileOutcomes('native', files);
+    const wasm = await compileFileOutcomes('wasm', files);
+    // A WASM trap has no error code, so the expected errors also prove that WASM
+    // returned an error object.
+    assert.deepEqual([wasm, native], [native, cases.map(([, , expected]) => expected)]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Method manifest assertions (AC-API-09)
 // ---------------------------------------------------------------------------

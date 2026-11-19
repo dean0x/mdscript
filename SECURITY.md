@@ -266,7 +266,9 @@ place each check runs, and the tests that pin them — in `spec.md` §4.6
 | Max total function calls | 16,000,000 per compile, across all evaluated modules | `limits.rs` (`MAX_TOTAL_FUNCTION_CALLS`) |
 | Max iterations per loop | 100,000 | `evaluator.rs` (`MAX_LOOP_ITERATIONS`) |
 | Max total iterations | 1,000,000 per module evaluation | `evaluator.rs` (`MAX_TOTAL_ITERATIONS`) |
-| Max output size | 50 MiB (52,428,800 bytes) per evaluation output buffer. Function results, message content and imported modules can use separate buffers. This limit does not bound total compile memory ([#420](https://github.com/dean0x/mdscript/issues/420)). | `limits.rs` (`MAX_OUTPUT_SIZE`) |
+| Max output size | 50 MiB (52,428,800 bytes) per evaluation output buffer. Function results, message content and imported modules can use separate buffers; the compile memory budget below bounds them together. | `limits.rs` (`MAX_OUTPUT_SIZE`) |
+| Max compile memory | 200 MiB (209,715,200 bytes, four output buffers) per compile ([#420](https://github.com/dean0x/mdscript/issues/420)). One budget counts output buffers by capacity, values that evaluation makes, retained module text and frontmatter trees (the merged trees of `@extends` bases included), kept source-map segments, warnings, messages and the finalize output. Exactly the budget passes; above it, `resource limit exceeded: compile memory exceeds maximum of 209715200 bytes`. A reused `ModuleCache` keeps the count of its cached modules until it is dropped. | `limits.rs` (`MAX_COMPILE_MEMORY`), `evaluator/budget.rs` |
+| Frontmatter byte allowance | 50 MiB (52,428,800 bytes) per frontmatter parse, or the rest of the compile budget when that is smaller. Each YAML node spends 192 bytes plus its string or key bytes before it is built, so an alias of a long scalar spends the scalar again at each use. The one exception is the bytes of a `!tag`: the parser spends them after it copies the tag. Above it, `resource limit exceeded: frontmatter YAML expands beyond maximum of 52428800 bytes`, or the compile memory message when the rest of the budget set the allowance. | `resolver/frontmatter.rs` (`NODE_YAML`, `Allowance`) |
 | Max warnings | 1,000 | `evaluator.rs` (`MAX_WARNINGS`) |
 | Max import depth | 64 | `resolver.rs` (`MAX_IMPORT_DEPTH`) |
 | Max module count | 256 distinct modules besides the entry; see [spec §4.1](spec.md#41-variables-yaml-frontmatter) for the count rule and virtual-map bound | `limits.rs` (`MAX_MODULE_COUNT`), `resolver.rs` |
@@ -278,7 +280,38 @@ place each check runs, and the tests that pin them — in `spec.md` §4.6
 | Max dot-path segments | 32 | `limits.rs` (`MAX_DOT_SEGMENTS`) |
 
 These limits apply to the quantities and scopes in the table. They do not bound
-total compilation memory or elapsed time.
+elapsed time. The compile memory budget does not count these stages:
+
+- the tokens and the syntax tree of each source, and the copy of a `@define` or
+  `@block` body that the compiler keeps. They grow with the source text, which the
+  10 MiB file cap bounds. On a 64-bit host they take at most 432 bytes per source byte
+  while a module resolves (the lexer alone at most 56), and a cached module keeps at
+  most 388 bytes per byte of its source until the compile returns;
+- the runtime variables that the caller supplies;
+- the line table of a source map;
+- the YAML event buffer of one frontmatter parse, whose input the 1 MiB frontmatter cap
+  bounds;
+- the conversion of a result into the host types of a binding (napi, WASM, Python);
+- the old buffer that a reallocation holds for one instant when it moves a buffer;
+- resolver warnings, the message and warning lists, and the call stack, which their
+  count caps bound.
+
+A few allocations are counted directly after they are made, each one allocation that
+an existing cap bounds. A host thus needs memory for the budget, plus the stages above,
+plus the largest of those allocations; on napi, WASM and Python, add the conversion of
+the result. `crates/mds-core/tests/memory_bound.rs` measures the peak heap of compiles
+that reach the budget: it allows each of them at most 8 MiB above the budget, plus one
+1 MiB output pass for a compile that writes output, plus 2 MiB per file for the tokens
+and syntax tree of 1 MiB of frontmatter in each file of a 24-file `@extends` chain. Its
+`assert_syntax_tree_peaks` measures the three syntax-tree numbers above for the densest
+syntax, two nodes for each four source bytes.
+
+At the end of a compile, the compiler checks its memory count. A failed check is a
+compiler defect: the compile returns `mds::internal` (`internal compiler error`, no
+help, no span) instead of a result, and the module is not cached. `mds build`, `mds check`
+and `mds lint` exit 101. `mds fmt` does not: when its safety gate's compile of the
+original source fails the check, the gate compares the tokens of the two sources. A live
+`mds watch` session keeps its exit code.
 
 ## ⚠️ The `debug-panics` feature must never ship enabled
 

@@ -98,6 +98,8 @@ impl OutputState {
     /// A file of a run that carries on past it was refused for a resource limit: the
     /// run exits 3 ([`ExitPolicy::Batch`]), as that file alone would (#157).
     const RESOURCE_LIMITED: u8 = 1 << 6;
+    /// A file returned an internal compiler error. A batch exits 101.
+    const INTERNAL_FAILED: u8 = 1 << 7;
 
     pub(crate) const fn new() -> Self {
         Self {
@@ -181,6 +183,14 @@ impl OutputState {
 
     pub(crate) fn resource_limited(&self) -> bool {
         self.has(Self::RESOURCE_LIMITED)
+    }
+
+    fn note_internal_failed(&self) {
+        self.set(Self::INTERNAL_FAILED);
+    }
+
+    fn internal_failed(&self) -> bool {
+        self.has(Self::INTERNAL_FAILED)
     }
 
     /// Ask for a terminal clear before the next byte this process prints (#380): the
@@ -285,10 +295,9 @@ pub(crate) fn eprint_io_failure(e: mds::MdsError) {
 /// A failure in the I/O and file-system class — exit 2 for the same file given alone:
 /// `mds::io` (a source that cannot be read, a forbidden path character),
 /// `mds::file_not_found`, `mds::not_mds` — is recorded for the exit code, so the run
-/// exits 2 as that file alone would. So is a resource limit, `mds::resource_limit`, exit
-/// 3 for the same file alone: the run exits 3, the worse of the two when both happen
-/// (#157). Any other failure, a template error, leaves the exit code to the caller's
-/// count of failed files (1).
+/// exits 2 as that file alone would. A resource limit lifts the exit code to 3.
+/// An internal compiler error lifts it to 101. A template error leaves the exit code
+/// to the caller's count of failed files (1).
 pub(crate) fn eprint_file_failure(report: miette::Report) {
     note_file_failure(&OUTPUT_STATE, &report);
     eprint_error(report);
@@ -301,6 +310,7 @@ fn note_file_failure(state: &OutputState, report: &miette::Report) {
     match crate::build::exit_code(report) {
         IO_FAILURE_EXIT => state.note_io_failure(),
         RESOURCE_LIMIT_EXIT => state.note_resource_limited(),
+        PANIC_EXIT => state.note_internal_failed(),
         _ => {}
     }
 }
@@ -458,8 +468,8 @@ fn write_stdout_to<W: std::io::Write + ?Sized>(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExitPolicy {
     /// A run that ends on its own — build, check, fmt, lint, init, and a watch session
-    /// that never went live: an output failure lifts the exit code to at least 2, and a
-    /// file refused for a resource limit to at least 3.
+    /// that never went live. An output failure lifts the exit code to at least 2.
+    /// A resource limit lifts it to at least 3. An internal compiler error sets it to 101.
     Batch,
     /// A watch session after it went live ([`note_watch_session_live`]): its per-rebuild
     /// failures were reported as they happened, and they do not change the exit code.
@@ -477,16 +487,16 @@ const RESOURCE_LIMIT_EXIT: i32 = 3;
 ///
 /// A panic comes first: a run that panicked exits 101 ([`PANIC_EXIT`]) under either
 /// policy, whatever its verdict (#389). Otherwise a closed stdout or stderr pipe never
-/// changes the code. Under [`ExitPolicy::Batch`], any other output failure lifts it to
-/// `max(verdict, 2)`, and a file refused for a resource limit to `max(verdict, 3)`, so
-/// the run exits with the worst class of its files (#157). [`ExitPolicy::WatchSession`]
-/// returns `verdict` unchanged.
+/// changes the code. A batch exits 101 after an internal compiler error in any file.
+/// Otherwise, an output failure lifts the batch code to at least 2. A resource limit
+/// lifts it to at least 3. [`ExitPolicy::WatchSession`] returns `verdict` unchanged.
 #[must_use]
 pub(crate) fn final_exit_code(verdict: i32, state: &OutputState, policy: ExitPolicy) -> i32 {
     if state.panicked() {
         return PANIC_EXIT;
     }
     match policy {
+        ExitPolicy::Batch if state.internal_failed() => PANIC_EXIT,
         ExitPolicy::Batch => {
             let after_io = if state.io_failed() {
                 verdict.max(IO_FAILURE_EXIT)
@@ -5378,6 +5388,17 @@ mod tests {
                 c.failed,
                 c.policy
             );
+        }
+        // An internal error is a file failure, not a panic. Watch keeps its verdict.
+        let report = miette::Report::new(mds::MdsError::Internal);
+        for (verdict, policy, want) in [(1, Batch, 101), (0, WatchSession, 0), (1, WatchSession, 1)]
+        {
+            let state = OutputState::new();
+            state.note_io_failure();
+            state.note_resource_limited();
+            note_file_failure(&state, &report);
+            assert!(!state.panicked());
+            assert_eq!(final_exit_code(verdict, &state, policy), want, "{policy:?}");
         }
     }
 

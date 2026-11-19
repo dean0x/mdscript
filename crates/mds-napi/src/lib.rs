@@ -20,14 +20,15 @@
 //! Errors thrown at the napi boundary carry a `code` property (set via
 //! N-API `napi_create_error` with an explicit code string). Codes that
 //! originate inside `mds-core` (e.g. `"mds::syntax"`) are defined by
-//! [`mds::MdsError`]. The following codes are **napi-only** — they are
-//! synthesised here and do not exist in the core crate:
+//! [`mds::MdsError`]. The following codes are synthesised here. Only
+//! `mds::invalid_options` is **binding-only**: the core crate also returns
+//! `mds::internal` and `mds::resource_limit`.
 //!
-//! | Code                   | Meaning                                      |
-//! |------------------------|----------------------------------------------|
-//! | `mds::internal`        | Unexpected panic caught at the napi boundary |
-//! | `mds::invalid_options` | Malformed or type-incorrect options object   |
-//! | `mds::resource_limit`  | Input exceeds an enforced size limit         |
+//! | Code                   | Meaning                                                                        |
+//! |------------------------|--------------------------------------------------------------------------------|
+//! | `mds::internal`        | Unexpected panic caught at the napi boundary, or a failed memory-counter check |
+//! | `mds::invalid_options` | Malformed or type-incorrect options object                                     |
+//! | `mds::resource_limit`  | Input exceeds an enforced size limit                                           |
 //!
 //! ## Usage (JavaScript)
 //!

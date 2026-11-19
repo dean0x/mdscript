@@ -604,6 +604,7 @@ pub(crate) fn parse_cli_value(val: String) -> mds::Value {
 /// - 1: logical/syntax error (undefined variable, arity mismatch, recursion, etc.)
 /// - 2: I/O or file-system error (file not found, not an MDS file, I/O failure)
 /// - 3: resource limit exceeded (output too large, too many iterations)
+/// - 101: internal compiler error
 ///
 /// Errors created via `miette::miette!()` do NOT downcast to `MdsError`
 /// and correctly fall through to exit code 1. Only `MdsError` values converted via
@@ -621,6 +622,7 @@ pub(crate) fn exit_code(err: &miette::Error) -> i32 {
         match mds_err {
             MdsError::Io { .. } | MdsError::FileNotFound { .. } | MdsError::NotMdsFile { .. } => 2,
             MdsError::ResourceLimit { .. } => 3,
+            MdsError::Internal => crate::output::PANIC_EXIT,
             // R4: --set/--set-string collision is a usage error over runtime
             // VARIABLES — the logical/content error class (exit 1).  Explicit
             // arm so the classification is a decision, not an accident of the
@@ -3246,6 +3248,17 @@ mod tests {
             }
             self.served += n as u64;
             Ok(n)
+        }
+    }
+
+    #[test]
+    fn exit_code_maps_internal_failures_to_101() {
+        let error = MdsError::Internal;
+        for report in [
+            miette::Report::new(error.clone()),
+            crate::output::relabel_stdin_error(&error, ""),
+        ] {
+            assert_eq!(exit_code(&report), 101);
         }
     }
 

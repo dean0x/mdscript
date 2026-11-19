@@ -43,8 +43,22 @@ pub(crate) const MAX_TRAVERSAL_DEPTH: usize = 256;
 /// (`push_capped`, #415) and by built-ins that can amplify output (e.g.
 /// `replace()`) to prevent runaway memory use from adversarial inputs. Shared
 /// with `builtins.rs` to ensure a single authoritative limit. It bounds each
-/// buffer, not a compile's total memory (#420).
+/// buffer. `MAX_COMPILE_MEMORY` bounds the memory of the whole compile.
 pub(crate) const MAX_OUTPUT_SIZE: usize = 50 * 1024 * 1024;
+
+/// Maximum memory one compile may hold, in bytes (four output buffers: 200 MiB).
+///
+/// One budget per compile, kept in `evaluator::budget::MemBudget`. It counts output
+/// buffers by capacity, the values that evaluation makes, the read text of each module,
+/// the text, frontmatter trees and scope layers that cached modules keep, kept
+/// source-map segments, warnings, messages and the finalize output. Each part is
+/// charged before its allocation, except at a few named sites that charge right after
+/// one allocation. Exactly the budget passes. The next charge fails with
+/// `mds::resource_limit` (`MdsError::compile_memory_exceeded`). The syntax tree,
+/// tokens, caller variables, the line table, the YAML event buffer and binding output
+/// conversion are outside the budget. The retained part of a reused `ModuleCache`
+/// never resets.
+pub(crate) const MAX_COMPILE_MEMORY: usize = 4 * MAX_OUTPUT_SIZE;
 
 /// Maximum total function calls per compile, across all evaluated modules.
 /// Allows sixteen calls per pass in a million-pass loop budget.
@@ -85,9 +99,12 @@ pub(crate) const MAX_FRONTMATTER_SIZE: usize = 1024 * 1024;
 /// repetition limit counts alias jumps, not nodes, and does not catch one large anchor
 /// referenced a few thousand times. An alias-free block needs at least 2 bytes per node
 /// (`[x,x,...]`), so under the size cap it stays around 525 000 nodes at most and a
-/// realistic `key: value` block near 100 000; 200 000 rejects only amplification and
-/// bounds the materialised tree at a few tens of MB per parse. Exceeding this surfaces
-/// as `mds::resource_limit`. See #162.
+/// realistic `key: value` block near 100 000; 200 000 rejects only amplification. The
+/// node cap does not bound the bytes of the tree: an alias of a long scalar copies the
+/// scalar at each node. The byte allowance of the parse bounds the tree: each node
+/// spends `NODE_YAML` plus its string or key bytes, at most `MAX_OUTPUT_SIZE` per parse,
+/// or the rest of the compile budget when that is smaller. Exceeding the node cap
+/// surfaces as `mds::resource_limit`. See #162.
 pub(crate) const MAX_FRONTMATTER_NODES: usize = 200_000;
 
 /// Maximum running depth of flow-collection nesting (`[`/`{`) in one frontmatter
@@ -97,7 +114,7 @@ pub(crate) const MAX_FRONTMATTER_NODES: usize = 200_000;
 /// the raw bytes, AFTER the size cap and BEFORE the budgeted parse. libyaml's flow scanner
 /// is O(depth^2) in flow-collection nesting, and that cost is paid inside the scanner
 /// UPSTREAM of deserialisation. The three existing depth limits are all post-hoc: serde's
-/// recursion limit (128 parse frames, "recursion limit exceeded"), and `Value::from_yaml`'s
+/// recursion limit (128 parse frames, "recursion limit exceeded"), and `Value::from_yaml_ref`'s
 /// `MAX_VALUE_DEPTH` (64, "value nesting exceeds maximum depth of 64"). Every one of them
 /// fires only AFTER the quadratic scan has already been paid, so a ~1 MiB pure deep
 /// flow-nest (no anchors) burns 10+ s of CPU at ~32 MB RSS before any of them rejects it —
