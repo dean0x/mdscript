@@ -70,7 +70,7 @@ pub(super) fn table_bytes(capacity: usize, entry: usize) -> Option<usize> {
 
 /// Count the bytes of a value tree. `None` is a value past the depth or step
 /// bound, or a count past the address space.
-pub(super) fn value_bytes(mut value: &Value) -> Option<usize> {
+pub(crate) fn value_bytes(mut value: &Value) -> Option<usize> {
     let mut total = VALUE_ROOT;
     let mut stack = [const { None }; MAX_VALUE_DEPTH];
     let mut depth = 0;

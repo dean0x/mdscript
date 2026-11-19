@@ -711,7 +711,7 @@ mod frontmatter_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evaluator::budget::Part;
+    use crate::evaluator::budget::{value_bytes, Part};
     use crate::limits::MAX_COMPILE_MEMORY;
 
     fn mapping_from_str(yaml: &str) -> serde_yaml_ng::Mapping {
@@ -963,5 +963,114 @@ mod tests {
             error_text(resolve_with_rest(&doc, NEAR_FULL_TEXT * 3 / 2)),
             BUDGET_TEXT
         );
+    }
+
+    /// Parse `raw` with no byte limit; return its mapping and the bytes it spent.
+    fn parsed(raw: &str) -> (serde_yaml_ng::Mapping, usize) {
+        match parse_frontmatter_yaml_with(raw, UNLIMITED).unwrap() {
+            (serde_yaml_ng::Value::Mapping(mapping), spent) => (mapping, spent),
+            _ => panic!("expected a YAML mapping"),
+        }
+    }
+
+    /// The bytes of the scope layer converted from `mapping`, in the unit of the
+    /// compile budget: each key, each value with its shared header, and a table at
+    /// least as large as the layer's own (an object table of the same capacity, whose
+    /// entries are larger than the layer's).
+    fn layer_bytes(scope: &Scope, mapping: &serde_yaml_ng::Mapping) -> usize {
+        let names: Vec<&str> = mapping
+            .keys()
+            .filter_map(serde_yaml_ng::Value::as_str)
+            .collect();
+        let table = Value::Object(std::collections::HashMap::with_capacity(names.len()));
+        names
+            .iter()
+            .fold(value_bytes(&table).unwrap(), |total, name| {
+                total + name.len() + value_bytes(scope.get_var(name).unwrap()).unwrap()
+            })
+    }
+
+    /// The start of a YAML shape, for a failure message.
+    fn label(raw: &str) -> &str {
+        &raw[..raw.len().min(24)]
+    }
+
+    #[test]
+    fn a_converted_scope_layer_stays_within_the_bytes_its_parse_spent() {
+        assert!(size_of::<crate::scope::Slot>() < size_of::<Value>());
+        let shapes = [
+            "k: vv\n".to_owned(),
+            "e: []\nf: {}\ng: ''\nh: ~\nt: !tag 5\nn: -1.5\nb: true\n".to_owned(),
+            "m:\n  a:\n    b:\n      c: 1\n".to_owned(),
+            "f: {x: {y: {z: [1, 2, {w: true}]}}}\n".to_owned(),
+            "s: [{a: 1}, {b: 2}, {c: 3}, {d: []}]\n".to_owned(),
+            (0..2000).map(|i| format!("k{i}: {i}\n")).collect(),
+            format!(
+                "n: [{}]\n",
+                (0..5000)
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            format!(
+                "a: &a {}\nb: [{}]\n",
+                "x".repeat(4096),
+                vec!["*a"; 63].join(", ")
+            ),
+        ];
+        for raw in &shapes {
+            let (mapping, spent) = parsed(raw);
+            let mut mem = MemBudget::default();
+            let (scope, _) = super::super::build_scope_from_frontmatter(
+                None,
+                Some(&mapping),
+                spent,
+                false,
+                &Arc::new(VarLayer::new()),
+                &mut mem,
+            )
+            .unwrap();
+            // The layer is charged with the spent bytes before it is built.
+            assert_eq!(mem.mark(), spent, "{:?}", label(raw));
+            let layer = layer_bytes(&scope, &mapping);
+            assert!(
+                layer <= spent,
+                "{:?}: the layer holds {layer} B, the parse spent {spent} B",
+                label(raw)
+            );
+        }
+    }
+
+    #[test]
+    fn a_merged_scope_layer_stays_within_the_bytes_of_both_parses() {
+        let pairs = [
+            (
+                "model: base\nconfig:\n  a: 1\n  b: [x, y]\n".to_owned(),
+                "config:\n  b: [z]\n  c: {d: 2}\nrole: child\n",
+            ),
+            (
+                format!("a: &a {}\nlist: [*a, *a, *a]\nkeep: 1\n", "x".repeat(4096)),
+                "list: [1]\nadded: {x: [1, 2]}\n",
+            ),
+            (
+                "m: {a: {b: {c: 1}}}\n".to_owned(),
+                "m: {a: {b: {d: 2}, e: 3}}\n",
+            ),
+        ];
+        for (base, child) in &pairs {
+            let (base_mapping, base_spent) = parsed(base);
+            let (child_mapping, child_spent) = parsed(child);
+            let merged = deep_merge_yaml(&base_mapping, &child_mapping, 0).unwrap();
+            let scope =
+                build_scope_from_merged_mapping(&merged, &Arc::new(VarLayer::new())).unwrap();
+            // The merged layer is charged with the bytes of both parses.
+            let charge = base_spent + child_spent;
+            let layer = layer_bytes(&scope, &merged);
+            assert!(
+                layer <= charge,
+                "{:?}: the layer holds {layer} B, the charge is {charge} B",
+                label(base)
+            );
+        }
     }
 }
