@@ -7,6 +7,8 @@ use budget::{
     bytes, display_len, format_exact, format_len, render_value, table_bytes, value_bytes,
     MemBudget, Part, NODE, VALUE_ROOT,
 };
+mod held;
+use held::{call_held, evaluate_held};
 
 use crate::arity::check_arity;
 use crate::ast::{
@@ -625,13 +627,7 @@ fn resolve_args(
                 Arg::Call {
                     name,
                     args: inner_args,
-                } => {
-                    // The callee gets this value; its text is not output here.
-                    let held = hold_map(ctx);
-                    let slot = call_function(name, inner_args, scope, ctx, depth + 1);
-                    release_map(ctx, held);
-                    return slot;
-                }
+                } => return call_held(name, inner_args, scope, ctx, depth + 1),
                 Arg::MemberAccess { object, fields } => {
                     return resolve_dot_path(object, fields, scope, &mut ctx.budget.mem)
                 }
@@ -814,7 +810,7 @@ fn evaluate_function_body(
     // Conditions for S8 (all must hold):
     //  1. A map is present (source-map mode active, AC-PERF-01).
     //  2. suppress == 0 — we are not inside a suppressed body or a held region
-    //     (`hold_map`: a condition, an iterable or a call argument).
+    //     (the `held` module: a condition, an iterable or a call argument).
     //  3. func.origin is Some — the function has provenance metadata (populated
     //     unconditionally since B1 dropped the source_map_mode gate, S7).
     //
@@ -951,28 +947,6 @@ fn trim_body(body: &mut String, mem: &mut MemBudget) -> (usize, usize) {
         mem.release_buffers(capacity - body.capacity());
     }
     (lead, trail)
-}
-
-/// Start a region whose text does not go to the output: a condition, an iterable or
-/// a call argument. While the region is held, the source map records nothing: a call
-/// takes the suppressed path, so it switches to no source and registers none. The
-/// cursor stays one global output offset. `None` when no map is recorded.
-#[inline(never)]
-fn hold_map(ctx: &mut EvalContext) -> Option<(u32, usize)> {
-    let map = ctx.map.as_mut()?;
-    map.suppress += 1;
-    Some((map.cursor, map.segments.len()))
-}
-
-/// End a region that [`hold_map`] started: put back the cursor and the segment count.
-/// Call it on the success path and on the error path.
-#[inline(never)]
-fn release_map(ctx: &mut EvalContext, held: Option<(u32, usize)>) {
-    if let (Some(map), Some((cursor, segments))) = (ctx.map.as_mut(), held) {
-        map.suppress = map.suppress.saturating_sub(1);
-        map.segments.truncate(segments);
-        map.cursor = cursor;
-    }
 }
 
 fn call_function(
@@ -1240,16 +1214,15 @@ fn evaluate_condition(
 ) -> Result<bool, MdsError> {
     let mark = ctx.budget.mem.mark();
     // The condition decides the branch; the text of a call in it is not output.
-    let held = hold_map(ctx);
     let result = (|| match condition {
         Condition::Truthy(expr) | Condition::Not(expr) => {
-            let slot = evaluate_expr(expr, scope, ctx)?;
+            let slot = evaluate_held(expr, scope, ctx)?;
             let truthy = slot.get().ok_or_else(invalid_projection)?.is_truthy();
             Ok(truthy != matches!(condition, Condition::Not(_)))
         }
         Condition::Eq(lhs, rhs) | Condition::NotEq(lhs, rhs) => {
-            let lhs = evaluate_expr(lhs, scope, ctx)?;
-            let rhs = evaluate_expr(rhs, scope, ctx)?;
+            let lhs = evaluate_held(lhs, scope, ctx)?;
+            let rhs = evaluate_held(rhs, scope, ctx)?;
             let lhs = lhs.get().ok_or_else(invalid_projection)?;
             let rhs = rhs.get().ok_or_else(invalid_projection)?;
             let eq = values_equal_same_type(lhs, rhs).ok_or_else(|| {
@@ -1294,7 +1267,6 @@ fn evaluate_condition(
             Ok(false)
         }
     })();
-    release_map(ctx, held);
     ctx.budget.mem.release_to(mark);
     result
 }
@@ -1359,10 +1331,7 @@ where
     let mark = ctx.budget.mem.mark();
     let result = (|| {
         // The iterable gives the items; the text of a call in it is not output.
-        let held = hold_map(ctx);
-        let slot = evaluate_expr(&block.iterable, scope, ctx);
-        release_map(ctx, held);
-        let slot = slot?;
+        let slot = evaluate_held(&block.iterable, scope, ctx)?;
         let iterable = slot.get().ok_or_else(invalid_projection)?;
 
         if let Some(ref key_var) = block.key_var {
@@ -1540,10 +1509,11 @@ fn evaluate_include(
     // an @include inside a @for loop registers the module's sources once (AC-PERF-05).
     // While the map is held or suppressed, this text is not mapped here, so the
     // include splices no segment and registers no source; the body is returned as before.
-    let map = ctx.map.as_mut().filter(|map| map.suppress == 0);
-    if let (Some(fragment), Some(map)) = (ns.prompt_map.as_ref(), map) {
-        let base = map.cursor;
-        map.splice_fragment(fragment, base);
+    if let (Some(fragment), Some(map)) = (ns.prompt_map.as_ref(), ctx.map.as_mut()) {
+        if map.suppress == 0 {
+            let base = map.cursor;
+            map.splice_fragment(fragment, base);
+        }
     }
 
     Ok(Some(prompt_body.clone()))
