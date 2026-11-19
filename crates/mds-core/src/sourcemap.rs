@@ -1291,7 +1291,7 @@ pub(crate) fn compensate_cr(
     let count_cr = |bytes: &[u8]| bytes.iter().filter(|&&b| b == b'\r').count() as u32;
     let mut total = 0;
     cr_prefix.push(total);
-    for block in raw_bytes.chunks_exact(BLOCK) {
+    for block in raw_bytes.as_chunks::<BLOCK>().0 {
         total += count_cr(block);
         cr_prefix.push(total);
     }
