@@ -159,6 +159,23 @@ fn assert_small_messages_do_not_keep_padding() {
     assert!(peak <= 17 * MIB, "padded messages kept {peak} B at peak");
 }
 
+fn assert_small_markdown_does_not_keep_padding() {
+    let frontmatter = "---\nlabel: value\n---\n";
+    let source = format!("{frontmatter}{{{{body}}}}");
+    let padded = format!("ok{}", " ".repeat(64 * 1024));
+    let vars = HashMap::from([("body".to_owned(), Value::String(padded))]);
+    let output = mds::compile_str_with(&source, None, Some(vars))
+        .unwrap()
+        .into_markdown()
+        .unwrap();
+    assert_eq!(output, format!("{frontmatter}ok\n"));
+    assert!(
+        output.capacity() <= 2 * output.len(),
+        "{} B",
+        output.capacity()
+    );
+}
+
 fn assert_mapped_output_peak() {
     let source = "---\ntype: mds\nlabel: value\n---\n{{body}}";
     let vars = HashMap::from([(
@@ -237,6 +254,33 @@ fn assert_over_cap_lower_with_sigma_does_not_build_its_result() {
     );
 }
 
+fn assert_join_refusal_precedes_result_allocation() {
+    let measured = |count| {
+        let vars = HashMap::from([
+            (
+                "parts".to_owned(),
+                Value::Array(vec![Value::String(String::new()); count]),
+            ),
+            ("sep".to_owned(), Value::String("x".repeat(MIB))),
+        ]);
+        LARGEST_REQUEST.store(0, Ordering::SeqCst);
+        let result = mds::compile_str_with("{{length(join(parts, sep))}}", None, Some(vars));
+        (result, LARGEST_REQUEST.load(Ordering::SeqCst))
+    };
+    let (fits, control) = measured(5);
+    assert_eq!(fits.unwrap().into_markdown().unwrap(), "4194304\n");
+    assert!(control >= 4 * MIB, "join control: {control} B");
+
+    let (refused, largest) = measured(52);
+    let error = refused.expect_err("join output cap error").serialize();
+    assert_eq!(error.code, "mds::builtin");
+    assert_eq!(
+        error.message,
+        "join() output exceeds maximum size of 52428800 bytes"
+    );
+    assert!(largest < 4 * MIB, "refused join requested {largest} B");
+}
+
 #[test]
 fn nested_if_output_does_not_raise_the_peak_heap() {
     let source = include_str!("memory_bound.rs");
@@ -277,7 +321,9 @@ fn nested_if_output_does_not_raise_the_peak_heap() {
 
     assert_message_edge_trim_peak();
     assert_small_messages_do_not_keep_padding();
+    assert_small_markdown_does_not_keep_padding();
     assert_mapped_output_peak();
+    assert_join_refusal_precedes_result_allocation();
     assert_over_cap_upper_does_not_build_its_result();
     assert_over_cap_lower_with_sigma_does_not_build_its_result();
 }

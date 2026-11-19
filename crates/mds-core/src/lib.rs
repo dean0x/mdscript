@@ -992,7 +992,14 @@ pub(crate) fn clean_output_owned(mut s: String, extra: usize) -> String {
     if s.is_empty() {
         return String::new();
     }
-    s.reserve_exact(1 + extra);
+    let additional = 1 + extra;
+    let final_len = s.len() + additional;
+    if s.capacity() / 2 > final_len {
+        // Do not keep a large discarded suffix in a small compiled result.
+        s.shrink_to(final_len);
+    } else {
+        s.reserve_exact(additional);
+    }
     s.push('\n');
     s
 }
