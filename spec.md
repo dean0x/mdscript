@@ -921,9 +921,13 @@ byte allowance from the budget (§4.1).
 At the end of a compile, the compiler checks its memory count: no evaluation value stays
 counted, and no counter went below zero. When the check fails, the compile returns
 `mds::internal` with the message `internal compiler error` instead of a result, and the
-module is not cached. A failed check is a compiler defect. The CLI exits 101 for it
-(§7.9). In a directory batch, the file counts as failed, and the run goes on with the
-next file.
+module is not cached. A failed check is a compiler defect. `mds build` and `mds check`
+exit 101 for it (§7.9), and so does `mds lint`, whose check gate compiles the source
+(§7.5). In a directory batch, the file counts as failed, and the run goes on with the
+next file. `mds fmt` does not exit 101 for it: when the safety gate's compile of the
+original source fails the check, the gate compares the tokens of the two sources, as it
+does for any compile error after the parse (§7.4). A live `mds watch` session keeps its
+exit code, as it does for every rebuild error.
 
 The budget does not count these stages:
 

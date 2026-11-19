@@ -308,7 +308,10 @@ syntax, two nodes for each four source bytes.
 
 At the end of a compile, the compiler checks its memory count. A failed check is a
 compiler defect: the compile returns `mds::internal` (`internal compiler error`, no
-help, no span) instead of a result, the module is not cached, and the CLI exits 101.
+help, no span) instead of a result, and the module is not cached. `mds build`, `mds check`
+and `mds lint` exit 101. `mds fmt` does not: when its safety gate's compile of the
+original source fails the check, the gate compares the tokens of the two sources. A live
+`mds watch` session keeps its exit code.
 
 ## ⚠️ The `debug-panics` feature must never ship enabled
 
