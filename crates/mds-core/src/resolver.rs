@@ -9,19 +9,21 @@ use indexmap::{IndexMap, IndexSet};
 
 use crate::ast::{BlockNode, DefineBlock, ExportDirective, ImportDirective, Node};
 use crate::error::MdsError;
+use crate::evaluator::budget::{bytes, Part};
 use crate::evaluator::{
     evaluate_messages_seeded, evaluate_seeded, evaluate_with_map_seeded, EvalBudget,
 };
 use crate::fs::{FileSystem, NativeFs, VirtualFs};
 use crate::lexer::tokenize;
 use crate::limits::{
-    MAX_BLOCKS_PER_MODULE, MAX_DEFINES_PER_MODULE, MAX_FILE_SIZE, MAX_MODULE_COUNT,
+    MAX_BLOCKS_PER_MODULE, MAX_COMPILE_MEMORY, MAX_DEFINES_PER_MODULE, MAX_FILE_SIZE,
+    MAX_MODULE_COUNT, MAX_SOURCES_CONTENT_BYTES,
 };
 use crate::parser::parse_with_ctx;
 use crate::scope::{FunctionDef, NamespaceScope, PromptText, Scope, VarLayer};
 // Import Origin from sourcemap.rs to avoid a scope→resolver import cycle.
 pub(crate) use crate::sourcemap::Origin;
-use crate::sourcemap::SourceIndex;
+use crate::sourcemap::{CompileOptions, MapBuilder, SourceIndex};
 use crate::validator;
 use crate::value::Value;
 
@@ -244,8 +246,29 @@ pub struct ModuleCache {
     /// for sub-modules (AC-PERF-01).
     source_map_mode: bool,
     budget: EvalBudget,
+    retained: usize,
+    kept: usize,
+    #[cfg(test)]
+    module_probes: Vec<ModuleProbe>,
     #[cfg(test)]
     function_call_seed: usize,
+}
+
+struct ModuleMark {
+    temporaries: usize,
+    outer_kept: usize,
+    #[cfg(test)]
+    probe: usize,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ModuleProbe {
+    buffers_before: usize,
+    buffers_after_insert: Option<usize>,
+    temporaries_before: usize,
+    temporaries_open: usize,
+    temporaries_closed: usize,
 }
 
 impl std::fmt::Debug for ModuleCache {
@@ -267,31 +290,14 @@ impl ModuleCache {
 
     /// Create a `ModuleCache` backed by the native OS filesystem.
     pub fn native() -> Self {
-        Self {
-            fs: Box::new(NativeFs::new()),
-            modules: IndexMap::new(),
-            resolving: IndexSet::new(),
-            source_map_mode: false,
-            budget: EvalBudget::default(),
-            #[cfg(test)]
-            function_call_seed: 0,
-        }
+        Self::with_fs(Box::new(NativeFs::new()))
     }
 
     /// Create a `ModuleCache` backed by an in-memory virtual filesystem.
     ///
-    /// Useful for testing and WASM environments where OS filesystem access
-    /// is unavailable.
+    /// Useful for testing and WASM environments where OS access is unavailable.
     pub fn virtual_fs(modules: HashMap<String, String>) -> Self {
-        Self {
-            fs: Box::new(VirtualFs::new(modules)),
-            modules: IndexMap::new(),
-            resolving: IndexSet::new(),
-            source_map_mode: false,
-            budget: EvalBudget::default(),
-            #[cfg(test)]
-            function_call_seed: 0,
-        }
+        Self::with_fs(Box::new(VirtualFs::new(modules)))
     }
 
     /// Create a `ModuleCache` with a custom [`FileSystem`] implementation.
@@ -302,6 +308,10 @@ impl ModuleCache {
             resolving: IndexSet::new(),
             source_map_mode: false,
             budget: EvalBudget::default(),
+            retained: 0,
+            kept: 0,
+            #[cfg(test)]
+            module_probes: Vec::new(),
             #[cfg(test)]
             function_call_seed: 0,
         }
@@ -340,10 +350,80 @@ impl ModuleCache {
     fn start_resolution(&mut self, key: &str) {
         if self.resolving.is_empty() {
             self.budget = EvalBudget::default();
+            self.kept = 0;
+            self.commit_retained(0);
             #[cfg(test)]
-            self.budget.seed_function_calls(self.function_call_seed);
+            {
+                self.module_probes.clear();
+                self.budget.seed_function_calls(self.function_call_seed);
+            }
         }
         self.resolving.insert(key.to_string());
+    }
+
+    fn open_module(&mut self, read_bytes: usize) -> (ModuleMark, Result<(), MdsError>) {
+        let mark = ModuleMark {
+            temporaries: self.budget.mem.mark(),
+            outer_kept: std::mem::take(&mut self.kept),
+            #[cfg(test)]
+            probe: self.module_probes.len(),
+        };
+        let charged = if read_bytes == 0 {
+            Ok(())
+        } else {
+            self.budget.mem.charge(Part::Temp, read_bytes)
+        };
+        #[cfg(test)]
+        self.module_probes.push(ModuleProbe {
+            buffers_before: self.budget.mem.buffers,
+            temporaries_before: mark.temporaries,
+            temporaries_open: self.budget.mem.mark(),
+            ..ModuleProbe::default()
+        });
+        (mark, charged)
+    }
+
+    fn close_module(&mut self, mark: ModuleMark) -> usize {
+        self.budget.mem.release_to(mark.temporaries);
+        #[cfg(test)]
+        {
+            self.module_probes[mark.probe].temporaries_closed = self.budget.mem.mark();
+        }
+        std::mem::replace(&mut self.kept, mark.outer_kept)
+    }
+
+    fn charge_kept(&mut self, n: usize) -> Result<(), MdsError> {
+        self.budget.mem.charge(Part::Buffers, n)?;
+        // The kept sum is part of buffers, which charge already checked.
+        self.kept += n;
+        Ok(())
+    }
+
+    fn commit_retained(&mut self, kept: usize) {
+        let Some(buffers) = self.budget.mem.buffers.checked_sub(kept) else {
+            return;
+        };
+        let Some(retained) = self
+            .retained
+            .checked_add(kept)
+            .filter(|n| *n <= MAX_COMPILE_MEMORY)
+        else {
+            return;
+        };
+        self.budget.mem.buffers = buffers;
+        self.retained = retained;
+        self.budget.mem.headroom = MAX_COMPILE_MEMORY - retained;
+    }
+
+    fn copy_raw_frontmatter(
+        &mut self,
+        module: &crate::ast::Module,
+    ) -> Result<Option<String>, MdsError> {
+        let Some(fm) = &module.frontmatter else {
+            return Ok(None);
+        };
+        self.charge_kept(fm.raw.len())?;
+        Ok(Some(fm.raw.clone()))
     }
 
     /// Guard against excessively deep import chains.
@@ -547,18 +627,23 @@ impl ModuleCache {
         // IndexSet preserves insertion order, so it serves as both the set (O(1) lookup)
         // and the ordered stack (for cycle path reconstruction).
         self.start_resolution(key);
-
-        let base_dir_owned = self.fs.parent_dir(key);
-        let display_owned = crate::source_path::display_path_for(&*self.fs, key);
-        let ctx = ModuleCtx {
-            key,
-            file_str: &display_owned,
-            source: &source,
-            base_dir: &base_dir_owned,
-            runtime_vars,
-            origin: OnceCell::new(),
-        };
-        let resolved = self.process_module(&ctx, is_md, warnings);
+        let (mark, read) = self.open_module(source.capacity());
+        let resolved = read.and_then(|()| {
+            let base_dir_owned = self.fs.parent_dir(key);
+            let display_owned = crate::source_path::display_path_for(&*self.fs, key);
+            let ctx = ModuleCtx {
+                key,
+                file_str: &display_owned,
+                source: &source,
+                base_dir: &base_dir_owned,
+                runtime_vars,
+                origin: OnceCell::new(),
+            };
+            self.process_module(&ctx, is_md, warnings)
+        });
+        #[cfg(test)]
+        let probe = mark.probe;
+        let kept = self.close_module(mark);
 
         // Unmark regardless of success or failure. resolve/unmark is strictly LIFO
         // (we always remove the last element we inserted), so pop() is O(1).
@@ -583,6 +668,11 @@ impl ModuleCache {
         let key_owned = key.to_string();
         let arc = Arc::new(resolved);
         self.modules.insert(key_owned, Arc::clone(&arc));
+        self.commit_retained(kept);
+        #[cfg(test)]
+        {
+            self.module_probes[probe].buffers_after_insert = Some(self.budget.mem.buffers);
+        }
 
         Ok(arc)
     }
@@ -659,6 +749,7 @@ impl ModuleCache {
         self.check_import_depth()?;
         self.check_module_count(SOURCE_LABEL)?;
         self.start_resolution(SOURCE_LABEL);
+        let (mark, read) = self.open_module(0);
 
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
@@ -668,7 +759,8 @@ impl ModuleCache {
             runtime_vars: &runtime_layer(runtime_vars),
             origin: OnceCell::new(),
         };
-        let resolved = self.process_module(&ctx, false, warnings);
+        let resolved = read.and_then(|()| self.process_module(&ctx, false, warnings));
+        self.close_module(mark);
 
         let popped = self.resolving.pop();
         Self::check_lifo_pop(resolved, popped, SOURCE_LABEL).map(Arc::new)
@@ -766,18 +858,21 @@ impl ModuleCache {
         check_module_type(entry, &source)?;
 
         self.start_resolution(key);
-
-        let base_dir_owned = self.fs.parent_dir(key);
-        let display_owned = crate::source_path::display_path_for(&*self.fs, key);
-        let ctx = ModuleCtx {
-            key,
-            file_str: &display_owned,
-            source: &source,
-            base_dir: &base_dir_owned,
-            runtime_vars,
-            origin: OnceCell::new(),
-        };
-        let result = self.process_module_intrinsic_opts(&ctx, is_md, opts, warnings);
+        let (mark, read) = self.open_module(source.capacity());
+        let result = read.and_then(|()| {
+            let base_dir_owned = self.fs.parent_dir(key);
+            let display_owned = crate::source_path::display_path_for(&*self.fs, key);
+            let ctx = ModuleCtx {
+                key,
+                file_str: &display_owned,
+                source: &source,
+                base_dir: &base_dir_owned,
+                runtime_vars,
+                origin: OnceCell::new(),
+            };
+            self.process_module_intrinsic_opts(&ctx, is_md, opts, warnings)
+        });
+        self.close_module(mark);
 
         let popped = self.resolving.pop();
         Self::check_lifo_pop(result, popped, key).map(|result| (result, source))
@@ -799,6 +894,7 @@ impl ModuleCache {
         self.check_import_depth()?;
         self.check_module_count(SOURCE_LABEL)?;
         self.start_resolution(SOURCE_LABEL);
+        let (mark, read) = self.open_module(0);
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
             file_str: SOURCE_LABEL,
@@ -807,7 +903,8 @@ impl ModuleCache {
             runtime_vars: &runtime_layer(runtime_vars),
             origin: OnceCell::new(),
         };
-        let result = self.process_module_intrinsic(&ctx, false, warnings);
+        let result = read.and_then(|()| self.process_module_intrinsic(&ctx, false, warnings));
+        self.close_module(mark);
         let popped = self.resolving.pop();
         Self::check_lifo_pop(result, popped, SOURCE_LABEL)
     }
@@ -827,6 +924,7 @@ impl ModuleCache {
         self.check_import_depth()?;
         self.check_module_count(SOURCE_LABEL)?;
         self.start_resolution(SOURCE_LABEL);
+        let (mark, read) = self.open_module(0);
         let ctx = ModuleCtx {
             key: SOURCE_LABEL,
             file_str: SOURCE_LABEL,
@@ -835,7 +933,9 @@ impl ModuleCache {
             runtime_vars: &runtime_layer(runtime_vars),
             origin: OnceCell::new(),
         };
-        let result = self.process_module_intrinsic_opts(&ctx, false, opts, warnings);
+        let result =
+            read.and_then(|()| self.process_module_intrinsic_opts(&ctx, false, opts, warnings));
+        self.close_module(mark);
         let popped = self.resolving.pop();
         Self::check_lifo_pop(result, popped, SOURCE_LABEL)
     }
@@ -1011,7 +1111,7 @@ impl ModuleCache {
         let tokens = tokenize(ctx.source, ctx.file_str)?;
         let module = parse_with_ctx(&tokens, ctx.file_str, ctx.source)?;
 
-        let raw_frontmatter = module.frontmatter.as_ref().map(|fm| fm.raw.clone());
+        let raw_frontmatter = module.frontmatter.as_ref().map(|fm| fm.raw.as_str());
 
         // ── Extends branch ────────────────────────────────────────────────────
         if let Some(ext) = module.extends.clone() {
@@ -1069,15 +1169,14 @@ impl ModuleCache {
                 warnings,
                 self.budget.start_module(),
             )?;
-            // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
-            let map_out = builder.and_then(|b| apply_map_degradation(b, opts, warnings));
-            return Ok(self.finalize_markdown(
+            return self.finalize_markdown(
                 body_raw,
                 merged_frontmatter.as_deref(),
-                map_out,
+                builder.map(|b| (b, 0)),
                 ctx.base_dir,
                 opts,
-            ));
+                warnings,
+            );
         }
 
         // ── Standalone path ───────────────────────────────────────────────────
@@ -1120,10 +1219,16 @@ impl ModuleCache {
         }
 
         let mut body_raw = String::new();
-        let map_out = if opts.source_map {
+        let builder = if opts.source_map {
             // The builder's seed (current source 0) is ctx.key / ctx.file_str / ctx.source;
             // evaluate_with_map derives display/source from builder (issue #58 / R3).
-            let builder = crate::sourcemap::MapBuilder::new(ctx.origin().clone());
+            let (origin, map_origin_bytes) = match ctx.origin.get() {
+                Some(origin) => (origin.clone(), 0),
+                // A map-only origin is part of optional map work. It is at most one
+                // capped source copy; charge it with the live segments at finalize.
+                None => (ctx.make_origin(), ctx.origin_bytes()),
+            };
+            let builder = MapBuilder::new(origin);
             let returned = evaluate_with_map_seeded(
                 &module.body,
                 &mut scope,
@@ -1132,8 +1237,7 @@ impl ModuleCache {
                 self.budget.start_module(),
                 &mut body_raw,
             )?;
-            // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
-            apply_map_degradation(returned, opts, warnings)
+            Some((returned, map_origin_bytes))
         } else {
             evaluate_seeded(
                 &module.body,
@@ -1147,26 +1251,72 @@ impl ModuleCache {
             None
         };
 
-        Ok(self.finalize_markdown(
+        self.finalize_markdown(
             body_raw,
-            raw_frontmatter.as_deref(),
-            map_out,
+            raw_frontmatter,
+            builder,
             ctx.base_dir,
             opts,
-        ))
+            warnings,
+        )
     }
 
     fn finalize_markdown(
-        &self,
+        &mut self,
         body_raw: String,
         frontmatter: Option<&str>,
-        map_out: Option<crate::sourcemap::MapBuilder>,
+        builder: Option<(MapBuilder, usize)>,
         base_dir: &str,
-        opts: &crate::sourcemap::CompileOptions,
-    ) -> (crate::CompiledOutput, Option<crate::sourcemap::SourceMap>) {
-        let pending_map = map_out.map(|b| b.finalize_points(&body_raw));
+        opts: &CompileOptions,
+        warnings: &mut Vec<String>,
+    ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
+        let mem = &mut self.budget.mem;
+        let mark = mem.mark();
+        if let Some(raw) = frontmatter {
+            let prefix_bytes = bytes(raw.len(), 2)
+                .and_then(|n| n.checked_add(9))
+                .ok_or_else(MdsError::compile_memory_exceeded)?;
+            mem.charge(Part::Temp, prefix_bytes)?;
+        }
         let prefix = crate::frontmatter_prefix(frontmatter);
         let fm_prefix_len = prefix.as_ref().map_or(0, String::len);
+        // Reserve the output's charge before optional map work can use headroom.
+        // The empty body takes the prefix as-is, without a final newline reserve.
+        let growth = fm_prefix_len + usize::from(!body_raw.trim_end().is_empty());
+        mem.charge(Part::Buffers, growth)?;
+        let charged_capacity = body_raw.capacity() + growth;
+
+        let pending_map = builder.and_then(|(mut builder, map_origin_bytes)| {
+            let total_src_bytes = builder.sources_content_bytes();
+            let label_base_bytes = opts
+                .source_map_base
+                .as_ref()
+                .map_or(0, |base| base.as_os_str().len());
+            let prefix_lines = prefix.as_deref().map_or(0, count_newlines);
+            if !builder.segments_dropped
+                && !charge_finalize(
+                    mem,
+                    &builder,
+                    &body_raw,
+                    FinalizeCosts {
+                        content: if opts.include_sources_content
+                            && total_src_bytes <= MAX_SOURCES_CONTENT_BYTES
+                        {
+                            total_src_bytes
+                        } else {
+                            0
+                        },
+                        map_origin_bytes,
+                        prefix_lines,
+                        label_base_bytes,
+                    },
+                )
+            {
+                builder.segments_dropped = true;
+            }
+            apply_map_degradation(builder, total_src_bytes, opts, warnings)
+                .map(|b| b.finalize_points(&body_raw))
+        });
         let mut body = crate::clean_output_owned(body_raw, fm_prefix_len);
         if let Some(prefix) = prefix {
             if body.is_empty() {
@@ -1175,8 +1325,14 @@ impl ModuleCache {
                 body.insert_str(0, &prefix);
             }
         }
+        if body.capacity() > charged_capacity {
+            mem.charge(Part::Buffers, body.capacity() - charged_capacity)?;
+        } else {
+            mem.release_buffers(charged_capacity - body.capacity());
+        }
 
         let source_map = pending_map.map(|map| map.finish(&body, fm_prefix_len, None));
+        mem.release_to(mark);
         self.anchor_root_for_source_map(base_dir);
         // Relativize every source label before the caller receives the map.
         let source_map = source_map.map(|mut sm| {
@@ -1188,7 +1344,7 @@ impl ModuleCache {
             }
             sm
         });
-        (crate::CompiledOutput::Markdown(body), source_map)
+        Ok((crate::CompiledOutput::Markdown(body), source_map))
     }
 
     /// Assert the LIFO pop invariant after `process_module`.
@@ -1231,9 +1387,6 @@ impl ModuleCache {
         let tokens = tokenize(ctx.source, ctx.file_str)?;
         let module = parse_with_ctx(&tokens, ctx.file_str, ctx.source)?;
 
-        // Capture raw frontmatter before build_scope_from_frontmatter borrows the module.
-        let raw_frontmatter = module.frontmatter.as_ref().map(|fm| fm.raw.clone());
-
         // Parse frontmatter YAML once for both scope building and storage.
         let frontmatter_values = parse_frontmatter_mapping(module.frontmatter.as_ref())?;
 
@@ -1243,6 +1396,7 @@ impl ModuleCache {
         }
 
         // ── Standalone (non-extending) path ──────────────────────────────────
+        let raw_frontmatter = self.copy_raw_frontmatter(&module)?;
 
         // Build scope from frontmatter + runtime vars; extract any frontmatter imports.
         let (mut scope, fm_imports) =
@@ -1271,7 +1425,7 @@ impl ModuleCache {
         // `ResolvedModule::is_exported` applies).
         let prompt_exported = is_visible_export(has_explicit_exports, &explicit_exports, "prompt");
 
-        let origin = ctx.origin();
+        let origin = ctx.origin(self)?;
 
         // Evaluate the body to get prompt text (and optionally a FragmentMap).
         //
@@ -1305,7 +1459,7 @@ impl ModuleCache {
             None
         };
         let (prompt_body, prompt_map) =
-            prompt_body_and_map(body_raw, builder, ctx.file_str, warnings);
+            self.prompt_body_and_map(body_raw, builder, ctx.file_str, warnings);
 
         // Build effective_blocks first so module.body can be moved into the Arc below.
         let effective_blocks = seed_effective_blocks(&module.body, &block_names, origin);
@@ -1492,7 +1646,8 @@ impl ModuleCache {
 
         // ── Step 3c: build effective_blocks from base, applying child overrides ──
         // Clone base's map first (diamond-inheritance safe — never mutate cached base).
-        let effective_blocks = apply_block_overrides(&base.effective_blocks, &module.body, ctx)?;
+        let effective_blocks =
+            apply_block_overrides(&base.effective_blocks, &module.body, ctx, self)?;
 
         // effective_skeleton is the root ancestor's body (Arc::clone — O(1), no deep-copy, P1).
         let effective_skeleton = Arc::clone(&base.effective_skeleton);
@@ -1625,7 +1780,7 @@ impl ModuleCache {
             self.budget.start_module(),
         )?;
         let (prompt_body, prompt_map) =
-            prompt_body_and_map(body_raw, builder, ctx.file_str, warnings);
+            self.prompt_body_and_map(body_raw, builder, ctx.file_str, warnings);
 
         let namespace = ResolvedModule::build_namespace(
             &functions,
@@ -1691,24 +1846,34 @@ impl ModuleCache {
         check_module_type(module, &source).map_err(|err| import_site.attach_type_error(err))?;
 
         self.start_resolution(key);
-
-        let base_dir_owned = self.fs.parent_dir(key);
-        let display_owned = crate::source_path::display_path_for(&*self.fs, key);
-        let ctx = ModuleCtx {
-            key,
-            file_str: &display_owned,
-            source: &source,
-            base_dir: &base_dir_owned,
-            runtime_vars,
-            origin: OnceCell::new(),
-        };
-        let resolved = self.process_module_skeleton(&ctx, is_md, warnings);
+        let (mark, read) = self.open_module(source.capacity());
+        let resolved = read.and_then(|()| {
+            let base_dir_owned = self.fs.parent_dir(key);
+            let display_owned = crate::source_path::display_path_for(&*self.fs, key);
+            let ctx = ModuleCtx {
+                key,
+                file_str: &display_owned,
+                source: &source,
+                base_dir: &base_dir_owned,
+                runtime_vars,
+                origin: OnceCell::new(),
+            };
+            self.process_module_skeleton(&ctx, is_md, warnings)
+        });
+        #[cfg(test)]
+        let probe = mark.probe;
+        let kept = self.close_module(mark);
 
         let popped = self.resolving.pop();
         let resolved = Self::check_lifo_pop(resolved, popped, key)?;
 
         let arc = Arc::new(resolved);
         self.modules.insert(key.to_string(), Arc::clone(&arc));
+        self.commit_retained(kept);
+        #[cfg(test)]
+        {
+            self.module_probes[probe].buffers_after_insert = Some(self.budget.mem.buffers);
+        }
         Ok(arc)
     }
 
@@ -1767,7 +1932,8 @@ impl ModuleCache {
         // Child-only-blocks check for this intermediate base (3b).
         check_child_only_blocks(module_body, ctx)?;
 
-        let eff_blocks = apply_block_overrides(&grandparent.effective_blocks, module_body, ctx)?;
+        let eff_blocks =
+            apply_block_overrides(&grandparent.effective_blocks, module_body, ctx, self)?;
 
         // skeleton_origin Arc::clone'd from grandparent — the root base's source bytes
         // ride down the chain so the leaf's validate_extends_components can attribute
@@ -1809,7 +1975,7 @@ impl ModuleCache {
         let tokens = tokenize(ctx.source, ctx.file_str)?;
         let module = parse_with_ctx(&tokens, ctx.file_str, ctx.source)?;
 
-        let raw_frontmatter = module.frontmatter.as_ref().map(|fm| fm.raw.clone());
+        let raw_frontmatter = self.copy_raw_frontmatter(&module)?;
         // own_fm_values: this module's raw frontmatter (not yet merged with ancestors).
         let own_fm_values = parse_frontmatter_mapping(module.frontmatter.as_ref())?;
 
@@ -1837,7 +2003,7 @@ impl ModuleCache {
                 self.resolve_intermediate_base(ext, &own_fm_values, &module.body, ctx, warnings)?
             } else {
                 // Root base: own body is the skeleton; blocks seeded from own @block declarations.
-                let root_origin = ctx.origin().clone();
+                let root_origin = ctx.origin(self)?.clone();
                 // Seed blocks first so module.body can be moved into the Arc (no element clones, P1).
                 let eff_blocks = seed_effective_blocks(&module.body, &block_names, &root_origin);
                 let eff_skeleton: Arc<[Node]> = Arc::from(module.body);
@@ -1897,7 +2063,7 @@ impl ModuleCache {
         for node in body {
             count_module_defines(node, &mut define_count)?;
             match node {
-                Node::Define(def) => collect_define(def, &mut defs, scope, ctx)?,
+                Node::Define(def) => collect_define(def, &mut defs, scope, ctx, self)?,
                 Node::Import(import) => self.resolve_import(import, scope, ctx, warnings)?,
                 Node::Export(export) => self.collect_export(export, &mut defs, ctx, warnings)?,
                 Node::Block(block) => {
@@ -2353,12 +2519,27 @@ impl ImportSite<'_> {
 }
 
 impl ModuleCtx<'_> {
-    fn origin(&self) -> &Origin {
-        self.origin.get_or_init(|| Origin {
+    fn origin(&self, cache: &mut ModuleCache) -> Result<&Origin, MdsError> {
+        if self.origin.get().is_none() {
+            cache.charge_kept(self.origin_bytes())?;
+        }
+        Ok(self.origin.get_or_init(|| self.make_origin()))
+    }
+
+    fn origin_bytes(&self) -> usize {
+        self.source
+            .len()
+            .saturating_add(self.key.len())
+            .saturating_add(self.file_str.len())
+            .saturating_add(6 * size_of::<usize>())
+    }
+
+    fn make_origin(&self) -> Origin {
+        Origin {
             file: Arc::from(self.key),
             display: Arc::from(self.file_str),
             source: Arc::from(self.source),
-        })
+        }
     }
 
     fn import_site(&self, offset: usize) -> ImportSite<'_> {
@@ -2448,25 +2629,82 @@ fn fragment_map_from(
     body.map(|_| Arc::new(builder.into_fragment()))
 }
 
-/// The `(prompt_body, prompt_map)` `ResolvedModule` fields, from a module's evaluated
-/// body and — when source maps are on for it — the builder that recorded it.
-///
-/// Shared by both module paths (`process_module`, `process_module_extends`): an empty
-/// body clears to `None` either way, and the map is kept only when [`fragment_map_from`]
-/// finds one worth splicing.
-fn prompt_body_and_map(
-    body_raw: String,
-    builder: Option<crate::sourcemap::MapBuilder>,
-    display: &str,
-    warnings: &mut Vec<String>,
-) -> (
-    Option<PromptText>,
-    Option<Arc<crate::sourcemap::FragmentMap>>,
-) {
-    let prompt_body = (!body_raw.trim().is_empty()).then(|| PromptText::from(body_raw));
-    let prompt_map =
-        builder.and_then(|b| fragment_map_from(b, prompt_body.as_deref(), display, warnings));
-    (prompt_body, prompt_map)
+impl ModuleCache {
+    fn prompt_body_and_map(
+        &mut self,
+        body_raw: String,
+        builder: Option<MapBuilder>,
+        display: &str,
+        warnings: &mut Vec<String>,
+    ) -> (
+        Option<PromptText>,
+        Option<Arc<crate::sourcemap::FragmentMap>>,
+    ) {
+        let capacity = body_raw.capacity();
+        let prompt_body = if body_raw.trim().is_empty() {
+            self.budget
+                .mem
+                .transfer(Part::Buffers, Part::Temp, capacity);
+            None
+        } else {
+            // Evaluation charged this capacity before its allocation.
+            self.kept += capacity;
+            Some(PromptText::from(body_raw))
+        };
+        let prompt_map = builder.and_then(|mut builder| {
+            if prompt_body.is_some()
+                && !builder.segments_dropped
+                && self.charge_kept(builder.segments_bytes()).is_err()
+            {
+                builder.segments_dropped = true;
+            }
+            fragment_map_from(builder, prompt_body.as_deref(), display, warnings)
+        });
+        (prompt_body, prompt_map)
+    }
+}
+
+struct FinalizeCosts {
+    content: usize,
+    map_origin_bytes: usize,
+    prefix_lines: usize,
+    label_base_bytes: usize,
+}
+
+fn count_newlines(text: &str) -> usize {
+    text.bytes().filter(|&byte| byte == b'\n').count()
+}
+
+fn charge_finalize(
+    mem: &mut crate::evaluator::budget::MemBudget,
+    builder: &MapBuilder,
+    body: &str,
+    costs: FinalizeCosts,
+) -> bool {
+    let n = builder.segment_count() + count_newlines(body);
+    let points = bytes(n, 36);
+    // Points (16 B), resolved points (20 B), and the sampled CR table.
+    let work = points
+        .and_then(|n| n.checked_add(4 * (body.len() / 64 + 1)))
+        .and_then(|n| n.checked_add(builder.segments_bytes()))
+        .and_then(|n| n.checked_add(costs.map_origin_bytes));
+    // A frontmatter line can also add a semicolon before the first point.
+    let output = points
+        .and_then(|n| n.checked_add(bytes(costs.prefix_lines, 2)?))
+        .and_then(|n| n.checked_add(costs.content))
+        .and_then(|n| n.checked_add(builder.source_labels_bytes(costs.label_base_bytes)?));
+    let mark = mem.mark();
+    if mem.charge(Part::Temp, work.unwrap_or(usize::MAX)).is_err() {
+        return false;
+    }
+    if mem
+        .charge(Part::Buffers, output.unwrap_or(usize::MAX))
+        .is_err()
+    {
+        mem.release_to(mark);
+        return false;
+    }
+    true
 }
 
 /// Apply AC-PERF-03 and AC-SEC-04 degradation checks to a completed builder.
@@ -2477,8 +2715,9 @@ fn prompt_body_and_map(
 ///   `no_sources_content` so [`crate::sourcemap::PendingMap::finish`] omits the array.
 /// - Caller opt-out: `!opts.include_sources_content` also sets the flag.
 fn apply_map_degradation(
-    mut builder: crate::sourcemap::MapBuilder,
-    opts: &crate::sourcemap::CompileOptions,
+    mut builder: MapBuilder,
+    total_src_bytes: usize,
+    opts: &CompileOptions,
     warnings: &mut Vec<String>,
 ) -> Option<crate::sourcemap::MapBuilder> {
     if builder.segments_dropped {
@@ -2489,8 +2728,7 @@ fn apply_map_degradation(
         ));
         return None;
     }
-    let total_src_bytes = builder.sources_content_bytes();
-    if total_src_bytes > crate::limits::MAX_SOURCES_CONTENT_BYTES {
+    if total_src_bytes > MAX_SOURCES_CONTENT_BYTES {
         warnings.push(format!(
             "sourcesContent total size ({} bytes) exceeds the {} byte ceiling; \
              sourcesContent will be omitted from the source map",
@@ -2588,6 +2826,7 @@ fn collect_define(
     defs: &mut CollectedDefs,
     scope: &mut Scope,
     ctx: &ModuleCtx<'_>,
+    cache: &mut ModuleCache,
 ) -> Result<(), MdsError> {
     if defs.functions.contains_key(&def.name) || defs.block_names.contains(&def.name) {
         return Err(MdsError::name_collision_at(
@@ -2601,7 +2840,7 @@ fn collect_define(
     let mut func = FunctionDef::from(def);
     // Freeze the definition site before inserting this function into scope.
     func.captured = scope.capture()?;
-    func.origin = Some(ctx.origin().clone());
+    func.origin = Some(ctx.origin(cache)?.clone());
     // Wrap in Arc for cheap storage and O(1) scope insertion.
     let arc = Arc::new(func);
     defs.functions.insert(def.name.clone(), Arc::clone(&arc));

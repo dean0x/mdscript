@@ -5469,3 +5469,393 @@ fn not_mds_entry_and_frontmatter_imports_keep_no_span() {
         assert!(err.source_name().is_none());
     }
 }
+
+fn limit_cache_headroom(cache: &mut ModuleCache, headroom: usize) {
+    let prior = MAX_COMPILE_MEMORY - headroom;
+    cache.budget.mem.charge(Part::Buffers, prior).unwrap();
+    cache.commit_retained(prior);
+}
+
+#[test]
+fn cached_module_moves_its_text_and_fragment_to_retained() {
+    let key = "part.mds";
+    let raw = "label: value\n";
+    let body = "body\n";
+    let source = format!("---\n{raw}---\n{body}");
+    let mut cache = virtual_cache(&[(key, &source)]);
+    cache.source_map_mode = true;
+    let resolved = cache
+        .resolve_key(key, &Default::default(), &mut vec![])
+        .unwrap();
+    assert_eq!(resolved.raw_frontmatter.as_deref(), Some(raw));
+    assert_eq!(resolved.prompt_body.as_deref(), Some(body));
+    assert_eq!(
+        resolved.frontmatter_values.as_ref().unwrap()["label"],
+        "value"
+    );
+    let vars = Arc::default();
+    let ctx = extends_ctx(&source, &vars);
+    let mut builder = MapBuilder::new(ctx.make_origin());
+    builder.push_segment(0, 0, body.len() as u32);
+    assert!(resolved.prompt_map.is_some());
+    let origin_bytes = source.len() + 2 * key.len() + 6 * size_of::<usize>();
+    assert_eq!(
+        cache.retained,
+        origin_bytes + raw.len() + body.len() + builder.segments_bytes()
+    );
+    assert_eq!(
+        cache.budget.mem.headroom,
+        MAX_COMPILE_MEMORY - cache.retained
+    );
+    assert_eq!(cache.budget.mem.buffers, 0);
+}
+
+#[test]
+fn cached_modules_count_across_resolve_calls() {
+    let files = [("one.mds", "one\n"), ("two.mds", "two\n")];
+    let run =
+        |cache: &mut ModuleCache, key| cache.resolve_key(key, &Default::default(), &mut vec![]);
+    let cost = 2 * ("one\n".len() + "one.mds".len()) + 6 * size_of::<usize>();
+    let mut reused = virtual_cache(&files);
+    limit_cache_headroom(&mut reused, 2 * cost - 1);
+    run(&mut reused, "one.mds").unwrap();
+    let error = run(&mut reused, "two.mds").unwrap_err().serialize();
+    assert_eq!(error.code, "mds::resource_limit");
+    assert_eq!(
+        error.message,
+        "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
+    );
+    assert!(error.span.is_none());
+    assert!(error.help.is_none());
+    assert_eq!(reused.dependencies(), ["one.mds"]);
+    assert!(reused.resolving.is_empty());
+    let mut fresh = virtual_cache(&files);
+    limit_cache_headroom(&mut fresh, 2 * cost - 1);
+    assert_eq!(
+        run(&mut fresh, "two.mds").unwrap().prompt_body.as_deref(),
+        Some("two\n")
+    );
+}
+
+#[test]
+fn fragment_refusal_keeps_prompt_and_uses_existing_warning() {
+    let files = [("part.mds", "body\n")];
+    let mut control = virtual_cache(&files);
+    control.source_map_mode = true;
+    let key = "part.mds";
+    let control_part = control
+        .resolve_key(key, &Default::default(), &mut vec![])
+        .unwrap();
+    assert!(control_part.prompt_map.is_some());
+
+    let mut tight = virtual_cache(&files);
+    tight.source_map_mode = true;
+    // Leave enough for the read and all retained text, but not the fragment.
+    let text = "body\n".len();
+    limit_cache_headroom(
+        &mut tight,
+        3 * text + 2 * key.len() + 6 * size_of::<usize>(),
+    );
+    let mut warnings = vec![];
+    let part = tight
+        .resolve_key(key, &Default::default(), &mut warnings)
+        .unwrap();
+    assert_eq!(
+        part.prompt_body.as_deref(),
+        control_part.prompt_body.as_deref()
+    );
+    assert!(part.prompt_map.is_none());
+    assert_eq!(warnings, ["source map segment cap (1000000 segments) exceeded in imported module 'part.mds'; text included from it is left unmapped in the source map"]);
+    assert_eq!(tight.budget.mem.buffers, 0);
+}
+
+struct PaddedReads(VirtualFs);
+
+impl FileSystem for PaddedReads {
+    fn resolve_entry(&self, path: &str) -> Result<String, MdsError> {
+        self.0.resolve_entry(path)
+    }
+
+    fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError> {
+        self.0.normalize_in_dir(dir, relative)
+    }
+
+    fn parent_dir(&self, key: &str) -> String {
+        self.0.parent_dir(key)
+    }
+
+    fn read(&self, key: &str) -> Result<String, MdsError> {
+        let source = self.0.read(key)?;
+        let mut padded = String::with_capacity(128);
+        padded.push_str(&source);
+        Ok(padded)
+    }
+
+    fn is_markdown(&self, key: &str) -> bool {
+        self.0.is_markdown(key)
+    }
+}
+
+#[test]
+fn module_reads_release_to_parent_and_inserts_keep_only_warnings() {
+    let files = [
+        (
+            "main.mds",
+            "@import \"./a.mds\" as a\n@import \"./b.mds\" as b\n@include b\n",
+        ),
+        (
+            "a.mds",
+            "@import \"./empty.mds\" as empty\n@include empty\n",
+        ),
+        ("b.mds", "body\n"),
+        ("empty.mds", "   \n"),
+    ];
+    let fs = VirtualFs::new(
+        files
+            .map(|(key, src)| (key.to_owned(), src.to_owned()))
+            .into(),
+    );
+    let mut cache = ModuleCache::with_fs(Box::new(PaddedReads(fs)));
+    let mut warnings = vec![];
+    let (output, _) = cache
+        .resolve_virtual_intrinsic_opts(
+            "main.mds",
+            &Default::default(),
+            &CompileOptions::default(),
+            &mut warnings,
+        )
+        .unwrap();
+    assert_eq!(output, crate::CompiledOutput::Markdown("body\n".to_owned()));
+    assert_eq!(warnings.len(), 1);
+    let [root, a, empty, b] = cache.module_probes.as_slice() else {
+        panic!("four modules")
+    };
+    for (probe, outer) in [(root, 0), (a, 128), (empty, 256), (b, 128)] {
+        assert_eq!(probe.temporaries_before, outer);
+        assert_eq!(probe.temporaries_open, outer + 128);
+        assert_eq!(probe.temporaries_closed, outer);
+    }
+    assert_eq!(
+        a.buffers_after_insert,
+        Some(a.buffers_before + warnings[0].len())
+    );
+    for probe in [empty, b] {
+        assert_eq!(probe.buffers_after_insert, Some(probe.buffers_before));
+    }
+    assert_eq!(cache.budget.mem.mark(), 0);
+}
+
+#[test]
+fn refused_root_read_releases_the_module_mark() {
+    let fs = VirtualFs::new(HashMap::from([("main.mds".to_owned(), "body".to_owned())]));
+    let mut cache = ModuleCache::with_fs(Box::new(PaddedReads(fs)));
+    limit_cache_headroom(&mut cache, 127);
+    let vars = Default::default();
+    let mut warnings = vec![];
+    let error = cache
+        .resolve_virtual_intrinsic("main.mds", &vars, &mut warnings)
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
+    );
+    assert!(cache.resolving.is_empty());
+    assert_eq!(cache.budget.mem.mark(), 0);
+    assert_eq!(
+        cache
+            .resolve_source_intrinsic("body", "", &vars, &mut warnings)
+            .unwrap(),
+        crate::CompiledOutput::Markdown("body\n".to_owned())
+    );
+}
+
+#[test]
+fn skeleton_upgrade_adds_to_the_old_retained_charge() {
+    let files = [
+        ("base.mds", "body\n"),
+        ("child.mds", "@extends \"./base.mds\"\n"),
+    ];
+    let mut cache = virtual_cache(&files);
+    let vars = Default::default();
+    let mut warnings = vec![];
+    cache
+        .resolve_key("child.mds", &vars, &mut warnings)
+        .unwrap();
+    assert!(cache.modules["base.mds"].is_skeleton);
+    let before = cache.retained;
+    let upgraded = cache.resolve_key("base.mds", &vars, &mut warnings).unwrap();
+    assert_eq!(upgraded.prompt_body.as_deref(), Some("body\n"));
+    let mut fresh = virtual_cache(&files);
+    fresh.resolve_key("base.mds", &vars, &mut warnings).unwrap();
+    assert_eq!(cache.retained, before + fresh.retained);
+}
+
+#[test]
+fn finalize_refusal_keeps_output_and_releases_map_work() {
+    let mut cache = virtual_cache(&[]);
+    let source = "body\n";
+    let opts = CompileOptions::default()
+        .with_source_map(true)
+        .with_include_sources_content(true);
+    let compile = |cache: &mut ModuleCache, opts: &CompileOptions, warnings: &mut Vec<String>| {
+        cache
+            .resolve_source_intrinsic_opts(source, "", &Default::default(), opts, warnings)
+            .unwrap()
+    };
+    let (_, control_map) = compile(&mut cache, &opts, &mut vec![]);
+    assert_eq!(
+        control_map.unwrap().sources_content,
+        Some(vec![source.to_owned()])
+    );
+    let (plain, _) = compile(&mut cache, &CompileOptions::default(), &mut vec![]);
+    // Enough to charge the work arrays and body, but not the retained map.
+    limit_cache_headroom(&mut cache, 230);
+    let mut warnings = vec![];
+    let (tight, dropped) = compile(&mut cache, &opts, &mut warnings);
+    assert_eq!(tight, plain);
+    assert!(dropped.is_none());
+    assert_eq!(
+        warnings,
+        ["source map segment cap (1000000 segments) exceeded; no source map will be generated"]
+    );
+    assert_eq!(cache.budget.mem.mark(), 0);
+    assert_eq!(cache.budget.mem.buffers, source.len());
+
+    // The failed map reservation must restore the parent's live bytes immediately.
+    let vars = Arc::default();
+    let ctx = extends_ctx(source, &vars);
+    let mut builder = MapBuilder::new(ctx.make_origin());
+    builder.push_segment(0, 0, source.len() as u32);
+    let mem = &mut cache.budget.mem;
+    mem.charge(Part::Temp, 3).unwrap();
+    let before = *mem;
+    let costs = FinalizeCosts {
+        content: source.len(),
+        map_origin_bytes: ctx.origin_bytes(),
+        prefix_lines: 0,
+        label_base_bytes: 0,
+    };
+    assert!(!charge_finalize(mem, &builder, source, costs));
+    assert_eq!(*mem, before);
+}
+
+#[test]
+fn final_output_charges_prefix_and_growth_before_the_reserve() {
+    let cases = [
+        "body".to_owned(),
+        "body".to_owned() + &" ".repeat(50),
+        " ".repeat(50),
+    ];
+    let raw = "label: value\n";
+    for body in cases {
+        let growth = raw.len() + 8 + usize::from(!body.trim_end().is_empty());
+        let needed = body.len() + 2 * raw.len() + 9 + growth;
+        let source = format!("---\n{raw}---\n{body}");
+        let compile = |headroom| {
+            let mut cache = virtual_cache(&[]);
+            limit_cache_headroom(&mut cache, headroom);
+            cache
+                .resolve_source_intrinsic_opts(
+                    &source,
+                    "",
+                    &Default::default(),
+                    &Default::default(),
+                    &mut vec![],
+                )
+                .map(|output| (output, cache.budget.mem))
+        };
+        let (output, mem) = compile(needed).unwrap();
+        let crate::CompiledOutput::Markdown(output) = output.0 else {
+            panic!("markdown output")
+        };
+        assert_eq!(
+            output,
+            format!(
+                "---\n{raw}---\n{}",
+                if body.trim_end().is_empty() {
+                    ""
+                } else {
+                    "body\n"
+                }
+            )
+        );
+        assert_eq!(mem.buffers, output.capacity());
+        assert_eq!(mem.mark(), 0);
+        assert_eq!(
+            compile(needed - 1).unwrap_err().to_string(),
+            "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
+        );
+        assert_eq!(
+            compile(body.len() + 2 * raw.len() + 8)
+                .unwrap_err()
+                .to_string(),
+            "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
+        );
+    }
+}
+
+#[test]
+fn only_commit_retained_updates_cache_headroom() {
+    fn writes(source: &str, field: &str) -> usize {
+        source
+            .match_indices(field)
+            .filter(|(pos, _)| {
+                let tail = &source[pos + field.len()..];
+                let first = tail.as_bytes().first().copied();
+                (tail.starts_with('=') && !tail.starts_with("=="))
+                    || (first.is_some_and(|byte| b"+-*/%&|^".contains(&byte))
+                        && tail.as_bytes().get(1) == Some(&b'='))
+            })
+            .count()
+    }
+
+    fn code(source: &str) -> String {
+        source
+            .lines()
+            .flat_map(|line| {
+                line.split_once("//")
+                    .map_or(line, |(code, _)| code)
+                    .split_whitespace()
+            })
+            .collect()
+    }
+
+    fn valid(resolver: &str, evaluator: &str) -> bool {
+        let resolver = code(resolver);
+        let evaluator = code(evaluator);
+        let Some((_, commit)) = resolver.split_once("fncommit_retained(") else {
+            return false;
+        };
+        let body = commit.split("}fn").next().unwrap_or_default();
+        [".retained", ".headroom"].iter().all(|field| {
+            writes(&resolver, field) == 1
+                && writes(body, field) == 1
+                && writes(&evaluator, field) == 0
+        }) && !evaluator.contains("ModuleCache")
+            && !evaluator.contains(".resolve_")
+    }
+
+    let resolver = include_str!("resolver.rs");
+    let evaluator = concat!(
+        include_str!("evaluator.rs"),
+        include_str!("evaluator/budget.rs")
+    );
+    assert!(valid(resolver, evaluator));
+    assert!(!valid(
+        &format!("{resolver}\nself.retained = 0;"),
+        evaluator
+    ));
+    assert!(!valid(&format!("{resolver}\nmem.headroom = 0;"), evaluator));
+    assert!(!valid(
+        resolver,
+        &format!("{evaluator}\nmem.headroom -= 1;")
+    ));
+    assert!(!valid(
+        resolver,
+        &format!("{evaluator}\nuse crate::resolver::ModuleCache;")
+    ));
+    assert!(!valid(
+        resolver,
+        &format!("{evaluator}\ncache.resolve_by_key(key);")
+    ));
+}

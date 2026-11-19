@@ -9,7 +9,7 @@ use crate::{
 pub(crate) const NODE: usize = size_of::<Value>();
 pub(super) const VALUE_ROOT: usize = NODE + 2 * size_of::<usize>();
 
-pub(super) fn bytes(count: usize, unit: usize) -> Option<usize> {
+pub(crate) fn bytes(count: usize, unit: usize) -> Option<usize> {
     count.checked_mul(unit)
 }
 
@@ -149,14 +149,14 @@ impl fmt::Write for Counter {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct MemBudget {
-    headroom: usize,
-    buffers: usize,
+pub(crate) struct MemBudget {
+    pub(crate) headroom: usize,
+    pub(crate) buffers: usize,
     temporaries: usize,
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum Part {
+pub(crate) enum Part {
     Buffers,
     Temp,
 }
@@ -173,7 +173,7 @@ impl Default for MemBudget {
 
 impl MemBudget {
     #[inline(never)]
-    pub(super) fn charge(&mut self, part: Part, n: usize) -> Result<(), MdsError> {
+    pub(crate) fn charge(&mut self, part: Part, n: usize) -> Result<(), MdsError> {
         let total = self
             .buffers
             .checked_add(self.temporaries)
@@ -188,23 +188,23 @@ impl MemBudget {
         Ok(())
     }
 
-    pub(super) fn mark(&self) -> usize {
+    pub(crate) fn mark(&self) -> usize {
         self.temporaries
     }
 
-    pub(super) fn release_to(&mut self, mark: usize) {
+    pub(crate) fn release_to(&mut self, mark: usize) {
         if self.temporaries.checked_sub(mark).is_some() {
             self.temporaries = mark;
         }
     }
 
-    pub(super) fn release_buffers(&mut self, n: usize) {
+    pub(crate) fn release_buffers(&mut self, n: usize) {
         if let Some(buffers) = self.buffers.checked_sub(n) {
             self.buffers = buffers;
         }
     }
 
-    pub(super) fn transfer(&mut self, from: Part, to: Part, n: usize) {
+    pub(crate) fn transfer(&mut self, from: Part, to: Part, n: usize) {
         let (from, to) = match (from, to) {
             (Part::Buffers, Part::Temp) => (&mut self.buffers, &mut self.temporaries),
             (Part::Temp, Part::Buffers) => (&mut self.temporaries, &mut self.buffers),

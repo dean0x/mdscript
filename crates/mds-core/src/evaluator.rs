@@ -74,7 +74,7 @@ pub(crate) struct EvalBudget {
     /// growth is caught before a giant `Vec` is built.
     message_bytes: usize,
     function_calls: usize,
-    mem: MemBudget,
+    pub(crate) mem: MemBudget,
 }
 
 impl EvalBudget {

@@ -1,8 +1,4 @@
-//! Pure helper functions for `@extends` / `@block` template inheritance.
-//!
-//! These are free functions extracted from `resolver.rs` that operate only on
-//! shared types (`Origin`, `EffectiveBlock`, `ModuleCtx`, `Node`) without
-//! requiring any `&mut self` access.
+//! Helpers for `@extends` / `@block` template inheritance.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -12,7 +8,7 @@ use indexmap::IndexMap;
 use crate::ast::Node;
 use crate::error::MdsError;
 
-use super::{EffectiveBlock, ModuleCtx, Origin};
+use super::{EffectiveBlock, ModuleCache, ModuleCtx, Origin};
 
 /// Build the initial `effective_blocks` map for a non-extending module.
 ///
@@ -109,6 +105,7 @@ pub(super) fn apply_block_overrides(
     parent_blocks: &IndexMap<String, EffectiveBlock>,
     body: &[Node],
     ctx: &ModuleCtx<'_>,
+    cache: &mut ModuleCache,
 ) -> Result<IndexMap<String, EffectiveBlock>, MdsError> {
     let mut blocks = parent_blocks.clone();
 
@@ -129,7 +126,7 @@ pub(super) fn apply_block_overrides(
                 b.name.clone(),
                 EffectiveBlock {
                     node: Arc::new(b.clone()),
-                    origin: ctx.origin().clone(),
+                    origin: ctx.origin(cache)?.clone(),
                 },
             );
         }
