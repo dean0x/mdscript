@@ -412,19 +412,27 @@ impl ModuleCache {
     }
 
     fn commit_retained(&mut self, kept: usize) {
-        let Some(buffers) = self.budget.mem.buffers.checked_sub(kept) else {
-            return;
-        };
-        let Some(retained) = self
-            .retained
-            .checked_add(kept)
-            .filter(|n| *n <= MAX_COMPILE_MEMORY)
-        else {
+        let (Some(buffers), Some(retained @ ..=MAX_COMPILE_MEMORY)) = (
+            self.budget.mem.buffers.checked_sub(kept),
+            self.retained.checked_add(kept),
+        ) else {
+            self.budget.mem.underflow = true;
             return;
         };
         self.budget.mem.buffers = buffers;
         self.retained = retained;
         self.budget.mem.headroom = MAX_COMPILE_MEMORY - retained;
+    }
+
+    fn retain_module(&mut self, key: &str, module: &Arc<ResolvedModule>, kept: usize) {
+        // Do not publish an entry from a failed counter check.
+        if self.budget.mem.underflow || (self.resolving.is_empty() && self.budget.mem.mark() != 0) {
+            return;
+        }
+        self.commit_retained(kept);
+        if !self.budget.mem.underflow {
+            self.modules.insert(key.to_string(), Arc::clone(module));
+        }
     }
 
     fn copy_raw_frontmatter(
@@ -657,12 +665,9 @@ impl ModuleCache {
         let probe = mark.probe;
         let kept = self.close_module(mark);
 
-        // Unmark regardless of success or failure. resolve/unmark is strictly LIFO
-        // (we always remove the last element we inserted), so pop() is O(1).
-        // Safety-critical LIFO invariant: a mismatched pop would silently corrupt
-        // cycle-detection state and allow unbounded recursion.
-        let popped = self.resolving.pop();
-        let mut resolved = Self::check_lifo_pop(resolved, popped, key)?;
+        let popped = self.pop_resolving(key);
+        let mut resolved = resolved?;
+        popped?;
 
         // A1 upgrade: if a skeleton entry was previously cached for this key, reuse its
         // Arc-shared skeleton/blocks/origin so descendants that already Arc::clone'd them
@@ -676,18 +681,16 @@ impl ModuleCache {
             }
         }
 
-        // Wrap in Arc, store in cache, and return a clone of the Arc (O(1)).
-        let key_owned = key.to_string();
         let arc = Arc::new(resolved);
-        self.modules.insert(key_owned, Arc::clone(&arc));
         #[cfg(test)]
         let kept = kept + self.retained_transfer_seed;
-        self.commit_retained(kept);
+        self.retain_module(key, &arc, kept);
         #[cfg(test)]
         {
             self.module_probes[probe].buffers_after_insert = Some(self.budget.mem.buffers);
         }
 
+        self.finish_root()?;
         Ok(arc)
     }
 
@@ -776,8 +779,11 @@ impl ModuleCache {
         let resolved = read.and_then(|()| self.process_module(&ctx, false, warnings));
         self.close_module(mark);
 
-        let popped = self.resolving.pop();
-        Self::check_lifo_pop(resolved, popped, SOURCE_LABEL).map(Arc::new)
+        let popped = self.pop_resolving(SOURCE_LABEL);
+        let resolved = resolved?;
+        popped?;
+        self.finish_root()?;
+        Ok(Arc::new(resolved))
     }
 
     /// Resolve a virtual-filesystem entry by key, dispatching on output shape.
@@ -888,8 +894,11 @@ impl ModuleCache {
         });
         self.close_module(mark);
 
-        let popped = self.resolving.pop();
-        Self::check_lifo_pop(result, popped, key).map(|result| (result, source))
+        let popped = self.pop_resolving(key);
+        let result = result?;
+        popped?;
+        self.finish_root()?;
+        Ok((result, source))
     }
 
     /// Resolve a module from an in-memory source string, dispatching on output shape.
@@ -919,8 +928,11 @@ impl ModuleCache {
         };
         let result = read.and_then(|()| self.process_module_intrinsic(&ctx, false, warnings));
         self.close_module(mark);
-        let popped = self.resolving.pop();
-        Self::check_lifo_pop(result, popped, SOURCE_LABEL)
+        let popped = self.pop_resolving(SOURCE_LABEL);
+        let result = result?;
+        popped?;
+        self.finish_root()?;
+        Ok(result)
     }
 
     /// Like [`Self::resolve_source_intrinsic`] but accepts [`crate::CompileOptions`] and
@@ -950,8 +962,11 @@ impl ModuleCache {
         let result =
             read.and_then(|()| self.process_module_intrinsic_opts(&ctx, false, opts, warnings));
         self.close_module(mark);
-        let popped = self.resolving.pop();
-        Self::check_lifo_pop(result, popped, SOURCE_LABEL)
+        let popped = self.pop_resolving(SOURCE_LABEL);
+        let result = result?;
+        popped?;
+        self.finish_root()?;
+        Ok(result)
     }
 
     /// Evaluate spliced `@extends` regions in order, accumulating their output and,
@@ -1361,16 +1376,13 @@ impl ModuleCache {
         Ok((crate::CompiledOutput::Markdown(body), source_map))
     }
 
-    /// Assert the LIFO pop invariant after `process_module`.
-    ///
-    /// On double-fault (module error + LIFO violation), prefer the module error
-    /// (user-facing root cause) over the LIFO violation (internal compiler bug).
-    fn check_lifo_pop<T>(
-        module_result: Result<T, MdsError>,
-        popped: Option<String>,
-        expected: &str,
-    ) -> Result<T, MdsError> {
-        let lifo_result = if popped.as_deref() == Some(expected) {
+    // Call even on error. Only propagate the pop error if the module result is Ok.
+    fn pop_resolving(&mut self, key: &str) -> Result<(), MdsError> {
+        Self::check_lifo_pop(self.resolving.pop(), key)
+    }
+
+    fn check_lifo_pop(popped: Option<String>, expected: &str) -> Result<(), MdsError> {
+        if popped.as_deref() == Some(expected) {
             Ok(())
         } else {
             Err(MdsError::syntax(format!(
@@ -1378,12 +1390,18 @@ impl ModuleCache {
                  (expected {expected}, got {got}) — this is a compiler bug, please report it",
                 got = popped.as_deref().unwrap_or("<empty>"),
             )))
-        };
-        match (module_result, lifo_result) {
-            (Err(module_err), _) => Err(module_err),
-            (Ok(_), Err(lifo_err)) => Err(lifo_err),
-            (Ok(resolved), Ok(())) => Ok(resolved),
         }
+    }
+
+    // Call after a successful resolution. The thread check is defense in depth.
+    fn finish_root(&self) -> Result<(), MdsError> {
+        if self.resolving.is_empty()
+            && (self.budget.mem.mark() != 0 || self.budget.mem.underflow)
+            && !std::thread::panicking()
+        {
+            return Err(MdsError::internal());
+        }
+        Ok(())
     }
 
     /// Common module processing: tokenize, parse, build scope, evaluate.
@@ -1878,12 +1896,12 @@ impl ModuleCache {
         let probe = mark.probe;
         let kept = self.close_module(mark);
 
-        let popped = self.resolving.pop();
-        let resolved = Self::check_lifo_pop(resolved, popped, key)?;
+        let popped = self.pop_resolving(key);
+        let resolved = resolved?;
+        popped?;
 
         let arc = Arc::new(resolved);
-        self.modules.insert(key.to_string(), Arc::clone(&arc));
-        self.commit_retained(kept);
+        self.retain_module(key, &arc, kept);
         #[cfg(test)]
         {
             self.module_probes[probe].buffers_after_insert = Some(self.budget.mem.buffers);

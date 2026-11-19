@@ -5903,6 +5903,21 @@ fn finish_preserves_the_first_error_even_with_live_temporaries() {
 }
 
 #[test]
+fn resolve_key_does_not_cache_output_when_temporaries_remain() {
+    let key = "part.mds";
+    let mut cache = virtual_cache(&[(key, "Body")]);
+    cache.temporaries_seed = 1;
+    assert_internal(
+        cache
+            .resolve_key(key, &HashMap::new(), &mut vec![])
+            .unwrap_err(),
+    );
+    assert!(cache.dependencies().is_empty());
+    cache.temporaries_seed = 0;
+    assert!(cache.resolve_key(key, &HashMap::new(), &mut vec![]).is_ok());
+}
+
+#[test]
 fn resolve_key_refuses_an_incomplete_retained_transfer() {
     let key = "part.mds";
     let mut cache = virtual_cache(&[(key, "Body")]);

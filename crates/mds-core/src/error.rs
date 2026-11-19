@@ -568,6 +568,11 @@ pub enum MdsError {
         help("this indicates a bug in `mds fmt` itself; please file an issue")
     )]
     FormatterInvariant { message: String },
+
+    /// The compiler found an inconsistent memory count.
+    #[error("internal compiler error")]
+    #[diagnostic(code(mds::internal))]
+    Internal,
 }
 
 /// The module-count refusal shared by the resolver and binding input guards.
@@ -579,6 +584,12 @@ pub fn module_count_exceeded() -> MdsError {
 }
 
 impl MdsError {
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn internal() -> Self {
+        Self::Internal
+    }
+
     pub(crate) fn syntax(message: impl Into<String>) -> Self {
         MdsError::Syntax {
             message: message.into(),
@@ -1142,7 +1153,8 @@ impl MdsError {
             | MdsError::VarConflict { .. }
             | MdsError::ExpectedMarkdown
             | MdsError::ExpectedMessages
-            | MdsError::FormatterInvariant { .. } => None,
+            | MdsError::FormatterInvariant { .. }
+            | MdsError::Internal => None,
         };
 
         SerializedError {
@@ -1235,7 +1247,8 @@ impl MdsError {
             | MdsError::VarConflict { .. }
             | MdsError::ExpectedMarkdown
             | MdsError::ExpectedMessages
-            | MdsError::FormatterInvariant { .. } => None,
+            | MdsError::FormatterInvariant { .. }
+            | MdsError::Internal => None,
         };
         src.map(|ns| ns.name())
     }

@@ -153,6 +153,7 @@ pub(crate) struct MemBudget {
     pub(crate) headroom: usize,
     pub(crate) buffers: usize,
     temporaries: usize,
+    pub(crate) underflow: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -167,6 +168,7 @@ impl Default for MemBudget {
             headroom: MAX_COMPILE_MEMORY,
             buffers: 0,
             temporaries: 0,
+            underflow: false,
         }
     }
 }
@@ -195,12 +197,16 @@ impl MemBudget {
     pub(crate) fn release_to(&mut self, mark: usize) {
         if self.temporaries.checked_sub(mark).is_some() {
             self.temporaries = mark;
+        } else {
+            self.underflow = true;
         }
     }
 
     pub(crate) fn release_buffers(&mut self, n: usize) {
         if let Some(buffers) = self.buffers.checked_sub(n) {
             self.buffers = buffers;
+        } else {
+            self.underflow = true;
         }
     }
 
@@ -214,6 +220,8 @@ impl MemBudget {
             *from = left;
             // The sum was checked at charge time. A transfer does not change it.
             *to += n;
+        } else {
+            self.underflow = true;
         }
     }
 }
