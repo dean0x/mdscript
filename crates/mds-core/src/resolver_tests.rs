@@ -3911,7 +3911,7 @@ fn source_label_appears_in_string_source_diagnostics() {
 // ── Adversarial YAML-injection: core-level twin (#154) ───────────────────────
 //
 // These tests exercise the resolver's `raw_frontmatter` serialization path
-// (serialize_merged_frontmatter / serde_yaml_ng::to_string) to verify that values
+// (serialize_merged_frontmatter / serde_yaml_ng::to_writer) to verify that values
 // containing fence-like sequences, YAML document-end markers, or block-scalar
 // `type: mds` lines cannot escape the emitted frontmatter block and smuggle
 // additional top-level keys into the compiled output.
@@ -6004,4 +6004,135 @@ fn resolution_funnel_has_one_pop_and_five_finish_calls() {
         1,
     );
     assert!(!valid(&with_assert));
+}
+
+/// Parse `yaml` as a compile parse does. Returns the mapping and its spent bytes.
+fn parsed_mapping(yaml: &str) -> (serde_yaml_ng::Mapping, usize) {
+    let (tree, spent) =
+        parse_frontmatter_yaml_with(yaml, Allowance::in_compile(&MemBudget::default())).unwrap();
+    let serde_yaml_ng::Value::Mapping(mapping) = tree else {
+        panic!("expected a mapping");
+    };
+    (mapping, spent)
+}
+
+#[test]
+fn merged_frontmatter_text_matches_the_text_of_a_cloned_value() {
+    let (mapping, spent) = parsed_mapping(concat!(
+        "name: \"a: b\"\n",
+        "nested:\n  list: [1, two, \"3\", ~]\n  text: \"line one\\nline two\"\n",
+        "quote: \"it's\"\n",
+        "control: \"\\x01\\t\\u0085\\u2028\"\n",
+    ));
+    let cloned = serde_yaml_ng::to_string(&serde_yaml_ng::Value::Mapping(mapping.clone())).unwrap();
+    let mut cache = virtual_cache(&[]);
+    let text = cache
+        .serialize_merged_frontmatter(&mapping, spent)
+        .unwrap()
+        .unwrap();
+    assert_eq!(text, format!("{}\n", cloned.trim_end()));
+    // The text is kept at its capacity, and no temporary remains.
+    assert_eq!(cache.budget.mem.buffers, text.capacity());
+    assert_eq!(cache.kept, text.capacity());
+    assert_eq!(cache.budget.mem.mark(), 0);
+}
+
+#[test]
+fn a_control_character_scalar_serializes_within_its_charge() {
+    // Each control byte serializes as a four-byte escape.
+    let (mapping, spent) = parsed_mapping(&format!("k: \"{}\"\n", "\\x01".repeat(100_000)));
+    let mut cache = virtual_cache(&[]);
+    let text = cache
+        .serialize_merged_frontmatter(&mapping, spent)
+        .unwrap()
+        .unwrap();
+    assert!(text.len() > 3 * spent, "{} B", text.len());
+    // The bound sized the text, so the text did not grow past it.
+    assert_eq!(text.capacity(), 4 * spent + 1);
+}
+
+#[test]
+fn a_frontmatter_merge_charges_both_trees_first() {
+    let mut cache = virtual_cache(&[("base.mds", "---\na: 1\n---\nBase\n")]);
+    let base = cache
+        .resolve_key("base.mds", &HashMap::new(), &mut vec![])
+        .unwrap();
+    let (child, child_bytes) = parsed_mapping("b: 2\n");
+    let child = Some(child);
+    let charge = base.frontmatter_bytes + child_bytes;
+    let (merged, charged) = cache.merge_frontmatter(&base, &child, child_bytes).unwrap();
+    assert_eq!((merged.len(), charged), (2, charge));
+    assert_eq!(cache.budget.mem.mark(), charge);
+    // With one byte less left than both trees take, the merge is refused.
+    let left = cache.budget.mem.headroom - cache.budget.mem.buffers - charge;
+    cache
+        .budget
+        .mem
+        .charge(Part::Buffers, Some(left - charge + 1))
+        .unwrap();
+    assert_eq!(
+        cache
+            .merge_frontmatter(&base, &child, child_bytes)
+            .unwrap_err()
+            .to_string(),
+        "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
+    );
+}
+
+#[test]
+fn every_frontmatter_merge_goes_through_the_charged_helper() {
+    fn calls(code: &str) -> usize {
+        code.lines()
+            .map(|line| {
+                line.split("//")
+                    .next()
+                    .unwrap_or_default()
+                    .matches("deep_merge_yaml(")
+                    .count()
+            })
+            .sum()
+    }
+    fn valid(resolver: &str, frontmatter: &str) -> bool {
+        let helper = resolver
+            .split_once("fn merge_frontmatter(")
+            .and_then(|(_, rest)| rest.split_once("\n    }"));
+        // Outside its tests, frontmatter.rs holds the definition and its recursion.
+        let production = frontmatter.split_once("\n#[cfg(test)]\nmod tests {");
+        calls(resolver) == 1
+            && helper.is_some_and(|(body, _)| calls(body) == 1)
+            && production.is_some_and(|(code, _)| calls(code) == 2)
+    }
+
+    let resolver = include_str!("resolver.rs");
+    let frontmatter = include_str!("resolver/frontmatter.rs");
+    assert!(valid(resolver, frontmatter));
+    let planted = "let merged = deep_merge_yaml(&base, &child, 0)?;";
+    assert!(!valid(&format!("{resolver}\n{planted}"), frontmatter));
+    assert!(!valid(resolver, &format!("{planted}\n{frontmatter}")));
+}
+
+#[test]
+fn the_extends_scope_layer_is_charged_with_the_merge_charge() {
+    let mut cache = virtual_cache(&[("base.mds", "---\na: 1\n---\nBase\n")]);
+    let base = cache
+        .resolve_key("base.mds", &HashMap::new(), &mut vec![])
+        .unwrap();
+    let (child, child_bytes) = parsed_mapping("b: 2\n");
+    let vars = Arc::default();
+    let ctx = extends_ctx("", &vars);
+    let (scope, merged, charge) = cache
+        .build_merged_extends_scope(
+            &base,
+            &Some(child),
+            child_bytes,
+            "base.mds",
+            &ctx,
+            &mut vec![],
+        )
+        .unwrap();
+    assert_eq!(merged.len(), 2);
+    assert!(scope.get_slot("b").is_some());
+    // The merged mapping and the scope layer each hold the merge charge.
+    assert_eq!(charge, base.frontmatter_bytes + child_bytes);
+    assert_eq!(cache.budget.mem.mark(), 2 * charge);
 }

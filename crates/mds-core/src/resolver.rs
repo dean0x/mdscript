@@ -1162,10 +1162,16 @@ impl ModuleCache {
 
         // ── Extends branch ────────────────────────────────────────────────────
         if let Some(ext) = module.extends.clone() {
-            let (frontmatter_values, _) =
+            let (frontmatter_values, frontmatter_bytes) =
                 parse_frontmatter_mapping(module.frontmatter.as_ref(), &mut self.budget.mem)?;
-            let components =
-                self.resolve_extends_components(&module, &ext, ctx, &frontmatter_values, warnings)?;
+            let components = self.resolve_extends_components(
+                &module,
+                &ext,
+                ctx,
+                &frontmatter_values,
+                frontmatter_bytes,
+                warnings,
+            )?;
 
             {
                 let mut scope = components.scope.clone();
@@ -1597,10 +1603,11 @@ impl ModuleCache {
         &mut self,
         base: &ResolvedModule,
         child_fm: &Option<serde_yaml_ng::Mapping>,
+        child_fm_bytes: usize,
         base_key: &str,
         ctx: &ModuleCtx<'_>,
         warnings: &mut Vec<String>,
-    ) -> Result<(Scope, serde_yaml_ng::Mapping), MdsError> {
+    ) -> Result<(Scope, serde_yaml_ng::Mapping, usize), MdsError> {
         // 3d-i: Extract frontmatter imports from BOTH base and child BEFORE the deep merge.
         //
         // Base imports resolve relative to the BASE file's directory (base_base_dir, derived
@@ -1624,16 +1631,16 @@ impl ModuleCache {
             .unwrap_or_default();
 
         // 3d-ii: Deep-merge base and child frontmatter value Mappings.
-        // Empty mapping used when either side has no frontmatter.
         // Reserved keys (imports, type, extends) are excluded by deep_merge_yaml.
         // Precedence: base < child (child overrides base on collision).
-        let empty_mapping = serde_yaml_ng::Mapping::new();
-        let base_mapping = base.frontmatter_values.as_ref().unwrap_or(&empty_mapping);
-        let child_mapping = child_fm.as_ref().unwrap_or(&empty_mapping);
-        let merged_mapping = deep_merge_yaml(base_mapping, child_mapping, 0)?;
+        // The merged mapping is a temporary.
+        let (merged_mapping, charge) = self.merge_frontmatter(base, child_fm, child_fm_bytes)?;
 
         // 3d-iii: Build scope from the merged mapping. Runtime vars applied LAST
-        // (base < child < runtime, F7, decision #3).
+        // (base < child < runtime, F7, decision #3). The layer is charged with the
+        // merge charge as a temporary first. It stays a temporary: an extending child
+        // has only @block overrides, so no function of its own can capture the layer.
+        self.budget.mem.charge(Part::Temp, Some(charge))?;
         let mut scope = build_scope_from_merged_mapping(&merged_mapping, ctx.runtime_vars)?;
 
         // 3d-iv: Resolve base frontmatter imports against base_key (frontmatter-first ordering,
@@ -1668,7 +1675,80 @@ impl ModuleCache {
             scope.set_function(name, Arc::clone(func));
         }
 
-        Ok((scope, merged_mapping))
+        Ok((scope, merged_mapping, charge))
+    }
+
+    /// Deep-merge the frontmatter tree of `base` with the child's tree. Every merge
+    /// in the resolver goes through here. The bytes of both trees are charged as a
+    /// temporary before the merge: they bound the merged tree, whose sub-mappings
+    /// are part of the result. Returns the merged tree and that charge.
+    fn merge_frontmatter(
+        &mut self,
+        base: &ResolvedModule,
+        child: &Option<serde_yaml_ng::Mapping>,
+        child_bytes: usize,
+    ) -> Result<(serde_yaml_ng::Mapping, usize), MdsError> {
+        let charge = self
+            .budget
+            .mem
+            .charge(Part::Temp, base.frontmatter_bytes.checked_add(child_bytes))?;
+        // An empty mapping stands in for a side with no frontmatter.
+        let empty = serde_yaml_ng::Mapping::new();
+        let merged = deep_merge_yaml(
+            base.frontmatter_values.as_ref().unwrap_or(&empty),
+            child.as_ref().unwrap_or(&empty),
+            0,
+        )?;
+        Ok((merged, charge))
+    }
+
+    /// Serialize a deep-merged frontmatter `Mapping` for `frontmatter_prefix`, by
+    /// reference.
+    ///
+    /// Return `Ok(None)` for an empty mapping. Otherwise return the canonical YAML
+    /// representation with a final newline and no fences.
+    ///
+    /// `charge` is the merge charge of the mapping. Four text bytes per charged byte,
+    /// plus one for the newline, bound the text: an escaped control byte takes four.
+    /// The bound is charged as a temporary before the text is allocated. A text past
+    /// the bound grows once, and that growth is charged after it. The entry keeps the
+    /// text, so its charge moves to the kept bytes at the text capacity.
+    ///
+    /// Used by `resolve_extends_components` for the `@extends` deep-merged FM output (#154).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(MdsError::YamlError)` if YAML serialization of the merged mapping fails.
+    /// This is not expected for well-formed mappings produced by `deep_merge_yaml`, but the
+    /// failure MUST propagate as a compile error rather than silently dropping the emitted
+    /// frontmatter fence from the output (no swallowed errors at boundaries).
+    fn serialize_merged_frontmatter(
+        &mut self,
+        mapping: &serde_yaml_ng::Mapping,
+        charge: usize,
+    ) -> Result<Option<String>, MdsError> {
+        if mapping.is_empty() {
+            return Ok(None);
+        }
+        let bound = self
+            .budget
+            .mem
+            .charge(Part::Temp, bytes(charge, 4).and_then(|n| n.checked_add(1)))?;
+        let mut yaml = Vec::with_capacity(bound);
+        serde_yaml_ng::to_writer(&mut yaml, mapping)
+            .map_err(|e| MdsError::yaml_error(e.to_string()))?;
+        // The serializer writes UTF-8 only.
+        let mut text = String::from_utf8(yaml).map_err(|_| MdsError::internal())?;
+        text.truncate(text.trim_end().len());
+        if text.is_empty() {
+            return Ok(None);
+        }
+        text.push('\n');
+        self.budget
+            .mem
+            .charge(Part::Temp, text.capacity().checked_sub(bound))?;
+        self.keep(text.capacity());
+        Ok(Some(text))
     }
 
     /// Shared extends-pipeline: steps 3a-3d are identical for the text-cached and
@@ -1695,6 +1775,7 @@ impl ModuleCache {
         ext: &crate::ast::ExtendsDirective,
         ctx: &ModuleCtx<'_>,
         frontmatter_values: &Option<serde_yaml_ng::Mapping>,
+        frontmatter_bytes: usize,
         warnings: &mut Vec<String>,
     ) -> Result<ExtendsComponents, MdsError> {
         // ── Step 3a: validate and resolve the base in skeleton mode ──────────
@@ -1744,9 +1825,15 @@ impl ModuleCache {
         // exclusion, array wholesale replace, both sets of FM imports resolved per-file).
         // The merged_mapping is also returned so we can serialize it for the output
         // frontmatter (#154: @extends emits deep-merged frontmatter).
-        let (mut scope, merged_mapping) =
-            self.build_merged_extends_scope(&base, frontmatter_values, &base_key, ctx, warnings)?;
-        let merged_frontmatter = serialize_merged_frontmatter(&merged_mapping)?;
+        let (mut scope, merged_mapping, charge) = self.build_merged_extends_scope(
+            &base,
+            frontmatter_values,
+            frontmatter_bytes,
+            &base_key,
+            ctx,
+            warnings,
+        )?;
+        let merged_frontmatter = self.serialize_merged_frontmatter(&merged_mapping, charge)?;
 
         // Collect child's own definitions from its body (currently zero @define after
         // child-only-blocks check, but structurally correct).
@@ -1822,8 +1909,14 @@ impl ModuleCache {
         frontmatter_bytes: usize,
         warnings: &mut Vec<String>,
     ) -> Result<ResolvedModule, MdsError> {
-        let components =
-            self.resolve_extends_components(&module, &ext, ctx, &frontmatter_values, warnings)?;
+        let components = self.resolve_extends_components(
+            &module,
+            &ext,
+            ctx,
+            &frontmatter_values,
+            frontmatter_bytes,
+            warnings,
+        )?;
 
         // ── Step 3e: validate + evaluate the spliced regions ──────────────────
         // Validate per-region so each region's offsets are checked against the correct
@@ -1982,6 +2075,7 @@ impl ModuleCache {
         &mut self,
         ext: &crate::ast::ExtendsDirective,
         own_fm: &Option<serde_yaml_ng::Mapping>,
+        own_fm_bytes: usize,
         module_body: &[Node],
         ctx: &ModuleCtx<'_>,
         warnings: &mut Vec<String>,
@@ -1991,6 +2085,7 @@ impl ModuleCache {
             IndexMap<String, EffectiveBlock>,
             Origin,
             Option<serde_yaml_ng::Mapping>,
+            usize,
         ),
         MdsError,
     > {
@@ -2028,14 +2123,13 @@ impl ModuleCache {
         // Phase 3: transitive FM merge: grandparent.frontmatter_values < own_fm_values.
         // This produces the accumulated FM for this intermediate base, so a leaf
         // descending from it gets the full transitive chain without re-traversing.
-        let empty = serde_yaml_ng::Mapping::new();
-        let gp_fm = grandparent.frontmatter_values.as_ref().unwrap_or(&empty);
-        let own_fm_ref = own_fm.as_ref().unwrap_or(&empty);
-        let merged_fm = deep_merge_yaml(gp_fm, own_fm_ref, 0)?;
-        let accumulated_fm = if merged_fm.is_empty() {
-            None
+        // The entry keeps the merged tree with its merge charge; the own tree stays
+        // a temporary.
+        let (merged_fm, charge) = self.merge_frontmatter(&grandparent, own_fm, own_fm_bytes)?;
+        let (accumulated_fm, accumulated_bytes) = if merged_fm.is_empty() {
+            (None, 0)
         } else {
-            Some(merged_fm)
+            (Some(merged_fm), charge)
         };
 
         Ok((
@@ -2043,6 +2137,7 @@ impl ModuleCache {
             eff_blocks,
             skel_origin,
             accumulated_fm,
+            accumulated_bytes,
         ))
     }
 
@@ -2093,20 +2188,38 @@ impl ModuleCache {
         //
         // Phase 3: B's frontmatter_values must be the transitive deep-merge of A's accumulated FM
         // with B's own FM (A < B), so that when C later merges against B, it gets A+B+C.
-        let (effective_skeleton, effective_blocks, skeleton_origin, frontmatter_values) =
-            if let Some(ext) = module.extends.as_ref() {
-                self.resolve_intermediate_base(ext, &own_fm_values, &module.body, ctx, warnings)?
-            } else {
-                // Root base: own body is the skeleton; blocks seeded from own @block declarations.
-                let root_origin = ctx.origin(self)?.clone();
-                // Seed blocks first so module.body can be moved into the Arc (no element clones, P1).
-                let eff_blocks = seed_effective_blocks(&module.body, &block_names, &root_origin);
-                let eff_skeleton: Arc<[Node]> = Arc::from(module.body);
-                // Root base: frontmatter_values is its own raw FM (no ancestors).
-                (eff_skeleton, eff_blocks, root_origin, own_fm_values)
-            };
+        let (
+            effective_skeleton,
+            effective_blocks,
+            skeleton_origin,
+            frontmatter_values,
+            frontmatter_bytes,
+        ) = if let Some(ext) = module.extends.as_ref() {
+            self.resolve_intermediate_base(
+                ext,
+                &own_fm_values,
+                own_fm_bytes,
+                &module.body,
+                ctx,
+                warnings,
+            )?
+        } else {
+            // Root base: own body is the skeleton; blocks seeded from own @block declarations.
+            let root_origin = ctx.origin(self)?.clone();
+            // Seed blocks first so module.body can be moved into the Arc (no element clones, P1).
+            let eff_blocks = seed_effective_blocks(&module.body, &block_names, &root_origin);
+            let eff_skeleton: Arc<[Node]> = Arc::from(module.body);
+            // Root base: frontmatter_values is its own raw FM (no ancestors).
+            (
+                eff_skeleton,
+                eff_blocks,
+                root_origin,
+                own_fm_values,
+                own_fm_bytes,
+            )
+        };
         // The entry keeps its frontmatter tree.
-        self.keep(own_fm_bytes);
+        self.keep(frontmatter_bytes);
 
         // Skeleton entries have no evaluated text or fragment map.
         let prompt_body: Option<PromptText> = None;
@@ -2133,7 +2246,7 @@ impl ModuleCache {
             effective_blocks,
             skeleton_origin,
             frontmatter_values,
-            frontmatter_bytes: own_fm_bytes,
+            frontmatter_bytes,
             is_skeleton: true,
         })
     }
@@ -3376,37 +3489,6 @@ fn attach_frontmatter_index(err: MdsError, i: usize) -> MdsError {
             MdsError::import_error(format!("{message} (in frontmatter imports[{i}])"))
         }
         other => other,
-    }
-}
-
-// ── Template inheritance helpers ──────────────────────────────────────────────
-
-/// Serialize a deep-merged frontmatter `Mapping` for `frontmatter_prefix`.
-///
-/// Return `Ok(None)` for an empty mapping. Otherwise return the canonical YAML
-/// representation with a final newline and no fences.
-///
-/// Used by `resolve_extends_components` for the `@extends` deep-merged FM output (#154).
-///
-/// # Errors
-///
-/// Returns `Err(MdsError::YamlError)` if YAML serialization of the merged mapping fails.
-/// This is not expected for well-formed mappings produced by `deep_merge_yaml`, but the
-/// failure MUST propagate as a compile error rather than silently dropping the emitted
-/// frontmatter fence from the output (no swallowed errors at boundaries).
-fn serialize_merged_frontmatter(
-    mapping: &serde_yaml_ng::Mapping,
-) -> Result<Option<String>, MdsError> {
-    if mapping.is_empty() {
-        return Ok(None);
-    }
-    let yaml = serde_yaml_ng::to_string(&serde_yaml_ng::Value::Mapping(mapping.clone()))
-        .map_err(|e| MdsError::yaml_error(e.to_string()))?;
-    let trimmed = yaml.trim_end();
-    if trimmed.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(format!("{trimmed}\n")))
     }
 }
 
