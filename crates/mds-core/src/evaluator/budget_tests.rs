@@ -39,14 +39,24 @@ fn nested_marks_release_temporaries_but_keep_escaped_buffers() {
 }
 
 #[test]
-fn invalid_releases_leave_the_counters_unchanged() {
-    let mut mem = MemBudget::default();
-    let empty = mem;
-    mem.transfer(Part::Buffers, Part::Temp, 1);
-    mem.transfer(Part::Temp, Part::Buffers, 1);
-    mem.release_to(1);
-    mem.release_buffers(1);
-    assert_eq!(mem, empty);
+fn each_invalid_release_latches_without_change_to_the_counts() {
+    let releases: [fn(&mut MemBudget); 4] = [
+        |mem| mem.transfer(Part::Buffers, Part::Temp, 1),
+        |mem| mem.transfer(Part::Temp, Part::Buffers, 1),
+        |mem| mem.release_to(1),
+        |mem| mem.release_buffers(1),
+    ];
+    for release in releases {
+        let mut mem = MemBudget::default();
+        let empty = mem;
+        release(&mut mem);
+        mem.release_to(0);
+        assert_eq!(
+            (mem.buffers, mem.mark(), mem.headroom),
+            (0, 0, empty.headroom)
+        );
+        assert_ne!(mem, empty, "the latch must survive a valid release");
+    }
 }
 
 #[test]

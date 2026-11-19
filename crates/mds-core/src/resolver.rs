@@ -252,6 +252,10 @@ pub struct ModuleCache {
     module_probes: Vec<ModuleProbe>,
     #[cfg(test)]
     function_call_seed: usize,
+    #[cfg(test)]
+    temporaries_seed: usize,
+    #[cfg(test)]
+    retained_transfer_seed: usize,
 }
 
 struct ModuleMark {
@@ -314,6 +318,10 @@ impl ModuleCache {
             module_probes: Vec::new(),
             #[cfg(test)]
             function_call_seed: 0,
+            #[cfg(test)]
+            temporaries_seed: 0,
+            #[cfg(test)]
+            retained_transfer_seed: 0,
         }
     }
 
@@ -356,6 +364,10 @@ impl ModuleCache {
             {
                 self.module_probes.clear();
                 self.budget.seed_function_calls(self.function_call_seed);
+                let seed = self.temporaries_seed + usize::from(key == tests::TEMPORARIES_SEED_KEY);
+                if seed != 0 {
+                    self.budget.mem.charge(Part::Temp, seed).unwrap();
+                }
             }
         }
         self.resolving.insert(key.to_string());
@@ -668,6 +680,8 @@ impl ModuleCache {
         let key_owned = key.to_string();
         let arc = Arc::new(resolved);
         self.modules.insert(key_owned, Arc::clone(&arc));
+        #[cfg(test)]
+        let kept = kept + self.retained_transfer_seed;
         self.commit_retained(kept);
         #[cfg(test)]
         {

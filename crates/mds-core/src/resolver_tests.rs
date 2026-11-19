@@ -5859,3 +5859,114 @@ fn only_commit_retained_updates_cache_headroom() {
         &format!("{evaluator}\ncache.resolve_by_key(key);")
     ));
 }
+
+pub(super) const TEMPORARIES_SEED_KEY: &str = "root-with-live-temporaries.mds";
+
+fn assert_internal(error: MdsError) {
+    let record = error.serialize();
+    assert_eq!(record.code, "mds::internal");
+    assert_eq!(record.message, "internal compiler error");
+    assert_eq!(record.help, None);
+    assert_eq!(record.span, None);
+    assert_eq!(error.source_name(), None);
+}
+
+#[test]
+fn resolve_source_refuses_to_return_output_with_live_temporaries() {
+    let mut cache = virtual_cache(&[]);
+    cache.temporaries_seed = 1;
+    let result = cache.resolve_source("Body", "", &HashMap::new(), &mut vec![]);
+    assert_eq!(cache.budget.mem.mark(), 1);
+    assert_internal(result.unwrap_err());
+}
+
+#[test]
+fn compile_virtual_refuses_to_return_output_with_live_temporaries() {
+    let modules = HashMap::from([(TEMPORARIES_SEED_KEY.into(), "Body".into())]);
+    assert_internal(crate::compile_virtual(modules, TEMPORARIES_SEED_KEY, None).unwrap_err());
+}
+
+#[test]
+fn finish_preserves_the_first_error_even_with_live_temporaries() {
+    let mut cache = virtual_cache(&[]);
+    let mut resolve = |seed| {
+        cache.temporaries_seed = seed;
+        cache
+            .resolve_source("{{missing}}", "", &HashMap::new(), &mut vec![])
+            .unwrap_err()
+            .serialize()
+    };
+    let original = resolve(0);
+    assert_eq!(original.code, "mds::undefined_var");
+    assert_eq!(resolve(1), original);
+    assert_eq!(cache.budget.mem.mark(), 1);
+}
+
+#[test]
+fn resolve_key_refuses_an_incomplete_retained_transfer() {
+    let key = "part.mds";
+    let mut cache = virtual_cache(&[(key, "Body")]);
+    cache.retained_transfer_seed = 1;
+    let result = cache.resolve_key(key, &HashMap::new(), &mut vec![]);
+    assert_eq!(cache.budget.mem.mark(), 0);
+    assert_eq!(cache.retained, 0);
+    assert!(cache.budget.mem.buffers > 0);
+    assert_internal(result.unwrap_err());
+    assert!(cache.dependencies().is_empty());
+    cache.retained_transfer_seed = 0;
+    cache
+        .resolve_key(key, &HashMap::new(), &mut vec![])
+        .unwrap();
+    assert!(cache.retained > 0);
+}
+
+#[test]
+fn resolution_funnel_has_one_pop_and_five_finish_calls() {
+    fn valid(source: &str) -> bool {
+        let body = |name| {
+            let (_, rest) = source.split_once(&format!("fn {name}("))?;
+            let (body, _) = rest.split_once("\n    }")?;
+            Some(body)
+        };
+        let Some(pop) = body("pop_resolving") else {
+            return false;
+        };
+        let bodies = [Some(pop), body("finish_root"), body("commit_retained")];
+        let code = |text: &str| {
+            text.lines()
+                .flat_map(|line| {
+                    line.split("//")
+                        .next()
+                        .unwrap_or_default()
+                        .split_whitespace()
+                })
+                .collect::<String>()
+        };
+        let all = code(source);
+        all.matches(".resolving.pop(").count() == 1
+            && code(pop).contains(".resolving.pop(")
+            && all.matches(".finish_root(").count() == 5
+            && all.matches("fnfinish_root(").count() == 1
+            && bodies.into_iter().all(|body| {
+                body.is_some_and(|body| {
+                    body.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                        .all(|token| {
+                            !matches!(token, "expect" | "unwrap" | "panic" | "RefCell")
+                                && !token.starts_with("assert")
+                                && !token.starts_with("debug_assert")
+                        })
+                })
+            })
+    }
+
+    let source = include_str!("resolver.rs");
+    assert!(valid(source));
+    assert!(!valid(&format!("{source}\nself.resolving . pop ();")));
+    assert!(!valid(&format!("{source}\nself.finish_root()?;")));
+    let with_assert = source.replacen(
+        "self.resolving.pop()",
+        "{ assert!(false); self.resolving.pop() }",
+        1,
+    );
+    assert!(!valid(&with_assert));
+}
