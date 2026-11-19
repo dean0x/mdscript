@@ -187,6 +187,9 @@ impl MemBudget {
         self.temporaries
     }
 
+    // The release helpers stay out of line. Each has many sites, and an
+    // inlined copy with its underflow store per site costs more than a call.
+    #[inline(never)]
     pub(crate) fn release_to(&mut self, mark: usize) {
         if self.temporaries.checked_sub(mark).is_some() {
             self.temporaries = mark;
@@ -195,6 +198,7 @@ impl MemBudget {
         }
     }
 
+    #[inline(never)]
     pub(crate) fn release_buffers(&mut self, n: usize) {
         if let Some(buffers) = self.buffers.checked_sub(n) {
             self.buffers = buffers;
@@ -203,6 +207,7 @@ impl MemBudget {
         }
     }
 
+    #[inline(never)]
     pub(crate) fn transfer(&mut self, from: Part, to: Part, n: usize) {
         let (from, to) = match (from, to) {
             (Part::Buffers, Part::Temp) => (&mut self.buffers, &mut self.temporaries),
