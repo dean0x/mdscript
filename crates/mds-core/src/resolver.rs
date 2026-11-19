@@ -148,6 +148,8 @@ pub struct ResolvedModule {
     pub(crate) skeleton_origin: Origin,
     /// Parsed YAML frontmatter mapping. Reserved-key splitting deferred to future refactor.
     pub(crate) frontmatter_values: Option<serde_yaml_ng::Mapping>,
+    /// The bytes charged for `frontmatter_values`, part of this entry's kept bytes.
+    pub(crate) frontmatter_bytes: usize,
     /// `true` when this entry was produced by `process_module_skeleton` (resolved as an
     /// `@extends` base: collect-only, NO standalone validate/evaluate, `prompt_body = None`).
     ///
@@ -191,6 +193,7 @@ impl Clone for ResolvedModule {
             effective_blocks: self.effective_blocks.clone(),
             skeleton_origin: self.skeleton_origin.clone(),
             frontmatter_values: self.frontmatter_values.clone(),
+            frontmatter_bytes: self.frontmatter_bytes,
             is_skeleton: self.is_skeleton,
         }
     }
@@ -422,6 +425,13 @@ impl ModuleCache {
         // The kept sum is part of buffers, which charge already checked.
         self.kept += n;
         Ok(())
+    }
+
+    /// Move `n` bytes charged as a temporary to the kept sum, because the module
+    /// entry keeps the value they count.
+    fn keep(&mut self, n: usize) {
+        self.budget.mem.transfer(Part::Temp, Part::Buffers, n);
+        self.kept += n;
     }
 
     fn commit_retained(&mut self, kept: usize) {
@@ -1152,7 +1162,7 @@ impl ModuleCache {
 
         // ── Extends branch ────────────────────────────────────────────────────
         if let Some(ext) = module.extends.clone() {
-            let frontmatter_values =
+            let (frontmatter_values, _) =
                 parse_frontmatter_mapping(module.frontmatter.as_ref(), &mut self.budget.mem)?;
             let components =
                 self.resolve_extends_components(&module, &ext, ctx, &frontmatter_values, warnings)?;
@@ -1218,12 +1228,19 @@ impl ModuleCache {
         }
 
         // ── Standalone path ───────────────────────────────────────────────────
-        let (mut scope, fm_imports) = build_scope_from_frontmatter(
-            module.frontmatter.as_ref(),
-            is_md,
-            ctx.runtime_vars,
-            &mut self.budget.mem,
-        )?;
+        // The parsed tree is dropped once the scope layer is built from it.
+        let (mut scope, fm_imports) = {
+            let (mapping, spent) =
+                parse_frontmatter_mapping(module.frontmatter.as_ref(), &mut self.budget.mem)?;
+            build_scope_from_frontmatter(
+                module.frontmatter.as_ref(),
+                mapping.as_ref(),
+                spent,
+                is_md,
+                ctx.runtime_vars,
+                &mut self.budget.mem,
+            )?
+        };
 
         self.resolve_frontmatter_imports(&fm_imports, &mut scope, ctx, warnings)?;
 
@@ -1432,13 +1449,22 @@ impl ModuleCache {
         let tokens = tokenize(ctx.source, ctx.file_str)?;
         let module = parse_with_ctx(&tokens, ctx.file_str, ctx.source)?;
 
-        // Parse frontmatter YAML once for both scope building and storage.
-        let frontmatter_values =
+        // Parse frontmatter YAML once for both scope building and storage. The
+        // module entry keeps the tree.
+        let (frontmatter_values, frontmatter_bytes) =
             parse_frontmatter_mapping(module.frontmatter.as_ref(), &mut self.budget.mem)?;
+        self.keep(frontmatter_bytes);
 
         // Branch: child template (@extends) vs. standalone module.
         if let Some(ext) = module.extends.clone() {
-            return self.process_module_extends(module, ext, ctx, frontmatter_values, warnings);
+            return self.process_module_extends(
+                module,
+                ext,
+                ctx,
+                frontmatter_values,
+                frontmatter_bytes,
+                warnings,
+            );
         }
 
         // ── Standalone (non-extending) path ──────────────────────────────────
@@ -1447,6 +1473,8 @@ impl ModuleCache {
         // Build scope from frontmatter + runtime vars; extract any frontmatter imports.
         let (mut scope, fm_imports) = build_scope_from_frontmatter(
             module.frontmatter.as_ref(),
+            frontmatter_values.as_ref(),
+            frontmatter_bytes,
             is_md,
             ctx.runtime_vars,
             &mut self.budget.mem,
@@ -1464,6 +1492,10 @@ impl ModuleCache {
             explicit_exports,
             block_names,
         } = self.collect_definitions_and_imports(&module.body, &mut scope, ctx, warnings)?;
+        // A function can capture the scope layer, so the entry keeps the layer too.
+        if !functions.is_empty() {
+            self.keep(frontmatter_bytes);
+        }
 
         // Validate that all named exports refer to defined functions or "prompt"
         validate_exports(&explicit_exports, &functions)?;
@@ -1536,6 +1568,7 @@ impl ModuleCache {
             effective_blocks,
             skeleton_origin: origin.clone(),
             frontmatter_values,
+            frontmatter_bytes,
             is_skeleton: false,
         })
     }
@@ -1786,6 +1819,7 @@ impl ModuleCache {
         ext: crate::ast::ExtendsDirective,
         ctx: &ModuleCtx<'_>,
         frontmatter_values: Option<serde_yaml_ng::Mapping>,
+        frontmatter_bytes: usize,
         warnings: &mut Vec<String>,
     ) -> Result<ResolvedModule, MdsError> {
         let components =
@@ -1853,6 +1887,7 @@ impl ModuleCache {
             effective_blocks,
             skeleton_origin,
             frontmatter_values,
+            frontmatter_bytes,
             is_skeleton: false,
         })
     }
@@ -2026,12 +2061,14 @@ impl ModuleCache {
 
         let raw_frontmatter = self.copy_raw_frontmatter(&module)?;
         // own_fm_values: this module's raw frontmatter (not yet merged with ancestors).
-        let own_fm_values =
+        let (own_fm_values, own_fm_bytes) =
             parse_frontmatter_mapping(module.frontmatter.as_ref(), &mut self.budget.mem)?;
 
         // Build scope for @define closure capture (base functions must be available).
         let (mut scope, fm_imports) = build_scope_from_frontmatter(
             module.frontmatter.as_ref(),
+            own_fm_values.as_ref(),
+            own_fm_bytes,
             is_md,
             ctx.runtime_vars,
             &mut self.budget.mem,
@@ -2044,6 +2081,10 @@ impl ModuleCache {
             explicit_exports,
             block_names,
         } = self.collect_definitions_and_imports(&module.body, &mut scope, ctx, warnings)?;
+        // A function can capture the scope layer, so the entry keeps the layer too.
+        if !functions.is_empty() {
+            self.keep(own_fm_bytes);
+        }
 
         // Multi-level chain (A←B←C): B may itself extend A.
         // B's effective_skeleton = A's effective_skeleton (Arc::clone, O(1) fold).
@@ -2064,6 +2105,8 @@ impl ModuleCache {
                 // Root base: frontmatter_values is its own raw FM (no ancestors).
                 (eff_skeleton, eff_blocks, root_origin, own_fm_values)
             };
+        // The entry keeps its frontmatter tree.
+        self.keep(own_fm_bytes);
 
         // Skeleton entries have no evaluated text or fragment map.
         let prompt_body: Option<PromptText> = None;
@@ -2090,6 +2133,7 @@ impl ModuleCache {
             effective_blocks,
             skeleton_origin,
             frontmatter_values,
+            frontmatter_bytes: own_fm_bytes,
             is_skeleton: true,
         })
     }
@@ -2955,11 +2999,16 @@ fn runtime_layer(vars: &HashMap<String, Value>) -> Arc<VarLayer> {
     )
 }
 
-/// Build a scope with runtime variables above frontmatter variables.
+/// Build a scope with runtime variables above frontmatter variables, from the
+/// module's one parsed `mapping`. `spent` is the bytes its parse spent: the layer
+/// is charged with them as a temporary before the conversion, because the
+/// converted values are never larger than their tree.
 /// A Markdown file uses `type` as a file marker, not a variable.
 /// Return `imports` separately for MDS files. Plain Markdown keeps it as a variable.
 fn build_scope_from_frontmatter(
     frontmatter: Option<&crate::ast::Frontmatter>,
+    mapping: Option<&serde_yaml_ng::Mapping>,
+    spent: usize,
     is_md: bool,
     runtime_vars: &Arc<VarLayer>,
     mem: &mut MemBudget,
@@ -2972,34 +3021,23 @@ fn build_scope_from_frontmatter(
     // parsing and the runtime_vars guard below.
     let is_mds = !is_md || frontmatter.is_some_and(|fm| has_type_mds_frontmatter_raw(&fm.raw));
 
-    if let Some(fm) = frontmatter {
-        // Parse YAML once to avoid double-parsing (bounded — #162).
-        let yaml = parse_frontmatter_charged(&fm.raw, mem)?;
-
-        if let serde_yaml_ng::Value::Mapping(map) = yaml {
-            for (key, val) in map {
-                let serde_yaml_ng::Value::String(key_str) = key else {
-                    continue;
-                };
-                if key_str == "type" && is_md {
-                    // Skip the 'type' meta-field for .md files (it's a file-type marker)
-                    continue;
-                }
-                if key_str == "imports" {
-                    if is_mds {
-                        // Parse as structured import declarations, not a scope variable
-                        fm_imports = parse_frontmatter_imports_from_yaml(&val)?;
-                    } else {
-                        // Plain .md: treat `imports` as a regular variable
-                        let value = Value::from_yaml(val)?;
-                        frontmatter_vars.insert(key_str, Arc::new(value));
-                    }
-                    continue;
-                }
-                let value = Value::from_yaml(val)?;
-                frontmatter_vars.insert(key_str, Arc::new(value));
-            }
+    mem.charge(Part::Temp, Some(spent))?;
+    for (key, val) in mapping.into_iter().flatten() {
+        let serde_yaml_ng::Value::String(key_str) = key else {
+            continue;
+        };
+        if key_str == "type" && is_md {
+            // Skip the 'type' meta-field for .md files (it's a file-type marker)
+            continue;
         }
+        if key_str == "imports" && is_mds {
+            // Parse as structured import declarations, not a scope variable.
+            // Plain .md keeps `imports` as a regular variable.
+            fm_imports = parse_frontmatter_imports_from_yaml(val)?;
+            continue;
+        }
+        let value = Value::from_yaml_ref(val)?;
+        frontmatter_vars.insert(key_str.clone(), Arc::new(value));
     }
 
     if is_mds && runtime_vars.contains_key("imports") {
@@ -3372,35 +3410,26 @@ fn serialize_merged_frontmatter(
     }
 }
 
-/// Parse the frontmatter YAML into a `serde_yaml_ng::Mapping` for storage.
+/// Parse the frontmatter YAML of a module into a `serde_yaml_ng::Mapping`, once per
+/// module, and return it with the bytes the parse spent.
 ///
-/// Returns `None` when there is no frontmatter or when the YAML is not a mapping.
-/// Called once per module to avoid double-parsing.
+/// The byte allowance is the smaller of the rest of the budget and `MAX_OUTPUT_SIZE`.
+/// The spent bytes stay charged as a temporary; a caller that keeps the tree moves
+/// them to the module's kept bytes. The mapping is `None` when there is no
+/// frontmatter or when the YAML is not a mapping.
 fn parse_frontmatter_mapping(
     frontmatter: Option<&crate::ast::Frontmatter>,
     mem: &mut MemBudget,
-) -> Result<Option<serde_yaml_ng::Mapping>, MdsError> {
+) -> Result<(Option<serde_yaml_ng::Mapping>, usize), MdsError> {
     let Some(fm) = frontmatter else {
-        return Ok(None);
+        return Ok((None, 0));
     };
-    let yaml = parse_frontmatter_charged(&fm.raw, mem)?;
-    if let serde_yaml_ng::Value::Mapping(map) = yaml {
-        Ok(Some(map))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Parse frontmatter inside a compile. The byte allowance is the smaller of the rest
-/// of the budget and `MAX_OUTPUT_SIZE`. The spent bytes stay charged as a temporary
-/// until the module mark releases them, so a second tree cannot reuse them.
-fn parse_frontmatter_charged(
-    raw: &str,
-    mem: &mut MemBudget,
-) -> Result<serde_yaml_ng::Value, MdsError> {
-    let (yaml, spent) = parse_frontmatter_yaml_with(raw, Allowance::in_compile(mem))?;
+    let (yaml, spent) = parse_frontmatter_yaml_with(&fm.raw, Allowance::in_compile(mem))?;
     mem.charge(Part::Temp, Some(spent))?;
-    Ok(yaml)
+    let serde_yaml_ng::Value::Mapping(map) = yaml else {
+        return Ok((None, spent));
+    };
+    Ok((Some(map), spent))
 }
 
 /// Returns the byte count from `offset` to just before the next `\n` (or

@@ -543,7 +543,7 @@ pub(super) fn build_scope_from_merged_mapping(
         let serde_yaml_ng::Value::String(key_str) = key else {
             continue;
         };
-        let value = Value::from_yaml(val.clone())?;
+        let value = Value::from_yaml_ref(val)?;
         frontmatter.insert(key_str.clone(), Arc::new(value));
     }
     Ok(Scope::with_layers(
@@ -955,9 +955,9 @@ mod tests {
     }
 
     #[test]
-    fn parsed_frontmatter_stays_charged_for_the_next_parse() {
-        // One tree fits in the rest of the budget. Two trees do not, and the module
-        // parses its frontmatter for the mapping and again for the scope.
+    fn the_scope_layer_is_charged_with_the_bytes_of_its_tree() {
+        // One tree fits in the rest of the budget. The tree and the scope layer
+        // converted from it do not: the layer is charged with the tree's bytes.
         let doc = alias_block(NEAR_FULL_LEN, NEAR_FULL_REFS, 0);
         assert_eq!(
             error_text(resolve_with_rest(&doc, NEAR_FULL_TEXT * 3 / 2)),

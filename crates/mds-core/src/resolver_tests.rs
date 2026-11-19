@@ -737,9 +737,15 @@ fn scope_layer_precedence_keeps_imports_reserved_only_for_mds() {
     let source = "{{imports}}";
     let tokens = tokenize(source, "plain.md").unwrap();
     let module = parse_with_ctx(&tokens, "plain.md", source).unwrap();
-    let (mut plain, _) =
-        build_scope_from_frontmatter(None, true, &runtime_layer(&vars), &mut MemBudget::default())
-            .unwrap();
+    let (mut plain, _) = build_scope_from_frontmatter(
+        None,
+        None,
+        0,
+        true,
+        &runtime_layer(&vars),
+        &mut MemBudget::default(),
+    )
+    .unwrap();
     assert_eq!(
         evaluate(
             &module.body,
@@ -766,7 +772,8 @@ fn runtime_layer_is_shared_by_module_scopes() {
     let vars = HashMap::from([("x".into(), Value::String("runtime".into()))]);
     let vars = runtime_layer(&vars);
     let (first, _) =
-        build_scope_from_frontmatter(None, false, &vars, &mut MemBudget::default()).unwrap();
+        build_scope_from_frontmatter(None, None, 0, false, &vars, &mut MemBudget::default())
+            .unwrap();
     let inherited = build_scope_from_merged_mapping(&serde_yaml_ng::Mapping::new(), &vars).unwrap();
     assert!(Arc::ptr_eq(
         first.get_slot("x").unwrap().root(),
@@ -5480,7 +5487,7 @@ fn limit_cache_headroom(cache: &mut ModuleCache, headroom: usize) {
 }
 
 #[test]
-fn cached_module_moves_its_text_and_fragment_to_retained() {
+fn cached_module_moves_its_text_tree_and_fragment_to_retained() {
     let key = "part.mds";
     let raw = "label: value\n";
     let body = "body\n";
@@ -5502,9 +5509,15 @@ fn cached_module_moves_its_text_and_fragment_to_retained() {
     builder.push_segment(0, 0, body.len() as u32);
     assert!(resolved.prompt_map.is_some());
     let origin_bytes = source.len() + 2 * key.len() + 6 * size_of::<usize>();
+    // The entry keeps its parsed tree. The module defines no function, so it does
+    // not keep its scope layer.
+    let tree = parse_frontmatter_yaml_with(raw, Allowance::in_compile(&MemBudget::default()))
+        .unwrap()
+        .1;
+    assert_eq!(resolved.frontmatter_bytes, tree);
     assert_eq!(
         cache.retained,
-        origin_bytes + raw.len() + body.len() + builder.segments_bytes()
+        origin_bytes + raw.len() + body.len() + builder.segments_bytes() + tree
     );
     assert_eq!(
         cache.budget.mem.headroom,
@@ -5750,13 +5763,13 @@ fn final_output_charges_prefix_and_growth_before_the_reserve() {
         " ".repeat(50),
     ];
     let raw = "label: value\n";
-    // The parsed frontmatter stays charged while the module runs.
+    // The parsed frontmatter and its scope layer stay charged while the module runs.
     let spent = parse_frontmatter_yaml_with(raw, Allowance::in_compile(&MemBudget::default()))
         .unwrap()
         .1;
     for body in cases {
         let growth = raw.len() + 8 + usize::from(!body.trim_end().is_empty());
-        let needed = body.len() + 2 * raw.len() + 9 + growth + spent;
+        let needed = body.len() + 2 * raw.len() + 9 + growth + 2 * spent;
         let source = format!("---\n{raw}---\n{body}");
         let compile = |headroom| {
             let mut cache = virtual_cache(&[]);
