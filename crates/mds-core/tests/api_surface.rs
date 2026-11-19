@@ -458,7 +458,8 @@ fn mds_error_variants_exist() {
         | MdsError::Recursion { .. }
         | MdsError::ExportError { .. }
         | MdsError::BuiltinError { .. }
-        | MdsError::FormatterInvariant { .. } => {}
+        | MdsError::FormatterInvariant { .. }
+        | MdsError::Internal => {}
         _ => {}
     }
 }
@@ -2263,7 +2264,8 @@ fn mds_error_variants_unchanged_by_lint() {
         | MdsError::Recursion { .. }
         | MdsError::ExportError { .. }
         | MdsError::BuiltinError { .. }
-        | MdsError::FormatterInvariant { .. } => {}
+        | MdsError::FormatterInvariant { .. }
+        | MdsError::Internal => {}
         _ => {}
     }
 }
