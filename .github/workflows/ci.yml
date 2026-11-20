@@ -128,10 +128,18 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/setup-wasm
+      # One codegen unit for every crate in the WASM build (#491). The release
+      # profile sets it for mds-wasm only, so mds-core and the dependencies kept
+      # 16 units. Then a new helper can regroup the units and move the size by
+      # about 1 KB. With one unit the binary is about 56 KB smaller and the size
+      # is stable. The `--config` applies to this command only, so the napi,
+      # Python and CLI release builds keep their build time. Keep these commands
+      # equal to the `build` script in packages/mds-wasm/package.json, which
+      # release.yml runs: this job measures the size that the release ships.
       - name: Build (nodejs + web targets)
         run: |
-          wasm-pack build crates/mds-wasm --target nodejs --out-dir pkg
-          wasm-pack build crates/mds-wasm --target web --out-dir pkg-web
+          wasm-pack build crates/mds-wasm --target nodejs --out-dir pkg -- --config profile.release.codegen-units=1
+          wasm-pack build crates/mds-wasm --target web --out-dir pkg-web -- --config profile.release.codegen-units=1
       - name: Smoke-test built artifact
         run: |
           node -e "
@@ -258,8 +266,10 @@ jobs:
         run: npm run build:native -w @mdscript/mds-napi
       # Build the WASM pkg so the WASM fallback (and wasm-backend tests) work.
       - uses: ./.github/actions/setup-wasm
+      # Same codegen setting as the wasm job (#491), so the tests use the binary
+      # shape that the release ships.
       - name: Build WASM (nodejs)
-        run: wasm-pack build crates/mds-wasm --target nodejs --out-dir pkg
+        run: wasm-pack build crates/mds-wasm --target nodejs --out-dir pkg -- --config profile.release.codegen-units=1
       - name: Build TS packages
         run: npm run build --workspaces --if-present
       # Every publishable workspace is built by this point (napi addon above,
