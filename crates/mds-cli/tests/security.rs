@@ -910,33 +910,42 @@ fn build_mds_error_message_escapes_control_bytes() {
 }
 
 #[test]
-fn fence_syntax_reports_use_fixed_messages_and_safe_source_frames() {
+fn conditional_syntax_reports_use_fixed_messages_and_safe_source_frames() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("fence.mds");
+    let path = dir.path().join("conditional.mds");
     let esc = char::from(0x1b);
     let bidi = char::from_u32(0x202e).unwrap();
     let sample = format!("tag{esc}{bidi}tail");
-    let safe_sample = format!("tag?{}tail", char::REPLACEMENT_CHARACTER);
     let opener = "```js +mds\n";
+    let file_key = "---\r\nindented-directives: true\r\n---\r\n";
 
-    for (before, line, message) in [
+    for (before, line, after, message) in [
         (
             opener,
             format!("  @end {sample}"),
+            "\n```\n",
             "conditional directive needs an open if in this code fence",
         ),
         (
             opener,
             format!("  @if x == \"{sample}\":"),
+            "\n```\n",
             "conditional directive must end before the code fence closes",
         ),
         (
             "",
             format!("```js +{sample}"),
+            "\n```\n",
             "invalid code fence info word",
         ),
+        (
+            file_key,
+            format!("  {esc}{bidi}@if a:"),
+            "\r\n",
+            "invalid indent for a conditional directive",
+        ),
     ] {
-        std::fs::write(&path, format!("{before}{line}\n```\n")).unwrap();
+        std::fs::write(&path, format!("{before}{line}{after}")).unwrap();
         let human = mds_bin().arg("lint").arg(&path).output().unwrap();
         let stderr = String::from_utf8(human.stderr).unwrap();
         assert_eq!(human.status.code(), Some(2), "{stderr}");
@@ -945,7 +954,8 @@ fn fence_syntax_reports_use_fixed_messages_and_safe_source_frames() {
             stderr.contains(&format!("syntax error: {message}")),
             "{stderr}"
         );
-        assert!(stderr.contains(&safe_sample), "{stderr:?}");
+        let safe_line = line.replace(esc, "?").replace(bidi, "�");
+        assert!(stderr.contains(safe_line.trim_start()), "{stderr:?}");
         assert!(!stderr.contains([esc, bidi]), "{stderr:?}");
 
         // The wire keeps the fixed message and byte span, not the source excerpt.

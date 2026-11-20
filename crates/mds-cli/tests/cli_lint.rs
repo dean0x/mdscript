@@ -968,6 +968,38 @@ fn the_file_key_suppresses_literal_directive_only_outside_plain_fences() {
     }
 }
 
+#[test]
+fn malformed_file_key_reports_a_fixed_message_and_a_safe_source_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("indented.mds");
+    let esc = char::from(0x1b);
+    let bidi = char::from_u32(0x202e).unwrap();
+    let prefix = "---\r\nname: café\r\n";
+    let line = format!("indented-directives: invalid{esc}{bidi}value");
+    let message = "syntax error: expected indented-directives: true or indented-directives: false";
+    fs::write(&path, format!("{prefix}{line}\r\n---\r\n")).unwrap();
+
+    let human = lint_path(&path, &[]);
+    let stderr = String::from_utf8(human.stderr).unwrap();
+    assert_eq!(human.status.code(), Some(2), "{stderr}");
+    assert!(stderr.replace("\n  │ ", " ").contains(message), "{stderr}");
+    let safe_value = format!("invalid?{}value", char::REPLACEMENT_CHARACTER);
+    assert!(stderr.contains(&safe_value), "{stderr:?}");
+    assert!(!stderr.contains([esc, bidi]), "{stderr:?}");
+
+    let json = lint_path(&path, &["--format", "json"]);
+    let wire = String::from_utf8(json.stdout).unwrap();
+    assert_eq!(json.status.code(), Some(2), "{wire}");
+    assert!(!wire.contains([esc, bidi]), "{wire:?}");
+    let document: serde_json::Value = serde_json::from_str(&wire).unwrap();
+    let error = &document["error"];
+    assert_eq!(error["code"], "mds::syntax");
+    assert_eq!(error["message"], message);
+    assert_eq!(error["help"], serde_json::Value::Null);
+    assert_eq!(error["span"]["offset"], prefix.len());
+    assert_eq!(error["span"]["length"], line.len());
+}
+
 // ── L-CLI-RESOURCE: exit code 3 for ResourceLimit (TEST-4) ──────────────────
 //
 // Verifies that a template causing a ResourceLimit in the RESOLVER causes

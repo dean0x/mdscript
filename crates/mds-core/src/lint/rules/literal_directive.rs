@@ -90,7 +90,10 @@ pub(crate) fn check(
     let mut report = |offset, line: &str| {
         builder.push(
             LintDiagnostic::new(RULE, severity, "This conditional line is literal text.")
-                .with_help("Use `+mds` to evaluate fence conditionals. Use the `mds` label for literal fence examples.")
+                .with_help(
+                    "Set `indented-directives: true` in frontmatter to evaluate indented conditionals. \
+                     Use `+mds` to evaluate fence conditionals. Use the `mds` label for literal fence examples.",
+                )
                 .with_span(SerializedSpan {
                     offset,
                     length: line.len(),
@@ -180,6 +183,23 @@ mod tests {
             .diagnostics
             .iter()
             .all(|d| d.severity == Severity::Warn));
+    }
+
+    #[test]
+    fn file_key_silences_warnings_on_indented_conditionals() {
+        let body = " \t@if 1 == 1:\nkeep\n    @end\n";
+        let literal = lint(body);
+        assert_eq!(
+            flagged_lines(body, &literal),
+            [" \t@if 1 == 1:", "    @end"]
+        );
+        let opted_in = format!("---\nindented-directives: true\n---\n{body}");
+        assert!(flagged_lines(&opted_in, &lint(&opted_in)).is_empty());
+        assert!(literal.diagnostics[0]
+            .help
+            .as_deref()
+            .unwrap()
+            .contains("`indented-directives: true`"));
     }
 
     #[test]
