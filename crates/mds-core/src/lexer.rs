@@ -103,8 +103,12 @@ impl OpenFence {
                 }
                 self.open_ifs.push(offset);
             }
-            _ if self.open_ifs.is_empty() => return Err(STRAY_CONDITIONAL.into()),
-            Conditional::End => self.open_ifs.truncate(self.open_ifs.len() - 1),
+            Conditional::End => {
+                self.open_ifs.pop().ok_or(STRAY_CONDITIONAL)?;
+            }
+            Conditional::Elseif | Conditional::Else if self.open_ifs.is_empty() => {
+                return Err(STRAY_CONDITIONAL.into());
+            }
             Conditional::Elseif | Conditional::Else => (),
         }
         Ok(())
@@ -387,18 +391,14 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    fn closes_fence(&self, m: &FenceMatch) -> bool {
-        self.code_fence
-            .as_ref()
-            .is_some_and(|fence| fence.closes(m, &self.chars))
-    }
-
     /// Scan raw content up to a closer or a conditional line.
-    fn scan_code_content(&mut self) {
+    fn scan_code_content(&mut self) -> Result<(), MdsError> {
+        let fence = self.code_fence.as_ref().ok_or_else(MdsError::internal)?;
         let start = self.byte_pos(self.pos);
         while self.pos < self.chars.len() {
             if is_line_start_chars(&self.chars, self.pos)
-                && (try_scan_fence_at(&self.chars, self.pos).is_some_and(|m| self.closes_fence(&m))
+                && (try_scan_fence_at(&self.chars, self.pos)
+                    .is_some_and(|m| fence.closes(&m, &self.chars))
                     || self.line_class(self.pos) != LineClass::Plain)
             {
                 break;
@@ -412,6 +412,7 @@ impl<'a> Lexer<'a> {
                 start,
             ));
         }
+        Ok(())
     }
 
     /// Scan a directive from its line start, including any indent.
@@ -633,7 +634,7 @@ impl<'a> Lexer<'a> {
                 }
                 self.scan_directive();
             }
-            LineClass::Plain if self.code_fence.is_some() => self.scan_code_content(),
+            LineClass::Plain if self.code_fence.is_some() => self.scan_code_content()?,
             LineClass::Plain => return self.step_text(),
         }
         Ok(())
@@ -798,6 +799,14 @@ mod tests {
         let result = tokenize("plain text", "test.mds");
         STALL_SCAN_TEXT.set(false);
         assert_eq!(result.unwrap_err().serialize().code, "mds::internal");
+    }
+
+    #[test]
+    fn code_content_scan_without_a_fence_returns_internal_error() {
+        let mut lexer = Lexer::new("plain text", "test.mds");
+        let error = lexer.scan_code_content().unwrap_err().serialize();
+        assert_eq!(error.code, "mds::internal");
+        assert!(lexer.tokens.is_empty(), "got: {:?}", lexer.tokens);
     }
 
     #[test]
