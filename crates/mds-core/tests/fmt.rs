@@ -420,6 +420,67 @@ fn gate_fallback_undefined_var_source_still_formats() {
 }
 
 #[test]
+fn fmt_keeps_the_fence_marker_and_round_trips_the_selected_arm() {
+    let source =
+        "```js +mds\r\n  @if 1 == 1: \t\r\nkeep\r\n  @else:\r\ndrop\r\n  @end \t\r\n```\r\n";
+    let formatted = format_str(source).unwrap();
+    assert_eq!(
+        formatted,
+        "```js +mds\n  @if 1 == 1:\nkeep\n  @else:\ndrop\n  @end\n```\n"
+    );
+    assert_eq!(format_str(&formatted).unwrap(), formatted);
+    let expected = Some("```js\nkeep\n```\n".to_owned());
+    assert_eq!(compiled_markdown(source), expected);
+    assert_eq!(compiled_markdown(&formatted), expected);
+}
+
+#[test]
+fn fmt_falls_back_to_structure_for_an_undefined_fence_condition() {
+    let source = "```js +mds\r\n\t@if runtime_flag: \t\r\nkeep\r\n\t@end\r\n```\r\n\r\n";
+    let err = mds::compile_str(source).unwrap_err().serialize();
+    assert_eq!(err.code, "mds::undefined_var");
+    assert!(err.message.contains("runtime_flag"), "{err:?}");
+    assert_eq!(err.span.unwrap().offset, "```js +mds\r\n".len());
+    let formatted = format_str(source).unwrap();
+    assert_eq!(
+        formatted,
+        "```js +mds\n\t@if runtime_flag:\nkeep\n\t@end\n```\n"
+    );
+    assert_eq!(format_str(&formatted).unwrap(), formatted);
+
+    let vars = std::collections::HashMap::from([("runtime_flag".into(), mds::Value::from(true))]);
+    let output = mds::compile_str_with(&formatted, None, Some(vars))
+        .unwrap()
+        .into_markdown()
+        .unwrap();
+    assert_eq!(output, "```js\nkeep\n```\n");
+}
+
+#[test]
+fn empty_block_fix_inside_an_opted_in_fence_passes_reverify() {
+    use mds::fix::{apply_fixes_incremental, plan_fixes, FixOutcome};
+
+    let source = "```js +mds\r\n  @if 1 == 1: \t\r\n\t@end\r\n keep\r\n```\r\n";
+    let lint = mds::lint_str(source).unwrap();
+    let outcome = apply_fixes_incremental(source, plan_fixes(&lint, source), &lint, |candidate| {
+        mds::compile_str(candidate)?;
+        mds::lint_str(candidate)
+    });
+    let FixOutcome::Fixed {
+        source: fixed,
+        residual,
+    } = outcome
+    else {
+        panic!("expected a full fix: {outcome:?}");
+    };
+    assert_eq!(fixed, "```js +mds\r\n keep\r\n```\r\n");
+    assert!(residual.diagnostics.is_empty(), "{residual:?}");
+    let expected = Some("```js\n keep\n```\n".into());
+    assert_eq!(compiled_markdown(source), expected);
+    assert_eq!(compiled_markdown(&fixed), expected);
+}
+
+#[test]
 fn gate_full_check_runs_when_base_dir_resolves_imports() {
     let dir = tempfile::tempdir().unwrap();
     let lib_path = dir.path().join("lib.mds");

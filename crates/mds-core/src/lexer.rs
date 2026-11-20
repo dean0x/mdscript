@@ -29,7 +29,7 @@ fn classify_line(chars: &[char], pos: usize) -> LineClass {
     for &ch in &chars[pos..] {
         match ch {
             ' ' | '\t' => (),
-            '\r' | '\n' => return LineClass::Plain,
+            '\n' => return LineClass::Plain,
             ch if ch.is_whitespace() || is_control_char(ch) => bad_indent = true,
             _ => break,
         }

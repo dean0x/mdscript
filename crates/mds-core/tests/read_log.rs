@@ -45,6 +45,39 @@ fn a_compile_records_the_byte_count_of_every_file_it_read() {
     assert_eq!(log.sizes().len(), 3, "{:?}", log.sizes());
 }
 
+#[test]
+fn literal_directives_in_an_opted_in_fence_read_only_the_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("main.mds");
+    let part = dir.path().join("part.mds");
+    std::fs::write(&part, "Part.\n").unwrap();
+    let compile = |source: &str| {
+        std::fs::write(&entry, source).unwrap();
+        let log = Arc::new(ReadLog::new());
+        let fs = NativeFs::new().with_read_log(Arc::clone(&log));
+        let output = mds::compile_native_fs(fs, &entry, None, CompileOptions::default())
+            .unwrap()
+            .into_markdown()
+            .unwrap();
+        assert_eq!(count(&log, &entry), Some(source.len() as u64));
+        (output, log)
+    };
+
+    let import_include = "@import \"./part.mds\" as p\n@include p\n";
+    let extends = "@extends \"./part.mds\"\n";
+    let literal = format!("{extends}{import_include}@for x in items:\n@define f():\n@message user:\n@block body:\n@export {{f}}\n");
+    let (output, log) = compile(&format!("```+mds\n@if 1 == 1:\n{literal}@end\n```\n"));
+    assert_eq!(output, format!("```\n{literal}```\n"));
+    assert_eq!(log.sizes().len(), 1, "{:?}", log.sizes());
+
+    for control in [import_include, extends] {
+        let (output, log) = compile(control);
+        assert_eq!(output, "Part.\n");
+        assert_eq!(count(&log, &part), Some(6));
+        assert_eq!(log.sizes().len(), 2, "{:?}", log.sizes());
+    }
+}
+
 /// A compile that fails still records what it read before the failure: the empty import
 /// that it failed on included.
 #[test]

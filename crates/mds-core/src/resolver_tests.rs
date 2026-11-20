@@ -4785,6 +4785,32 @@ fn parse_nodes(source: &str) -> Vec<Node> {
         .body
 }
 
+#[test]
+fn stripped_fence_opener_maps_its_prefix_and_one_source_byte() {
+    let source = "  ```js \t+mds\n  @if 1 == 1:\n  keep\n  @end\n  ```\n";
+    let origin = arc_origin("/p/main.mds", "main.mds", source);
+    let nodes = parse_nodes(source);
+    let (output, map) = ModuleCache::evaluate_regions_with_map(
+        &[(&nodes, &origin)],
+        &mut Scope::new(),
+        &mut vec![],
+        Some(crate::sourcemap::MapBuilder::new(origin.clone())),
+        &mut EvalBudget::default(),
+    )
+    .unwrap();
+
+    assert_eq!(output, "  ```js\n  keep\n  ```\n");
+    let segments: Vec<_> = map
+        .unwrap()
+        .segments
+        .iter()
+        .map(|s| (s.out, s.src, s.src_off, s.len))
+        .collect();
+    assert_eq!(segments, [(0, 0, 0, 8), (8, 0, 28, 7), (15, 0, 42, 6)]);
+    // The opener's synthetic LF takes the place of the space after `js`.
+    assert_eq!(&source[..8], "  ```js ");
+}
+
 /// #416: after region-by-region evaluation every builder entry is the region
 /// origin that registered it, pointer-identical to that module's source — including
 /// when a later region carries another `Origin` value of an already-registered module
