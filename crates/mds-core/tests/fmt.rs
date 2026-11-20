@@ -495,6 +495,50 @@ fn fmt_preserves_the_file_key_and_round_trips_indented_directives() {
 }
 
 #[test]
+fn shared_fence_opt_in_fixture_has_the_same_directives_across_rust_surfaces() {
+    use mds::{check_str, compile_str, lint_str, scan_import_records, ResolveAs};
+
+    let source = include_str!("../../../packages/mds/__test__/fixtures/fence_optin.mds")
+        .replace("\r\n", "\n");
+    let expected = include_str!("../../../packages/mds/__test__/fixtures/fence_optin.expected.md")
+        .replace("\r\n", "\n");
+    assert_eq!(
+        compile_str(&source).unwrap().into_markdown().unwrap(),
+        expected
+    );
+    check_str(&source).unwrap();
+    assert!(lint_str(&source)
+        .unwrap()
+        .diagnostics
+        .iter()
+        .any(|finding| finding.rule == "unreachable-branch"));
+    assert_eq!(format_str(&source).unwrap(), source);
+    let padded = source.replace(":\n", ": \t\n");
+    assert_eq!(format_str(&padded).unwrap(), source);
+    assert!(scan_import_records(&source, ResolveAs::Standalone)
+        .unwrap()
+        .is_empty());
+
+    // Break each conditional separately. A surface that treats it as text will accept it.
+    for condition in ["@if 1 == 2:", "@if 2 == 2:"] {
+        let broken = source.replacen(condition, "@if ):", 1);
+        let expected = compile_str(&broken).unwrap_err().serialize();
+        assert_eq!(expected.code, "mds::syntax");
+        assert!(expected.span.is_some());
+        for error in [
+            check_str(&broken).unwrap_err(),
+            lint_str(&broken).unwrap_err(),
+            format_str(&broken).unwrap_err(),
+            scan_import_records(&broken, ResolveAs::Standalone).unwrap_err(),
+        ] {
+            let diagnostic = error.serialize();
+            assert_eq!(diagnostic.code, expected.code);
+            assert_eq!(diagnostic.span, expected.span);
+        }
+    }
+}
+
+#[test]
 fn check_lint_and_fmt_report_file_key_yaml_disagreement() {
     let valid = "---\nindented-directives: true\n---\n  @if 1 == 1:\nkeep\n  @end\n";
     mds::check_str(valid).unwrap();
