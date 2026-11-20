@@ -893,13 +893,13 @@ fn baseline_key(path: &Path, baseline: &StampMap) -> Option<PathBuf> {
     if baseline.contains_key(path) {
         return Some(path.to_path_buf());
     }
-    let spelled = path.as_os_str().to_string_lossy();
+    let spelled = path.as_os_str().as_encoded_bytes();
     baseline
         .keys()
         .filter(|key| {
             key.as_os_str()
-                .to_string_lossy()
-                .eq_ignore_ascii_case(&spelled)
+                .as_encoded_bytes()
+                .eq_ignore_ascii_case(spelled)
         })
         .find(|key| graph_key(key) == path)
         .cloned()
