@@ -177,6 +177,7 @@ fn locate_file_key(raw: &str) -> Result<Option<(usize, bool)>, FileKeyError> {
         };
         let value = tail
             .strip_prefix(':')
+            .and_then(|value| value.strip_prefix(is_blank))
             .ok_or_else(invalid)?
             .trim_start_matches(is_blank);
         let end = value.find(is_blank).unwrap_or(value.len());
@@ -1143,6 +1144,7 @@ mod tests {
     fn indented_directives_malformed_key_reports_the_original_line() {
         let prefix = "---\r\nname: café\r\n";
         for line in [
+            "indented-directives:true",
             "indented-directives: True",
             "indented-directives: yes",
             "indented-directives: 'true'",
@@ -1299,6 +1301,11 @@ mod tests {
                     assert_eq!(source.get(offset..offset + text.len()), Some(text.as_str()));
                     if fence == Some(true) {
                         assert!(matches!(token, Token::CodeContent(..)));
+                    }
+                    if fence == Some(true)
+                        || (matches!(token, Token::Text(..))
+                            && source.starts_with("---\nindented-directives: true\n---\n"))
+                    {
                         let first_is_line_start =
                             offset == 0 || source.as_bytes()[offset - 1] == b'\n';
                         for line in text.split('\n').skip(usize::from(!first_is_line_start)) {

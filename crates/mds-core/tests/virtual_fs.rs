@@ -1383,7 +1383,7 @@ fn assert_syntax(err: &MdsError, message: &str, offset: usize) -> SerializedSpan
 fn example_04_keeps_its_literal_fence_byte_for_byte() {
     let source = include_str!("../../../examples/edge-cases/04_escaped_and_code.mds");
     let expected = "```\n@if condition:\nThis is literal text inside a code fence.\n@end\n{this_is_also_literal}\n```\n";
-    assert!(source.contains(expected));
+    assert!(source.replace("\r\n", "\n").contains(expected));
     assert!(entry_markdown(source).contains(expected));
 }
 

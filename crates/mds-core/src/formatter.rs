@@ -122,9 +122,8 @@ pub fn format_str_with(source: &str, base_dir: Option<&Path>) -> Result<String, 
 
 /// Format MDS source code with an explicit base directory and file name.
 ///
-/// Identical to [`format_str_with`] but threads `file_name` into lexer errors
-/// and into any [`MdsError::Syntax`] surfaced by the safety gate, so callers
-/// get a diagnostic that names the file rather than showing a blank path.
+/// Like [`format_str_with`], but syntax errors in the input use `file_name`.
+/// A syntax error in an imported file keeps that file's name and source.
 ///
 /// `file_name` is used only for error reporting — it does not affect how
 /// `@import` paths are resolved (that is controlled by `base_dir`).
@@ -474,8 +473,13 @@ fn assert_equivalent(
         // fails at parse time). There is nothing safe to format: surface the
         // real error rather than papering over it with the structural check.
         //
-        // Rebuild `src` so the diagnostic names `file_name` rather than the
-        // blank label used internally by `compile_str_collecting_warnings`.
+        // Keep an imported module's span with its own source. Only the entry
+        // needs the caller's label instead of the in-memory source label.
+        Err(err @ MdsError::Syntax { .. })
+            if err.source_name().is_some() && !err.is_string_source() =>
+        {
+            Err(err)
+        }
         Err(MdsError::Syntax { message, span, .. }) => Err(MdsError::Syntax {
             message,
             span,

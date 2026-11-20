@@ -911,6 +911,19 @@ fn strip_reserved_keys(raw: &str) -> Option<String> {
     let mut in_imports_block = false;
 
     for line in raw.lines() {
+        let line = if line
+            .strip_prefix(lexer::INDENTED_DIRECTIVES)
+            .is_some_and(|tail| tail.starts_with(':'))
+        {
+            in_imports_block = false;
+            // YAML can end the key's comment before the next LF. Keep the next field.
+            let Some((_, rest)) = line.split_once(['\u{85}', '\u{2028}', '\u{2029}']) else {
+                continue;
+            };
+            rest
+        } else {
+            line
+        };
         // Blank lines are not YAML keys — preserve them outside an imports block
         // and skip them (without resetting state) inside one.
         if line.is_empty() {
@@ -937,10 +950,7 @@ fn strip_reserved_keys(raw: &str) -> Option<String> {
                 let v = v.trim();
                 v == "mds" || v == "\"mds\"" || v == "'mds'"
             });
-            let is_file_key = line
-                .strip_prefix(lexer::INDENTED_DIRECTIVES)
-                .is_some_and(|tail| tail.starts_with(':'));
-            if is_type_mds || is_file_key {
+            if is_type_mds {
                 continue;
             }
         } else if in_imports_block {

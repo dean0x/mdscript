@@ -277,7 +277,8 @@ Markdown list structure does not affect these directives. Outside fences, an ind
 An indented conditional in an invalid form, such as `@else` without its colon, causes a syntax error under this opt-in.
 
 Write the key once, at the start of a frontmatter line, with an unquoted lowercase Boolean.
-Spaces and tabs can follow the value. If you add a comment, put a space or tab before it.
+Put at least one space or tab after the colon. Spaces and tabs can follow the value.
+If you add a comment, put a space or tab before it.
 A quoted value, a blank before the colon or a repeated key line causes `mds::syntax` at that line.
 If the key in parsed YAML does not match the source line and Boolean value, the compiler reports `mds::yaml`.
 `mds check`, `mds lint` and `mds fmt` also report this YAML error.

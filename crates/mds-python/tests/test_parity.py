@@ -336,10 +336,8 @@ def test_par4_lint_virtual_matches_golden(
 # emits them as JSON null. This diverged report.to_dict() from result.to_dict()["files"][i]
 # for any diagnostic with a null help or span.
 #
-# None of the current 10 lint rules produce null help or span in production, so the
-# divergence was invisible to the existing LINT_GOLDENS. This test constructs a
-# LintResult directly from a canonical dict (via LintResult.__new__) to exercise the
-# null-help / null-span path explicitly, providing a non-circular differential check.
+# The LINT_GOLDENS had no null help or span, so they missed this difference.
+# This test constructs a LintResult from a canonical dict to check both null fields.
 
 
 def test_par6_file_report_to_dict_parity_null_help_span() -> None:

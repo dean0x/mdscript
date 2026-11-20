@@ -74,6 +74,23 @@ fn is_unmarked_example_candidate(opener: &str, offset: usize, source: &str) -> b
     info.split([' ', '\t']).find(|word| !word.is_empty()) != Some("mds")
 }
 
+/// Emit all conditional lines only if the same fence has an `@if` before an `@end`.
+fn check_fence(
+    text: &str,
+    base: usize,
+    source: &str,
+    report: &mut impl FnMut(usize, &str) -> bool,
+) -> bool {
+    let candidates = || {
+        complete_lines(text, base, source)
+            .filter_map(|(offset, line)| conditional(line).map(|kind| (offset, line, kind)))
+    };
+    let has_pair = candidates()
+        .skip_while(|(_, _, kind)| *kind != Conditional::If)
+        .any(|(_, _, kind)| kind == Conditional::End);
+    !has_pair || candidates().all(|(offset, line, _)| report(offset, line))
+}
+
 /// Check text and code content tokens. Never inspect directive tokens.
 pub(crate) fn check(
     tokens: &[Token],
@@ -123,25 +140,10 @@ pub(crate) fn check(
                 else {
                     continue;
                 };
-                if !is_unmarked_example_candidate(opener, *offset, source) {
-                    continue;
-                }
-                let candidates = || {
-                    complete_lines(text, *base, source).filter_map(|(offset, line)| {
-                        conditional(line).map(|kind| (offset, line, kind))
-                    })
-                };
-                let mut seen_if = false;
-                let has_pair = candidates().any(|(_, _, kind)| {
-                    seen_if |= kind == Conditional::If;
-                    seen_if && kind == Conditional::End
-                });
-                if has_pair {
-                    for (offset, line, _) in candidates() {
-                        if !report(offset, line) {
-                            return;
-                        }
-                    }
+                if is_unmarked_example_candidate(opener, *offset, source)
+                    && !check_fence(text, *base, source, &mut report)
+                {
+                    return;
                 }
             }
             _ => {}
@@ -269,7 +271,7 @@ mod tests {
     fn warns_on_the_two_literal_example_lines() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/edge-cases/04_escaped_and_code.mds");
-        let source = std::fs::read_to_string(path).unwrap();
+        let source = std::fs::read_to_string(path).unwrap().replace("\r\n", "\n");
         assert_eq!(
             flagged_lines(&source, &lint(&source)),
             ["@if condition:", "@end"]

@@ -560,6 +560,20 @@ fn check_lint_and_fmt_report_file_key_yaml_disagreement() {
 }
 
 #[test]
+fn format_str_named_keeps_the_imported_fence_error_location() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = "@import \"./lib.mds\" as lib\n@include lib\n";
+    let prefix = "First\nSecond\n```+mds\n";
+    std::fs::write(dir.path().join("lib.mds"), format!("{prefix}  @end\n```\n")).unwrap();
+    let error = format_str_named(entry, Some(dir.path()), "entry.mds").unwrap_err();
+    assert_eq!(error.source_name(), Some("lib.mds"));
+    let diagnostic = error.serialize();
+    assert_eq!(diagnostic.code, "mds::syntax");
+    let span = diagnostic.span.unwrap();
+    assert_eq!((span.offset, span.line), (prefix.len(), Some(4)));
+}
+
+#[test]
 fn gate_full_check_runs_when_base_dir_resolves_imports() {
     let dir = tempfile::tempdir().unwrap();
     let lib_path = dir.path().join("lib.mds");

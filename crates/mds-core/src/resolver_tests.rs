@@ -1356,8 +1356,21 @@ fn indented_directives_yaml_agreement_accepts_a_key_after_other_values() {
 }
 
 #[test]
+fn indented_directives_preserves_metadata_after_a_yaml_line_break() {
+    for eol in ['\u{85}', '\u{2028}', '\u{2029}'] {
+        let source = format!(
+            "---\nindented-directives: true # flag{eol}title: Sample\n---\nTitle: {{{{title}}}}\n"
+        );
+        assert_eq!(
+            compile_virtual(&[("entry.mds", &source)], "entry.mds").unwrap(),
+            "---\ntitle: Sample\n---\nTitle: Sample\n"
+        );
+    }
+}
+
+#[test]
 fn indented_directives_yaml_agreement_rejects_a_probe_hit_in_a_scalar() {
-    let src = "---\nindented-directives:true\n---\nbody\n";
+    let src = "---\n\"text\nindented-directives: true\nend\"\n---\nbody\n";
     let err = compile_virtual(&[("entry.mds", src)], "entry.mds").unwrap_err();
     assert!(matches!(err, MdsError::YamlError { message } if message == INDENTED_DIRECTIVES_FORM));
 }
