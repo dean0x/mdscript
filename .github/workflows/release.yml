@@ -1310,7 +1310,7 @@ jobs:
       # performance-01 / PF-021: pin to the same 1.96.0 SHA that ci.yml's wasm
       # job uses so the compiler that MEASURES size and the compiler that BUILDS
       # the published artifact are identical. Unpinned @stable lets toolchain
-      # drift silently push the binary past the 850 KB guard between releases.
+      # drift silently push the binary past the WASM size limit between releases.
       # WHEN BUMPING: update ci.yml's wasm job pin first, re-measure, then
       # update here to keep both in sync.
       - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e  # 1.96.0
@@ -1339,11 +1339,14 @@ jobs:
           npm run build -w @mdscript/mds-wasm
           npm run build --workspaces --if-present
       # performance-01 / PF-021: defence-in-depth size guard on the ACTUAL
-      # published artifact (built above by the pinned 1.96.0 toolchain). Mirrors
-      # ci.yml's 850,000-byte threshold byte-for-byte. Runs BEFORE any irreversible
-      # npm publish so a bloated binary aborts before anything reaches the registry.
-      - name: "Assert WASM binary size < 850,000 bytes (PF-021)"
+      # published artifact (built above by the pinned 1.96.0 toolchain). Runs
+      # BEFORE any irreversible npm publish so a bloated binary aborts before
+      # anything reaches the registry. The limit and its reason live in ci.yml's
+      # wasm job ("WHY THIS LIMIT EXISTS"); this value must stay equal to it
+      # (scripts/__test__/wasm-build-parity.spec.mjs checks it).
+      - name: "Assert WASM binary size limit (PF-021)"
         run: |
+          WASM_SIZE_LIMIT=821000
           for f in packages/mds-wasm/dist/node/mds_wasm_bg.wasm \
                    packages/mds-wasm/dist/web/mds_wasm_bg.wasm; do
             if [ ! -f "$f" ]; then
@@ -1352,8 +1355,8 @@ jobs:
             fi
             raw=$(wc -c < "$f" | tr -d ' ')
             echo "::notice::WASM ${f}: ${raw} bytes"
-            if [ "$raw" -gt 850000 ]; then
-              echo "::error::WASM binary exceeds 850,000 byte threshold: ${f} is ${raw} bytes"
+            if [ "$raw" -gt "$WASM_SIZE_LIMIT" ]; then
+              echo "::error::WASM binary exceeds the ${WASM_SIZE_LIMIT}-byte limit: ${f} is ${raw} bytes"
               exit 1
             fi
           done

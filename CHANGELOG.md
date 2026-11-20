@@ -78,6 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BREAKING (CLI): `mds lint --vars <file>` exits 3 for a vars file over the 10 MiB cap (`mds::resource_limit`), as `mds build --vars` does and as `mds lint` does for a source over the cap (#309).** It exited 2.
 
 - **BREAKING: the Node.js floor is 22.12.0 for `@mdscript/mds`, `@mdscript/mds-wasm` and the bundler packages (#483).** The `engines` field was `>=22.0.0`. The WASM binding for Node.js now loads a small ES module with `require`. Node 22.0 to 22.6 fail at load with `Unexpected token 'export'`. Node 22.12.0 is the first Node 22 release where `require` of an ES module is on by default. The packages are `@mdscript/bundler-utils`, `@mdscript/vite-plugin`, `@mdscript/rollup-plugin`, `@mdscript/webpack-loader` and `@mdscript/rspack-loader`. `@mdscript/mds-napi` keeps `>=22.0.0`, because the native addon does not load that module.
+- The WASM build gives one codegen unit to every crate (#491). On the same source, the `@mdscript/mds-wasm` binary is 54,972 bytes (6.5%) smaller in CI: 790,820 bytes raw and 329,259 bytes gzipped. The native addon, the Python wheels and the CLI do not change.
 
 ### Removed
 

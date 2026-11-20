@@ -90,6 +90,9 @@ panic = "unwind"
 lto = true
 panic = "unwind" # required by the native catch_unwind boundaries; see comment above
 
+# codegen-units here applies to the mds-wasm crate only. The WASM build commands add
+# `--config profile.release.codegen-units=1`, which gives mds-core and every
+# dependency one unit in that build only (#491; see the wasm job in ci.yml).
 [profile.release.package.mds-wasm]
 opt-level = "z"
 strip = true
