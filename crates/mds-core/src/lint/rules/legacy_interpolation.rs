@@ -3,9 +3,9 @@
 //!
 //! ## Detection strategy
 //!
-//! TOKEN-based, not AST-based. Fenced code blocks become `Node::Text` in the AST
-//! so AST scanning would false-positive on code examples. Instead, we scan
-//! `Token::Text` tokens, which structurally skip fences/directives/frontmatter.
+//! The parser turns literal fence content into `Node::Text`.
+//! Scan tokens instead. Literal content in opted-in and unmarked fences
+//! stays `Token::CodeContent`, which this rule skips.
 //!
 //! ## What we detect
 //!

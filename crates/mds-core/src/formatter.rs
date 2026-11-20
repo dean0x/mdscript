@@ -168,8 +168,8 @@ fn token_offset(t: &Token) -> usize {
 
 /// Compute the start byte offset of every directive line.
 ///
-/// A `Token::Directive` is only ever lexed at line-start, outside code, so its
-/// own offset IS the directive line's start offset.
+/// Directive tokens can occur inside opted-in fences and can include an indent.
+/// Their offsets still point to the start of the line, before any indent.
 fn directive_line_offsets(tokens: &[Token]) -> BTreeSet<usize> {
     tokens
         .iter()
