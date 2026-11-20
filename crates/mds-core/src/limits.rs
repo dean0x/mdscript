@@ -50,8 +50,8 @@ pub(crate) const MAX_OUTPUT_SIZE: usize = 50 * 1024 * 1024;
 ///
 /// One budget per compile or check, kept in `evaluator::budget::MemBudget`. It counts
 /// output buffers by capacity, the values that evaluation makes, the read text of each
-/// module, the tree estimate of each module (see `TREE_PER_TOKEN`), the compiler's copy
-/// of the caller variables, the text, tree estimates, frontmatter trees and scope layers
+/// module, the tree estimate of each module (see `TREE_PER_TOKEN`; an import scan
+/// charges it against its own new budget), the compiler's copy of the caller variables, the text, tree estimates, frontmatter trees and scope layers
 /// that cached modules keep, kept source-map segments, warnings, messages and the
 /// finalize output. Each part is charged before its allocation, except at a few named
 /// sites that charge right after one allocation. Exactly the budget passes. The next
@@ -79,8 +79,10 @@ pub(crate) const MAX_COMPILE_MEMORY: usize = 4 * MAX_OUTPUT_SIZE;
 /// count past the address space fails the charge. Expression bytes are the text of each
 /// directive line and interpolation. The compile memory budget charges the estimate after
 /// the lexer and before the parse of each module: a cached import, an `@extends` base,
-/// the file entry and the string entry. A refused tree is never built. A cached module
-/// keeps its estimate charged. A skeleton entry that is upgraded keeps one estimate.
+/// the file entry and the string entry. An import scan (`scan_imports`,
+/// `scan_import_records`) charges it in the same place against its own new budget. A
+/// refused tree is never built. A cached module keeps its estimate charged. A skeleton
+/// entry that is upgraded keeps one estimate.
 ///
 /// The three factors are measured on a 64-bit host: for each of the 62 shapes in
 /// `tests/memory_bound.rs`, the estimate is at least the compile peak and the bytes

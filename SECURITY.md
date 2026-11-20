@@ -267,7 +267,7 @@ place each check runs, and the tests that pin them — in `spec.md` §4.6
 | Max iterations per loop | 100,000 | `evaluator.rs` (`MAX_LOOP_ITERATIONS`) |
 | Max total iterations | 1,000,000 per module evaluation | `evaluator.rs` (`MAX_TOTAL_ITERATIONS`) |
 | Max output size | 50 MiB (52,428,800 bytes) per evaluation output buffer. Function results, message content and imported modules can use separate buffers; the compile memory budget below bounds them together. | `limits.rs` (`MAX_OUTPUT_SIZE`) |
-| Max compile memory | 200 MiB (209,715,200 bytes, four output buffers) per compile ([#420](https://github.com/dean0x/mdscript/issues/420), [#488](https://github.com/dean0x/mdscript/issues/488)). One budget counts output buffers by capacity, values that evaluation makes, an estimate of the syntax tree of each module (charged before the parse), the compiler's copy of the runtime variables, retained module text and frontmatter trees (the merged trees of `@extends` bases included), kept source-map segments, warnings, messages and the finalize output. Exactly the budget passes; above it, `resource limit exceeded: compile memory exceeds maximum of 209715200 bytes`. A reused `ModuleCache` keeps the count of its cached modules until it is dropped, so it fills faster. The tree estimate and its ceilings are below the table. | `limits.rs` (`MAX_COMPILE_MEMORY`, `TREE_PER_TOKEN`), `evaluator/budget.rs` |
+| Max compile memory | 200 MiB (209,715,200 bytes, four output buffers) per compile ([#420](https://github.com/dean0x/mdscript/issues/420), [#488](https://github.com/dean0x/mdscript/issues/488)). One budget counts output buffers by capacity, values that evaluation makes, an estimate of the syntax tree of each module (charged before the parse, by a compile, a check and an import scan), the compiler's copy of the runtime variables, retained module text and frontmatter trees (the merged trees of `@extends` bases included), kept source-map segments, warnings, messages and the finalize output. Exactly the budget passes; above it, `resource limit exceeded: compile memory exceeds maximum of 209715200 bytes`. A reused `ModuleCache` keeps the count of its cached modules until it is dropped, so it fills faster. The tree estimate and its ceilings are below the table. | `limits.rs` (`MAX_COMPILE_MEMORY`, `TREE_PER_TOKEN`), `evaluator/budget.rs` |
 | Frontmatter byte allowance | 50 MiB (52,428,800 bytes) per frontmatter parse, or the rest of the compile budget when that is smaller. Each YAML node spends 192 bytes plus its string or key bytes before it is built, so an alias of a long scalar spends the scalar again at each use. The one exception is the bytes of a `!tag`: the parser spends them after it copies the tag. Above it, `resource limit exceeded: frontmatter YAML expands beyond maximum of 52428800 bytes`, or the compile memory message when the rest of the budget set the allowance. | `resolver/frontmatter.rs` (`NODE_YAML`, `Allowance`) |
 | Max warnings | 1,000 | `evaluator.rs` (`MAX_WARNINGS`) |
 | Max import depth | 64 | `resolver.rs` (`MAX_IMPORT_DEPTH`) |
@@ -287,7 +287,10 @@ of each module: a cached import, an `@extends` base, the file entry and the stri
 entry. The estimate is `tokens × 832 + expression bytes × 184 + source bytes × 16`
 bytes, in checked arithmetic. Expression bytes are the text of each directive line and
 each interpolation. The compiler charges the estimate after the lexer and before the
-parse, so it never builds a tree that does not fit. A cached module keeps its estimate
+parse, so it never builds a tree that does not fit. An import scan (`scan_imports`,
+`scan_import_records` and the WASM file pre-scan of `@mdscript/mds`) charges the same
+estimate against its own new budget, so a scan of a very large or dense module stops
+with `mds::resource_limit`. A cached module keeps its estimate
 charged. A module resolved first as an `@extends` base and then as an import keeps one
 estimate. The factors are measured on a 64-bit host: for each of the 62 shapes in
 `crates/mds-core/tests/memory_bound.rs`, the estimate is at least the compile peak and

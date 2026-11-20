@@ -930,7 +930,10 @@ byte allowance from the budget (§4.1).
 `TREE_PER_EXPR_BYTE` and `TREE_PER_TEXT_BYTE`), in checked arithmetic. Expression bytes
 are the text of each directive line and each interpolation. The compiler charges the
 estimate after the lexer and before the parse. Thus the compiler refuses a module whose
-estimate does not fit before it builds the tree. A cached module keeps its estimate
+estimate does not fit before it builds the tree. An import scan (`scan_imports`,
+`scan_import_records` and the WASM file pre-scan of `@mdscript/mds`) charges the same
+estimate against its own new budget, and stops with the same error when the estimate
+does not fit. A cached module keeps its estimate
 charged, and the entry holds its estimate until it resolves. A module that a compile
 resolves first as an `@extends` base and then as an import keeps one estimate. The
 estimate counts the tokens during the parse, the syntax tree, and the copy of a
