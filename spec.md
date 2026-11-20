@@ -251,7 +251,8 @@ Debug mode is off.
   digit, underscore or hyphen after a keyword makes it part of a longer word, such as `@endnote`.
   Invalid forms such as `@Else:`, `@end.` and `@if(x):` cause syntax errors.
   The indent before a conditional cannot contain other whitespace or control characters.
-  There is no escape for a conditional line. To show that line as text, omit `+mds`.
+  A backslash before the `@` makes the line literal. The compiler keeps the backslash in selected content.
+  To show a conditional line as text without a prefix, omit `+mds`.
 - Close each in-fence `@if` before the fence closes. The lexer permits up to 64 open conditionals per fence.
   At the closer, an open conditional causes a syntax error at the innermost open `@if`.
   If the fence does not close, the compiler reports the unclosed fence at its opener instead.

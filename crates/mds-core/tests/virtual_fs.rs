@@ -1462,6 +1462,13 @@ fn braces_and_non_keywords_stay_literal_inside_an_opted_in_fence() {
 }
 
 #[test]
+fn backslash_prefixed_conditionals_stay_literal_in_an_opted_in_fence() {
+    let literal = "  \\@if missing:\n\\@elseif missing:\n\\@else:\n\\@end\n";
+    let source = format!("```+mds\n@if 1 == 1:\n{literal}@end\n```\n");
+    assert_eq!(entry_markdown(&source), format!("```\n{literal}```\n"));
+}
+
+#[test]
 fn interpolation_does_not_re_scan_a_value_with_a_marked_fence() {
     let value = "```+mds\n@if 1 == 0:\nliteral\n@end\n```\n";
     let vars = HashMap::from([("body".into(), Value::String(value.into()))]);
