@@ -1744,7 +1744,7 @@ pub(crate) fn is_within_default_excluded_dir(root: &Path, path: &Path) -> bool {
 /// directory — shows its results in the order it visits them.
 fn by_name(read_dir: std::fs::ReadDir) -> Vec<std::fs::DirEntry> {
     let mut entries: Vec<_> = read_dir.flatten().collect();
-    entries.sort_by_key(std::fs::DirEntry::file_name);
+    entries.sort_by_cached_key(std::fs::DirEntry::file_name);
     entries
 }
 

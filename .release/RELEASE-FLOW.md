@@ -91,8 +91,9 @@ publishes nothing.
   #345 is closed; Trusted Publishing for crates.io is tracked in #368.
 - **Flow (tag-push)**: version-gate → build-napi (7 targets) + build-python (7 wheels + sdist,
   parallel) → stage+verify (A3 gate, then the x64 Alpine load test) → load-test-musl-arm64
-  (arm64 Alpine load test) + rehearse-publish-python (pin, GHCR manifest, pull, `twine check`;
-  uploads nothing) → publish-crates → publish-npm → publish-python → github-release
+  (arm64 Alpine load test). rehearse-publish-python (pin, GHCR manifest, pull, `twine check`;
+  uploads nothing) needs only build-python. publish-crates needs all of them → publish-npm →
+  publish-python → github-release
 - **Critical gate**: A3 name↔loader verification (`scripts/verify-napi-names.mjs`)
 - **Toolchain pins**: Unpinned inputs that have broken release builds: stable rustc (1.98.0 added
   `-Wl,--fix-cortex-a53-843419`; cargo-zigbuild 0.23.0 filters this flag internally in `src/zig.rs`

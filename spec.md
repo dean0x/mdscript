@@ -1209,8 +1209,8 @@ holds eight more test-only hooks, compiled out in the same way: the pauses
 `MDS_TEST_PAUSE_BEFORE_REPLACE`, `MDS_TEST_PAUSE_AFTER_WALK`,
 `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT`, `MDS_TEST_PAUSE_AFTER_LOOK`,
 `MDS_TEST_PAUSE_AFTER_READ`, `MDS_TEST_PAUSE_BEFORE_LATE_LOOK` and
-`MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE`, each of which stops a write or
-a rebuild at one point until a test lets it go, and the readiness marker `MDS_TEST_READY`,
+`MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE`, each of which stops a write,
+a directory command or a rebuild at one point until a test lets it go, and the readiness marker `MDS_TEST_READY`,
 the file `mds watch` creates once it is watching. `tests/panic_hook.rs` pins that each is
 compiled only under `cfg(debug_assertions)` and has an empty release stub.
 

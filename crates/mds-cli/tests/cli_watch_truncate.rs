@@ -1523,6 +1523,95 @@ fn dir_mode_a_dependency_a_held_compile_read_empty_holds_the_batch_its_truncatio
     }
 }
 
+/// The failing twin of the test above: the page calls a function of the dependency, so the
+/// compile that reads the dependency empty fails. That compile is held, and the file it read
+/// empty stays among the files the look stamps until the hold ends, as for a compile that
+/// would write: the batch the truncation's own event starts finds it emptied and is held
+/// too, so the failure on the empty file is never reported (#380).
+#[cfg(debug_assertions)]
+#[test]
+fn dir_mode_a_dependency_a_failed_held_compile_read_empty_holds_the_batch_its_truncation_starts() {
+    let base = tempfile::tempdir().unwrap();
+    let (root, shared) = (base.path().join("root"), base.path().join("shared"));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&shared).unwrap();
+    // The project's root marker, so the page may import from beside the root.
+    std::fs::write(base.path().join(".git"), "").unwrap();
+    std::fs::write(
+        shared.join("_x.mds"),
+        "@define greet():\nX one\n@end\n\n@export greet\n",
+    )
+    .unwrap();
+    let page = root.join("page.mds");
+    std::fs::write(&page, "@import \"../shared/_x.mds\" as x\n{{x.greet()}}\n").unwrap();
+    let out = base.path().join("out");
+    let output = out.join("page.md");
+    // Outside every watched directory, so the pause's files raise no event.
+    let (go, paused) = (base.path().join("go"), base.path().join("go.paused"));
+
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .arg("watch")
+            .arg(&root)
+            .arg("--out-dir")
+            .arg(&out)
+            .args(["--debounce", "50", "--poll-interval", "0"])
+            .env("MDS_TEST_PAUSE_AFTER_LOOK", &go)
+            .stdout(Stdio::null()),
+    );
+    let mut log = OutputLog::default();
+    log.wait_for(&output, "X one", TIMEOUT);
+
+    // The page is saved calling a function of a file that is not there: its batch stops
+    // after its look, is let go, and the compile fails, which leaves the page errored.
+    let missing = shared.join("_y.mds");
+    write_atomic(&page, "@import \"../shared/_y.mds\" as y\n{{y.greet()}}\n");
+    wait_for_the_pause(&paused, &tap, "the batch of the page's save");
+    std::fs::write(&go, "").unwrap();
+    wait_for_tap(&tap, "_y.mds", TIMEOUT);
+
+    // The pause is set again: the batch the creation of `_y.mds` starts stops after its look,
+    // with the file full, and the page is compiled again for its failure.
+    std::fs::rename(&go, base.path().join("go.spent")).unwrap();
+    std::fs::rename(&paused, base.path().join("go.paused.spent")).unwrap();
+    write_atomic(&missing, "@define greet():\nY one\n@end\n\n@export greet\n");
+    wait_for_the_pause(&paused, &tap, "the batch of the creation of _y.mds");
+    let hold = Hold::start(&missing);
+    std::fs::write(&go, "").unwrap();
+    log.poll_for(&output, TRUNCATE_HOLD);
+    let timing = hold.write_and_close("@define greet():\nY two\n@end\n\n@export greet\n");
+    // The positive control: once `_y.mds` is written, the output is published with its
+    // content, by the one rebuild that ends the hold.
+    log.wait_for(&output, "Y two", TIMEOUT);
+
+    let stderr = stderr_through_the_marker(&page, tap, &mut child);
+    let what = "directory mode, a dependency beside the root truncated after its batch looked, \
+                read empty by a compile that fails on it";
+    assert_no_empty_before_the_deadline(&log, timing.started, what);
+    if strict_claims_apply(
+        "dir_mode_a_dependency_a_failed_held_compile_read_empty_holds_the_batch_its_truncation_starts",
+        &timing,
+        what,
+    ) {
+        assert_eq!(
+            log.contents(),
+            ["X one\n", "Y two\n"],
+            "{what}: the output goes from the first import to the content finally written; \
+             stderr:\n{stderr}"
+        );
+        let before = before_the_marker(&stderr);
+        assert_eq!(
+            (
+                count_occurrences(before, "mds::"),
+                count_occurrences(before, "mds::file_not_found"),
+            ),
+            (1, 1),
+            "{what}: only the missing file of the first save is reported, never the failure \
+             on the empty file; stderr:\n{stderr}"
+        );
+    }
+}
+
 // ── The deadline ────────────────────────────────────────────────────────────
 
 /// Truncate the entry and close it without writing: the empty output IS published —

@@ -452,7 +452,7 @@ For a new file, it pauses the write between its name lookup and its commit.
 `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT` pauses a directory `mds watch` rebuild after its source-presence check, before the compile.
 `MDS_TEST_PAUSE_AFTER_LOOK` pauses a rebuild, in either watch mode, after its empty-file check, before any source read.
 `MDS_TEST_PAUSE_AFTER_READ` pauses a file-mode rebuild after the compile reads its files, before its baseline snapshot.
-`MDS_TEST_PAUSE_BEFORE_LATE_LOOK` pauses a rebuild, in either watch mode, after its `--vars` load and compile read their files, before its late empty-file check.
+`MDS_TEST_PAUSE_BEFORE_LATE_LOOK` pauses a file-mode rebuild after its `--vars` load and compile read their files, and a directory batch after each source's compile, before the late empty-file check.
 `MDS_TEST_PAUSE_AFTER_WALK` pauses a directory command after its file walk.
 `MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE` pauses a watch compile after its path check, before entry resolution.
 Each pause variable names a file. The run writes `<file>.paused` at the pause point.

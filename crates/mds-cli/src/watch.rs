@@ -878,9 +878,31 @@ fn read_empty(reads: &mds::ReadLog, baseline: &StampMap) -> BTreeSet<PathBuf> {
         .sizes()
         .into_iter()
         .filter(|&(_, bytes)| bytes == 0)
-        .map(|(key, _)| graph_key(Path::new(&key)))
+        .filter_map(|(key, _)| baseline_key(&graph_key(Path::new(&key)), baseline))
         .filter(|path| went_empty(baseline.get(path), &(None, Some(0))))
         .collect()
+}
+
+/// The key `baseline` holds for `path`, a file a read named ([`read_empty`]): `path`
+/// itself, or, after a rename that changed only the case of a name on a file system that
+/// ignores case, the key spelled as the baseline took it that names the same file. A read
+/// names a file as it is spelled on disk now; the baseline keeps the spelling it was
+/// taken with. `None` when the baseline has no key for the file. Only a key that differs
+/// from `path` in ASCII case alone is resolved again.
+fn baseline_key(path: &Path, baseline: &StampMap) -> Option<PathBuf> {
+    if baseline.contains_key(path) {
+        return Some(path.to_path_buf());
+    }
+    let spelled = path.as_os_str().to_string_lossy();
+    baseline
+        .keys()
+        .filter(|key| {
+            key.as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&spelled)
+        })
+        .find(|key| graph_key(key) == path)
+        .cloned()
 }
 
 /// The late look (#380): `emptied` holds the files a rebuild found emptied after its look
@@ -1969,8 +1991,8 @@ impl From<miette::Report> for CompileFailure {
 
 /// Compile the file at `path` with the default options: `mds watch` writes no source
 /// maps. Every file the compile reads is recorded in `reads` with its byte count
-/// ([`mds::ReadLog`]), for the late look ([`held_after_look`]). The one place a watch compile runs, so the one place a panic in it is caught
-/// and the session goes on (#389).
+/// ([`mds::ReadLog`]), for the late look ([`held_after_look`]). The one place a watch
+/// compile runs, so the one place a panic in it is caught and the session goes on (#389).
 fn compile_caught(
     path: &Path,
     canonical: &Path,
@@ -3092,8 +3114,9 @@ struct FileCompiled {
 /// load that failed compiles nothing. A failure is returned as what to report — `None` for
 /// a compile that panicked, which the panic hook reported (#389) — and how to settle it:
 /// [`Settle::Rebaseline`] for the load, [`Settle::MarkErrored`] for the compile. Nothing is
-/// reported or settled here: the caller's late look decides first ([`held_after_look`]). The load and the
-/// compile record the byte count of every file they read in `reads`, a failed one included.
+/// reported or settled here: the caller's late look decides first ([`held_after_look`]).
+/// The load and the compile record the byte count of every file they read in `reads`, a
+/// failed one included.
 fn load_and_compile<'a>(
     ctx: &'a FileCompileCtx,
     reads: &Arc<mds::ReadLog>,
@@ -4488,10 +4511,9 @@ struct BatchCtx<'a> {
 /// because `src` is gone since the batch found it there retires it as a deleted source
 /// ([`DirWatchState::retire_deleted`], #160). A compile that read a file emptied since the
 /// batch looked — whether it then failed or would write — holds `src` back, unless the
-/// deadline ended the hold in this rebuild ([`held_after_look`], #380). A compile
-/// that succeeded keeps the files it read empty in the baseline until the hold ends
-/// ([`HeldBatch::hold_read_empty`]); one that failed read the files its last compile
-/// reported, which the baseline holds already. A source
+/// deadline ended the hold in this rebuild ([`held_after_look`], #380). Either way the
+/// files it read empty stay in the baseline until the hold ends
+/// ([`HeldBatch::hold_read_empty`]). A source
 /// whose output is written, kept with a notice, or not written with a report shows
 /// something: the batch's `--vars` duplicate keys are reported with it, before its
 /// `Recompiled` line, after the notice, or before the report, unless an earlier source of
@@ -4540,11 +4562,13 @@ fn compile_one_source(src: &Path, ctx: &mut BatchCtx<'_>, state: &mut DirWatchSt
             // truncation that began between the batch's look and the read, failed on —
             // holds `src` back as the look would have, unless the deadline ended the hold in
             // this rebuild: nothing reported or recorded, `src` kept to be rebuilt with the
-            // batch that ends the hold. The byte counts the reads gave decide
-            // ([`read_empty`]); a file the baseline saw is in it already, so none stays in it
-            // for the hold.
-            if held_after_look(&mut state.hold, read_empty(&reads, &state.last_mtimes)).is_some() {
-                state.hold_back(src, kept_before, BTreeSet::new(), root);
+            // batch that ends the hold, and the files it read empty kept in the baseline until
+            // then, as for a compile that would write. The byte counts the reads gave decide
+            // ([`read_empty`]).
+            if let Some(read_empty) =
+                held_after_look(&mut state.hold, read_empty(&reads, &state.last_mtimes))
+            {
+                state.hold_back(src, kept_before, read_empty, root);
                 return;
             }
             settle(
@@ -6309,8 +6333,9 @@ fn process_dir_batch_incremental(
 /// emptied, before the rebuild takes its baseline — so that a test can truncate a file the
 /// rebuild has read whole (`tests/cli_watch_truncate.rs`, #380).
 /// The compile pause stops after the watched-path check and before entry resolution.
-/// `MDS_TEST_PAUSE_BEFORE_LATE_LOOK`: how it is made to stop a rebuild, in either mode,
-/// once its `--vars` load and compile have read their files, before its late look
+/// `MDS_TEST_PAUSE_BEFORE_LATE_LOOK`: how it is made to stop a file-mode rebuild once its
+/// `--vars` load and compile have read their files, or a directory batch once one source's
+/// compile has read its files, before the late look
 /// ([`held_after_look`]) — so that a test can write a file the compile read empty
 /// (`tests/cli_watch_truncate.rs`, #380).
 /// A release build has none of these pauses.
@@ -11868,6 +11893,44 @@ mod tests {
             "the batch is held on the empty read"
         );
         assert!(state.held.vars_changed, "a change to the vars file");
+    }
+
+    /// #380: after a rename that changed only the case of a name, on a file system that
+    /// ignores case, a read names the file as it is spelled on disk now, and the baseline
+    /// keeps the spelling it was taken with: the read is matched to the baseline's key. A
+    /// key that names another file is never matched. On a file system that keeps case
+    /// apart, the two spellings are two files and only the exact key matches.
+    #[test]
+    fn a_read_after_a_case_only_rename_is_matched_to_the_baseline_s_key() {
+        let (_dir, root) = canonical_tempdir();
+        let on_disk = root.join("page.mds");
+        std::fs::write(&on_disk, "").unwrap();
+        let taken_as = root.join("PAGE.mds");
+        let other = root.join("other.mds");
+        std::fs::write(&other, "x\n").unwrap();
+        let baseline: StampMap = [
+            (taken_as.clone(), (None, Some(6))),
+            (other.clone(), (None, Some(2))),
+        ]
+        .into_iter()
+        .collect();
+
+        let ignores_case = taken_as.exists();
+        assert_eq!(
+            baseline_key(&on_disk, &baseline),
+            ignores_case.then(|| taken_as.clone()),
+            "ignores case: {ignores_case}"
+        );
+        assert_eq!(
+            baseline_key(&other, &baseline),
+            Some(other.clone()),
+            "an exact key matches as it is"
+        );
+        assert_eq!(
+            baseline_key(&root.join("new.mds"), &baseline),
+            None,
+            "a file the baseline never saw has no key"
+        );
     }
 
     /// #380: a file a compile read empty, which the baseline saw with bytes, is found
