@@ -38,6 +38,8 @@ mds lint examples/linting/config-demo/loop-shadow.mds
 
 Set [`indented-directives: true`](../spec.md#indented-directives) in a template's frontmatter to evaluate its indented conditionals, even with four or more spaces.
 The key does not affect unmarked fences.
+Add `+mds` as the last info word of a code fence to evaluate conditional lines inside it.
+Other fence info words that start with `+` and a letter are [reserved](../spec.md#conditionals-inside-a-fence).
 
 ## Templates
 

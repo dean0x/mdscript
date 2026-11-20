@@ -18,7 +18,8 @@ demonstrates `fix_edits` in a non-null state — visible in the JSON output for 
 
 [Example 04](../edge-cases/04_escaped_and_code.mds) shows `literal-directive`.
 Its `@if` and `@end` lines stay literal in the unmarked fence. Use `mds` as the first info word to keep them literal without this warning.
-Use [`+mds`](../../spec.md#conditionals-inside-a-fence) instead to evaluate fence conditionals.
+Use `+mds` as the last info word instead to evaluate fence conditionals.
+Other fence info words that start with `+` and a letter are [reserved](../../spec.md#conditionals-inside-a-fence).
 Set [`indented-directives: true`](../../spec.md#indented-directives) in the file's frontmatter to evaluate indented conditionals outside fences.
 The file key does not suppress warnings in unmarked fences.
 

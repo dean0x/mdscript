@@ -67,7 +67,10 @@ Unlike general-purpose template engines, MDS is Markdown-native: no delimiters t
 ## Features
 
 - **Variables**: YAML frontmatter or runtime `--set KEY=VALUE` flags
-- **Conditionals**: `@if`/`@elseif`/`@else:`/`@end` with negation and equality comparisons. Add `+mds` as the last info word of a code fence to [evaluate conditional lines inside it](spec.md#conditionals-inside-a-fence). Set [`indented-directives: true`](spec.md#indented-directives) in a file's frontmatter to evaluate its indented conditional lines outside fences.
+- **Conditionals**: `@if`/`@elseif`/`@else:`/`@end` with negation and equality comparisons.
+  Add `+mds` as the last info word of a code fence to evaluate conditional lines inside it.
+  Other fence info words that start with `+` and a letter are [reserved](spec.md#conditionals-inside-a-fence).
+  Set [`indented-directives: true`](spec.md#indented-directives) in a file's frontmatter to evaluate indented conditionals outside fences.
 - **Loops**: `@for item in list:` iteration over arrays and objects
 - **Functions**: `@define` reusable blocks with parameters
 - **Imports/Exports**: modular prompt libraries with alias, merge, and selective imports
