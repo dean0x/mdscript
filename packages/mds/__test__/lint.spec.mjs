@@ -789,7 +789,8 @@ describe('unknown lint rule names (AC-224-1 / D8)', () => {
   // field can appear. Without this, an implementation that always populated
   // lint_warnings would pass every assertion above.
   test('U-L-WARN-4: every recognised rule name is accepted with no lint_warnings', () => {
-    assert.equal(LINT_RULE_NAMES.length, 10, 'LINT_RULE_NAMES must have exactly 10 entries');
+    assert.equal(LINT_RULE_NAMES.length, 11, 'LINT_RULE_NAMES must have exactly 11 entries');
+    assert.ok(LINT_RULE_NAMES.includes('literal-directive'));
     for (const name of LINT_RULE_NAMES) {
       const result = lint(CLEAN_SOURCE, { rules: { [name]: 'off' } });
       assert.equal(
@@ -841,7 +842,7 @@ describe('unknown lint rule names (AC-224-1 / D8)', () => {
     }
     const warned = wasmBackend.lint(CLEAN_SOURCE, { rules: { 'no-such-rule-xyzzy': 'warn' } });
     assertWarnsAbout(warned, 'no-such-rule-xyzzy', 'U-L-WARN-6');
-    const clean = wasmBackend.lint(CLEAN_SOURCE, { rules: { 'unused-variable': 'off' } });
+    const clean = wasmBackend.lint(CLEAN_SOURCE, { rules: { 'literal-directive': 'off' } });
     assert.equal(
       clean.lint_warnings,
       undefined,

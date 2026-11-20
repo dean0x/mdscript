@@ -4221,14 +4221,14 @@ fn unknown_rule_plural_sorted_warning() {
 #[test]
 fn unknown_rule_cli_exact_golden() {
     // We cannot import mds:: directly from an integration test; hard-code the
-    // current ten names in alphabetical order (the same value KNOWN_LINT_RULES
+    // current eleven names in alphabetical order (the same value KNOWN_LINT_RULES
     // holds, verified by AC-224-7).  If the registry grows this golden must be
     // updated alongside the registry — the test will fail loudly.
     #[rustfmt::skip]
     let recognised = concat!(
         "duplicate-export, duplicate-import, empty-block, legacy-interpolation, ",
-        "redundant-else, shadow-variable, unreachable-branch, unused-function, ",
-        "unused-import, unused-variable"
+        "literal-directive, redundant-else, shadow-variable, unreachable-branch, ",
+        "unused-function, unused-import, unused-variable"
     );
 
     // ── Singular golden ────────────────────────────────────────────────────────
@@ -4319,8 +4319,8 @@ fn unknown_rule_cli_exact_golden_single_file() {
     #[rustfmt::skip]
     let recognised = concat!(
         "duplicate-export, duplicate-import, empty-block, legacy-interpolation, ",
-        "redundant-else, shadow-variable, unreachable-branch, unused-function, ",
-        "unused-import, unused-variable"
+        "literal-directive, redundant-else, shadow-variable, unreachable-branch, ",
+        "unused-function, unused-import, unused-variable"
     );
 
     // ── Singular golden (single-file path) ────────────────────────────────────
