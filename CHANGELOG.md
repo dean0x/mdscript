@@ -11,10 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add `+mds` as the last info word of a code fence to evaluate conditional lines. The compiler removes the marker and keeps other content literal (#452).
 - `literal-directive` warns about conditional lines that stay literal. It offers no automatic fix (#452).
+- Set `indented-directives: true` in a file's frontmatter to evaluate indented conditional lines outside fences (#452).
 
 ### Changed
 
 - Fence info words that start with `+` and an ASCII letter or a non-ASCII character are reserved. Words that contain `+mds` and the split form `+ mds` are also reserved, regardless of ASCII letter case. Only the exact final `+mds` is valid among these forms (#452).
+- The top-level frontmatter key `indented-directives` is reserved. It does not enter variable scope or appear in output frontmatter (#452).
 
 ### Internal
 

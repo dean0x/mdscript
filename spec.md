@@ -266,6 +266,26 @@ or a non-ASCII character causes a syntax error. So does a word that contains `+m
 letter case, or a `+` word just before `mds` in any ASCII letter case. The only exception is
 the exact final marker. Words such as `+5`, `+=` and `++` stay valid.
 
+#### Indented directives
+
+Set `indented-directives: true` in a file's own YAML frontmatter to enable indented directives outside fences.
+Only `@if`, `@elseif`, `@else:` and `@end` can use this opt-in. Use ASCII spaces or tabs for the indent.
+Four or more spaces also count. If the key is absent or `false`, indented conditional lines are text, not directives.
+
+The key does not affect `>`-prefixed lines or unmarked fences. Other indented `@` lines are not directives.
+Markdown list structure does not affect these directives. Outside fences, an indented `@end` closes the innermost open MDS block of any kind.
+An indented conditional in an invalid form, such as `@else` without its colon, causes a syntax error under this opt-in.
+
+Write the key once, at the start of a frontmatter line, with an unquoted lowercase Boolean.
+Spaces and tabs can follow the value. If you add a comment, put a space or tab before it.
+A quoted value, a blank before the colon or a repeated key line causes `mds::syntax` at that line.
+If the key in parsed YAML does not match the source line and Boolean value, the compiler reports `mds::yaml`.
+`mds check`, `mds lint` and `mds fmt` also report this YAML error.
+
+The key does not pass through `@extends`, `@import` or `@include`. This also applies to imported `@define` bodies.
+This top-level key is reserved. It does not enter variable scope or appear in standalone or merged output frontmatter.
+The `unused-variable` rule does not report it.
+
 ---
 
 ### 4.4 Loops
@@ -830,7 +850,7 @@ The blank lines between sections come from the base skeleton (the blank line bet
 
 - Frontmatter from all ancestors is deep-merged in order: base < intermediate < child < runtime vars
 - Nested mappings are merged key-by-key; arrays replace wholesale; scalars: child wins
-- Reserved keys (`imports`, `type`, `extends`) are excluded from the merged scope
+- The merged scope excludes reserved top-level keys (`imports`, `type`, `extends`, `indented-directives`).
 - Per-file `imports:` entries in frontmatter are each resolved against their own file's location
 - The **deep-merged** frontmatter (base < child, reserved keys excluded) is emitted in the compiled output — not just the child's raw frontmatter. Both base-only and child-only keys appear; child wins on collisions
 
@@ -840,7 +860,7 @@ The blank lines between sections come from the base skeleton (the blank line bet
 
 | Template type | Emitted frontmatter |
 |---------------|---------------------|
-| **Standalone** | Raw-verbatim: the original source YAML between `---` fences, byte-for-byte (comments and quoting preserved) |
+| **Standalone** | Raw source YAML with reserved keys removed (comments and quoting preserved on retained lines) |
 | **`@extends` child** | Canonically re-serialized: serde-yaml output of the deep-merged mapping (comments and original quoting are normalized away; YAML structure is canonical) |
 
 This asymmetry is intentional: standalone templates can round-trip YAML comments and non-canonical quoting, while `@extends` templates must emit a merged structure that has no single "source" YAML string. Runtime `--set`/`--set-string` variables do not alter the emitted frontmatter in either case — they affect only the compiled body.
@@ -1957,7 +1977,7 @@ Rules default to the severities shown below — **not all rules default to `warn
 | `duplicate-import` | **error** | yes (A) | A | The same file is imported more than once in a single file (modulo alias). |
 | `duplicate-export` | **error** | yes (A) | A | The same export name is defined more than once in a single file. |
 | `legacy-interpolation` | warn | yes (A) | A | A legacy `{x}` interpolation can use `{{x}}` instead. |
-| `literal-directive` | warn | no | C | A conditional line stays literal: an indented line outside a fence, or a line in an unmarked fence with `@if …:` before `@end`. The rule skips fences with `mds` as the first info word. |
+| `literal-directive` | warn | no | C | A conditional line stays literal: an indented line outside a fence without `indented-directives: true`, or a line in an unmarked fence with `@if …:` before `@end`. The rule skips fences with `mds` as the first info word. |
 
 ¹ **`unused-import` is report-only in practice**: `fixable` is always `false` for this rule. A file that triggers `unused-import` contains at least one `@import` directive, making it non-*structural-standalone* (see below); Tier B fixes require a structural-standalone file. The rule is still useful — the warning clears as a side effect of applying other fixes (e.g. removing a duplicate import that was also the unused one). To silence it, set `"unused-import": "off"` in `mds.json`.
 
@@ -2144,6 +2164,8 @@ These are intentionally deferred to keep the language simple and the compiler fo
 ```
 file            := frontmatter? extends? (directive | text)*
 frontmatter     := "---\n" yaml_content "---\n"
+indented_key    := "indented-directives:" [ \t]+ ("true" | "false") ([ \t]+ "#" <rest of line>)? [ \t]*
+                   (* optional top-level line in yaml_content; see §4.3 *)
 extends         := "@extends" quoted_path
 directive       := import | export | define | include | if_block | for_block | message_block | block
 

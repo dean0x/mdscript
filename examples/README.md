@@ -36,6 +36,9 @@ source .venv/bin/activate && python examples/python/demo.py
 mds lint examples/linting/config-demo/loop-shadow.mds
 ```
 
+Set [`indented-directives: true`](../spec.md#indented-directives) in a template's frontmatter to evaluate its indented conditionals, even with four or more spaces.
+The key does not affect unmarked fences.
+
 ## Templates
 
 | Directory | What it shows |
