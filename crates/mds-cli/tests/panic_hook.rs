@@ -1812,12 +1812,13 @@ fn the_pause_after_a_walk_is_compiled_only_into_debug_builds() {
 
 /// The pause between a directory watch batch's split and its compile (#160), the pause
 /// between a watch rebuild's look and its reads (#380) and the pause between a file
-/// rebuild's reads and its baseline (#380) compile only into a debug build, as the pause
-/// before a replace does: every mention of `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT`, of
-/// `MDS_TEST_PAUSE_AFTER_LOOK` and of `MDS_TEST_PAUSE_AFTER_READ` sits inside
-/// `mod batch_pause_trigger`, whose attributes hold `#[cfg(debug_assertions)]`, and
-/// `pause_after_batch_split`, `pause_after_look` and `pause_after_read` each have a release
-/// build's stub that does nothing.
+/// rebuild's reads and its baseline (#380), the pause before a watch compile, and the pause
+/// between a rebuild's reads and its late look (#380) compile only into a debug build, as
+/// the pause before a replace does: every mention of `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT`,
+/// `MDS_TEST_PAUSE_AFTER_LOOK`, `MDS_TEST_PAUSE_AFTER_READ`,
+/// `MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE` and `MDS_TEST_PAUSE_BEFORE_LATE_LOOK` sits inside
+/// `mod batch_pause_trigger`, whose attributes hold `#[cfg(debug_assertions)]`, and each
+/// pause function has a release build's stub that does nothing.
 ///
 /// Controls: the module without its `cfg`, a mention of any of the variables outside it, a
 /// release stub that does something, and no release stub for any of the pauses are each
@@ -1829,8 +1830,9 @@ fn the_pause_after_a_batch_split_is_compiled_only_into_debug_builds() {
     let found = gate_findings(&sources, &BATCH_PAUSE_TRIGGER);
     assert!(
         found.is_empty(),
-        "the pauses after a batch's split, after a rebuild's look and after a file \
-         rebuild's reads must be compiled only into debug builds:\n{}",
+        "the pauses after a batch's split, after a rebuild's look, after a file \
+         rebuild's reads, before a watch compile and before a late look must be compiled \
+         only into debug builds:\n{}",
         found.join("\n")
     );
 
@@ -1849,6 +1851,7 @@ fn the_pause_after_a_batch_split_is_compiled_only_into_debug_builds() {
     let look_stub = "fn pause_after_look() {}";
     let read_stub = "fn pause_after_read() {}";
     let compile_stub = "fn pause_before_compile() {}";
+    let late_stub = "fn pause_before_late_look() {}";
     for (planted, what) in [
         (
             with(
@@ -1903,6 +1906,22 @@ fn the_pause_after_a_batch_split_is_compiled_only_into_debug_builds() {
         (
             with(compile_stub, ""),
             "a compile pause without a release stub",
+        ),
+        (
+            with(
+                late_stub,
+                "fn pause_before_late_look() {\n    \
+                 let _ = std::env::var_os(\"MDS_TEST_PAUSE_BEFORE_LATE_LOOK\");\n}",
+            ),
+            "the late-look pause's variable outside its module",
+        ),
+        (
+            with(late_stub, "fn pause_before_late_look() { let _ = 1; }"),
+            "a late-look release stub that does something",
+        ),
+        (
+            with(late_stub, ""),
+            "a late-look pause without a release stub",
         ),
     ] {
         assert!(
@@ -3091,7 +3110,9 @@ const PAUSE_TRIGGER: DebugGate = DebugGate {
 /// `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT`, the pause between a watch rebuild's look and its
 /// reads (#380), `MDS_TEST_PAUSE_AFTER_LOOK`, and the pause between a file rebuild's reads
 /// and its baseline (#380), `MDS_TEST_PAUSE_AFTER_READ`, all in `mod batch_pause_trigger`.
-/// The same module holds `MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE` before entry resolution.
+/// The same module holds `MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE` before entry resolution. It also
+/// holds `MDS_TEST_PAUSE_BEFORE_LATE_LOOK`, between a rebuild's reads and its late empty-file
+/// check (#380).
 const BATCH_PAUSE_TRIGGER: DebugGate = DebugGate {
     module: "batch_pause_trigger",
     needles: &[
@@ -3099,12 +3120,14 @@ const BATCH_PAUSE_TRIGGER: DebugGate = DebugGate {
         ("MDS_TEST_PAUSE_AFTER_LOOK", true),
         ("MDS_TEST_PAUSE_AFTER_READ", true),
         ("MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE", true),
+        ("MDS_TEST_PAUSE_BEFORE_LATE_LOOK", true),
     ],
     fns: &[
         "pause_after_batch_split",
         "pause_after_look",
         "pause_after_read",
         "pause_before_compile",
+        "pause_before_late_look",
     ],
 };
 

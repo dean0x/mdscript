@@ -945,7 +945,8 @@ fn too_many_block_declarations_exits_3_resource_limit() {
 // Verifies the F1 invariant: files[] in --format json directory-mode output is
 // always in sorted (path-ascending) order regardless of filesystem walk order.
 // Exercises the explicit `files.sort()` in run_lint_directory, which is
-// required because collect_mds_files() does NOT guarantee any walk order.
+// required because collect_mds_files() sorts each directory's entries by name, which
+// is not a sort of the full paths.
 //
 // Files MUST carry diagnostics: to_canonical_json() only emits file entries
 // for files that have at least one diagnostic — clean files are omitted from

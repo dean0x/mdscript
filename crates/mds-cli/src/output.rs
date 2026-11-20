@@ -1738,6 +1738,16 @@ pub(crate) fn is_within_default_excluded_dir(root: &Path, path: &Path) -> bool {
     false
 }
 
+/// The entries of one directory, sorted by file name: the walk visits a tree in the same
+/// order on every platform. `read_dir` gives no set order (hash or creation order on most
+/// Linux filesystems), and a run that processes files one by one — `mds fmt` of a
+/// directory — shows its results in the order it visits them.
+fn by_name(read_dir: std::fs::ReadDir) -> Vec<std::fs::DirEntry> {
+    let mut entries: Vec<_> = read_dir.flatten().collect();
+    entries.sort_by_cached_key(std::fs::DirEntry::file_name);
+    entries
+}
+
 fn collect_mds_files_inner(
     dir: &Path,
     depth: usize,
@@ -1762,7 +1772,7 @@ fn collect_mds_files_inner(
         Ok(rd) => rd,
         Err(_) => return,
     };
-    for entry in read_dir.flatten() {
+    for entry in by_name(read_dir) {
         let path = entry.path();
 
         // Skip the output directory when it is nested inside the root.
@@ -3631,6 +3641,30 @@ mod tests {
         // Non-vacuity: the inverted name IS collected.
         std::fs::write(dir.path().join(".tmp-4242-8.t.mds"), "wrong shape").unwrap();
         assert_eq!(collect_mds_files(dir.path(), 64, None).len(), 2);
+    }
+
+    /// The walk visits each directory's entries by name, on every platform: a file beside a
+    /// directory comes before the directory's files when its name sorts first, and after
+    /// them when it sorts last. `read_dir` order is not sorted on most Linux filesystems,
+    /// and `mds fmt` of a directory rewrites and reports in walk order.
+    #[test]
+    fn collect_mds_files_visits_each_directory_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // Created in reverse name order, so creation order is not name order.
+        for name in ["z.mds", "m/b.mds", "m/a.mds", "a.mds"] {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x\n").unwrap();
+        }
+        let names: Vec<_> = collect_mds_files(dir.path(), 64, None)
+            .iter()
+            .map(|path| path.strip_prefix(dir.path()).unwrap().to_path_buf())
+            .collect();
+        let want: Vec<PathBuf> = ["a.mds", "m/a.mds", "m/b.mds", "z.mds"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(names, want);
     }
 
     #[test]

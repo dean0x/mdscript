@@ -86,7 +86,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use miette::Result;
@@ -95,7 +95,7 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use mds::MdsError;
 
 use crate::build::{
-    admit_output, auto_detect_mds_file, build_runtime_vars, compile_inputs,
+    admit_output, auto_detect_mds_file, build_runtime_vars_logged, compile_inputs,
     compile_native_to_content, resolve_dir_as_created, resolve_output_path_for_kind, source_inputs,
     write_output, CompileOutput, EntryPaths, OutputKind, ProjectConfig, RuntimeVarArgs,
     RuntimeVars,
@@ -864,9 +864,50 @@ impl EmptyHold {
     }
 }
 
-/// The late look (#380): the files of `read` — those a `--vars` load or a compile read —
-/// that went from non-empty to empty since `baseline` was taken, a truncation that began
-/// between the rebuild's look and the read. When there are any, the rebuild is held as the
+/// The files of `reads` — the byte counts a rebuild's `--vars` load and compile read
+/// ([`mds::ReadLog`]) — that a read found empty and `baseline` saw with bytes
+/// ([`went_empty`]): a truncation that began between the rebuild's look and the read.
+///
+/// The count the read gave decides, never a later `stat`. A save that truncates and then
+/// writes can end between the read and that `stat`: the `stat` finds the bytes written and
+/// misses the empty read, and the empty output is published (#380). A file read whole and
+/// truncated after is not found here; the rebuild publishes what it read, and the next
+/// look finds the file emptied.
+fn read_empty(reads: &mds::ReadLog, baseline: &StampMap) -> BTreeSet<PathBuf> {
+    reads
+        .sizes()
+        .into_iter()
+        .filter(|&(_, bytes)| bytes == 0)
+        .filter_map(|(key, _)| baseline_key(&graph_key(Path::new(&key)), baseline))
+        .filter(|path| went_empty(baseline.get(path), &(None, Some(0))))
+        .collect()
+}
+
+/// The key `baseline` holds for `path`, a file a read named ([`read_empty`]): `path`
+/// itself, or, after a rename that changed only the case of a name on a file system that
+/// ignores case, the key spelled as the baseline took it that names the same file. A read
+/// names a file as it is spelled on disk now; the baseline keeps the spelling it was
+/// taken with. `None` when the baseline has no key for the file. Only a key that differs
+/// from `path` in ASCII case alone is resolved again.
+fn baseline_key(path: &Path, baseline: &StampMap) -> Option<PathBuf> {
+    if baseline.contains_key(path) {
+        return Some(path.to_path_buf());
+    }
+    let spelled = path.as_os_str().as_encoded_bytes();
+    baseline
+        .keys()
+        .filter(|key| {
+            key.as_os_str()
+                .as_encoded_bytes()
+                .eq_ignore_ascii_case(spelled)
+        })
+        .find(|key| graph_key(key) == path)
+        .cloned()
+}
+
+/// The late look (#380): `emptied` holds the files a rebuild found emptied after its look
+/// — read empty by its `--vars` load or its compile ([`read_empty`]), or, for a batch whose
+/// `--vars` load failed, `stat`ed empty. When there are any, the rebuild is held as the
 /// look would have held it ([`EmptyHold::on_late_empty`], at the instant read here, once)
 /// and the files are returned. `None` lets the rebuild run: no file went empty, or the
 /// deadline ended the hold in this rebuild, which compiles the files as they are.
@@ -876,12 +917,7 @@ impl EmptyHold {
 /// emptied after the look — so the next event or tick finds the emptied file again, and the
 /// rebuild is held again or run ([`Settle::Defer`]).
 #[must_use]
-fn held_after_look<'a>(
-    hold: &mut EmptyHold,
-    read: impl IntoIterator<Item = &'a PathBuf>,
-    baseline: &StampMap,
-) -> Option<BTreeSet<PathBuf>> {
-    let emptied = emptied_paths(read, baseline);
+fn held_after_look(hold: &mut EmptyHold, emptied: BTreeSet<PathBuf>) -> Option<BTreeSet<PathBuf>> {
     if emptied.is_empty() {
         return None;
     }
@@ -1861,9 +1897,10 @@ impl WatchedPath {
         &self,
         runtime_vars: Option<HashMap<String, mds::Value>>,
         quiet: bool,
+        reads: &Arc<mds::ReadLog>,
     ) -> std::result::Result<CompileOutput, CompileFailure> {
         self.ensure_unmoved().map_err(miette::Error::from)?;
-        compile_caught(&self.typed, &self.canonical, runtime_vars, quiet)
+        compile_caught(&self.typed, &self.canonical, runtime_vars, quiet, reads)
     }
 
     /// The root in the two forms an output below it is resolved and named by: walked
@@ -1909,9 +1946,10 @@ impl WatchedPath {
         src: &Path,
         runtime_vars: Option<HashMap<String, mds::Value>>,
         quiet: bool,
+        reads: &Arc<mds::ReadLog>,
     ) -> std::result::Result<CompileOutput, CompileFailure> {
         if !src.starts_with(&self.canonical) {
-            return compile_caught(src, src, runtime_vars, quiet);
+            return compile_caught(src, src, runtime_vars, quiet, reads);
         }
         self.ensure_unmoved().map_err(miette::Error::from)?;
         WatchedPath {
@@ -1919,7 +1957,7 @@ impl WatchedPath {
             canonical: src.to_path_buf(),
             what: Watched::Source,
         }
-        .compile(runtime_vars, quiet)
+        .compile(runtime_vars, quiet, reads)
     }
 }
 
@@ -1952,16 +1990,19 @@ impl From<miette::Report> for CompileFailure {
 }
 
 /// Compile the file at `path` with the default options: `mds watch` writes no source
-/// maps. The one place a watch compile runs, so the one place a panic in it is caught
-/// and the session goes on (#389).
+/// maps. Every file the compile reads is recorded in `reads` with its byte count
+/// ([`mds::ReadLog`]), for the late look ([`held_after_look`]). The one place a watch
+/// compile runs, so the one place a panic in it is caught and the session goes on (#389).
 fn compile_caught(
     path: &Path,
     canonical: &Path,
     runtime_vars: Option<HashMap<String, mds::Value>>,
     quiet: bool,
+    reads: &Arc<mds::ReadLog>,
 ) -> std::result::Result<CompileOutput, CompileFailure> {
     let fs = mds::NativeFs::new()
-        .with_entry_pin(mds::EntryPin::parent_dir(mds::effective_parent(canonical)));
+        .with_entry_pin(mds::EntryPin::parent_dir(mds::effective_parent(canonical)))
+        .with_read_log(Arc::clone(reads));
     pause_before_compile();
     let compiled = crate::output::catch_compile(
         path,
@@ -2429,7 +2470,7 @@ fn compile_and_write(
     runtime_vars: Option<HashMap<String, mds::Value>>,
     quiet: bool,
 ) -> Result<CompileWriteOutcome> {
-    let compiled = match entry.compile(runtime_vars, quiet) {
+    let compiled = match entry.compile(runtime_vars, quiet, &Arc::new(mds::ReadLog::new())) {
         Ok(compiled) => compiled,
         Err(failure) => return Ok(CompileWriteOutcome::CompileFailed(failure.into_report())),
     };
@@ -2855,18 +2896,16 @@ fn run_file_rebuild(
     // "Recompiled" line, a "Kept" notice, or a failed write's report — so the
     // vars-file duplicate is re-reported exactly once per OBSERVABLE rebuild
     // (tests I16, I18, I20; a kept change of kind, #160).
-    let loaded = load_and_compile(ctx);
-    // #380: a file of interest emptied since the look above — a truncation that began
-    // between the two, so the `--vars` load or the compile read it empty — holds the
+    let reads = Arc::new(mds::ReadLog::new());
+    let loaded = load_and_compile(ctx, &reads);
+    // A debug build's test pause (#380): the reads are done, the late look is not.
+    pause_before_late_look();
+    // #380: a file the `--vars` load or the compile read empty, which the baseline saw with
+    // bytes — a truncation that began between the look above and the read — holds the
     // rebuild back as the look would have, with nothing reported or recorded, unless the
-    // deadline ended the hold in this rebuild. A compile that succeeded read the files of
-    // interest it reports. A load or a compile that failed reports none, so the files of
-    // interest are those of the compile before.
-    let read = match &loaded {
-        Ok(done) => &done.foi,
-        Err(_) => &state.foi,
-    };
-    if held_after_look(&mut state.hold, read, &state.last_mtimes).is_some() {
+    // deadline ended the hold in this rebuild. The byte counts the reads gave decide
+    // ([`read_empty`]), for a load or a compile that failed too.
+    if held_after_look(&mut state.hold, read_empty(&reads, &state.last_mtimes)).is_some() {
         state.kept = kept_before;
         settle(SettleInto::File(state), None, Settle::Defer);
         return ControlFlow::Continue(());
@@ -3076,14 +3115,20 @@ struct FileCompiled {
 /// a compile that panicked, which the panic hook reported (#389) — and how to settle it:
 /// [`Settle::Rebaseline`] for the load, [`Settle::MarkErrored`] for the compile. Nothing is
 /// reported or settled here: the caller's late look decides first ([`held_after_look`]).
-fn load_and_compile(
-    ctx: &FileCompileCtx,
-) -> std::result::Result<FileCompiled, (Option<miette::Report>, Settle<'_>)> {
-    let mut resolved = build_runtime_vars(RuntimeVarArgs {
-        vars: ctx.vars_path_typed.clone(),
-        set_vars: ctx.static_set_vars.clone(),
-        set_string_vars: ctx.static_set_string_vars.clone(),
-    })
+/// The load and the compile record the byte count of every file they read in `reads`, a
+/// failed one included.
+fn load_and_compile<'a>(
+    ctx: &'a FileCompileCtx,
+    reads: &Arc<mds::ReadLog>,
+) -> std::result::Result<FileCompiled, (Option<miette::Report>, Settle<'a>)> {
+    let mut resolved = build_runtime_vars_logged(
+        RuntimeVarArgs {
+            vars: ctx.vars_path_typed.clone(),
+            set_vars: ctx.static_set_vars.clone(),
+            set_string_vars: ctx.static_set_string_vars.clone(),
+        },
+        reads,
+    )
     .map_err(|e| (Some(e), Settle::Rebaseline))?;
     // Move the map out instead of cloning it: `compile_native_to_content` takes
     // `runtime_vars` by value, and the emitter in `run_file_rebuild` only ever reads
@@ -3094,7 +3139,7 @@ fn load_and_compile(
     let started = Instant::now();
     let entry = &ctx.entry;
     let compiled = entry
-        .compile(runtime_vars, ctx.quiet)
+        .compile(runtime_vars, ctx.quiet, reads)
         .map_err(|failure| (failure.into_report(), Settle::MarkErrored(&entry.canonical)))?;
     let deps = graph_keys(&compiled.dependencies);
     let foi = files_of_interest(&entry.canonical, &deps, ctx.vars_path.as_deref());
@@ -4228,10 +4273,19 @@ impl DirWatchState {
     /// holds the whole batch back as the look would have ([`held_after_look`]), every file
     /// found emptied joined to it, its own event lost or not ([`join_emptied`]). Returns
     /// whether the batch was held; nothing else is recorded, and nothing is held when the
-    /// deadline ended the hold in this rebuild.
-    fn hold_after_vars_load_failed(&mut self, batch: &Batch, root: &Path) -> bool {
+    /// deadline ended the hold in this rebuild. The vars file is found emptied by the byte
+    /// count its load read (`reads`, [`read_empty`]); the other watched files, which nothing
+    /// read, by a `stat`.
+    fn hold_after_vars_load_failed(
+        &mut self,
+        batch: &Batch,
+        root: &Path,
+        reads: &mds::ReadLog,
+    ) -> bool {
         let watched = self.watched_set();
-        let Some(emptied) = held_after_look(&mut self.hold, &watched, &self.last_mtimes) else {
+        let mut emptied = emptied_paths(&watched, &self.last_mtimes);
+        emptied.extend(read_empty(reads, &self.last_mtimes));
+        let Some(emptied) = held_after_look(&mut self.hold, emptied) else {
             return false;
         };
         let batch = join_emptied(batch.clone(), &emptied, self.vars_file.as_deref());
@@ -4457,10 +4511,9 @@ struct BatchCtx<'a> {
 /// because `src` is gone since the batch found it there retires it as a deleted source
 /// ([`DirWatchState::retire_deleted`], #160). A compile that read a file emptied since the
 /// batch looked — whether it then failed or would write — holds `src` back, unless the
-/// deadline ended the hold in this rebuild ([`held_after_look`], #380). A compile
-/// that succeeded keeps the files it read empty in the baseline until the hold ends
-/// ([`HeldBatch::hold_read_empty`]); one that failed read the files its last compile
-/// reported, which the baseline holds already. A source
+/// deadline ended the hold in this rebuild ([`held_after_look`], #380). Either way the
+/// files it read empty stay in the baseline until the hold ends
+/// ([`HeldBatch::hold_read_empty`]). A source
 /// whose output is written, kept with a notice, or not written with a report shows
 /// something: the batch's `--vars` duplicate keys are reported with it, before its
 /// `Recompiled` line, after the notice, or before the report, unless an earlier source of
@@ -4489,7 +4542,11 @@ fn compile_one_source(src: &Path, ctx: &mut BatchCtx<'_>, state: &mut DirWatchSt
     let kept_before = state.kept.remove(src);
     // A debug build's test pause (#160): the batch found `src` there, and has not read it.
     pause_after_batch_split();
-    let compiled = match watch_root.compile_source(src, ctx.vars.map.clone(), quiet) {
+    let reads = Arc::new(mds::ReadLog::new());
+    let compiled = watch_root.compile_source(src, ctx.vars.map.clone(), quiet, &reads);
+    // A debug build's test pause (#380): the reads are done, the late look is not.
+    pause_before_late_look();
+    let compiled = match compiled {
         Ok(compiled) => compiled,
         // The source went after the batch found it there (#160): whatever the compile
         // said of a file that is no longer there — `file not found`, or a read that
@@ -4501,19 +4558,17 @@ fn compile_one_source(src: &Path, ctx: &mut BatchCtx<'_>, state: &mut DirWatchSt
             return;
         }
         Err(failure) => {
-            // #380: a file the compile read, emptied since the batch looked — a truncation
-            // that began between the two, read empty and failed on — holds `src` back as
-            // the look would have, unless the deadline ended the hold in this rebuild:
-            // nothing reported or recorded, `src` kept to be rebuilt with the batch that
-            // ends the hold. A failed compile reports no dependencies, so the files it read
-            // are taken to be those its last compile reported, which the baseline holds
-            // already: none stays in it for the hold.
-            let source = src.to_path_buf();
-            let reads = std::iter::once(&source)
-                .chain(state.forward_deps.get(src).into_iter().flatten())
-                .chain(state.vars_file.as_ref());
-            if held_after_look(&mut state.hold, reads, &state.last_mtimes).is_some() {
-                state.hold_back(src, kept_before, BTreeSet::new(), root);
+            // #380: a file the compile read empty, which the baseline saw with bytes — a
+            // truncation that began between the batch's look and the read, failed on —
+            // holds `src` back as the look would have, unless the deadline ended the hold in
+            // this rebuild: nothing reported or recorded, `src` kept to be rebuilt with the
+            // batch that ends the hold, and the files it read empty kept in the baseline until
+            // then, as for a compile that would write. The byte counts the reads gave decide
+            // ([`read_empty`]).
+            if let Some(read_empty) =
+                held_after_look(&mut state.hold, read_empty(&reads, &state.last_mtimes))
+            {
+                state.hold_back(src, kept_before, read_empty, root);
                 return;
             }
             settle(
@@ -4571,16 +4626,16 @@ fn compile_one_source(src: &Path, ctx: &mut BatchCtx<'_>, state: &mut DirWatchSt
         state.record_success(src, dep_paths, root, None, None);
         return;
     }
-    // #380: a file the compile read, emptied since the batch looked — a truncation that
-    // began between the two — holds `src` back as the look would have, unless the
-    // deadline ended the hold in this rebuild: nothing written or recorded, `src` kept to
-    // be rebuilt with the batch that ends the hold, and the files it read empty kept in
-    // the baseline until then. The look is taken only when the output would be written.
-    let source = src.to_path_buf();
-    let reads = std::iter::once(&source)
-        .chain(&dep_paths)
-        .chain(state.vars_file.as_ref());
-    if let Some(read_empty) = held_after_look(&mut state.hold, reads, &state.last_mtimes) {
+    // #380: a file the compile read empty, which the baseline saw with bytes — a
+    // truncation that began between the batch's look and the read — holds `src` back as
+    // the look would have, unless the deadline ended the hold in this rebuild: nothing
+    // written or recorded, `src` kept to be rebuilt with the batch that ends the hold, and
+    // the files it read empty kept in the baseline until then. The byte counts the reads
+    // gave decide ([`read_empty`]). The batch's `--vars` load parsed a JSON object, so it
+    // did not read the vars file empty.
+    if let Some(read_empty) =
+        held_after_look(&mut state.hold, read_empty(&reads, &state.last_mtimes))
+    {
         state.hold_back(src, kept_before, read_empty, root);
         return;
     }
@@ -5099,18 +5154,22 @@ fn run_dir_batch(ctx: &DirWatchCtx, batch: Batch, state: &mut DirWatchState, due
     // A debug build's test pause (#380): the batch found no file emptied, and has read none.
     pause_after_look();
 
-    let resolved = match build_runtime_vars(RuntimeVarArgs {
-        vars: ctx.vars_path_typed.clone(),
-        set_vars: ctx.static_set_vars.clone(),
-        set_string_vars: ctx.static_set_string_vars.clone(),
-    }) {
+    let reads = mds::ReadLog::new();
+    let resolved = match build_runtime_vars_logged(
+        RuntimeVarArgs {
+            vars: ctx.vars_path_typed.clone(),
+            set_vars: ctx.static_set_vars.clone(),
+            set_string_vars: ctx.static_set_string_vars.clone(),
+        },
+        &reads,
+    ) {
         Ok(v) => v,
         Err(e) => {
             // #380: a watched file emptied since the look above — the vars file the load read
             // empty, a truncation that began between the two — holds the whole batch back,
             // with nothing reported or recorded, unless the deadline ended the hold in this
             // rebuild.
-            if state.hold_after_vars_load_failed(&batch, root) {
+            if state.hold_after_vars_load_failed(&batch, root, &reads) {
                 settle(SettleInto::Dir(state), None, Settle::Defer);
                 return;
             }
@@ -5306,7 +5365,7 @@ mod dir_startup {
     use std::collections::{BTreeSet, HashMap, HashSet};
     use std::ops::ControlFlow;
     use std::path::PathBuf;
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
 
     use miette::Result;
@@ -5633,7 +5692,12 @@ mod dir_startup {
 
         for source in &all_files {
             let key = graph_key(source);
-            match watch_root.compile_source(source, runtime_vars.clone(), quiet) {
+            match watch_root.compile_source(
+                source,
+                runtime_vars.clone(),
+                quiet,
+                &Arc::new(mds::ReadLog::new()),
+            ) {
                 Ok(compiled) => {
                     let dep_paths = graph_keys(&compiled.dependencies);
 
@@ -6115,10 +6179,12 @@ fn process_dir_batch_vars_changed(
 /// dependencies it reports and never for an output.
 fn refresh_dependency(src: &Path, ctx: &BatchCtx<'_>, state: &mut DirWatchState) {
     // Compile to refresh deps only; suppress output by using quiet=true.
-    match ctx
-        .watch_root
-        .compile_source(src, ctx.vars.map.clone(), true)
-    {
+    match ctx.watch_root.compile_source(
+        src,
+        ctx.vars.map.clone(),
+        true,
+        &Arc::new(mds::ReadLog::new()),
+    ) {
         Ok(compiled) => {
             state
                 .forward_deps
@@ -6267,6 +6333,11 @@ fn process_dir_batch_incremental(
 /// emptied, before the rebuild takes its baseline — so that a test can truncate a file the
 /// rebuild has read whole (`tests/cli_watch_truncate.rs`, #380).
 /// The compile pause stops after the watched-path check and before entry resolution.
+/// `MDS_TEST_PAUSE_BEFORE_LATE_LOOK`: how it is made to stop a file-mode rebuild once its
+/// `--vars` load and compile have read their files, or a directory batch once one source's
+/// compile has read its files, before the late look
+/// ([`held_after_look`]) — so that a test can write a file the compile read empty
+/// (`tests/cli_watch_truncate.rs`, #380).
 /// A release build has none of these pauses.
 #[cfg(debug_assertions)]
 mod batch_pause_trigger {
@@ -6293,6 +6364,10 @@ mod batch_pause_trigger {
     /// The file that ends the pause after the watched-path check, before entry resolution.
     const COMPILE_VARIABLE: &str = "MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE";
 
+    /// The variable naming the file that ends the pause after a rebuild's compile read its
+    /// files, before the late look, which says it has stopped in the same way.
+    const LATE_LOOK_VARIABLE: &str = "MDS_TEST_PAUSE_BEFORE_LATE_LOOK";
+
     /// How long the pause waits between two looks for the file that ends it.
     const POLL: Duration = Duration::from_millis(5);
 
@@ -6317,6 +6392,11 @@ mod batch_pause_trigger {
     /// Stop before entry resolution when the compile pause names a file ([`pause_on`]).
     pub(super) fn pause_before_compile() {
         pause_on(COMPILE_VARIABLE);
+    }
+
+    /// Stop here when `MDS_TEST_PAUSE_BEFORE_LATE_LOOK` names a file ([`pause_on`]).
+    pub(super) fn pause_before_late_look() {
+        pause_on(LATE_LOOK_VARIABLE);
     }
 
     /// Stop here when `variable` names a file: say so by writing `<file>.paused`, then wait
@@ -6347,6 +6427,7 @@ mod batch_pause_trigger {
 #[cfg(debug_assertions)]
 use batch_pause_trigger::{
     pause_after_batch_split, pause_after_look, pause_after_read, pause_before_compile,
+    pause_before_late_look,
 };
 
 /// A release build's pause between a directory batch's split and its compile: none.
@@ -6364,6 +6445,10 @@ fn pause_after_read() {}
 /// A release build has no pause before entry resolution.
 #[cfg(not(debug_assertions))]
 fn pause_before_compile() {}
+
+/// A release build's pause between a rebuild's compile and its late look: none.
+#[cfg(not(debug_assertions))]
+fn pause_before_late_look() {}
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
@@ -6483,7 +6568,14 @@ mod tests {
         std::fs::write(dir.path().join("lib.mds"), "@define hi():\nHi\n@end\n").unwrap();
         let main = dir.path().join("main.mds");
 
-        let compiled = compile_caught(&main, &main.canonicalize().unwrap(), None, true).unwrap();
+        let compiled = compile_caught(
+            &main,
+            &main.canonicalize().unwrap(),
+            None,
+            true,
+            &Arc::new(mds::ReadLog::new()),
+        )
+        .unwrap();
         let reported = mds::compile_with_deps(&main, None).unwrap().dependencies;
         assert_eq!(
             compiled.dependencies, reported,
@@ -8851,7 +8943,7 @@ mod tests {
                 canonical: canonical.to_path_buf(),
                 what: Watched::Entry,
             }
-            .compile(None, true)
+            .compile(None, true, &Arc::new(mds::ReadLog::new()))
             .map(|compiled| compiled.content)
             .map_err(|failure| {
                 failure
@@ -9957,7 +10049,7 @@ mod tests {
             if empties_dependency {
                 std::fs::write(&module, "").unwrap();
             }
-            let runtime_vars = build_runtime_vars(RuntimeVarArgs {
+            let runtime_vars = crate::build::build_runtime_vars(RuntimeVarArgs {
                 vars: Some(vars.clone()),
                 set_vars: Vec::new(),
                 set_string_vars: Vec::new(),
@@ -11693,7 +11785,7 @@ mod tests {
 
         std::fs::write(&dep, "").unwrap();
         assert!(
-            state.hold_after_vars_load_failed(&batch, &root),
+            state.hold_after_vars_load_failed(&batch, &root, &mds::ReadLog::new()),
             "the batch is held"
         );
 
@@ -11722,7 +11814,7 @@ mod tests {
 
         std::fs::write(&vars, "").unwrap();
         assert!(
-            state.hold_after_vars_load_failed(&batch, &root),
+            state.hold_after_vars_load_failed(&batch, &root, &mds::ReadLog::new()),
             "the batch is held"
         );
 
@@ -11747,7 +11839,7 @@ mod tests {
         };
 
         assert!(
-            !state.hold_after_vars_load_failed(&batch, &root),
+            !state.hold_after_vars_load_failed(&batch, &root, &mds::ReadLog::new()),
             "no file went empty"
         );
         assert_eq!(state.held, HeldBatch::default(), "nothing is held");
@@ -11756,15 +11848,134 @@ mod tests {
         std::fs::write(&dep, "").unwrap();
         state.hold = EmptyHold::Expired;
         assert!(
-            !state.hold_after_vars_load_failed(&batch, &root),
+            !state.hold_after_vars_load_failed(&batch, &root, &mds::ReadLog::new()),
             "the deadline ended the hold in this rebuild"
         );
         assert_eq!(state.held, HeldBatch::default(), "nothing is held");
 
         state.hold = EmptyHold::Off;
         assert!(
-            state.hold_after_vars_load_failed(&batch, &root),
+            state.hold_after_vars_load_failed(&batch, &root, &mds::ReadLog::new()),
             "positive control: the same file, with the deadline still ahead, holds the batch"
+        );
+    }
+
+    /// #380: a batch whose `--vars` load read the vars file empty is held although the save
+    /// wrote the file again before the check: the count the load read decides, not a later
+    /// `stat` of the file.
+    #[test]
+    fn a_batch_whose_vars_load_read_the_vars_file_empty_is_held_after_the_file_is_written() {
+        let (_dir, root) = canonical_tempdir();
+        let (mut state, [page, _dep, vars]) = state_with_a_vars_file(&root);
+        let batch = Batch {
+            paths: BTreeSet::from([page]),
+            vars_changed: false,
+        };
+        std::fs::write(&vars, "").unwrap();
+        let reads = mds::ReadLog::new();
+        let loaded = crate::build::build_runtime_vars_logged(
+            RuntimeVarArgs {
+                vars: Some(vars.clone()),
+                set_vars: Vec::new(),
+                set_string_vars: Vec::new(),
+            },
+            &reads,
+        );
+        assert!(loaded.is_err(), "setup: the load fails on the empty file");
+        std::fs::write(&vars, "{\"a\": 1}\n").unwrap();
+
+        assert!(
+            emptied_paths(&state.watched_set(), &state.last_mtimes).is_empty(),
+            "control: a stat now finds no file emptied"
+        );
+        assert!(
+            state.hold_after_vars_load_failed(&batch, &root, &reads),
+            "the batch is held on the empty read"
+        );
+        assert!(state.held.vars_changed, "a change to the vars file");
+    }
+
+    /// #380: after a rename that changed only the case of a name, on a file system that
+    /// ignores case, a read names the file as it is spelled on disk now, and the baseline
+    /// keeps the spelling it was taken with: the read is matched to the baseline's key. A
+    /// key that names another file is never matched. On a file system that keeps case
+    /// apart, the two spellings are two files and only the exact key matches.
+    #[test]
+    fn a_read_after_a_case_only_rename_is_matched_to_the_baseline_s_key() {
+        let (_dir, root) = canonical_tempdir();
+        let on_disk = root.join("page.mds");
+        std::fs::write(&on_disk, "").unwrap();
+        let taken_as = root.join("PAGE.mds");
+        let other = root.join("other.mds");
+        std::fs::write(&other, "x\n").unwrap();
+        let baseline: StampMap = [
+            (taken_as.clone(), (None, Some(6))),
+            (other.clone(), (None, Some(2))),
+        ]
+        .into_iter()
+        .collect();
+
+        let ignores_case = taken_as.exists();
+        assert_eq!(
+            baseline_key(&on_disk, &baseline),
+            ignores_case.then(|| taken_as.clone()),
+            "ignores case: {ignores_case}"
+        );
+        assert_eq!(
+            baseline_key(&other, &baseline),
+            Some(other.clone()),
+            "an exact key matches as it is"
+        );
+        assert_eq!(
+            baseline_key(&root.join("new.mds"), &baseline),
+            None,
+            "a file the baseline never saw has no key"
+        );
+    }
+
+    /// #380: a file a compile read empty, which the baseline saw with bytes, is found
+    /// emptied although it was written again since — the save ended between the read and
+    /// the check. A `stat` now misses it; the count the read gave does not. A file the
+    /// baseline saw empty, or never saw, is not found.
+    #[test]
+    fn a_file_a_compile_read_empty_is_found_although_written_again_since() {
+        let (_dir, root) = canonical_tempdir();
+        let [entry, was_empty] = ["page.mds", "empty.mds"].map(|name| root.join(name));
+        std::fs::write(&entry, "").unwrap();
+        std::fs::write(&was_empty, "").unwrap();
+        let baseline: StampMap = [
+            (entry.clone(), (None, Some(6))),
+            (was_empty.clone(), (None, Some(0))),
+        ]
+        .into_iter()
+        .collect();
+        let reads = Arc::new(mds::ReadLog::new());
+        for path in [&entry, &was_empty] {
+            assert!(
+                compile_caught(path, path, None, true, &reads).is_ok(),
+                "setup: {} compiles",
+                path.display()
+            );
+        }
+        std::fs::write(&entry, "Page.\n").unwrap();
+
+        assert!(
+            emptied_paths([&entry, &was_empty], &baseline).is_empty(),
+            "control: a stat now finds no file emptied"
+        );
+        assert_eq!(
+            read_empty(&reads, &baseline),
+            BTreeSet::from([entry]),
+            "the read found the entry empty; the file empty in the baseline too is not emptied"
+        );
+        let mut hold = EmptyHold::Off;
+        assert!(
+            held_after_look(&mut hold, read_empty(&reads, &baseline)).is_some(),
+            "the rebuild is held"
+        );
+        assert!(
+            hold.deadline().is_some(),
+            "the hold runs towards its deadline"
         );
     }
 

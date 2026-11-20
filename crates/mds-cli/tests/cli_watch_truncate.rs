@@ -769,6 +769,146 @@ fn the_vars_file_truncated_after_its_rebuild_read_it_triggers_nothing_until_writ
     );
 }
 
+// ── A save that ends between a rebuild's read and its late look ─────────────
+
+/// A save that truncates a file and writes it again, and ends between a rebuild's read and
+/// its late look, never publishes the empty read (#380): the rebuild read the file empty,
+/// so it is held, whatever the file holds when the late look runs, and the next rebuild
+/// publishes what was written. A `stat` at the late look would find the bytes written and
+/// let the empty read through. The debug build's pause after the look
+/// (`MDS_TEST_PAUSE_AFTER_LOOK`) lets the test empty the file before the read, and its
+/// pause before the late look (`MDS_TEST_PAUSE_BEFORE_LATE_LOOK`) lets it write the file
+/// before the check; outside a test, an editor's truncate-then-write save that ends in
+/// that window opens it.
+#[cfg(debug_assertions)]
+fn a_save_ending_between_the_read_and_the_late_look(case: &DependencyCase<'_>, saved: &Path) {
+    let what = case.what;
+    let out = case.output;
+    // Outside every watched directory, so the pauses' files raise no event.
+    let gate = tempfile::tempdir().unwrap();
+    let (look_go, look_paused) = (gate.path().join("look"), gate.path().join("look.paused"));
+    let (late_go, late_paused) = (gate.path().join("late"), gate.path().join("late.paused"));
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .arg("watch")
+            .arg(case.watched)
+            .args(case.extra)
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .env("MDS_TEST_PAUSE_AFTER_LOOK", &look_go)
+            .env("MDS_TEST_PAUSE_BEFORE_LATE_LOOK", &late_go)
+            .stdout(Stdio::null()),
+    );
+    let mut log = OutputLog::default();
+    log.wait_for(out, case.before, TIMEOUT);
+
+    // The file saved as it is: its rebuild looks, finds every file full, and pauses.
+    let content = std::fs::read_to_string(saved).unwrap();
+    write_atomic(saved, &content);
+    wait_for_the_pause(&look_paused, &tap, what);
+    // The save begins: the file is emptied before the rebuild reads it.
+    File::create(case.dependency).expect("truncate the file");
+    std::fs::write(&look_go, "").unwrap();
+    wait_for_the_pause(&late_paused, &tap, what);
+    // The save ends after the read, before the late look.
+    std::fs::write(case.dependency, case.rewrite).expect("write the file again");
+    std::fs::write(&late_go, "").unwrap();
+    log.wait_for(out, case.after, TIMEOUT);
+
+    let stderr = stderr_through_the_marker(case.source, tap, &mut child);
+    assert!(
+        !log.contents().contains(&""),
+        "{what}: the empty read is never published; states read: {:?}; stderr:\n{stderr}",
+        log.contents()
+    );
+    assert!(
+        !before_the_marker(&stderr).contains(EMPTY_OUTPUT_NOTICE),
+        "{what}: no empty output is written; stderr:\n{stderr}"
+    );
+    assert_holding_printed_nothing(&stderr, 1, what);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn the_entry_saved_between_its_rebuild_s_read_and_late_look_never_publishes_an_empty_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("t.mds");
+    std::fs::write(&entry, "Entry one\n").unwrap();
+
+    a_save_ending_between_the_read_and_the_late_look(
+        &DependencyCase {
+            test: "the_entry_saved_between_its_rebuild_s_read_and_late_look_never_publishes_an_empty_output",
+            what: "the entry, saved between its rebuild's read and late look",
+            watched: &entry,
+            source: &entry,
+            output: &dir.path().join("t.md"),
+            dependency: &entry,
+            rewrite: "Entry two\n",
+            extra: &[],
+            before: "Entry one",
+            after: "Entry two",
+        },
+        &entry,
+    );
+}
+
+/// The `--vars` file read empty by a file rebuild's load, which refuses it, and written
+/// again before the late look: the rebuild is held and reports nothing.
+#[cfg(debug_assertions)]
+#[test]
+fn the_vars_file_saved_between_its_rebuild_s_read_and_late_look_reports_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+    let entry = dir.path().join("t.mds");
+    std::fs::write(&entry, "Vars {{v}}\n").unwrap();
+
+    a_save_ending_between_the_read_and_the_late_look(
+        &DependencyCase {
+            test: "the_vars_file_saved_between_its_rebuild_s_read_and_late_look_reports_nothing",
+            what: "the vars file, saved between its rebuild's read and late look",
+            watched: &entry,
+            source: &entry,
+            output: &dir.path().join("t.md"),
+            dependency: &vars,
+            rewrite: r#"{"v": "two"}"#,
+            extra: &["--vars", vars.to_str().unwrap()],
+            before: "Vars one",
+            after: "Vars two",
+        },
+        &entry,
+    );
+}
+
+/// In directory mode, a source read empty by its batch's compile and written again before
+/// the late look: the source is held, and the next batch publishes what was written.
+#[cfg(debug_assertions)]
+#[test]
+fn dir_mode_a_source_saved_between_its_batch_s_read_and_late_look_never_publishes_an_empty_output()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    let source = root.join("t.mds");
+    std::fs::write(&source, "Source one\n").unwrap();
+    let out = dir.path().join("out");
+
+    a_save_ending_between_the_read_and_the_late_look(
+        &DependencyCase {
+            test: "dir_mode_a_source_saved_between_its_batch_s_read_and_late_look_never_publishes_an_empty_output",
+            what: "directory mode, a source saved between its batch's read and late look",
+            watched: &root,
+            source: &source,
+            output: &out.join("t.md"),
+            dependency: &source,
+            rewrite: "Source two\n",
+            extra: &["--out-dir", out.to_str().unwrap()],
+            before: "Source one",
+            after: "Source two",
+        },
+        &source,
+    );
+}
+
 // ── A file truncated while a directory batch runs ───────────────────────────
 
 /// In directory mode, the `--vars` file truncated while a batch runs — after the batch read
@@ -1379,6 +1519,95 @@ fn dir_mode_a_dependency_a_held_compile_read_empty_holds_the_batch_its_truncatio
             rebuilds, 1,
             "{what}: exactly one rebuild of page.md, for the content finally written; \
              stderr:\n{stderr}"
+        );
+    }
+}
+
+/// The failing twin of the test above: the page calls a function of the dependency, so the
+/// compile that reads the dependency empty fails. That compile is held, and the file it read
+/// empty stays among the files the look stamps until the hold ends, as for a compile that
+/// would write: the batch the truncation's own event starts finds it emptied and is held
+/// too, so the failure on the empty file is never reported (#380).
+#[cfg(debug_assertions)]
+#[test]
+fn dir_mode_a_dependency_a_failed_held_compile_read_empty_holds_the_batch_its_truncation_starts() {
+    let base = tempfile::tempdir().unwrap();
+    let (root, shared) = (base.path().join("root"), base.path().join("shared"));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&shared).unwrap();
+    // The project's root marker, so the page may import from beside the root.
+    std::fs::write(base.path().join(".git"), "").unwrap();
+    std::fs::write(
+        shared.join("_x.mds"),
+        "@define greet():\nX one\n@end\n\n@export greet\n",
+    )
+    .unwrap();
+    let page = root.join("page.mds");
+    std::fs::write(&page, "@import \"../shared/_x.mds\" as x\n{{x.greet()}}\n").unwrap();
+    let out = base.path().join("out");
+    let output = out.join("page.md");
+    // Outside every watched directory, so the pause's files raise no event.
+    let (go, paused) = (base.path().join("go"), base.path().join("go.paused"));
+
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .arg("watch")
+            .arg(&root)
+            .arg("--out-dir")
+            .arg(&out)
+            .args(["--debounce", "50", "--poll-interval", "0"])
+            .env("MDS_TEST_PAUSE_AFTER_LOOK", &go)
+            .stdout(Stdio::null()),
+    );
+    let mut log = OutputLog::default();
+    log.wait_for(&output, "X one", TIMEOUT);
+
+    // The page is saved calling a function of a file that is not there: its batch stops
+    // after its look, is let go, and the compile fails, which leaves the page errored.
+    let missing = shared.join("_y.mds");
+    write_atomic(&page, "@import \"../shared/_y.mds\" as y\n{{y.greet()}}\n");
+    wait_for_the_pause(&paused, &tap, "the batch of the page's save");
+    std::fs::write(&go, "").unwrap();
+    wait_for_tap(&tap, "_y.mds", TIMEOUT);
+
+    // The pause is set again: the batch the creation of `_y.mds` starts stops after its look,
+    // with the file full, and the page is compiled again for its failure.
+    std::fs::rename(&go, base.path().join("go.spent")).unwrap();
+    std::fs::rename(&paused, base.path().join("go.paused.spent")).unwrap();
+    write_atomic(&missing, "@define greet():\nY one\n@end\n\n@export greet\n");
+    wait_for_the_pause(&paused, &tap, "the batch of the creation of _y.mds");
+    let hold = Hold::start(&missing);
+    std::fs::write(&go, "").unwrap();
+    log.poll_for(&output, TRUNCATE_HOLD);
+    let timing = hold.write_and_close("@define greet():\nY two\n@end\n\n@export greet\n");
+    // The positive control: once `_y.mds` is written, the output is published with its
+    // content, by the one rebuild that ends the hold.
+    log.wait_for(&output, "Y two", TIMEOUT);
+
+    let stderr = stderr_through_the_marker(&page, tap, &mut child);
+    let what = "directory mode, a dependency beside the root truncated after its batch looked, \
+                read empty by a compile that fails on it";
+    assert_no_empty_before_the_deadline(&log, timing.started, what);
+    if strict_claims_apply(
+        "dir_mode_a_dependency_a_failed_held_compile_read_empty_holds_the_batch_its_truncation_starts",
+        &timing,
+        what,
+    ) {
+        assert_eq!(
+            log.contents(),
+            ["X one\n", "Y two\n"],
+            "{what}: the output goes from the first import to the content finally written; \
+             stderr:\n{stderr}"
+        );
+        let before = before_the_marker(&stderr);
+        assert_eq!(
+            (
+                count_occurrences(before, "mds::"),
+                count_occurrences(before, "mds::file_not_found"),
+            ),
+            (1, 1),
+            "{what}: only the missing file of the first save is reported, never the failure \
+             on the empty file; stderr:\n{stderr}"
         );
     }
 }

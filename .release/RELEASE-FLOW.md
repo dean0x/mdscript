@@ -9,14 +9,15 @@ publishes nothing.
 ## Packages
 
 - **Crates**: `mds-core`, `mds-cli` (published to crates.io in dependency order)
-- **npm**: `@mdscript/mds-napi` (7 native targets), `@mdscript/mds-wasm`, `@mdscript/mds`,
-  `@mdscript/bundler-utils`, `@mdscript/vite-plugin`, `@mdscript/rollup-plugin`, `@mdscript/webpack-loader`
+- **npm** (15 packages): `@mdscript/mds-napi` and its 7 platform packages, `@mdscript/mds-wasm`,
+  `@mdscript/mds`, `@mdscript/bundler-utils`, `@mdscript/vite-plugin`, `@mdscript/rollup-plugin`,
+  `@mdscript/webpack-loader`, `@mdscript/rspack-loader`
 - **PyPI**: `markdown-script` (7 cp311-abi3 wheels + 1 sdist; OIDC trusted publishing)
 
 ## Version Strategy
 
 - All packages share the same semver version
-- Version files: `Cargo.toml` (workspace), 7 `package.json` files
+- Version files: `Cargo.toml` (workspace), 8 `package.json` files
 - Bump tool: `node scripts/bump-version.mjs <version>` — rewrites manifests and CHANGELOG
   only; does NOT refresh `Cargo.lock` or `package-lock.json`, and never touches `.rs` files
   (so `#[deprecated(since = ...)]` attributes must be checked by hand via
@@ -66,8 +67,9 @@ publishes nothing.
 ## Publish
 
 - **Trigger (tag-push — the only path)**: Land version bump on `main` via CI-gated PR. Before
-  merging, run `node scripts/verify-pr-checks.mjs <pr-number>` — it tolerates the four
-  tag-guarded publish jobs appearing as `skipped` on a branch dry-run head; any other conclusion
+  merging, run `node scripts/verify-pr-checks.mjs <pr-number>` — it tolerates the five
+  tag-guarded or dispatch-guarded publish jobs (`TIER_B_EXPECTED_SKIPPED`, the TestPyPI leg
+  included) appearing as `skipped` on a branch dry-run head; any other conclusion
   fails. Wait for the `CI` workflow run on the merge commit to finish green before tagging — the
   release version-gate asserts a completed+success CI run for the tagged SHA and fails closed
   while CI is still running. Then:
@@ -81,11 +83,17 @@ publishes nothing.
 - **Recovery**: Publishes are idempotent (crates.io matches "already uploaded/exists"; npm
   pre-checks `npm view <pkg>@<ver>` and tolerates E403 on `napi prepublish`). A partial failure
   is recoverable with `gh run rerun --failed <run-id>`. Never re-tag.
-- **Known gap (issue #345)**: The version-gate credential probe runs `npm whoami` for npm but
-  only checks `CARGO_REGISTRY_TOKEN` for non-emptiness, not capability — a dead crates.io token
-  is only discovered after builds have run.
+- **Known gap (crates.io token)**: The version-gate credential probe runs `npm whoami` for npm
+  (authentication only, not publish rights) but only checks `CARGO_REGISTRY_TOKEN` for
+  non-emptiness: the crates.io API has no read route that accepts a scoped token, so this is
+  the strongest check it allows. A dead crates.io token is only discovered at `Publish
+  mds-core`, after the builds (fail-before-write; recover with `gh run rerun --failed`).
+  #345 is closed; Trusted Publishing for crates.io is tracked in #368.
 - **Flow (tag-push)**: version-gate → build-napi (7 targets) + build-python (7 wheels + sdist,
-  parallel) → stage+verify → publish-crates → publish-npm → publish-python → github-release
+  parallel) → stage+verify (A3 gate, then the x64 Alpine load test) → load-test-musl-arm64
+  (arm64 Alpine load test). rehearse-publish-python (pin, GHCR manifest, pull, `twine check`;
+  uploads nothing) needs only build-python. publish-crates needs all of them → publish-npm →
+  publish-python → github-release
 - **Critical gate**: A3 name↔loader verification (`scripts/verify-napi-names.mjs`)
 - **Toolchain pins**: Unpinned inputs that have broken release builds: stable rustc (1.98.0 added
   `-Wl,--fix-cortex-a53-843419`; cargo-zigbuild 0.23.0 filters this flag internally in `src/zig.rs`
@@ -95,12 +103,17 @@ publishes nothing.
 
 1. Verify packages on registries (crates.io, npmjs.com)
 2. Check provenance attestation on npm
-3. Smoke test: `npm i @mdscript/mds && node -e "import('@mdscript/mds').then(m=>m.init())"`
-4. musl artifact check: `npm pack @mdscript/mds-napi-linux-x64-musl@X.Y.Z` and confirm the `.node`
+3. Smoke test: `npm i @mdscript/mds && node -e "import('@mdscript/mds').then(m=>m.init())"`.
+   The registry serves the packument some minutes before every tarball: before a clean
+   install, wait until each tarball URL returns HTTP 200, not only until `npm view` shows the
+   version, and install with `--prefer-online`
+4. PyPI: `markdown-script` X.Y.Z has 8 files (7 wheels + sdist), each with its PEP 740
+   attestation; smoke `pip install markdown-script==X.Y.Z` in a clean venv (Python 3.11+)
+5. musl artifact check: `npm pack @mdscript/mds-napi-linux-x64-musl@X.Y.Z` and confirm the `.node`
    file has no glibc markers (`GLIBC_`/`libc.so.6`/`ld-linux` absent); `0.1.0`–`0.3.0` shipped
    glibc-linked; `release.yml` now gates this
-5. Close the milestone; check PyPI pending-publisher expiry if one is outstanding (#292)
-6. CHANGELOG: `[Unreleased]` section is auto-created by bump script
+6. Close the milestone; check PyPI pending-publisher expiry if one is outstanding (#292)
+7. CHANGELOG: `[Unreleased]` section is auto-created by bump script
 
 ## Tag Format
 
