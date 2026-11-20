@@ -204,7 +204,7 @@
 //!    reports any mention of its name, `use std::eprintln as say;` included.
 //! 7. **The raw-print, exit and stream-handle bans read this crate's text only, by
 //!    name.** Code in a dependency that prints through std or ends the process is not a
-//!    mention here: mds-core's `emit_warnings`, still an `eprintln!` (#435), and clap's
+//!    mention here: mds-core's `emit_warnings`, a `writeln!` to locked stderr (#435), and clap's
 //!    `Error::exit` and `Parser::parse`, which exit on their own — `main.rs` calls
 //!    neither. Nor is a way out or a stream reached without its std name: `libc::exit`
 //!    (a unix dev-dependency, so only a test module could reach it), a descriptor opened
@@ -837,6 +837,13 @@ const PATH_TEXT_HELPERS: &[(&str, &str, usize, &str)] = &[
         1,
         "Names the typed watched path through `mds::escape_path_for_message` of its \
          lossy text when it resolves somewhere new.",
+    ),
+    (
+        "watch.rs",
+        "ensure_unmoved",
+        1,
+        "Names the typed root through `mds::escape_path_for_message` of its \
+         lossy text when its lookup fails.",
     ),
 ];
 

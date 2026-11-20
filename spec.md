@@ -61,11 +61,15 @@ config:
 | `MAX_FRONTMATTER_NODES` | 200,000 YAML nodes per block, counted during parsing so alias expansion stops before the tree is built |
 | `MAX_FRONTMATTER_FLOW_DEPTH` | 1024 levels of flow-collection (`[`/`{`) nesting, checked before the parser scans (bounds libyaml's O(depth²) flow scan) |
 | `MAX_FILE_SIZE` | 10 MiB per source, including strings passed to the string APIs |
+| `MAX_OUTPUT_SIZE` | 50 MiB per evaluation output buffer. The compiler reports the output limit at the first byte that crosses it. |
+| `MAX_COMPILE_MEMORY` | 209,715,200 bytes (four times `MAX_OUTPUT_SIZE`) per compile. One budget counts output buffers by capacity, values that evaluation makes, an estimate of the syntax tree of each module, the compiler's copy of the runtime variables, retained module text and frontmatter trees (the merged trees of `@extends` bases included), kept source-map segments, warnings, messages and the finalize output. Exactly the budget passes. Above it the compile fails with `resource limit exceeded: compile memory exceeds maximum of 209715200 bytes`. §5 "Compile memory budget" names what the budget does not count. |
+| Frontmatter byte allowance | 50 MiB (52,428,800 bytes) per frontmatter parse, or the rest of the compile budget when that is smaller. Each YAML node spends 192 bytes plus its string or key bytes before it is built, so an alias of a long scalar spends the scalar again at each use. The one exception is the bytes of a `!tag`: the parser spends them after it copies the tag. Past 50 MiB the parse fails with `resource limit exceeded: frontmatter YAML expands beyond maximum of 52428800 bytes`; past a smaller rest of the budget, with the compile memory message. Lint and the import scans parse with the 50 MiB allowance. |
+| `MAX_MODULE_COUNT` | 256; counts every distinct module besides the entry, even before its resolution completes. Binding virtual module maps accept at most 257 entries and use their own message above that bound. |
 
 Exceeding one of these returns `mds::resource_limit` (exit 3). YAML the parser
 itself refuses — syntax errors, duplicate keys, nesting deeper than 128 levels,
 its alias-repetition limit — returns `mds::yaml`, as does value nesting deeper
-than 64 levels. These bounds are pinned by the `parse_frontmatter_yaml` tests in
+than 64 levels. The frontmatter bounds are pinned by the `parse_frontmatter_yaml` tests in
 `crates/mds-core/src/resolver/frontmatter.rs` and by the
 `yaml_parse_sites_are_funnelled` test.
 
@@ -299,8 +303,8 @@ MDS provides 18 built-in functions that can be called without `@define`:
 
 | Function | Args | Description |
 |----------|------|-------------|
-| `upper(s)` | 1 | Convert string to uppercase |
-| `lower(s)` | 1 | Convert string to lowercase |
+| `upper(s)` | 1 | Convert a string to uppercase. A result above 50 MiB fails with `mds::builtin`: `upper() output exceeds maximum size of 52428800 bytes`. |
+| `lower(s)` | 1 | Convert a string to lowercase. A result above 50 MiB fails with `mds::builtin`: `lower() output exceeds maximum size of 52428800 bytes`. |
 | `trim(s)` | 1 | Strip leading/trailing whitespace |
 | `replace(s, from, to)` | 3 | Literal string replacement |
 | `split(s, sep)` | 2 | Split string into array |
@@ -872,6 +876,7 @@ For the base skeleton:
 | Limit | Value |
 |-------|-------|
 | `MAX_BLOCKS_PER_MODULE` | 256 blocks per module |
+| `MAX_DEFINES_PER_MODULE` | 256 `@define` declarations per module |
 | `MAX_FRONTMATTER_MERGE_DEPTH` | 64 levels of nested YAML merging |
 
 ---
@@ -883,8 +888,123 @@ For the base skeleton:
 | 1. Parse | Tokenize → AST (frontmatter, directives, text nodes) | Syntax errors (unexpected token, unclosed block) |
 | 2. Resolve | Recursively load imports, build dependency graph | File not found, circular import |
 | 3. Validate | Check all references, types, arity | Undefined var/function, type mismatch, wrong arg count |
-| 4. Evaluate | Execute directives (expand loops, resolve conditions, call functions) | Iterate non-array, recursion detected |
+| 4. Evaluate | Execute directives (expand loops, resolve conditions, call functions) | Iterate non-array, recursion detected, resource limit |
 | 5. Render | Flatten evaluated tree → final Markdown string | (none expected) |
+
+A compile permits at most 16,000,000 function calls across all evaluated modules
+and `@extends` regions. This limit includes built-ins and calls through an alias.
+The next call fails with `mds::resource_limit`. The limit applies to all output modes.
+
+**Compile memory budget (#420, #488).** A compile or a check has one memory budget of
+209,715,200 bytes (`MAX_COMPILE_MEMORY`, four times the 50 MiB output limit). The budget
+counts these parts:
+
+- output buffers, by capacity;
+- values that evaluation makes: call and built-in results, argument copies, computed
+  loop iterables, loop and call frames, and rendered interpolations;
+- the text of each module that the compile reads, while that module resolves;
+- an estimate of the syntax tree of each module that the compile parses: a cached
+  import, an `@extends` base, the file entry and the string entry ("Syntax tree
+  estimate" below);
+- the compiler's copy of the runtime variables that the caller supplies, once per
+  compile ("Runtime variables" below);
+- the parts that a cached module keeps: its source text, its prompt text, its syntax
+  tree estimate, its frontmatter text and tree, its captured scope layers and its
+  source-map fragments. The merged frontmatter tree of an `@extends` base is one of
+  these parts;
+- kept source-map segments, warnings, messages and the finalize output.
+
+A part that modules share is counted once, for the module that makes it. The compiler
+counts a part before it allocates it. A few allocations are counted directly after they
+are made; each of them is one allocation that an existing cap bounds. Exactly the budget
+passes. The next charge fails with `mds::resource_limit` and the message
+`resource limit exceeded: compile memory exceeds maximum of 209715200 bytes`, with no
+help and no span. The message does not name the part. The budget applies to every output
+mode and every surface. Each compile starts a new count, but a reused `ModuleCache`
+(Rust API) keeps the count of its cached modules until it is dropped, so a cache that
+lives long eventually refuses calls. Each frontmatter parse in a compile spends its own
+byte allowance from the budget (§4.1).
+
+**Syntax tree estimate.** The estimate of a module is
+`tokens × 832 + expression bytes × 184 + source bytes × 16` bytes (`TREE_PER_TOKEN`,
+`TREE_PER_EXPR_BYTE` and `TREE_PER_TEXT_BYTE`), in checked arithmetic. Expression bytes
+are the text of each directive line and each interpolation. The compiler charges the
+estimate after the lexer and before the parse. Thus the compiler refuses a module whose
+estimate does not fit before it builds the tree. An import scan (`scan_imports`,
+`scan_import_records` and the WASM file pre-scan of `@mdscript/mds`) charges the same
+estimate against its own new budget, and stops with the same error when the estimate
+does not fit. A cached module keeps its estimate
+charged, and the entry holds its estimate until it resolves. A module that a compile
+resolves first as an `@extends` base and then as an import keeps one estimate. The
+estimate counts the tokens during the parse, the syntax tree, and the copy of a
+`@define` or `@block` body that the compiler keeps. Its factors are measured on a
+64-bit host: for each of the 62 source shapes that `crates/mds-core/tests/memory_bound.rs`
+measures, the estimate is at least the peak heap of a compile and at least the bytes
+that a cached module keeps. On wasm32 the estimate is higher than the memory that it
+counts, so a compile there is refused earlier.
+
+The table gives the largest source of each shape for a module compiled alone, with no
+runtime variables, when the budget counts only its estimate and its read text. A larger
+source of the same shape is refused.
+Other parts, such as the output, also take budget, so the real ceiling is a little
+lower. A reused `ModuleCache` fills faster: each module that it caches keeps its
+estimate until the cache is dropped. So the sources of all the modules that it caches
+in its life share about the same ceiling.
+
+| Source shape | One compile | Reused `ModuleCache`, all cached sources |
+|---|---|---|
+| The densest syntax, `\{{a` repeated | 484,330 bytes | 484,610 bytes |
+| `{{a}}` repeated | 952,385 bytes | 956,729 bytes |
+| The densest measured expression shape | 678,735 bytes | 680,939 bytes |
+| Prose with one `{{a}}` in each 80 bytes | 5,229,805 bytes | 5,237,969 bytes |
+| Prose | 10,485,760 bytes: the 10 MiB file cap applies first, and the budget alone admits 12,336,188 | 12,336,188 bytes |
+
+**Runtime variables.** The compiler makes its own copy of the runtime variables that the
+caller supplies. The budget counts that copy once per compile, at the start of the root
+resolution: its table, the name text and each value. The caller's own map is outside the
+budget. A copy that does not fit fails the compile with the compile memory message. The
+count stops at 64 levels of value nesting. YAML and JSON input refuse a deeper value,
+but a `Value` built in Rust can hold one. A runtime variable nested deeper than 64 levels
+thus fails with the compile memory message, not with a depth error. Two copies are not
+counted. On a cache hit at the root of a reused `ModuleCache`, the compiler makes a copy
+and frees it before it returns. On a reused `ModuleCache`, a copy that a cached function
+captures stays alive after its compile, and only the compile that made it counts it.
+
+At the end of a compile, the compiler checks its memory count: no evaluation value stays
+counted, and no counter went below zero. When the check fails, the compile returns
+`mds::internal` with the message `internal compiler error` instead of a result, and the
+module is not cached. A failed check is a compiler defect. `mds build` and `mds check`
+exit 101 for it (§7.9), and so does `mds lint`, whose check gate compiles the source
+(§7.5). In a directory batch, the file counts as failed, and the run goes on with the
+next file. `mds fmt` does not exit 101 for it: when the safety gate's compile of the
+original source fails the check, the gate compares the tokens of the two sources, as it
+does for any compile error after the parse (§7.4). A live `mds watch` session keeps its
+exit code, as it does for every rebuild error.
+
+The budget does not count these stages:
+
+- the lexer stage of each source: its array of characters (`Vec<char>`), its array of
+  byte offsets (`byte_offsets`) and the tokens that it makes. This stage ends before
+  the compiler charges the syntax tree estimate. It grows with the source text, which is
+  at most 10 MiB per source. On a 64-bit host it holds 14 bytes per source byte for
+  ASCII prose, and at most 56 bytes per source byte for the densest syntax;
+- the caller's own map of runtime variables (the compiler's copy is counted);
+- the line table of a source map;
+- the YAML event buffer of one frontmatter parse, whose input is at most 1 MiB;
+- the conversion of a result into the host types of a binding (napi, WASM, Python);
+- the old buffer that a reallocation holds for one instant when it moves a buffer;
+- resolver warnings, the message and warning lists, and the call stack, which their
+  count caps bound.
+
+A host thus needs memory for the budget, plus these stages, plus the largest allocation
+that is counted after it is made. On napi, WASM and Python, add the conversion of the
+result. `crates/mds-core/tests/memory_bound.rs` measures the peak heap of compiles that
+reach the budget. It allows each of them at most 8 MiB above the budget, plus one 1 MiB
+output pass for a compile that writes output. A module of the densest syntax whose
+estimate does not fit grows the heap by at most 56 bytes per source byte, because the
+compiler does not build its tree. The test's `assert_syntax_tree_peaks` checks the estimate
+against the 62 source shapes, and the lexer stage against the 56-byte bound for the
+densest syntax, two tokens for each four source bytes.
 
 ### Project Root
 
@@ -944,9 +1064,9 @@ breaking change.
 
 "Exit" is the CLI exit class (§7.9) for `mds build`, `mds check`, `mds fmt` and
 `mds watch` startup — 1 template or content error, 2 I/O or file-system error,
-3 resource limit — followed by the `mds lint` code, which reports analysis failures
-as 2 except for the two carve-outs shown. The CLI's own stream and I/O failures are
-described below the table.
+3 resource limit, 101 internal compiler error — followed by the `mds lint` code, which
+reports analysis failures as 2 except for the two carve-outs shown. The CLI's own stream
+and I/O failures are described below the table.
 
 | Code | Meaning | Raised by | Exit | Surfaces |
 |---|---|---|---|---|
@@ -961,7 +1081,7 @@ described below the table.
 | `mds::file_not_found` | Entry file or import target does not exist, or a directory above it does not, or the path cannot otherwise be resolved — a symlink loop, a name too long, a directory that cannot be searched (native filesystem) | `NativeFs`, CLI input check; `@mdscript/mds`'s WASM-backend file pre-scanner, with the native message | 2 / 2 | CLI, Rust, napi, Python, `@mdscript/mds` |
 | `mds::import` | An `@import` the resolver refuses: not `./`/`../`-relative, empty, NUL byte, a forbidden path character, symlinked final component, escapes the project root, or another import-directive violation (§4.6 "Filesystem constraints"); on `@mdscript/mds`'s WASM backend also, on POSIX, an import whose own path names a symlinked directory and leaves it through `..` (`./link/../x.mds`), which its by-name virtual filesystem would resolve to a different file than the native backend reads (Windows applies `..` lexically before it follows a link, so there both backends read the same file) | resolver, `NativeFs`, `VirtualFs`, `@mdscript/mds` WASM-backend pre-scanner | 1 / 2 | all |
 | `mds::name_collision` | A merge import or definition redefines a name already in scope | resolver | 1 / 2 | all |
-| `mds::not_mds` | An entry file, or the target of an `@import`, `@export … from`, frontmatter import or `@extends`, is not an MDS file (neither a `.mds` file nor a `.md` file whose frontmatter declares `type: mds`). The message names the path as the caller typed it — the entry path as passed, or the string as written in the template — escaped, never the resolved absolute path (#417) | resolver; `mds fmt`/`mds lint` file-argument check; `@mdscript/mds`'s WASM-backend pre-scanner, through the resolver's own check (`preflightModule`) | 2 / 2 | all |
+| `mds::not_mds` | An entry file, or the target of an `@import`, `@export … from`, frontmatter import or `@extends`, is not an MDS file (neither a `.mds` file nor a `.md` file whose frontmatter declares `type: mds`). The message names the path as the caller typed it — the entry path as passed, or the string as written in the template — escaped, never the resolved absolute path (#417). A directive import's span points at the importer's directive line; an entry and a frontmatter `imports:` entry have no span (#423) | resolver; `mds fmt`/`mds lint` file-argument check; `@mdscript/mds`'s WASM-backend pre-scanner, through the resolver's own check (`preflightModule`) | 2 / 2 | all |
 | `mds::io` | Filesystem or I/O failure; a path or base directory that is not valid UTF-8; an entry path or virtual entry key that is empty or contains a NUL byte; an entry path, entry key, base directory, resolved canonical path or `lint_str_named` file name carrying a forbidden path character (§4.6); a `VirtualFs::with_aliases` alias refused — the alias, or the module key it names, not a normalized module key, the alias a module key itself, or the module key naming no module (`module alias "<alias>": <reason>`, #414); on the CLI also a `--vars` file that is a symlink, a directory argument that is a symlink or the filesystem root (#413), an output path that is the entry file itself, or an output that would replace an MDS module or a file the run reads — the entry, an imported module, the `--vars` file or the `mds.json` in force, and in directory mode the `mds.json` nearest the source (#425), a `-o`/`--out-dir`/`build.output_dir`/`mds init` path carrying a forbidden path character (for `-o`/`--out-dir`/`build.output_dir`, as written or as resolved), a `-o`/`--out-dir` value that is not valid UTF-8, a working directory that cannot be determined when a relative `-o`/`--out-dir`, a source map's base or `mds lint -`'s base needs it (`cannot determine current directory: <reason>`, the words mds-core uses when a string compile given no base directory cannot determine it, #390), a working directory that auto-detection cannot list (`cannot read directory .: <reason>`, #390), a `build.output_dir` that is absolute or contains `..`, a `lint --fix` rewrite refused by the compile-equivalence check, an `mds fmt` or `mds lint --fix` rewrite of a file that changed after it was read (`"<path>" changed since it was read; not written`, §7.4, #160), the stream and I/O failures listed below the table (#157), and an `mds watch` file-mode rebuild refused because the entry's path as typed now leads to a different file than the one being watched (a symlinked directory on it retargeted: `watched entry now resolves to a different file: "<path>"; restart mds watch to follow it`, #417), or a directory-mode rebuild refused because the directory argument, or a source below it, as typed now leads to a different directory or file than the one being watched (`watched directory now resolves to a different directory: "<dir>"; restart mds watch to follow it`, `watched file now resolves to a different file: "<dir>/<path below it>"; restart mds watch to follow it`; §7.2, #413), or a write below its out-dir refused because the out-dir as typed now leads to a different directory than the one the session started with (`cannot write <path>: the output directory now resolves to a different directory; restart mds watch to follow it`; §7.2, #160) | `mds-core` API boundary, resolver, `NativeFs`, `VirtualFs`, CLI, `@mdscript/mds` WASM-backend pre-scanner | 2 / 2 | all |
 | `mds::resource_limit` | A documented limit exceeded (§4.1 resource-limits table, `SECURITY.md`), CLI stdin over 10 MiB included; bindings also raise it before compilation for oversized sources, module and alias maps, and their counts (as `VirtualFs::with_aliases` does for an alias map); `@mdscript/mds`'s WASM-backend pre-scanner raises the native error for a path over the segment cap, a file over the size cap and a module over the module count, and one of its own for modules that together pass 10 MiB | evaluator, resolver, `VirtualFs`, bindings, `@mdscript/mds` WASM-backend pre-scanner | 3 / 3 | all |
 | `mds::yaml` | Frontmatter YAML the parser itself refuses (syntax, duplicate keys, nesting beyond the parser's limits — §4.1) | resolver | 1 / 2 | all |
@@ -976,7 +1096,7 @@ described below the table.
 | `mds::expected_markdown` | Rust API only: `CompileResult::into_markdown()` on a messages result | `mds-core` API | n/a | Rust |
 | `mds::expected_messages` | Rust API only: `CompileResult::into_messages()` on a markdown result | `mds-core` API | n/a | Rust |
 | `mds::formatter_invariant` | The formatter's rewrite failed the compile-equivalence gate — a formatter defect; nothing is written | formatter | 1 / n/a | CLI (`fmt`), Rust |
-| `mds::internal` | A panic caught at a binding boundary, or a result that could not be serialised; the raw payload is attached as `detail` only under the off-by-default `debug-panics` feature (`SECURITY.md`). On the CLI, the error `mds lint --format json` records for an input whose analysis panicked, with the fixed message `internal compiler error` and nothing of the panic (§5 "Panics on the CLI") | napi, WASM, Python; `mds lint` | n/a / 101 | napi, WASM, Python, CLI (`lint --format json`) |
+| `mds::internal` | A failed memory-counter check at the end of a compile (§5 "Compile memory budget"), with the message `internal compiler error`, no help and no span; a panic caught at a binding boundary, or a result that could not be serialised; the raw payload is attached as `detail` only under the off-by-default `debug-panics` feature (`SECURITY.md`). On the CLI, also the error `mds lint --format json` records for an input whose analysis panicked, with the fixed message `internal compiler error` and nothing of the panic (§5 "Panics on the CLI") | resolver (the counter check); napi, WASM, Python; `mds lint` | 101 / 101 | all |
 | `mds::invalid_options` | Malformed or type-incorrect options: unknown keys, wrong types, `basePath` on file methods or on the WASM backend, source-map options on `check`, an empty `basePath`, a WASM `moduleAliases` entry that is not a normalized module key or names no module (`options.moduleAliases["<alias>"]: <reason>`) | napi, WASM, Python, `@mdscript/mds` | n/a | napi, WASM, Python, `@mdscript/mds` |
 | `mds::filename_collision` | `options.modules` already contains the entry `filename` | WASM (surfaced through `@mdscript/mds`) | n/a | WASM, `@mdscript/mds` |
 | `mds::invalid_backend_result` | The selected backend returned a result of an unexpected shape | `@mdscript/mds` | n/a | `@mdscript/mds` |
@@ -1085,10 +1205,12 @@ after the text. A build with debug assertions — `cargo install --debug`, or a 
 that turns them on — also holds a test-only trigger that panics on purpose when
 `MDS_TEST_PANIC` is `main`, `thread`, `compile:<file stem>`, `notify` or `ctrlc`; a
 release build compiles it out unless its profile turns debug assertions on. Such a build
-holds five more test-only hooks, compiled out in the same way: the pauses
-`MDS_TEST_PAUSE_BEFORE_REPLACE`, `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT`,
-`MDS_TEST_PAUSE_AFTER_LOOK` and `MDS_TEST_PAUSE_AFTER_READ`, each of which stops a write or
-a rebuild at one point until a test lets it go, and the readiness marker `MDS_TEST_READY`,
+holds eight more test-only hooks, compiled out in the same way: the pauses
+`MDS_TEST_PAUSE_BEFORE_REPLACE`, `MDS_TEST_PAUSE_AFTER_WALK`,
+`MDS_TEST_PAUSE_AFTER_BATCH_SPLIT`, `MDS_TEST_PAUSE_AFTER_LOOK`,
+`MDS_TEST_PAUSE_AFTER_READ`, `MDS_TEST_PAUSE_BEFORE_LATE_LOOK` and
+`MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE`, each of which stops a write,
+a directory command or a rebuild at one point until a test lets it go, and the readiness marker `MDS_TEST_READY`,
 the file `mds watch` creates once it is watching. `tests/panic_hook.rs` pins that each is
 compiled only under `cfg(debug_assertions)` and has an empty release stub.
 
@@ -1198,7 +1320,7 @@ Whichever route resolves it, an output that is the entry file itself is refused 
 
 **What `mds watch` writes after a change of kind.** When a rebuild compiles a source to the other kind than the output the session last wrote for it — a template edited into messages, or back — in file mode without `-o` as in directory mode, the output of the new kind is written only where nothing is, or over a file this session last wrote there for that source that still holds exactly the bytes it wrote (#160), whatever the source now compiles to — the same bytes included. The write gives its file that name only where nothing has it at that moment, so a file that appears after the session looked is not replaced either, and the session's own file is replaced only while it is still that file, unchanged. Anything else there — a hand-written file, one an earlier session or `mds build` left, one the session wrote for another source, one changed since the session wrote it, a symlink, a directory — is kept, with one notice, `Kept <output>: not written by this session; not overwritten`, `Kept <output>: not written by this source; not overwritten` or `Kept <output>: changed since it was written; not overwritten` (`--quiet` prints none of them); the old kind's output is kept as it was, nothing else is reported, and watching goes on. A file the session wrote there that it cannot read again — one whose mode no longer lets the user read it, say — is neither its own nor changed, as nothing tells which: the write fails, reported as any failed write is (`cannot write <path>: <cause>`, the read's cause), the file is left as it is, and watching goes on. The next save tries again: once the file is gone, the output is written, and the old kind's output removed by the rule above. The session's first write for a source — at startup, for a source created while it runs, or after a startup compile or write that failed — and every write under `-o`, which names the output whatever the kind, write over whatever is there, as `mds build` does.
 
-**When a watched file is momentarily empty.** An editor that saves by truncating a file and then writing it leaves the file empty in between, and a rebuild in that moment would publish an empty output nobody wrote (#380). So at every `--debounce`, a rebuild that finds a watched file — the entry, a file it imports or includes, the `--vars` file, in directory mode any source of the directory or a dependency of one — empty where it last saw bytes is held: nothing is compiled, written or printed, and in directory mode the whole batch waits, other sources changed meanwhile included. The hold ends at the first rebuild that finds the file written, which then rebuilds once for what was written, or one second after the rebuild that first found the file empty, whatever events, truncations or ticks came meanwhile — that deadline never moves, and is kept under `--poll-interval 0` too; it is that hold's alone: once the hold has ended, a file found emptied again — by a later rebuild's look, or after the look of the rebuild that found the file written — starts a hold of its own, with a deadline of its own, one second after the rebuild that found it; a debounce window already collecting events when it comes finishes first, so the held rebuild can run later by at most that window's cap. A file found emptied after a rebuild looked, and read empty by its compile or its `--vars` load, holds that rebuild the same way, whether that read then failed or not — in directory mode the one source that read it, or for the `--vars` file the whole batch — unless the deadline ended the hold in that rebuild, so a save that truncates a file while a rebuild is reading it is not reported as an error; a compile that failed reports no dependencies, so after a failure the files looked at are the entry (in directory mode, the source), the `--vars` file and the files the compile before it read — a file the failing edit itself starts to import, and that is truncated after the look, is not among them, and the failure is reported; and in directory mode a file the hold finds emptied is rebuilt with the batch that ends it, whether or not its own events came. A file that a held rebuild read empty stays among the files each rebuild looks at while the hold lasts, so the rebuild its own truncation event starts is held too, a file outside the directory that the source imported for the first time included. A source that drops an import of a file that is still empty waits as well, for that file to be written or for the deadline. A file truncated while a rebuild runs, after it looked — read whole before the truncation, or in directory mode not read by the batch — is still found emptied by the next rebuild, which is held; so is, in directory mode, the `--vars` file truncated while the session starts, after the startup read it. What the watcher compares with is taken before the files it describes are read, so no rebuild takes the empty file for the one it saw. A file still empty then is compiled as it is: an entry left empty is published as an empty output, an emptied `--vars` file is reported as the error it is, and an emptied import is compiled as it is — an `@include`d module gives an empty string with a warning (§4.8), and an import that no longer defines what the source uses is reported as any error is. A rebuild that writes an output empty over the non-empty one the session wrote there prints `Wrote an empty output: <output>` once (not under `--quiet`). A file empty when the session starts is compiled at once, and a file left empty after its hold is compiled at once on its next change.
+**When a watched file is momentarily empty.** An editor that saves by truncating a file and then writing it leaves the file empty in between, and a rebuild in that moment would publish an empty output nobody wrote (#380). So at every `--debounce`, a rebuild that finds a watched file — the entry, a file it imports or includes, the `--vars` file, in directory mode any source of the directory or a dependency of one — empty where it last saw bytes is held: nothing is compiled, written or printed, and in directory mode the whole batch waits, other sources changed meanwhile included. The hold ends at the first rebuild that finds the file written, which then rebuilds once for what was written, or one second after the rebuild that first found the file empty, whatever events, truncations or ticks came meanwhile — that deadline never moves, and is kept under `--poll-interval 0` too; it is that hold's alone: once the hold has ended, a file found emptied again — by a later rebuild's look, or after the look of the rebuild that found the file written — starts a hold of its own, with a deadline of its own, one second after the rebuild that found it; a debounce window already collecting events when it comes finishes first, so the held rebuild can run later by at most that window's cap. A file emptied after a rebuild looked, and read empty by its compile or its `--vars` load where the watcher last saw bytes, holds that rebuild the same way, whether that read then failed or not — in directory mode the one source that read it, or for the `--vars` file the whole batch — unless the deadline ended the hold in that rebuild, so a save that truncates a file while a rebuild is reading it is neither published nor reported as an error. The byte count that the read gave decides, not the file as it is when the rebuild checks: a save that ends between the read and the check is held too. A file the watcher has not seen with bytes — one the failing edit itself starts to import, say — holds nothing, and the failure is reported; and in directory mode a file the hold finds emptied is rebuilt with the batch that ends it, whether or not its own events came. A file that a held rebuild read empty stays among the files each rebuild looks at while the hold lasts, so the rebuild its own truncation event starts is held too, a file outside the directory that the source imported for the first time included. A source that drops an import of a file that is still empty waits as well, for that file to be written or for the deadline. A file truncated while a rebuild runs, after it looked — read whole before the truncation, or in directory mode not read by the batch — is still found emptied by the next rebuild, which is held; so is, in directory mode, the `--vars` file truncated while the session starts, after the startup read it. What the watcher compares with is taken before the files it describes are read, so no rebuild takes the empty file for the one it saw. A file still empty then is compiled as it is: an entry left empty is published as an empty output, an emptied `--vars` file is reported as the error it is, and an emptied import is compiled as it is — an `@include`d module gives an empty string with a warning (§4.8), and an import that no longer defines what the source uses is reported as any error is. A rebuild that writes an output empty over the non-empty one the session wrote there prints `Wrote an empty output: <output>` once (not under `--quiet`). A file empty when the session starts is compiled at once, and a file left empty after its hold is compiled at once on its next change.
 
 ### 7.3 `mds check`
 
@@ -1386,7 +1508,7 @@ lines with the tests that pin each.
 | `1` | Warning-severity findings only (no errors) |
 | `2` | Any error-severity finding, analysis failure (parse/resolve/IO/config), or usage error |
 | `3` | Resource limit exceeded |
-| `101` | Internal compiler error: a panic (§5 "Panics on the CLI", #389) — wins over every other code |
+| `101` | Internal compiler error: a panic (§5 "Panics on the CLI", #389), or a failed memory-counter check (`mds::internal`, §5 "Compile memory budget") — wins over every other code |
 
 With `--fix`, residual post-fix findings determine the exit code.
 
@@ -1703,8 +1825,8 @@ Maximum config file size: 1 MiB (1,048,576 bytes).
 | `0` | Success |
 | `1` | Template error (syntax, undefined variable, arity mismatch, recursion, etc.); in directory mode, also "nothing to process" (no `.mds` files, all under default-excluded directories, or — `build`/`check` only — nothing but `_`-prefixed partials), and a run in which files failed but none with an error of the `2` or `3` row below — template errors, say (§7.2 continue-on-error) |
 | `2` | I/O or file-system error (file not found, not an MDS file, I/O failure, a path that is not valid UTF-8, a path carrying a forbidden path character — §4.6); also an output location (`-o`, `--out-dir`, `build.output_dir`) or `mds init` filename carrying one, a `-o`/`--out-dir` value that is not valid UTF-8, a relative `-o`/`--out-dir` when the working directory cannot be determined, and a working directory that auto-detection cannot list (§7.2, §7.7, #390), a `build.output_dir` that is absolute or contains `..`, a directory argument that is a symlink or the filesystem root (§7.2), an output that is the entry file itself, and one that would replace an MDS module or a file the run reads (§7.2). The CLI's I/O failures listed in §5 "Streams and I/O failures" are `mds::io`, exit 2: an output, `.map` sidecar or starter file that cannot be written (a symlink at the destination included), an output directory that cannot be created, a stale sidecar, or a stale `.json` output shown to be mds's, that cannot be removed or whose removal is refused (§7.2), a stale sidecar or `.json` output that cannot be read, a stdout write that fails other than by a closed pipe, and stdin that cannot be read or is not valid UTF-8 (#157). In directory mode a failure of this row — one of these, or a file's own, such as a source that cannot be read — makes the run exit 2 while the other files are still processed (§7.2 continue-on-error). (Changed in v0.5.0: these exited 1, a directory run whose failed files included one of this row's errors exited 1, and a stale sibling or sidecar that could not be removed, or a stale sidecar that could not be read, only warned.) |
-| `3` | Resource limit exceeded (output too large, too many iterations, message count exceeds `MAX_MESSAGE_COUNT` (10,000), cumulative message content exceeds 50 MB, frontmatter over 1 MiB, over 200,000 YAML nodes, or flow-nesting deeper than 1024 levels, or stdin over 10 MiB — changed in v0.5.0; previously exit 1). In directory mode a run in which any file fails with one of these exits 3, whatever else failed, as `mds lint <dir>` does (§7.2 continue-on-error; changed in v0.5.0, previously exit 1) |
-| `101` | Internal compiler error: a panic (§5 "Panics on the CLI", #389) — wins over every other code |
+| `3` | Resource limit exceeded (output too large, too many iterations, message count exceeds `MAX_MESSAGE_COUNT` (10,000), cumulative message content exceeds 50 MB, frontmatter over 1 MiB, over 200,000 YAML nodes, deeper than 1024 flow-nesting levels or past its byte allowance, compile memory over its budget, or stdin over 10 MiB — changed in v0.5.0; previously exit 1). In directory mode a run in which any file fails with one of these exits 3, whatever else failed, as `mds lint <dir>` does (§7.2 continue-on-error; changed in v0.5.0, previously exit 1) |
+| `101` | Internal compiler error: a panic (§5 "Panics on the CLI", #389), or a failed memory-counter check under `mds build` or `mds check` (`mds::internal`, §5 "Compile memory budget") — wins over every other code |
 
 A closed stdout or stderr pipe never changes any of these codes (§5 "Streams and I/O failures").
 
@@ -1716,7 +1838,7 @@ A closed stdout or stderr pipe never changes any of these codes (§5 "Streams an
 | `1` | Warning-severity findings only (no errors) |
 | `2` | Error-severity finding, analysis failure, or usage error (including a directory with nothing to lint, stdin under `--fix --format json`, or a directory entry whose path is not valid UTF-8); also an I/O failure (#157): a `--fix` rewrite that fails, a stdout write that fails other than by a closed pipe — which lifts a clean or warning-only run to 2 — stdin that cannot be read or is not valid UTF-8, and a working directory that cannot be determined for stdin, each `mds::io` (a rewrite failure in the one wording of §7.5). Under `--format json` each is reported in the run's one JSON document (§7.5), except a usage error the argument parser reports and a stdout write that fails, which are reported on stderr |
 | `3` | Resource limit exceeded (stdin over 10 MiB included — changed in v0.5.0; previously exit 2); a source file over 10 MiB in every mode and format, a directory's entry included, unless its `mds.json` cannot load (§7.5) (changed in v0.5.0 for a directory under `--format human`; previously exit 2, #309); a `--vars` file over 10 MiB (changed in v0.5.0; previously exit 2, #309) |
-| `101` | Internal compiler error: a panic (§5 "Panics on the CLI", #389) — wins over every other code |
+| `101` | Internal compiler error: a panic (§5 "Panics on the CLI", #389), or a failed memory-counter check (`mds::internal`, §5 "Compile memory budget") — wins over every other code |
 
 The code-by-code classification behind these tables is the "Error Codes" registry in §5.
 

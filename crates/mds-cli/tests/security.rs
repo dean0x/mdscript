@@ -6,6 +6,62 @@ use common::{
 use std::collections::HashMap;
 
 #[test]
+#[cfg(unix)]
+fn check_directory_refuses_a_file_replaced_after_walk() {
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("page.mds"), "Original\n").unwrap();
+    std::fs::write(src.path().join("good.mds"), "Good\n").unwrap();
+    let output = common::run_after_walk(mds_bin().arg("check").arg(src.path()), || {
+        std::fs::rename(src.path().join("page.mds"), src.path().join("saved.txt")).unwrap();
+        std::fs::write(src.path().join("page.mds"), "Replacement\n").unwrap();
+    });
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("mds::io") && stderr.contains("file changed"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("1 passed, 1 failed"), "{stderr}");
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn check_directory_refuses_a_parent_redirected_after_walk() {
+    let src = tempfile::tempdir().unwrap();
+    let sub = src.path().join("sub");
+    let moved = src.path().join("moved");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("page.mds"), "Original\n").unwrap();
+    if !make_symlink(&sub, &src.path().join("probe")) {
+        return;
+    }
+    let output = common::run_after_walk(mds_bin().arg("check").arg(src.path()), || {
+        std::fs::rename(&sub, &moved).unwrap();
+        assert!(make_symlink(&moved, &sub));
+    });
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("mds::io") && stderr.contains("file changed"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("0 passed, 1 failed"), "{stderr}");
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn check_directory_accepts_an_unchanged_tree_after_walk() {
+    let src = tempfile::tempdir().unwrap();
+    std::fs::create_dir(src.path().join("sub")).unwrap();
+    std::fs::write(src.path().join("sub/page.mds"), "Original\n").unwrap();
+    let output = common::run_after_walk(mds_bin().arg("check").arg(src.path()), || {});
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("1 passed, 0 failed"), "{stderr}");
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
 fn file_size_limit_rejects_huge_file() {
     let dir = tempfile::tempdir().unwrap();
     let huge = dir.path().join("huge.mds");

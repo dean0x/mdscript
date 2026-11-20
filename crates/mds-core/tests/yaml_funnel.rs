@@ -82,6 +82,65 @@ fn yaml_parse_sites_are_funnelled() {
     );
 }
 
+#[test]
+fn cfg_test_items_do_not_hide_later_production_parses() {
+    let items = [
+        "fn test_only() { serde_yaml_ng::from_str(ignored); }",
+        "impl TestOnly { fn parse() { serde_yaml_ng::from_str(ignored); } }",
+        "const TEST_ONLY: () = { serde_yaml_ng::from_str(ignored); };",
+        "use serde_yaml_ng::from_str;",
+        "mod test_only { fn parse() { serde_yaml_ng::from_str(ignored); } }",
+        "mod test_only;",
+    ];
+    for item in items {
+        let raw = format!(
+            "#[cfg(test)]\n#[allow(dead_code)]\n#[tokens({{ ; }})]\n{item}\n\
+             fn production() {{ serde_yaml_ng::from_str(input); }}\n\
+             #[cfg(test)]\n#[path = \"tests.rs\"]\nmod tests;"
+        );
+        let code = strip_cfg_test_mods(&mask_comments_and_strings(&raw));
+        assert_eq!(
+            code.matches(NEEDLES[0]).count(),
+            1,
+            "the production parse must survive after `{item}`: {code}"
+        );
+        assert!(
+            !code.contains("test_only"),
+            "the guarded item must be removed"
+        );
+        assert!(
+            !code.contains("mod tests"),
+            "the guarded module must be removed"
+        );
+    }
+}
+
+#[test]
+fn builtin_production_parse_inserted_in_memory_is_detected() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/builtins.rs");
+    let mut raw = std::fs::read_to_string(path).expect("builtins source must be readable");
+    let insert_at = raw.find("fn builtin_upper(").expect("production anchor");
+    let test_fn = raw.find("#[cfg(test)]").expect("test function attribute");
+    let test_mod = raw.find("mod tests {").expect("test module anchor");
+    assert!(test_fn < insert_at && insert_at < test_mod);
+    let clean = strip_cfg_test_mods(&mask_comments_and_strings(&raw));
+    assert!(
+        !clean.contains(NEEDLES[0]),
+        "the original source has no raw parse"
+    );
+
+    raw.insert_str(
+        insert_at,
+        "fn planted_parse() { serde_yaml_ng::from_str(input); }\n",
+    );
+    let code = strip_cfg_test_mods(&mask_comments_and_strings(&raw));
+    assert_eq!(
+        code.matches(NEEDLES[0]).count(),
+        1,
+        "the planted parse must be found"
+    );
+}
+
 fn is_choke_point(path: &Path) -> bool {
     let comps: Vec<String> = path
         .components()
@@ -225,44 +284,48 @@ fn mask_comments_and_strings(src: &str) -> String {
     String::from_utf8(out).expect("masking preserves UTF-8 boundaries on ASCII delimiters")
 }
 
-/// Remove every `#[cfg(test)]`-guarded item from already-masked source. Handles both an
-/// inline `mod name { ... }` (brace-matched) and a `mod name;` / `#[path=...] mod name;`
-/// declaration (whose body is an external `*_tests.rs`, excluded separately). Individual
-/// `#[cfg(test)] fn ...` items are left in place; the codebase places test parse calls
-/// inside `mod tests` or `*_tests.rs`, both of which are handled.
+/// Remove each `#[cfg(test)]` attribute and only the item it annotates in masked source.
+/// Skip whitespace and other attributes, then remove the item's brace-matched body or
+/// semicolon-terminated declaration. A test-only function never marks a later module.
 fn strip_cfg_test_mods(code: &str) -> String {
     let mut result = code.to_string();
-    // Bounded: at most one removal per `#[cfg(test)]` occurrence, and each iteration
-    // either removes a block or blanks the attribute, so no occurrence is seen twice.
+    // Bounded: each iteration removes a guarded item or blanks its attribute.
     while let Some(attr) = result.find("#[cfg(test)]") {
-        // Find the next `mod` keyword after the attribute.
         let after = attr + "#[cfg(test)]".len();
-        let Some(mod_rel) = result[after..].find("mod ") else {
-            // No module follows (e.g. a cfg(test) fn) — blank the attribute and move on.
-            result.replace_range(attr..after, &" ".repeat(after - attr));
-            continue;
-        };
-        let mod_start = after + mod_rel;
-        // Look for the block-open `{` or the statement-terminating `;`.
-        let brace = result[mod_start..].find('{');
-        let semi = result[mod_start..].find(';');
-        match (brace, semi) {
-            (Some(bo), semi_opt) if semi_opt.is_none_or(|s| bo < s) => {
-                let open = mod_start + bo;
-                if let Some(close) = match_brace(&result, open) {
-                    result.replace_range(attr..=close, "");
-                } else {
-                    result.replace_range(attr..open, "");
+        let b = result.as_bytes();
+        let mut item = after;
+        // Bounded: advance over whitespace and complete attributes in this source.
+        while item < b.len() {
+            if b[item].is_ascii_whitespace() {
+                item += 1;
+            } else if b[item..].starts_with(b"#[") {
+                item += 2;
+                let mut depth = 1usize;
+                while item < b.len() && depth > 0 {
+                    match b[item] {
+                        b'[' => depth += 1,
+                        b']' => depth -= 1,
+                        _ => {}
+                    }
+                    item += 1;
                 }
+            } else {
+                break;
             }
-            (_, Some(so)) => {
-                // `mod name;` declaration — remove the attribute + statement.
-                let end = mod_start + so + 1;
-                result.replace_range(attr..end, "");
+        }
+        let brace = result[item..].find('{');
+        let semi = result[item..].find(';');
+        let end = match (brace, semi) {
+            (Some(bo), semi) if semi.is_none_or(|s| bo < s) => {
+                match_brace(&result, item + bo).map(|close| close + 1)
             }
-            _ => {
-                result.replace_range(attr..after, &" ".repeat(after - attr));
-            }
+            (_, Some(so)) => Some(item + so + 1),
+            _ => None,
+        };
+        if let Some(end) = end {
+            result.replace_range(attr..end, "");
+        } else {
+            result.replace_range(attr..after, &" ".repeat(after - attr));
         }
     }
     result

@@ -3,7 +3,7 @@ members = ["crates/mds-core", "crates/mds-cli", "crates/mds-wasm", "crates/mds-n
 resolver = "2"
 
 [workspace.package]
-version = "0.4.4"
+version = "0.5.1"
 edition = "2021"
 rust-version = "1.88" # napi 3.12.2 sets rust-version = "1.88" in its published Cargo.toml
 license = "MIT"
@@ -74,9 +74,13 @@ similar = "3.1"
 # rust-version 1.63, within the workspace MSRV.
 rustix = { version = "1.1.4", default-features = false, features = ["fs", "std"] }
 
-# panic = "unwind" is required workspace-wide because mds-wasm and mds-napi use
-# catch_unwind at the JS boundary to convert panics into structured JS errors.
-# Cargo does not support per-package panic strategy overrides for workspace profiles.
+# panic = "unwind" is required workspace-wide because mds-napi and mds-python catch
+# panics with catch_unwind at the host boundary and return `mds::internal` errors, and
+# mds-cli catches a panic in `output::catch_panic`. Cargo does not support per-package
+# panic strategy overrides for workspace profiles.
+# This setting does not make mds-wasm unwind: wasm32-unknown-unknown cannot unwind, so
+# a panic there traps (a JS `RuntimeError`, "unreachable") and the catch_unwind in
+# mds-wasm does not catch it.
 # Note: "unwind" is already Rust's default for dev, so the dev setting is
 # explicit documentation only.
 [profile.dev]
@@ -84,8 +88,11 @@ panic = "unwind"
 
 [profile.release]
 lto = true
-panic = "unwind" # required by mds-wasm catch_unwind; see comment above
+panic = "unwind" # required by the native catch_unwind boundaries; see comment above
 
+# codegen-units here applies to the mds-wasm crate only. The WASM build commands add
+# `--config profile.release.codegen-units=1`, which gives mds-core and every
+# dependency one unit in that build only (#491; see the wasm job in ci.yml).
 [profile.release.package.mds-wasm]
 opt-level = "z"
 strip = true

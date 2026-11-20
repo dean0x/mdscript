@@ -21,5 +21,12 @@ serde_json = { workspace = true }
 miette = { workspace = true }
 thiserror = { workspace = true }
 
+# Reuse the workspace's portable O_NONBLOCK constant for regular vars opens.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.60.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }

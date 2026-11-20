@@ -50,10 +50,30 @@ input. The compiler enforces several defense-in-depth controls:
   checks the directory argument of `mds build`, `mds check`, `mds fmt`, `mds lint`
   and `mds watch` by the same rule before it is walked, however it is typed (`link/`
   and `link/.` included), and refuses a symlinked one, or the filesystem root, as
-  `mds::io`, exit 2 (#413). `mds watch` re-checks the path it watches before every
-  rebuild — the entry in file mode, the directory argument and each source below
-  it in directory mode — and refuses the rebuild once a symbolic link on that path
-  has been retargeted (#417, #413).
+  `mds::io`, exit 2 (#413).
+- **Native source reads**: `NativeFs::read` accepts only a key that the same instance
+  resolved as an entry or import. Before it reads bytes, it compares the opened file
+  with that resolve record: device and inode on Unix, the handle's final path on Windows.
+  A mismatch returns `mds::io`: `cannot read <display>: the file changed while it was opened`.
+  An absent or unreadable record returns `mds::io`: `cannot read <display>: it was not resolved first`.
+  Other targets refuse native source reads. `mds::lint` applies its rules to the entry text
+  that the check gate read. Imported-module reads can still select a same-named file from
+  another directory. On Windows, a replacement regular file at the same path is still read.
+  Some overlay or network filesystems report different identities and refuse the read.
+  A source open can still wait indefinitely for a named pipe.
+- **Directory and watch entries**: a directory build, check, lint or fmt compares each
+  entry with its walked canonical path, plus the walk's device and inode on Unix.
+  `mds watch` compares the directory argument with its watched canonical directory before each rebuild.
+  It compares each entry or source's canonical parent with its watched parent before the compile
+  and again during entry resolution. A case-only file-name change within that parent is not a move.
+  A path lookup error, a different root or a different parent refuses the compile.
+  Watch reports the rebuild error and keeps the session active.
+  Watch uses the parent path, not a stored file identity; same-parent replacements remain possible.
+- **Vars file reads**: `--vars` accepts a regular file or a named pipe, with the same 10 MiB cap.
+  Regular files use the opened-file comparison above. Named pipes must have that type at lookup and open;
+  their device and inode are not compared. Other types and type mismatches return `mds::io`.
+  Process substitution works on macOS; Linux refuses `/dev/fd` links.
+  A watch vars path can still read a same-named file from another directory.
 - **Null-byte rejection**: paths containing NUL bytes are rejected at the API
   boundary rather than being passed to the OS.
 - **Forbidden path characters are refused at input, not only escaped on output**
@@ -243,19 +263,93 @@ place each check runs, and the tests that pin them — in `spec.md` §4.6
 | YAML parser nesting depth | 128 | serde_yaml_ng (reported as `mds::yaml`) |
 | Max `mds.json` size | 1 MiB (1,048,576 bytes), read no more than one byte past it | `mds-cli/src/build.rs` (`MAX_CONFIG_SIZE`) |
 | Max call depth | 128 | `evaluator.rs` (`MAX_CALL_DEPTH`) |
+| Max total function calls | 16,000,000 per compile, across all evaluated modules | `limits.rs` (`MAX_TOTAL_FUNCTION_CALLS`) |
 | Max iterations per loop | 100,000 | `evaluator.rs` (`MAX_LOOP_ITERATIONS`) |
-| Max total iterations | 1,000,000 | `evaluator.rs` (`MAX_TOTAL_ITERATIONS`) |
-| Max output size | 50 MiB (52,428,800 bytes) per output buffer, checked before every append; it does not bound a compile's total memory, since nested blocks, function results and imported modules each hold a buffer of their own ([#420](https://github.com/dean0x/mdscript/issues/420)) | `limits.rs` (`MAX_OUTPUT_SIZE`) |
+| Max total iterations | 1,000,000 per module evaluation | `evaluator.rs` (`MAX_TOTAL_ITERATIONS`) |
+| Max output size | 50 MiB (52,428,800 bytes) per evaluation output buffer. Function results, message content and imported modules can use separate buffers; the compile memory budget below bounds them together. | `limits.rs` (`MAX_OUTPUT_SIZE`) |
+| Max compile memory | 200 MiB (209,715,200 bytes, four output buffers) per compile ([#420](https://github.com/dean0x/mdscript/issues/420), [#488](https://github.com/dean0x/mdscript/issues/488)). One budget counts output buffers by capacity, values that evaluation makes, an estimate of the syntax tree of each module (charged before the parse, by a compile, a check and an import scan), the compiler's copy of the runtime variables, retained module text and frontmatter trees (the merged trees of `@extends` bases included), kept source-map segments, warnings, messages and the finalize output. Exactly the budget passes; above it, `resource limit exceeded: compile memory exceeds maximum of 209715200 bytes`. A reused `ModuleCache` keeps the count of its cached modules until it is dropped, so it fills faster. The tree estimate and its ceilings are below the table. | `limits.rs` (`MAX_COMPILE_MEMORY`, `TREE_PER_TOKEN`), `evaluator/budget.rs` |
+| Frontmatter byte allowance | 50 MiB (52,428,800 bytes) per frontmatter parse, or the rest of the compile budget when that is smaller. Each YAML node spends 192 bytes plus its string or key bytes before it is built, so an alias of a long scalar spends the scalar again at each use. The one exception is the bytes of a `!tag`: the parser spends them after it copies the tag. Above it, `resource limit exceeded: frontmatter YAML expands beyond maximum of 52428800 bytes`, or the compile memory message when the rest of the budget set the allowance. | `resolver/frontmatter.rs` (`NODE_YAML`, `Allowance`) |
 | Max warnings | 1,000 | `evaluator.rs` (`MAX_WARNINGS`) |
 | Max import depth | 64 | `resolver.rs` (`MAX_IMPORT_DEPTH`) |
+| Max module count | 256 distinct modules besides the entry; see [spec §4.1](spec.md#41-variables-yaml-frontmatter) for the count rule and virtual-map bound | `limits.rs` (`MAX_MODULE_COUNT`), `resolver.rs` |
 | Max path segments | 256 per entry or import path | `fs.rs` (`MAX_PATH_SEGMENTS`) |
 | Max block nesting depth | 64 | `limits.rs` (`MAX_NESTING_DEPTH`) |
+| Max `@define` declarations per module | 256 | `limits.rs` (`MAX_DEFINES_PER_MODULE`) |
 | Max @elseif branches per @if | 256 | `limits.rs` (`MAX_ELSEIF_BRANCHES`) |
 | Max value (YAML/JSON) nesting depth | 64 | `value.rs` (`MAX_VALUE_DEPTH`) |
 | Max dot-path segments | 32 | `limits.rs` (`MAX_DOT_SEGMENTS`) |
 
-These guard against adversarial input causing stack overflow, unbounded memory
-growth, or non-termination.
+These limits apply to the quantities and scopes in the table. They do not bound
+elapsed time.
+
+In a compile or a check, the compile memory budget counts an estimate of the syntax tree
+of each module: a cached import, an `@extends` base, the file entry and the string
+entry. The estimate is `tokens × 832 + expression bytes × 184 + source bytes × 16`
+bytes, in checked arithmetic. Expression bytes are the text of each directive line and
+each interpolation. The compiler charges the estimate after the lexer and before the
+parse, so it never builds a tree that does not fit. An import scan (`scan_imports`,
+`scan_import_records` and the WASM file pre-scan of `@mdscript/mds`) charges the same
+estimate against its own new budget, so a scan of a very large or dense module stops
+with `mds::resource_limit`. A cached module keeps its estimate
+charged. A module resolved first as an `@extends` base and then as an import keeps one
+estimate. The factors are measured on a 64-bit host: for each of the 62 shapes in
+`crates/mds-core/tests/memory_bound.rs`, the estimate is at least the compile peak and
+the bytes that a cached module keeps. On wasm32 the estimate is high, so a compile is
+refused earlier. The table gives about the largest source of each shape for a module
+compiled alone, with no runtime variables:
+
+| Source shape | One compile | Reused `ModuleCache`, all cached sources |
+|---|---|---|
+| The densest syntax, `\{{a` repeated | 484,330 bytes | 484,610 bytes |
+| `{{a}}` repeated | 952,385 bytes | 956,729 bytes |
+| The densest measured expression shape | 678,735 bytes | 680,939 bytes |
+| Prose with one `{{a}}` in each 80 bytes | 5,229,805 bytes | 5,237,969 bytes |
+| Prose | 10,485,760 bytes (the 10 MiB file cap applies first; the budget alone admits 12,336,188) | 12,336,188 bytes |
+
+A reused `ModuleCache` fills faster: each module that it caches keeps its estimate until
+the cache is dropped.
+
+The budget also counts the compiler's copy of the runtime variables, once per compile.
+The caller's own map is outside the budget. The count stops at 64 levels of value
+nesting, so a `Value` built in Rust and nested deeper fails with the compile memory
+message. On a cache hit at the root of a reused `ModuleCache`, the compiler makes a copy
+and frees it before it returns, and does not count it. A copy that a cached function
+captures stays alive in a reused cache after its compile, and only the compile that made
+it counts it.
+
+The compile memory budget does not count these stages:
+
+- the lexer stage of each source: its array of characters (`Vec<char>`), its array of
+  byte offsets (`byte_offsets`) and the tokens that it makes. This stage ends before the
+  compiler charges the syntax tree estimate. It grows with the source text, which the
+  10 MiB file cap bounds. On a 64-bit host it holds 14 bytes per source byte for ASCII
+  prose, and at most 56 bytes per source byte for the densest syntax;
+- the caller's own map of runtime variables (the compiler's copy is counted);
+- the line table of a source map;
+- the YAML event buffer of one frontmatter parse, whose input the 1 MiB frontmatter cap
+  bounds;
+- the conversion of a result into the host types of a binding (napi, WASM, Python);
+- the old buffer that a reallocation holds for one instant when it moves a buffer;
+- resolver warnings, the message and warning lists, and the call stack, which their
+  count caps bound.
+
+A few allocations are counted directly after they are made, each one allocation that
+an existing cap bounds. A host thus needs memory for the budget, plus the stages above,
+plus the largest of those allocations; on napi, WASM and Python, add the conversion of
+the result. `crates/mds-core/tests/memory_bound.rs` measures the peak heap of compiles
+that reach the budget: it allows each of them at most 8 MiB above the budget, plus one
+1 MiB output pass for a compile that writes output. A module of the densest syntax whose
+estimate does not fit grows the heap by at most 56 bytes per source byte. The test's
+`assert_syntax_tree_peaks` checks the estimate against the 62 source shapes, and the
+lexer stage against the 56-byte bound for the densest syntax, two tokens for each four
+source bytes.
+
+At the end of a compile, the compiler checks its memory count. A failed check is a
+compiler defect: the compile returns `mds::internal` (`internal compiler error`, no
+help, no span) instead of a result, and the module is not cached. `mds build`, `mds check`
+and `mds lint` exit 101. `mds fmt` does not: when its safety gate's compile of the
+original source fails the check, the gate compares the tokens of the two sources. A live
+`mds watch` session keeps its exit code.
 
 ## ⚠️ The `debug-panics` feature must never ship enabled
 
@@ -267,6 +361,23 @@ the raw Rust panic payload as `err.detail` on `mds::internal` errors thrown at t
 binding boundary; in the CLI it prints the panic's message and location after the
 internal-compiler-error text below. Both exist to help diagnose unexpected panics
 during local development.
+
+**Native host panic boundaries (#436).** The napi and Python bindings use the shared
+`mds::host_panic::catching` helper around core calls. It installs one hook per library
+and silences the previous hook only inside the current thread's catch boundary.
+Outside that boundary, the previous hook receives the original panic information.
+The previous hook is Rust's default hook unless the host replaced it first.
+Nested calls restore the prior boundary state. Other threads keep their own state.
+The error remains `mds::internal` with message `internal compiler error`.
+The off-by-default `debug-panics` feature still adds the payload as error detail.
+
+A later host `set_hook` call replaces this hook. The library does not reinstall it
+per call, because that would race with the host. With `panic = "abort"`, a panic
+cannot return through the catch boundary. A Python panic outside `guard` can still
+become a `PanicException` with the payload.
+
+WASM installs no hook: on wasm32-unknown-unknown, the default hook has no output channel.
+A panic traps on that target.
 
 **The CLI's panic output (#389).** A panic in `mds` is reported with these two lines on
 stderr, and the run exits 101:
@@ -335,18 +446,19 @@ A release build therefore does not contain it — the variable is never read —
 profile turns debug assertions on. Build with debug assertions for development, not for
 anything you ship.
 
-Five more test-only hooks are compiled in the same way. Four of them stop the run at one
-point until a test lets it go, so that the test can change a file in the window that point
-opens. `MDS_TEST_PAUSE_BEFORE_REPLACE` stops a rewrite between its read and its replace,
-and a write of a new file between its look at the name and its commit.
-`MDS_TEST_PAUSE_AFTER_BATCH_SPLIT` stops a directory `mds watch` rebuild after it has told
-the sources still there from the sources gone, and before it compiles them.
-`MDS_TEST_PAUSE_AFTER_LOOK` stops a rebuild, in either watch mode, after it has looked for
-emptied files and before it reads any. `MDS_TEST_PAUSE_AFTER_READ` stops a file-mode
-rebuild after its compile has read every file, before it takes its baseline. Each variable
-names a file: the run writes `<file>.paused` when it stops, and goes on once `<file>`
-exists, or after ten seconds. The fifth, `MDS_TEST_READY`, has `mds watch` create the file
-the variable names once it is watching — by path, outside the write primitive's checks.
+Eight more test-only hooks use the same compile condition. Seven pause the run at one point until a test releases it.
+`MDS_TEST_PAUSE_BEFORE_REPLACE` pauses a rewrite between its read and its replace.
+For a new file, it pauses the write between its name lookup and its commit.
+`MDS_TEST_PAUSE_AFTER_BATCH_SPLIT` pauses a directory `mds watch` rebuild after its source-presence check, before the compile.
+`MDS_TEST_PAUSE_AFTER_LOOK` pauses a rebuild, in either watch mode, after its empty-file check, before any source read.
+`MDS_TEST_PAUSE_AFTER_READ` pauses a file-mode rebuild after the compile reads its files, before its baseline snapshot.
+`MDS_TEST_PAUSE_BEFORE_LATE_LOOK` pauses a file-mode rebuild after its `--vars` load and compile read their files, and a directory batch after each source's compile, before the late empty-file check.
+`MDS_TEST_PAUSE_AFTER_WALK` pauses a directory command after its file walk.
+`MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE` pauses a watch compile after its path check, before entry resolution.
+Each pause variable names a file. The run writes `<file>.paused` at the pause point.
+It resumes once `<file>` exists, or after ten seconds.
+`MDS_TEST_READY` has `mds watch` create the file the variable names once the watch is active.
+It creates that file by path, outside the write primitive's checks.
 A release build contains none of them: each has an empty stub there, so it never reads the
 variable and never writes the file, unless its profile turns debug assertions on.
 `panic_hook.rs` pins this for each hook, as it does for `MDS_TEST_PANIC`.
@@ -360,10 +472,11 @@ published artifacts — `napi build --release` in `release.yml` for the addon, t
 `@mdscript/mds-wasm` build script (`wasm-pack build ../../crates/mds-wasm --target
 nodejs …` and `--target web …`) for the WASM package, and `maturin` with
 `pyproject.toml`'s `features = ["pyo3/abi3-py311"]` for the wheels — pass no
-`--features debug-panics`. For `mds-cli` alone, `crates/mds-cli/tests/panic_hook.rs`
-fails when a line of its manifest names the feature in quotes outside a comment — how a
-`default` feature or any other feature turns it on, on one line or several — or when the
-manifest declares it as anything but `debug-panics = []`; the build sites are checked by
-reading them. `mds-cli` is published to crates.io, so
+`--features debug-panics`. `crates/mds-cli/tests/panic_hook.rs` checks all four
+manifests. It rejects a quoted feature value outside a comment, or a declaration
+other than `debug-panics = []`. It also checks the maturin features, napi package
+scripts and `release.yml` for feature selection. Each input has a planted control.
+The same test file checks both native catch funnels and the WASM hook policy.
+`mds-cli` is published to crates.io, so
 `cargo install mds-cli --features debug-panics` builds a CLI that prints panic
 messages: build one only for your own debugging.

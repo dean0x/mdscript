@@ -43,8 +43,68 @@ pub(crate) const MAX_TRAVERSAL_DEPTH: usize = 256;
 /// (`push_capped`, #415) and by built-ins that can amplify output (e.g.
 /// `replace()`) to prevent runaway memory use from adversarial inputs. Shared
 /// with `builtins.rs` to ensure a single authoritative limit. It bounds each
-/// buffer, not a compile's total memory (#420).
+/// buffer. `MAX_COMPILE_MEMORY` bounds the memory of the whole compile.
 pub(crate) const MAX_OUTPUT_SIZE: usize = 50 * 1024 * 1024;
+
+/// Maximum memory one compile may hold, in bytes (four output buffers: 200 MiB).
+///
+/// One budget per compile or check, kept in `evaluator::budget::MemBudget`. It counts
+/// output buffers by capacity, the values that evaluation makes, the read text of each
+/// module, the tree estimate of each module (see `TREE_PER_TOKEN`; an import scan
+/// charges it against its own new budget), the compiler's copy of the caller variables, the text, tree estimates, frontmatter trees and scope layers
+/// that cached modules keep, kept source-map segments, warnings, messages and the
+/// finalize output. Each part is charged before its allocation, except at a few named
+/// sites that charge right after one allocation. Exactly the budget passes. The next
+/// charge fails with `mds::resource_limit` (`MdsError::compile_memory_exceeded`).
+///
+/// The compiler's copy of the caller variables is charged once per compile, as buffers,
+/// at the root. The caller's own map is outside the budget. The count stops at 64 levels
+/// of value nesting, so a Rust `Value` nested deeper fails this charge. On a root cache
+/// hit, the copy is made and freed without a charge. On a reused `ModuleCache`, a copy
+/// that a cached function captures lives after its compile, and only that compile counts
+/// it.
+///
+/// Outside the budget: the lexer stage of each source (its `Vec<char>`, its
+/// `byte_offsets` and the tokens it makes), which ends before the tree estimate is
+/// charged. On a 64-bit host it holds 14 B per source byte for ASCII prose, and at most
+/// 56 B per source byte for the densest syntax. Also outside: the caller's own variable
+/// map, the line table, the YAML event buffer and binding output conversion. The
+/// retained part of a reused `ModuleCache` never resets.
+pub(crate) const MAX_COMPILE_MEMORY: usize = 4 * MAX_OUTPUT_SIZE;
+
+/// Syntax tree bytes per token in the tree estimate.
+///
+/// The estimate of a module is `tokens * TREE_PER_TOKEN + expression bytes *
+/// TREE_PER_EXPR_BYTE + source bytes * TREE_PER_TEXT_BYTE`, in checked arithmetic: a
+/// count past the address space fails the charge. Expression bytes are the text of each
+/// directive line and interpolation. The compile memory budget charges the estimate after
+/// the lexer and before the parse of each module: a cached import, an `@extends` base,
+/// the file entry and the string entry. An import scan (`scan_imports`,
+/// `scan_import_records`) charges it in the same place against its own new budget. A
+/// refused tree is never built. A cached module keeps its estimate charged. A skeleton
+/// entry that is upgraded keeps one estimate.
+///
+/// The three factors are measured on a 64-bit host: for each of the 62 shapes in
+/// `tests/memory_bound.rs`, the estimate is at least the compile peak and the bytes
+/// that a cached module keeps. On wasm32 the estimate is high, so a compile refuses
+/// early. For a module compiled alone, the largest sources that pass are about: 484,330 B
+/// of the densest syntax (`\{{a`), 952,385 B of `{{a}}`, 678,735 B of the densest
+/// measured expression shape and 5,229,805 B of prose with one `{{a}}` per 80 B. Plain
+/// prose stops at the 10 MiB file cap first (the budget alone allows 12,336,188 B). A
+/// reused `ModuleCache` fills faster: the sources of all modules that it caches in its
+/// life share about the same ceilings (484,610 B, 956,729 B, 680,939 B, 5,237,969 B and
+/// 12,336,188 B).
+pub(crate) const TREE_PER_TOKEN: usize = 832;
+
+/// Syntax tree bytes per byte of directive and interpolation text in the tree estimate.
+pub(crate) const TREE_PER_EXPR_BYTE: usize = 184;
+
+/// Syntax tree bytes per source byte in the tree estimate.
+pub(crate) const TREE_PER_TEXT_BYTE: usize = 16;
+
+/// Maximum total function calls per compile, across all evaluated modules.
+/// Allows sixteen calls per pass in a million-pass loop budget.
+pub(crate) const MAX_TOTAL_FUNCTION_CALLS: usize = 16_000_000;
 
 /// Maximum number of elements that `split()` may produce in a single call.
 ///
@@ -81,9 +141,12 @@ pub(crate) const MAX_FRONTMATTER_SIZE: usize = 1024 * 1024;
 /// repetition limit counts alias jumps, not nodes, and does not catch one large anchor
 /// referenced a few thousand times. An alias-free block needs at least 2 bytes per node
 /// (`[x,x,...]`), so under the size cap it stays around 525 000 nodes at most and a
-/// realistic `key: value` block near 100 000; 200 000 rejects only amplification and
-/// bounds the materialised tree at a few tens of MB per parse. Exceeding this surfaces
-/// as `mds::resource_limit`. See #162.
+/// realistic `key: value` block near 100 000; 200 000 rejects only amplification. The
+/// node cap does not bound the bytes of the tree: an alias of a long scalar copies the
+/// scalar at each node. The byte allowance of the parse bounds the tree: each node
+/// spends `NODE_YAML` plus its string or key bytes, at most `MAX_OUTPUT_SIZE` per parse,
+/// or the rest of the compile budget when that is smaller. Exceeding the node cap
+/// surfaces as `mds::resource_limit`. See #162.
 pub(crate) const MAX_FRONTMATTER_NODES: usize = 200_000;
 
 /// Maximum running depth of flow-collection nesting (`[`/`{`) in one frontmatter
@@ -93,7 +156,7 @@ pub(crate) const MAX_FRONTMATTER_NODES: usize = 200_000;
 /// the raw bytes, AFTER the size cap and BEFORE the budgeted parse. libyaml's flow scanner
 /// is O(depth^2) in flow-collection nesting, and that cost is paid inside the scanner
 /// UPSTREAM of deserialisation. The three existing depth limits are all post-hoc: serde's
-/// recursion limit (128 parse frames, "recursion limit exceeded"), and `Value::from_yaml`'s
+/// recursion limit (128 parse frames, "recursion limit exceeded"), and `Value::from_yaml_ref`'s
 /// `MAX_VALUE_DEPTH` (64, "value nesting exceeds maximum depth of 64"). Every one of them
 /// fires only AFTER the quadratic scan has already been paid, so a ~1 MiB pure deep
 /// flow-nest (no anchors) burns 10+ s of CPU at ~32 MB RSS before any of them rejects it —
@@ -121,6 +184,12 @@ pub(crate) const MAX_MESSAGE_COUNT: usize = 10_000;
 /// unbounded name-collision checks in `collect_block`. 256 blocks is generous
 /// for any real template.
 pub(crate) const MAX_BLOCKS_PER_MODULE: usize = 256;
+
+/// Maximum number of `@define` declarations per module.
+///
+/// This also bounds the number of capture links per module.
+/// A module above the limit returns `mds::resource_limit`.
+pub(crate) const MAX_DEFINES_PER_MODULE: usize = 256;
 
 /// Maximum recursion depth for `deep_merge_yaml` when merging frontmatter
 /// Mappings across template inheritance chains.
@@ -170,17 +239,17 @@ pub(crate) const MAX_SOURCEMAP_SEGMENTS: usize = 1_000_000;
 ///
 /// Set equal to `MAX_OUTPUT_SIZE` (50 MB): the content set should not dwarf the
 /// compiled output it annotates.
+///
+/// A compile reaches the compile memory budget (`MAX_COMPILE_MEMORY`) first: each
+/// source byte costs at least 17 bytes of that budget, so a compile holds less than
+/// this ceiling of sources. The ceiling stays as an extra guard.
 pub(crate) const MAX_SOURCES_CONTENT_BYTES: usize = MAX_OUTPUT_SIZE;
 
-/// Maximum number of distinct modules (files) that may be resolved in a single
-/// compilation, across all paths (native file, virtual/WASM/napi).
+/// Maximum number of distinct modules besides the entry in a compilation.
 ///
-/// Enforced on the native file resolution path by `resolve_by_key` so that
-/// adversarial import graphs cannot cause unbounded module loading.  The
-/// virtual/WASM/napi binding layers enforce the same cap at input-validation time
-/// before any resolution begins (applies PF-004).
-///
-/// 256 matches the binding-layer constant so all code paths behave identically.
+/// The resolver counts both cached keys and keys still being resolved, before
+/// it reads each candidate. Binding input guards separately bound virtual maps,
+/// including unused entries, to the entry plus this many modules.
 pub(crate) const MAX_MODULE_COUNT: usize = 256;
 
 /// Maximum number of aliases a `VirtualFs` takes (`VirtualFs::with_aliases`), and the

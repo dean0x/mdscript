@@ -2,11 +2,16 @@
  * Backend contract parity tests for @mdscript/mds.
  * Tests: U-BC1 through U-BC20
  *
- * All tests use STUB backend objects — no live wasm build required.
- * This file is env-independent and must pass in CI on every platform.
+ * Shape tests use stub backends. Conversion parity tests require current native
+ * and WASM builds and fail if either backend is absent.
  */
-import { test, describe } from 'node:test';
+import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { compileFileOutcomes } from './helpers.mjs';
 import {
   assertResultShape,
   validateBackendMethods,
@@ -14,8 +19,456 @@ import {
   NODE_METHODS,
   WASM_EXPORTS,
 } from '../dist/backend/contract.js';
-import { createWasmBackend } from '../dist/backend/wasm.js';
+import { createWasmBackend, initWasmNode } from '../dist/backend/wasm.js';
 import { createNativeBackend } from '../dist/backend/native.js';
+
+// Both live backends must reject the same unsupported value at the same field.
+test('native and WASM conversion errors share their code and field prefix', async () => {
+  const require = createRequire(import.meta.url);
+  const native = createNativeBackend(require('../../../crates/mds-napi/mds-napi.node'));
+  const wasm = createWasmBackend(await initWasmNode());
+  const prefix = 'invalid options.vars: ';
+  const summarize = (backend, bad) => {
+    let error;
+    try {
+      backend.compile('ok', { vars: { bad } });
+    } catch (caught) {
+      error = caught;
+    }
+    assert.ok(error instanceof Error, 'the unsupported value must reach the converter');
+    return [error.code, error.message.slice(0, prefix.length)];
+  };
+  // #479: a BigInt outside the i64/u64 range is refused by both backends.
+  for (const bad of [Symbol('unsupported'), 2n ** 70n]) {
+    assert.deepEqual(
+      [summarize(native, bad), summarize(wasm, bad)],
+      Array.from({ length: 2 }, () => ['mds::invalid_options', prefix]),
+    );
+  }
+  const assertClean = (backend) => assert.equal(
+    backend.compile('{{value}}', { vars: { value: 'ok' } }).output,
+    'ok\n',
+  );
+  assertClean(native);
+  assertClean(wasm);
+  assert.throws(
+    () => assertClean({ compile: () => ({ output: 'wrong' }) }),
+    assert.AssertionError,
+  );
+});
+
+// #483: both backends refuse a BigInt in `vars` or `rules`, and the values that pass
+// the depth and count limits convert alike. Each case runs on both live backends,
+// and the test compares the two outcomes, the full message included. The cases that
+// differ by design pin the result of each backend.
+describe('#483: native and WASM convert vars and rules alike', () => {
+  const require = createRequire(import.meta.url);
+  let native;
+  let wasm;
+  before(async () => {
+    native = createNativeBackend(require('../../../crates/mds-napi/mds-napi.node'));
+    wasm = createWasmBackend(await initWasmNode());
+  });
+  const outcome = (backend, field, value, source = 'ok') => {
+    try {
+      return field === 'vars'
+        ? { output: backend.compile(source, { vars: value }).output }
+        : { version: backend.lint(source, { rules: value }).version };
+    } catch (err) {
+      return { code: err.code, message: err.message };
+    }
+  };
+  // `make` builds a new value for each backend, so that a getter counts its own reads.
+  const outcomes = (field, make, source) =>
+    [native, wasm].map((backend) => outcome(backend, field, make(), source));
+  const refusal = (field, detail) => ({
+    code: 'mds::invalid_options',
+    message: `invalid options.${field}: InvalidArg, ${detail}`,
+  });
+  const bigintDetail = 'typeof BigInt value could not be deserialized';
+  const depthDetail = 'value nesting exceeds maximum depth of 1024';
+  const countDetail = 'value has more than 1000000 entries';
+  const nested = (levels) => {
+    let value = 0;
+    for (let level = 0; level < levels; level += 1) value = { value };
+    return value;
+  };
+
+  for (const field of ['vars', 'rules']) {
+    for (const [label, make] of [
+      ['a BigInt value', () => ({ bad: 1n })],
+      ['a BigInt in an array', () => ({ bad: [1, [2n]] })],
+      ['a large BigInt in a nested object', () => ({ bad: { inner: { deep: 2n ** 70n } } })],
+    ]) {
+      test(`${field} holding ${label} is refused with one full message on both backends`, () => {
+        const expected = refusal(field, bigintDetail);
+        assert.deepEqual(outcomes(field, make), [expected, expected]);
+      });
+    }
+
+    test(`${field} set to a BigInt is refused on both backends, each in its own words`, () => {
+      // napi checks the type of the option before its walk and names a BigInt
+      // "unknown". The WASM walk checks the BigInt first, the root included.
+      assert.deepEqual(outcomes(field, () => 1n), [
+        { code: 'mds::invalid_options', message: `options.${field} must be a plain object, got unknown` },
+        refusal(field, bigintDetail),
+      ]);
+    });
+
+    test(`${field} with a getter that gives a BigInt on its first read is refused on both backends`, () => {
+      const make = () => {
+        let reads = 0;
+        return { get bad() { reads += 1; return reads === 1 ? 1n : 'off'; } };
+      };
+      const expected = refusal(field, bigintDetail);
+      assert.deepEqual(outcomes(field, make), [expected, expected]);
+    });
+
+    test(`${field} with a getter that gives a string first and a BigInt later: native refuses it, WASM reads it once`, () => {
+      const counted = () => {
+        const state = { reads: 0 };
+        const value = { get bad() { state.reads += 1; return state.reads === 1 ? 'off' : 1n; } };
+        return { state, value };
+      };
+      const onNative = counted();
+      assert.deepEqual(
+        outcome(native, field, onNative.value),
+        refusal(field, 'a value changed while it was read and could not be deserialized'),
+      );
+      const onWasm = counted();
+      outcome(wasm, field, onWasm.value);
+      assert.equal(onWasm.state.reads, 1, 'WASM must read each value once');
+    });
+
+    test(`${field} with a read that throws: WASM gives a coded error, native passes the exception through`, () => {
+      const boom = new Error('boom');
+      const getter = () => ({ get bad() { throw boom; } });
+      const proxy = () => new Proxy({}, { ownKeys() { throw boom; } });
+      for (const make of [getter, proxy]) {
+        const [onNative, onWasm] = outcomes(field, make);
+        assert.deepEqual(onNative, { code: undefined, message: 'boom' });
+        assert.deepEqual(onWasm, refusal(field, 'a value could not be read'));
+      }
+    });
+
+    test(`${field} nested past 1024 levels, or holding itself, is refused on both backends`, () => {
+      const expected = refusal(field, depthDetail);
+      const cyclic = () => {
+        const value = {};
+        value.self = value;
+        return value;
+      };
+      assert.deepEqual(outcomes(field, () => nested(1025)), [expected, expected]);
+      assert.deepEqual(outcomes(field, cyclic), [expected, expected]);
+    });
+
+    test(`${field} nested 1024 levels deep passes the depth check on both backends`, () => {
+      const [onNative, onWasm] = outcomes(field, () => nested(1024));
+      assert.notDeepEqual(onNative, refusal(field, depthDetail));
+      assert.deepEqual(onWasm, onNative);
+    });
+
+    test(`${field} with more than 1000000 values is refused on both backends`, () => {
+      const expected = refusal(field, countDetail);
+      assert.deepEqual(outcomes(field, () => ({ bad: new Array(1_000_001).fill(0) })), [expected, expected]);
+      const [onNative, onWasm] = outcomes(field, () => ({ bad: new Array(999_998).fill(0) }));
+      assert.notDeepEqual(onNative, expected);
+      assert.deepEqual(onWasm, onNative);
+    });
+
+    test(`${field} holding a Map with a BigInt is read as an empty object on both backends`, () => {
+      // A Map has no own enumerable keys: neither backend reads its entries or
+      // refuses the BigInt in one.
+      const entry = () => new Map([['a', 1n]]);
+      const clean = field === 'vars' ? { output: 'ok\n' } : { version: 1 };
+      assert.deepEqual(outcomes(field, entry), [clean, clean]);
+      // As a value inside `vars` or `rules`, the Map is an empty object. Under
+      // `rules`, an object is not a severity string.
+      const nestedMap = field === 'vars'
+        ? clean
+        : { code: 'mds::invalid_options', message: 'options.rules["m"] must be a severity string, got object' };
+      assert.deepEqual(outcomes(field, () => ({ m: entry() })), [nestedMap, nestedMap]);
+      if (field === 'vars') {
+        const [onNative, onWasm] = outcomes(field, () => ({ m: entry() }), '{{m.a}}');
+        assert.deepEqual(onWasm, onNative);
+        assert.equal(onWasm.code, 'mds::syntax', 'the entry is not a field of the value');
+      }
+    });
+
+    test(`${field} with an inherited BigInt key: native refuses it, WASM reads own keys only`, () => {
+      assert.deepEqual(outcomes(field, () => Object.create({ bad: 1n })), [
+        refusal(field, bigintDetail),
+        field === 'vars' ? { output: 'ok\n' } : { version: 1 },
+      ]);
+    });
+
+    // A typed array and an ArrayBuffer go through the WASM copy as they are, so that
+    // serde_wasm_bindgen refuses them by their type. Neither backend reads an item.
+    const byteArrayTail = 'invalid type: byte array, expected any valid JSON value';
+    const byteArrayOnNative = refusal(field, byteArrayTail);
+    const byteArrayOnWasm = {
+      code: 'mds::invalid_options',
+      message: `invalid options.${field}: Error: ${byteArrayTail}`,
+    };
+
+    test(`${field} holding a typed array or an ArrayBuffer is refused as a byte array, each backend in its own words`, () => {
+      for (const make of [() => ({ bad: new Uint8Array(2) }), () => ({ bad: new ArrayBuffer(2) })]) {
+        assert.deepEqual(outcomes(field, make), [byteArrayOnNative, byteArrayOnWasm]);
+      }
+    });
+
+    test(`${field} holding a typed array with its own iterator is refused as a byte array and the iterator never runs`, () => {
+      for (const [backend, expected] of [[native, byteArrayOnNative], [wasm, byteArrayOnWasm]]) {
+        let reads = 0;
+        const view = new Uint8Array(2);
+        Object.defineProperty(view, Symbol.iterator, {
+          value: function* () {
+            reads += 1;
+            yield 1n;
+          },
+        });
+        assert.deepEqual(outcome(backend, field, { bad: view }), expected);
+        assert.equal(reads, 0, 'neither backend may read an item of a typed array');
+      }
+    });
+
+    test(`${field} holding a DataView: native refuses it as a byte array, WASM copies it as an object with no keys`, () => {
+      const [onNative, onWasm] = outcomes(field, () => ({ bad: new DataView(new ArrayBuffer(2)) }));
+      assert.deepEqual(onNative, byteArrayOnNative);
+      // Under `rules`, an object is not a severity string.
+      assert.deepEqual(onWasm, field === 'vars'
+        ? { output: 'ok\n' }
+        : { code: 'mds::invalid_options', message: 'options.rules["bad"] must be a severity string, got object' });
+    });
+
+    test(`${field} holding a BigInt64Array is refused on both backends, so that no BigInt reaches the compiler as a number`, () => {
+      const [onNative, onWasm] = outcomes(field, () => ({ x: new BigInt64Array([1n]) }));
+      // The text after the prefix is the own text of each converter. The native one
+      // is a napi message, so that only its code and prefix are pinned.
+      assert.equal(onNative.code, 'mds::invalid_options');
+      assert.ok(onNative.message.startsWith(`invalid options.${field}: InvalidArg, `), onNative.message);
+      assert.deepEqual(onWasm, {
+        code: 'mds::invalid_options',
+        message: `invalid options.${field}: Error: invalid type: JsValue(BigInt64Array), expected any valid JSON value`,
+      });
+    });
+  }
+
+  test('clean vars and rules give the same result on both backends', () => {
+    const vars = {
+      v: { s: 'x', n: 2.5, i: -3, t: true, f: false, z: null, o: { b: 'deep' }, a: [1, 'two', true, [4]] },
+    };
+    const source = '{{v.s}}|{{v.n}}|{{v.i}}|{{v.t}}|{{v.f}}|{{v.o.b}}\n' +
+      '@for item in v.a:\n- {{item}}\n@end\n@if v.z == null:\nnull ok\n@end\n';
+    const rendered = { output: 'x|2.5|-3|true|false|deep\n- 1\n- two\n- true\n- 4\nnull ok\n' };
+    assert.deepEqual(outcomes('vars', () => vars, source), [rendered, rendered]);
+    const linted = { version: 1 };
+    assert.deepEqual(outcomes('rules', () => ({ 'unused-variable': 'off' })), [linted, linted]);
+  });
+});
+
+test('native and WASM import refusals share code, message, span and importer source', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mds-not-mds-parity-'));
+  try {
+    await mkdir(path.join(root, 'sub'));
+    await writeFile(path.join(root, '.mdsroot'), '');
+    const entry = path.join(root, 'a.mds');
+    const importer = path.join(root, 'sub', 'b.mds');
+    const entrySource = '@import "./sub/b.mds" as b\nEntry\n';
+    const targetSource = '@import "./never.mds"\n';
+    const directives = [
+      ['alias import', '@import "./c.txt" as c'],
+      ['merge import', '@import "./c.txt"'],
+      ['selective import', '@import { f } from "./c.txt"'],
+      ['named re-export', '@export f from "./c.txt"'],
+      ['wildcard re-export', '@export * from "./c.txt"'],
+      ['extends', '@extends "./c.txt"'],
+      ['include namespace import', '@import "./c.txt" as c\n@include c'],
+    ];
+    await writeFile(entry, entrySource);
+    await writeFile(path.join(root, 'sub', 'c.txt'), targetSource);
+    await writeFile(path.join(root, 'sub', 'c.mds'), '@define f():\nOK\n@end\nBody\n');
+    const cases = directives.flatMap(([label, directive]) => [
+      [label, directive, 'c.txt', 'mds::not_mds', 'not an MDS file: ./c.txt'],
+      [label, directive.replace('c.txt', 'missing.mds'), 'missing.mds', 'mds::file_not_found', 'file not found: ./missing.mds'],
+    ]);
+    for (const [label, directive, target, code, message] of cases) {
+      await t.test(`${label}: ${code}`, async () => {
+        const prefix = label === 'extends' ? '\n'.repeat(112) : '# Importer é\n'.repeat(8);
+        const source = `${prefix}${directive}\n`;
+        await writeFile(importer, source.replace(target, 'c.mds'));
+        const cleanNative = await compileFileOutcomes('native', [entry]);
+        const cleanWasm = await compileFileOutcomes('wasm', [entry]);
+        assert.ok(Object.hasOwn(cleanNative[0], 'output'), 'the native control must compile');
+        assert.deepEqual(cleanWasm, cleanNative, 'the valid target must compile on both backends');
+        await writeFile(importer, source);
+        const [native] = await compileFileOutcomes('native', [entry]);
+        const [wasm] = await compileFileOutcomes('wasm', [entry]);
+        const sources = { 'a.mds': entrySource, 'sub/b.mds': source, 'sub/c.txt': targetSource };
+        const line = directive.split('\n')[0];
+        const summarize = (err) => {
+          // The JS error has no source-name field. Identify the source by its unique
+          // byte slice instead of assuming that an in-bounds span belongs to b.mds.
+          const files = Object.entries(sources).filter(([, text]) => err.span != null &&
+            Buffer.from(text).subarray(err.span.offset, err.span.offset + err.span.length).toString() === line,
+          ).map(([file]) => file);
+          return [err.code, err.message, err.span?.offset ?? null, err.span?.length ?? null, files];
+        };
+        const expected = [code, message, Buffer.byteLength(prefix), Buffer.byteLength(line), ['sub/b.mds']];
+        // Compare WASM directly with native, then pin the reference to the importer.
+        assert.deepEqual([summarize(wasm), summarize(native)], [summarize(native), expected], label);
+      });
+    }
+    await t.test('intermediate extends: mds::not_mds', async () => {
+      const base = path.join(root, 'sub', 'c.mds');
+      const importerSource = '@extends "./c.mds"\n';
+      const directive = '@extends "./d.txt"';
+      const prefix = '\n'.repeat(23);
+      const source = `${prefix}${directive}\n`;
+      await writeFile(importer, importerSource);
+      await writeFile(path.join(root, 'sub', 'd.txt'), targetSource);
+      await writeFile(path.join(root, 'sub', 'd.mds'), 'Body\n');
+      await writeFile(base, source.replace('d.txt', 'd.mds'));
+      const cleanNative = await compileFileOutcomes('native', [entry]);
+      const cleanWasm = await compileFileOutcomes('wasm', [entry]);
+      assert.ok(Object.hasOwn(cleanNative[0], 'output'), 'the intermediate-base control must compile');
+      assert.deepEqual(cleanWasm, cleanNative, 'the intermediate-base control must match on both backends');
+      await writeFile(base, source);
+      const [native] = await compileFileOutcomes('native', [entry]);
+      const [wasm] = await compileFileOutcomes('wasm', [entry]);
+      const sources = {
+        'a.mds': entrySource, 'sub/b.mds': importerSource,
+        'sub/c.mds': source, 'sub/d.txt': targetSource,
+      };
+      const summarize = (err) => {
+        const files = Object.entries(sources).filter(([, text]) => err.span != null &&
+          Buffer.from(text).subarray(err.span.offset, err.span.offset + err.span.length).toString() === directive,
+        ).map(([file]) => file);
+        return [err.code, err.message, err.span?.offset ?? null, err.span?.length ?? null, files];
+      };
+      const expected = ['mds::not_mds', 'not an MDS file: ./d.txt', Buffer.byteLength(prefix), Buffer.byteLength(directive), ['sub/c.mds']];
+      assert.deepEqual(wasm, native, 'the complete intermediate-base errors must match');
+      assert.deepEqual([summarize(wasm), summarize(native)], [summarize(native), expected]);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('native and WASM nested frontmatter failures keep their code and no outer span', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mds-frontmatter-parity-'));
+  try {
+    await mkdir(path.join(root, 'sub'));
+    await writeFile(path.join(root, '.mdsroot'), '');
+    const entry = path.join(root, 'a.mds');
+    const importer = path.join(root, 'sub', 'b.mds');
+    await writeFile(entry, '\n\n@import "./sub/b.mds" as b\nEntry\n');
+    await writeFile(path.join(root, 'sub', 'c.txt'), 'Text\n');
+    await writeFile(path.join(root, 'sub', 'c.mds'), 'Body\n');
+    for (const [target, code, message] of [
+      ['c.mds', null, null],
+      ['missing.mds', 'mds::import', 'import error: file not found: "./missing.mds" (in frontmatter imports[0])'],
+      ['c.txt', 'mds::not_mds', 'not an MDS file: ./c.txt'],
+    ]) {
+      await writeFile(importer, `---\nimports:\n  - path: ./${target}\n    as: c\n---\nBody\n`);
+      const [native] = await compileFileOutcomes('native', [entry]);
+      const [wasm] = await compileFileOutcomes('wasm', [entry]);
+      if (code === null) {
+        assert.deepEqual([wasm, native], [native, { output: '\n\nEntry\n' }], 'the valid target must compile');
+      } else {
+        const summarize = (err) => [err.code, err.message, err.span?.offset ?? null, err.span?.length ?? null];
+        const expected = [code, message, null, null];
+        assert.deepEqual([summarize(wasm), summarize(native)], [summarize(native), expected], target);
+      }
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('native and WASM compileFile agree at 255–259 total modules in flat and nested graphs', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mds-module-count-parity-'));
+  try {
+    await writeFile(path.join(root, '.mdsroot'), '');
+    const cases = [];
+    for (const nested of [false, true]) {
+      for (const total of [255, 256, 257, 258, 259]) {
+        const label = `${nested ? 'nested' : 'flat'}-${total}`;
+        const dir = path.join(root, label);
+        await mkdir(dir);
+        const imports = (start) => Array.from({ length: total - start }, (_, i) => {
+          const id = start + i;
+          return `@import "./m${id}.mds" as m${id}\n`;
+        }).join('');
+        for (let i = 1; i < total; i++) {
+          // Two modules stay in flight while the nested graph resolves its leaves.
+          const source = nested && i === 1 ? `${imports(2)}Branch\n` : 'Leaf\n';
+          await writeFile(path.join(dir, `m${i}.mds`), source);
+        }
+        const entry = path.join(dir, 'entry.mds');
+        await writeFile(entry, `${nested ? '@import "./m1.mds" as m1\n' : imports(1)}OK\n`);
+        cases.push({ label, entry, total });
+      }
+    }
+    // The helper forces each public backend and fails if that backend is absent.
+    const files = cases.map(({ entry }) => entry);
+    const native = await compileFileOutcomes('native', files);
+    const wasm = await compileFileOutcomes('wasm', files);
+    const sharedMessage = native[cases.findIndex(({ total }) => total === 258)].message;
+    assert.equal(typeof sharedMessage, 'string', 'native must refuse the first graph above the cap');
+    for (const [i, { label, total }] of cases.entries()) {
+      await t.test(label, () => {
+        const expected = total <= 257 ? { output: 'OK\n' } : {
+          code: 'mds::resource_limit', message: sharedMessage, help: null, span: null,
+        };
+        assert.deepEqual([wasm[i], native[i]], [native[i], expected], label);
+      });
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('native and WASM compileFile agree on the compile memory limit and the frontmatter allowance', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mds-memory-parity-'));
+  try {
+    await writeFile(path.join(root, '.mdsroot'), '');
+    // A frontmatter scalar of 1 MiB, with its key and newline.
+    const x = 'a'.repeat(1024 * 1024 - 'x: \n'.length);
+    const frontmatter = `---\nx: ${x}\n---\n`;
+    // Functions f1 to fD: each body has 49 lines of x, then the length of the next call.
+    const nested = (depth) => frontmatter + Array.from({ length: depth }, (_, i) => {
+      const next = i + 1 < depth ? `{{length(f${i + 2}())}}\n` : '';
+      return `@define f${i + 1}():\n${'{{x}}\n'.repeat(49)}${next}@end\n`;
+    }).join('') + '{{length(f1())}}\n';
+    // 66 aliases expand an 800 KB scalar past the 50 MiB parse allowance.
+    const aliases = Array.from({ length: 66 }, () => '*a').join(', ');
+    const overAllowance = `---\na: &a ${'x'.repeat(800_000)}\nb: [${aliases}]\n---\nHi\n`;
+    // The inner body loses its last newline. The outer body ends in that length.
+    const lines = 49 * (x.length + 1);
+    const limit = (message) => ({
+      code: 'mds::resource_limit', message: `resource limit exceeded: ${message}`, help: null, span: null,
+    });
+    const cases = [
+      ['depth-2.mds', nested(2), { output: `${frontmatter}${lines + String(lines - 1).length}\n` }],
+      ['depth-5.mds', nested(5), limit('compile memory exceeds maximum of 209715200 bytes')],
+      ['frontmatter.mds', overAllowance, limit('frontmatter YAML expands beyond maximum of 52428800 bytes')],
+    ];
+    const files = [];
+    for (const [name, source] of cases) {
+      files.push(path.join(root, name));
+      await writeFile(files.at(-1), source);
+    }
+    // The helper forces each public backend and fails if that backend is absent.
+    const native = await compileFileOutcomes('native', files);
+    const wasm = await compileFileOutcomes('wasm', files);
+    // A WASM trap has no error code, so the expected errors also prove that WASM
+    // returned an error object.
+    assert.deepEqual([wasm, native], [native, cases.map(([, , expected]) => expected)]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Method manifest assertions (AC-API-09)

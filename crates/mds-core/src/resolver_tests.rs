@@ -2,6 +2,7 @@
 
 use super::frontmatter::deep_merge_yaml;
 use super::*;
+use crate::evaluator::evaluate;
 use crate::limits::{MAX_FRONTMATTER_IMPORTS, MAX_FRONTMATTER_MERGE_DEPTH};
 
 // Helper to build a YAML Value from inline YAML text
@@ -246,6 +247,183 @@ fn has_type_mds_frontmatter_ignores_indented() {
     );
 }
 
+// ── Module count: the entry plus 256 distinct modules ────────────────────
+
+fn module_count_graph(total: usize, nested: bool) -> HashMap<String, String> {
+    let imports = |start, end| {
+        (start..end)
+            .map(|i| format!("@import \"./m{i}.mds\" as m{i}\n"))
+            .collect::<String>()
+    };
+    let mut files: HashMap<_, _> = (0..total)
+        .map(|i| (format!("m{i}.mds"), "Body\n".to_string()))
+        .collect();
+    let entry = if nested {
+        files.insert("m1.mds".into(), imports(2, total));
+        imports(1, 2)
+    } else {
+        imports(1, total)
+    };
+    files.insert("m0.mds".into(), format!("{entry}OK\n"));
+    files
+}
+
+fn assert_module_count_outcome<T: std::fmt::Debug>(result: Result<T, MdsError>, total: usize) {
+    if total <= 257 {
+        result.expect("the entry plus at most 256 modules must compile");
+    } else {
+        assert!(result.is_err(), "a graph of {total} modules must fail");
+        let err = result.unwrap_err();
+        assert_eq!(err.serialize().code, "mds::resource_limit");
+        assert_eq!(
+            err.to_string(),
+            "resource limit exceeded: module count exceeds maximum of 256 modules besides the entry"
+        );
+    }
+}
+
+#[test]
+fn module_count_legacy_graph_boundaries() {
+    for nested in [true, false] {
+        for total in 255..=259 {
+            let mut cache = ModuleCache::virtual_fs(module_count_graph(total, nested));
+            assert_module_count_outcome(
+                cache.resolve_key("m0.mds", &HashMap::new(), &mut Vec::new()),
+                total,
+            );
+        }
+    }
+}
+
+#[test]
+fn module_count_intrinsic_graph_boundaries() {
+    for nested in [true, false] {
+        for total in 255..=259 {
+            for with_opts in [false, true] {
+                let mut cache = ModuleCache::virtual_fs(module_count_graph(total, nested));
+                let result = if with_opts {
+                    cache
+                        .resolve_virtual_intrinsic_opts(
+                            "m0.mds",
+                            &HashMap::new(),
+                            &Default::default(),
+                            &mut Vec::new(),
+                        )
+                        .map(|(output, _)| output)
+                } else {
+                    cache.resolve_virtual_intrinsic("m0.mds", &HashMap::new(), &mut Vec::new())
+                };
+                assert_module_count_outcome(result, total);
+            }
+        }
+    }
+}
+
+#[test]
+fn module_count_native_graph_boundaries() {
+    for nested in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        for total in 255..=259 {
+            for (key, source) in module_count_graph(total, nested) {
+                std::fs::write(dir.path().join(key), source).unwrap();
+            }
+            assert_module_count_outcome(crate::compile(dir.path().join("m0.mds"), None), total);
+        }
+    }
+}
+
+#[test]
+fn module_count_string_entry_counts_root() {
+    for total in 257..=258 {
+        for mode in 0..3 {
+            let mut files = module_count_graph(total, true);
+            let source = files.remove("m0.mds").unwrap();
+            let mut cache = ModuleCache::virtual_fs(files);
+            let result = match mode {
+                0 => cache
+                    .resolve_source(&source, "", &HashMap::new(), &mut Vec::new())
+                    .map(|_| ()),
+                1 => cache
+                    .resolve_source_intrinsic(&source, "", &HashMap::new(), &mut Vec::new())
+                    .map(|_| ()),
+                _ => cache
+                    .resolve_source_intrinsic_opts(
+                        &source,
+                        "",
+                        &HashMap::new(),
+                        &Default::default(),
+                        &mut Vec::new(),
+                    )
+                    .map(|_| ()),
+            };
+            assert_module_count_outcome(result, total);
+        }
+    }
+}
+
+#[test]
+fn module_count_skeleton_graph_boundaries() {
+    for total in 257..=258 {
+        let mut files = module_count_graph(total, true);
+        files.insert("m0.mds".into(), "@extends \"./m1.mds\"\n".into());
+        assert_module_count_outcome(crate::compile_virtual(files, "m0.mds", None), total);
+    }
+}
+
+#[test]
+fn module_count_reused_cache_checks_each_entry_path() {
+    for mode in 0..5 {
+        let mut files = module_count_graph(257, false);
+        files.insert("fresh.mds".into(), "Fresh\n".into());
+        let mut cache = ModuleCache::virtual_fs(files);
+        cache
+            .resolve_key("m0.mds", &HashMap::new(), &mut Vec::new())
+            .expect("the cache can hold the entry plus 256 modules");
+        let result = match mode {
+            0 => cache
+                .resolve_virtual_intrinsic("fresh.mds", &HashMap::new(), &mut Vec::new())
+                .map(|_| ()),
+            1 => cache
+                .resolve_virtual_intrinsic_opts(
+                    "fresh.mds",
+                    &HashMap::new(),
+                    &Default::default(),
+                    &mut Vec::new(),
+                )
+                .map(|_| ()),
+            2 => cache
+                .resolve_source("Fresh\n", "", &HashMap::new(), &mut Vec::new())
+                .map(|_| ()),
+            3 => cache
+                .resolve_source_intrinsic("Fresh\n", "", &HashMap::new(), &mut Vec::new())
+                .map(|_| ()),
+            _ => cache
+                .resolve_source_intrinsic_opts(
+                    "Fresh\n",
+                    "",
+                    &HashMap::new(),
+                    &Default::default(),
+                    &mut Vec::new(),
+                )
+                .map(|_| ()),
+        };
+        assert_module_count_outcome(result, 258);
+    }
+}
+
+#[test]
+fn module_count_cached_skeleton_upgrade_counts_once() {
+    let mut files = module_count_graph(257, false);
+    files.insert("m1.mds".into(), "@extends \"./m2.mds\"\n".into());
+    let entry = files.get_mut("m0.mds").unwrap();
+    *entry = entry.replace("@import \"./m2.mds\" as m2\n", "");
+    entry.push_str("@import \"./m2.mds\" as m2\n@import \"./m3.mds\" as again\n");
+    let result = crate::compile_virtual(files, "m0.mds", None)
+        .expect("cached modules and a skeleton upgrade must not consume another slot");
+    assert_eq!(result.dependencies.len(), 256);
+    assert_eq!(result.into_markdown().unwrap(), "OK\n");
+}
+
 // ── Phase 1: @block collision and resource-limit tests ────────────────────
 
 #[test]
@@ -321,6 +499,104 @@ fn block_exactly_at_max_allowed() {
     );
 }
 
+fn define_source(count: usize, prefix: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut source = String::new();
+    for i in 1..=count {
+        writeln!(source, "@define {prefix}{i}():\nbody\n@end").unwrap();
+    }
+    source
+}
+
+fn assert_define_limit(source: &str) {
+    let error = crate::compile_str_md(source).unwrap_err().serialize();
+    assert_eq!(error.code, "mds::resource_limit");
+    assert_eq!(
+        error.message,
+        "resource limit exceeded: module has more than 256 @define declarations"
+    );
+}
+
+#[test]
+fn define_cap_accepts_256_declarations() {
+    let mut source = define_source(256, "f");
+    source.push_str("{{f256()}}");
+    assert_eq!(crate::compile_str_md(&source).unwrap(), "body\n");
+}
+
+#[test]
+fn define_cap_refuses_257_declarations() {
+    assert_define_limit(&define_source(257, "f"));
+}
+
+#[test]
+fn define_cap_counts_declarations_in_nested_bodies() {
+    for (open, outer_defines) in [
+        ("@if enabled:", 0),
+        ("@if disabled:\n@elseif enabled:", 0),
+        ("@if enabled:\n@else:", 0),
+        ("@for item in items:", 0),
+        ("@block section:", 0),
+        ("@message user:", 0),
+        ("@define outer():", 1),
+    ] {
+        let prefix = define_source(255 - outer_defines, "f");
+        let source = format!(
+            "---\nenabled: true\ndisabled: false\nitems: []\n---\n{prefix}{open}\n@define inner():\nbody\n@end\ntext\n@end\n"
+        );
+        crate::compile_str(&source).unwrap();
+        assert_define_limit(&format!("{source}@define last():\nbody\n@end"));
+    }
+}
+
+#[test]
+fn define_cap_error_precedes_a_name_collision() {
+    let mut source = define_source(256, "f");
+    source.push_str("@define f1():\nother\n@end");
+    assert_define_limit(&source);
+}
+
+#[test]
+fn define_cap_does_not_count_reexports() {
+    let library = define_source(10, "lib");
+    let mut source = String::from("@export * from \"./lib.mds\"\n");
+    source.push_str(&define_source(256, "f"));
+    source.push_str("@export prompt\n{{f256()}}");
+    let module = virtual_cache(&[("lib.mds", &library)])
+        .resolve_source(&source, "", &HashMap::new(), &mut Vec::new())
+        .unwrap();
+    assert_eq!(module.prompt_body.as_deref(), Some("body"));
+    assert!(module.explicit_exports.contains("lib10"));
+}
+
+#[test]
+fn define_capture_holds_one_function_node_per_define() {
+    use std::fmt::Write as _;
+
+    let defines = [1, 2, 3, 12, 13];
+    let counts = defines.map(|k| {
+        let mut source = String::new();
+        for i in 1..=k {
+            writeln!(source, "@define f{i}(x):\nv{{{{x}}}}\n@end").unwrap();
+        }
+        let name = format!("f{k}");
+        write!(source, "{{{{{name}(\"a\")}}}}").unwrap();
+
+        let module = virtual_cache(&[("main.mds", &source)])
+            .resolve_key("main.mds", &HashMap::new(), &mut Vec::new())
+            .unwrap();
+        assert_eq!(module.prompt_body.as_deref(), Some("va"), "K={k}");
+        crate::scope::captured_function_nodes(&module.functions[&name])
+    });
+    let delta = counts[4].checked_sub(counts[3]);
+    assert_eq!(
+        (&counts[..4], delta),
+        (&[1, 2, 3, 12][..], Some(1)),
+        "FunctionDef counts for K={defines:?}: {counts:?}; change from K=12 to K=13: {delta:?}"
+    );
+}
+
 // ── Phase 2: Template inheritance ─────────────────────────────────────────
 
 /// Helper: create a VirtualFs-backed ModuleCache from a &[(&str, &str)] slice.
@@ -331,6 +607,646 @@ fn virtual_cache(files: &[(&str, &str)]) -> ModuleCache {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
     )
+}
+
+#[test]
+fn function_call_limit_counts_each_kind_across_modules() {
+    use crate::limits::MAX_TOTAL_FUNCTION_CALLS;
+
+    let lib = "@define word():\nb\n@end\n{{upper(\"a\")}}";
+    let entry = concat!(
+        "@import \"./lib.mds\" as lib\n",
+        "@define local():\nc\n@end\n"
+    );
+    for (body, source_map) in [
+        ("@include lib\n{{lib.word()}}{{local()}}", false),
+        ("@include lib\n{{lib.word()}}{{local()}}", true),
+        (
+            "@message user:\n@include lib\n{{lib.word()}}{{local()}}\n@end",
+            false,
+        ),
+    ] {
+        let source = format!("{entry}{body}");
+        let compile = |calls_left| {
+            let mut cache = virtual_cache(&[("entry.mds", &source), ("lib.mds", lib)]);
+            cache.function_call_seed = MAX_TOTAL_FUNCTION_CALLS - calls_left;
+            let opts = crate::CompileOptions {
+                source_map,
+                ..Default::default()
+            };
+            cache.resolve_virtual_intrinsic_opts(
+                "entry.mds",
+                &HashMap::new(),
+                &opts,
+                &mut Vec::new(),
+            )
+        };
+        let (output, _) = compile(3).unwrap();
+        let text = match output {
+            crate::CompiledOutput::Markdown(text) => text,
+            crate::CompiledOutput::Messages(messages) => messages[0].content.clone(),
+        };
+        assert_eq!(text.lines().collect::<String>(), "Abc");
+        assert_eq!(
+            compile(2).unwrap_err().serialize().code,
+            "mds::resource_limit"
+        );
+    }
+}
+
+#[test]
+fn function_call_limit_counts_across_extends_regions() {
+    use crate::limits::MAX_TOTAL_FUNCTION_CALLS;
+
+    let compile = |calls_left| {
+        let mut cache = virtual_cache(&[
+            ("base.mds", "{{upper(\"a\")}}\n@block content:\nx\n@end"),
+            (
+                "entry.mds",
+                "@extends \"./base.mds\"\n@block content:\n{{upper(\"b\")}}\n@end",
+            ),
+        ]);
+        cache.function_call_seed = MAX_TOTAL_FUNCTION_CALLS - calls_left;
+        cache.resolve_virtual_intrinsic("entry.mds", &HashMap::new(), &mut Vec::new())
+    };
+    let crate::CompiledOutput::Markdown(text) = compile(2).unwrap() else {
+        panic!("expected Markdown output");
+    };
+    assert_eq!(text.lines().collect::<String>(), "AB");
+    assert_eq!(
+        compile(1).unwrap_err().serialize().code,
+        "mds::resource_limit"
+    );
+}
+
+#[test]
+fn scope_layer_precedence_keeps_runtime_above_frontmatter() {
+    let mut cache = virtual_cache(&[
+        (
+            "base.mds",
+            "---\nx: base\ny: base\n---\n@block content:\n{{x}}/{{y}}\n@end",
+        ),
+        ("standalone.mds", "---\nx: local\n---\n{{x}}"),
+        ("child.mds", "---\ny: child\n---\n@extends \"./base.mds\"\n"),
+    ]);
+    let vars = HashMap::from([("x".into(), Value::String("runtime".into()))]);
+    for (key, expected) in [
+        ("standalone.mds", "runtime"),
+        ("child.mds", "runtime/child"),
+    ] {
+        let module = cache.resolve_key(key, &vars, &mut Vec::new()).unwrap();
+        assert_eq!(module.prompt_body.as_deref().map(str::trim), Some(expected));
+    }
+}
+
+#[test]
+fn scope_layer_precedence_keeps_imported_prompt_above_both_layers() {
+    let vars = HashMap::from([("prompt".into(), Value::String("runtime".into()))]);
+    for source in [
+        "---\nprompt: local\n---\n@import \"./lib.mds\"\n{{prompt}}",
+        "---\nprompt: local\n---\n@import { prompt } from \"./lib.mds\"\n{{prompt}}",
+        "---\nprompt: local\nimports:\n  - path: ./lib.mds\n---\n{{prompt}}",
+    ] {
+        let module = virtual_cache(&[("entry.mds", source), ("lib.mds", "imported")])
+            .resolve_key("entry.mds", &vars, &mut Vec::new())
+            .unwrap();
+        assert_eq!(
+            module.prompt_body.as_deref().map(str::trim),
+            Some("imported")
+        );
+    }
+}
+
+#[test]
+fn scope_layer_precedence_keeps_imports_reserved_only_for_mds() {
+    let vars = HashMap::from([("imports".into(), Value::String("runtime".into()))]);
+    let mut cache = virtual_cache(&[
+        ("entry.mds", "{{imports}}"),
+        ("invalid.mds", "---\nimports: invalid\n---\n{{imports}}"),
+    ]);
+    let err = cache
+        .resolve_key("entry.mds", &vars, &mut Vec::new())
+        .unwrap_err();
+    assert_eq!(
+        miette::Diagnostic::code(&err).unwrap().to_string(),
+        "mds::import"
+    );
+    assert!(err.to_string().ends_with(
+        "'imports' is a reserved frontmatter key for MDS files and cannot be set via --set"
+    ));
+    let source = "{{imports}}";
+    let tokens = tokenize(source, "plain.md").unwrap();
+    let module = parse_with_ctx(&tokens, "plain.md", source).unwrap();
+    let (mut plain, _) = build_scope_from_frontmatter(
+        None,
+        None,
+        0,
+        true,
+        &runtime_layer(&vars),
+        &mut MemBudget::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        evaluate(
+            &module.body,
+            &mut plain,
+            &mut Vec::new(),
+            "plain.md",
+            source
+        )
+        .unwrap(),
+        "runtime"
+    );
+    let invalid = cache
+        .resolve_key("invalid.mds", &vars, &mut Vec::new())
+        .unwrap_err();
+    let no_runtime = cache
+        .resolve_key("invalid.mds", &HashMap::new(), &mut Vec::new())
+        .unwrap_err();
+    assert_eq!(invalid.to_string(), no_runtime.to_string());
+    assert_ne!(invalid.to_string(), err.to_string());
+}
+
+#[test]
+fn runtime_layer_is_shared_by_module_scopes() {
+    let vars = HashMap::from([("x".into(), Value::String("runtime".into()))]);
+    let vars = runtime_layer(&vars);
+    let (first, _) =
+        build_scope_from_frontmatter(None, None, 0, false, &vars, &mut MemBudget::default())
+            .unwrap();
+    let inherited = build_scope_from_merged_mapping(&serde_yaml_ng::Mapping::new(), &vars).unwrap();
+    assert!(Arc::ptr_eq(
+        first.get_slot("x").unwrap().root(),
+        inherited.get_slot("x").unwrap().root()
+    ));
+}
+
+#[test]
+fn runtime_layer_cache_reuse_preserves_import_values() {
+    let mut cache = virtual_cache(&[("lib.mds", "@define from_lib():\n{{x}}\n@end")]);
+    let source = "@import \"./lib.mds\"\n{{from_lib()}}/{{x}}";
+    for (runtime, expected) in [("first", "first/first"), ("second", "first/second")] {
+        let vars = HashMap::from([("x".into(), Value::String(runtime.into()))]);
+        let module = cache
+            .resolve_source(source, "", &vars, &mut Vec::new())
+            .unwrap();
+        assert_eq!(module.prompt_body.as_deref().map(str::trim), Some(expected));
+    }
+}
+
+#[test]
+fn captures_keep_each_imported_prompt_write() {
+    let source = concat!(
+        "@import \"./first.mds\"\n@define before():\n{{prompt}}\n@end\n",
+        "@import \"./second.mds\"\n@define after():\n{{prompt}}\n@end\n",
+        "{{before()}}/{{after()}}",
+    );
+    let module = virtual_cache(&[("first.mds", "one"), ("second.mds", "two")])
+        .resolve_source(source, "", &HashMap::new(), &mut Vec::new())
+        .unwrap();
+    assert_eq!(module.prompt_body.as_deref(), Some("one/two"));
+}
+
+#[test]
+fn prompt_imports_and_captures_share_the_module_text() {
+    let mut cache = virtual_cache(&[("lib.mds", "library")]);
+    let mut shared = Vec::new();
+    for names in ["", "    names: [prompt]\n"] {
+        let source = format!(
+            "---\nimports:\n  - path: ./lib.mds\n{names}---\n{}",
+            concat!(
+                "@define fm():\n{{prompt}}\n@end\n",
+                "@import \"./lib.mds\"\n@define first():\n{{prompt}}\n@end\n",
+                "@import \"./lib.mds\"\n@define second():\n{{prompt}}\n@end\n",
+                "@import { prompt } from \"./lib.mds\"\n@define pick():\n{{prompt}}\n@end\n",
+                "{{fm()}}/{{first()}}/{{second()}}/{{pick()}}"
+            )
+        );
+        let module = cache
+            .resolve_source(&source, "", &HashMap::new(), &mut Vec::new())
+            .unwrap();
+        assert_eq!(
+            module.prompt_body.as_deref(),
+            Some("library/library/library/library")
+        );
+        let library = &cache.modules["lib.mds"];
+        let body = library.prompt_body.as_deref().unwrap();
+        let value = library.shared_prompt_value().unwrap();
+        let mut scope = Scope::new();
+        for name in ["fm", "first", "second", "pick"] {
+            scope.push_call(&module.functions[name]);
+            let slot = scope.get_slot("prompt").unwrap();
+            let Value::String(text) = slot.get().unwrap() else {
+                panic!("{name} must capture prompt text");
+            };
+            assert!(
+                Arc::ptr_eq(slot.root(), &value),
+                "{name} must share the prompt value"
+            );
+            shared.push((name, text.as_ptr() == body.as_ptr()));
+            scope.pop().unwrap();
+        }
+    }
+    assert_eq!(
+        shared,
+        [
+            ("fm", true),
+            ("first", true),
+            ("second", true),
+            ("pick", true)
+        ]
+        .repeat(2)
+    );
+}
+
+#[test]
+fn alias_imports_share_the_module_namespace_and_text() {
+    let source = concat!(
+        "---\nimports:\n  - path: ./lib.mds\n    as: front\n---\n",
+        "@import \"./lib.mds\" as body\n@define f():\n{{front.g()}}/{{body.g()}}\n@end\n{{f()}}"
+    );
+    let mut cache = virtual_cache(&[("lib.mds", "@define g():\nresult\n@end\nlibrary")]);
+    let module = cache
+        .resolve_source(source, "", &HashMap::new(), &mut Vec::new())
+        .unwrap();
+    assert_eq!(module.prompt_body.as_deref(), Some("result/result"));
+    let capture = &module.functions["f"].captured;
+    let front = capture.weak_namespace("front").unwrap();
+    let body = capture.weak_namespace("body").unwrap();
+    let library = &cache.modules["lib.mds"];
+    let text = library.prompt_body.as_deref().unwrap();
+    let namespace = front.upgrade().unwrap();
+    let namespace_text = namespace.prompt_body.as_deref().unwrap();
+    assert_eq!(
+        (
+            front.ptr_eq(&body),
+            Arc::ptr_eq(&namespace, &library.shared_namespace()),
+            text.as_ptr() == namespace_text.as_ptr(),
+        ),
+        (true, true, true)
+    );
+}
+
+#[test]
+fn captured_import_graph_drops_after_the_last_owner() {
+    let (keep, imported, link, namespace, prompt) = {
+        let mut cache = virtual_cache(&[
+            ("merge.mds", "@define merged():\nmerge\n@end"),
+            ("alias.mds", "@define aliased():\nalias\n@end"),
+            ("prompt.mds", "prompt"),
+        ]);
+        let source = concat!(
+            "@import \"./merge.mds\"\n@import \"./alias.mds\" as lib\n",
+            "@import { prompt } from \"./prompt.mds\"\n",
+            "@define local():\n{{merged()}}/{{lib.aliased()}}/{{prompt}}\n@end\n{{local()}}",
+        );
+        let module = cache
+            .resolve_source(source, "", &HashMap::new(), &mut Vec::new())
+            .unwrap();
+        assert_eq!(module.prompt_body.as_deref(), Some("merge/alias/prompt"));
+        let keep = Arc::clone(&module.functions["local"]);
+        let imported = Arc::downgrade(&cache.modules["merge.mds"].functions["merged"]);
+        let link = keep.captured.weak_head().unwrap();
+        let namespace = keep.captured.weak_namespace("lib").unwrap();
+        let prompt = Arc::downgrade(&cache.modules["prompt.mds"].shared_prompt_value().unwrap());
+        (keep, imported, link, namespace, prompt)
+    };
+    let local = Arc::downgrade(&keep);
+    assert!(local.upgrade().is_some());
+    assert!(imported.upgrade().is_some());
+    assert!(link.upgrade().is_some());
+    assert!(namespace.upgrade().is_some());
+    assert!(prompt.upgrade().is_some());
+
+    drop(keep);
+    assert!(local.upgrade().is_none());
+    assert!(imported.upgrade().is_none());
+    assert!(link.upgrade().is_none());
+    assert!(namespace.upgrade().is_none());
+    assert!(prompt.upgrade().is_none());
+}
+
+mod prompt_source_scan {
+    #[test]
+    fn internal_prompt_producers_use_shared_accessors() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut dirs = vec![src];
+        let mut files = 0;
+        let mut hits = Vec::new();
+        for _ in 0..1024 {
+            let Some(dir) = dirs.pop() else { break };
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    dirs.push(path);
+                } else if kind.is_file()
+                    && path.extension().is_some_and(|ext| ext == "rs")
+                    && !entry.file_name().to_string_lossy().ends_with("_tests.rs")
+                {
+                    files += 1;
+                    let count = forbidden_producers(&std::fs::read_to_string(&path).unwrap());
+                    if count != 0 {
+                        hits.push((path, count));
+                    }
+                }
+            }
+        }
+        assert!(dirs.is_empty(), "must visit every source directory");
+        assert!(
+            files >= 10,
+            "expected at least ten source files, saw {files}"
+        );
+        assert!(
+            hits.is_empty(),
+            "use the shared accessors instead: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn prompt_source_scan_detects_each_planted_producer() {
+        let ignored = r##"
+            pub fn get_prompt_value(&self) -> Option<Value> { None }
+            // m.get_prompt_value();
+            /* outer /* nested */ m.to_namespace(); */
+            const TEXT: &str = r#"m.to_namespace();"#;
+            #[cfg(test)] fn sample() { m.get_prompt_value(); }
+            #[cfg(test)] mod extra;
+        "##;
+        assert_eq!(forbidden_producers(ignored), 0);
+        for planted in ["m.get_prompt_value();", "m.to_namespace();"] {
+            assert_eq!(forbidden_producers(&format!("{ignored}{planted}")), 1);
+        }
+
+        let field = r"
+            struct Sample { #[cfg(test)] test_field: bool }
+            fn production(m: ResolvedModule) { m.to_namespace(); }
+        ";
+        let initializer = r"
+            fn production(m: ResolvedModule) {
+                Sample {
+                    #[cfg(test)] test_field: false,
+                    namespace: { m.to_namespace() },
+                };
+            }
+        ";
+        assert_eq!(
+            [field, initializer].map(forbidden_producers),
+            [1, 1],
+            "scan must count each producer after a test-only field"
+        );
+    }
+
+    fn forbidden_producers(source: &str) -> usize {
+        let tokens = source_tokens(source);
+        let mut rest = tokens.as_slice();
+        let mut prev = "";
+        let mut hits = 0;
+        for _ in 0..tokens.len() {
+            if let Some(tail) = rest.strip_prefix(&["#", "[", "cfg", "(", "test", ")", "]"]) {
+                // Scan the tail if the attribute has no clear item boundary.
+                rest = after_test_item(tail).unwrap_or(tail);
+                prev = "";
+            } else if let Some((&token, tail)) = rest.split_first() {
+                hits += usize::from(
+                    token == "to_namespace" || (token == "get_prompt_value" && prev != "fn"),
+                );
+                rest = tail;
+                prev = token;
+            } else {
+                break;
+            }
+        }
+        hits
+    }
+
+    fn after_test_item<'a>(item: &'a [&'a str]) -> Option<&'a [&'a str]> {
+        let mut nested = 0_usize;
+        for (i, &token) in item.iter().enumerate() {
+            match token {
+                "[" | "(" | "{" => nested += 1,
+                "]" | ")" | "}" => {
+                    nested = nested.checked_sub(1)?;
+                    if nested == 0 && token == "}" {
+                        return Some(&item[i + 1..]);
+                    }
+                }
+                ";" if nested == 0 => return Some(&item[i + 1..]),
+                // A comma can end a field or arm, but does not prove an item end.
+                "," if nested == 0 => return None,
+                _ => {}
+            }
+        }
+        panic!("expected an end to the #[cfg(test)] item");
+    }
+
+    // Ignore comments and literals before the scan considers names or test attributes.
+    fn source_tokens(mut rest: &str) -> Vec<&str> {
+        let mut tokens = Vec::new();
+        for _ in 0..rest.len() {
+            rest = rest.trim_start();
+            let Some(first) = rest.chars().next() else {
+                break;
+            };
+            if let Some(line) = rest.strip_prefix("//") {
+                rest = line.split_once('\n').map_or("", |(_, tail)| tail);
+            } else if let Some(block) = rest.strip_prefix("/*") {
+                rest = after_block_comment(block);
+            } else if let Some(tail) = after_literal(rest) {
+                rest = tail;
+            } else {
+                let len = if first.is_alphanumeric() || first == '_' {
+                    rest.find(|c: char| !c.is_alphanumeric() && c != '_')
+                        .unwrap_or(rest.len())
+                } else {
+                    first.len_utf8()
+                };
+                let (token, tail) = rest.split_at(len);
+                tokens.push(token);
+                rest = tail;
+            }
+        }
+        tokens
+    }
+
+    fn after_block_comment(mut rest: &str) -> &str {
+        let mut depth = 1;
+        for _ in 0..rest.len() {
+            let at = rest.find(['/', '*']).expect("must close block comment");
+            rest = &rest[at..];
+            if rest.starts_with("/*") {
+                depth += 1;
+                rest = &rest[2..];
+            } else if rest.starts_with("*/") {
+                depth -= 1;
+                rest = &rest[2..];
+                if depth == 0 {
+                    return rest;
+                }
+            } else {
+                rest = &rest[1..];
+            }
+        }
+        panic!("must close block comment");
+    }
+
+    fn after_literal(source: &str) -> Option<&str> {
+        let source = source
+            .strip_prefix('b')
+            .or_else(|| source.strip_prefix('c'))
+            .unwrap_or(source);
+        if let Some(raw) = source.strip_prefix('r') {
+            let quote = raw.find(|c| c != '#')?;
+            let body = raw[quote..].strip_prefix('"')?;
+            let end = format!("\"{}", &raw[..quote]);
+            return body.split_once(&end).map(|(_, tail)| tail);
+        }
+        if let Some(body) = source.strip_prefix('"') {
+            let mut escaped = false;
+            for (i, c) in body.char_indices() {
+                if !escaped && c == '"' {
+                    return Some(&body[i + 1..]);
+                }
+                escaped = !escaped && c == '\\';
+            }
+            return None;
+        }
+        let body = source.strip_prefix('\'')?;
+        let len = if let Some(escape) = body.strip_prefix('\\') {
+            match escape.as_bytes().first()? {
+                b'x' => 4,
+                b'u' => escape.find('}')? + 2,
+                _ => 2,
+            }
+        } else {
+            body.chars().next()?.len_utf8()
+        };
+        body.get(len..)?.strip_prefix('\'')
+    }
+}
+
+#[test]
+fn imported_defines_share_the_runtime_layer_of_their_call() {
+    let mut cache = virtual_cache(&[
+        ("first.mds", "@define first():\n{{x}}\n@end"),
+        ("second.mds", "@define second():\n{{x}}\n@end"),
+    ]);
+    let source = concat!(
+        "@import \"./first.mds\"\n@import \"./second.mds\"\n",
+        "@define local():\n{{x}}\n@end\n{{first()}}/{{second()}}/{{local()}}",
+    );
+    let first_vars = HashMap::from([("x".into(), Value::String("one".into()))]);
+    let second_vars = HashMap::from([("x".into(), Value::String("two".into()))]);
+    let first = cache
+        .resolve_source(source, "", &first_vars, &mut Vec::new())
+        .unwrap();
+    let second = cache
+        .resolve_source(source, "", &second_vars, &mut Vec::new())
+        .unwrap();
+    assert_eq!(first.prompt_body.as_deref(), Some("one/one/one"));
+    assert_eq!(second.prompt_body.as_deref(), Some("one/one/two"));
+    fn runtime<'a>(module: &'a ResolvedModule, function: &str) -> &'a Arc<VarLayer> {
+        module.functions[function]
+            .captured
+            .runtime
+            .as_ref()
+            .unwrap()
+    }
+    let imported = runtime(&cache.modules["first.mds"], "first");
+    assert!(Arc::ptr_eq(
+        imported,
+        runtime(&cache.modules["second.mds"], "second")
+    ));
+    assert!(Arc::ptr_eq(imported, runtime(&first, "local")));
+    assert!(!Arc::ptr_eq(
+        runtime(&first, "local"),
+        runtime(&second, "local")
+    ));
+}
+
+#[test]
+fn selective_import_shadows_a_define_in_the_next_capture() {
+    let source = concat!(
+        "@define same():\nlocal\n@end\n@define earlier():\n{{same()}}\n@end\n",
+        "@import { same } from \"./lib.mds\"\n",
+        "@define captured():\n{{same()}}\n@end\n{{earlier()}}/{{same()}}/{{captured()}}",
+    );
+    let module = virtual_cache(&[("lib.mds", "@define same():\nimported\n@end")])
+        .resolve_source(source, "", &HashMap::new(), &mut Vec::new())
+        .unwrap();
+    assert_eq!(
+        module.prompt_body.as_deref(),
+        Some("local/imported/imported")
+    );
+}
+
+#[test]
+fn define_shadows_an_earlier_merge_import_in_the_next_capture() {
+    let source = concat!(
+        "@import \"./lib.mds\"\n@define same():\nlocal\n@end\n",
+        "@define captured():\n{{same()}}\n@end\n{{same()}}/{{captured()}}",
+    );
+    let module = virtual_cache(&[("lib.mds", "@define same():\nimported\n@end")])
+        .resolve_source(source, "", &HashMap::new(), &mut Vec::new())
+        .unwrap();
+    assert_eq!(module.prompt_body.as_deref(), Some("local/local"));
+}
+
+#[test]
+fn merge_import_refuses_a_name_that_a_define_already_uses() {
+    let source = "@define same():\nlocal\n@end\n@import \"./lib.mds\"";
+    let err = virtual_cache(&[("lib.mds", "@define same():\nimported\n@end")])
+        .resolve_source(source, "", &HashMap::new(), &mut Vec::new())
+        .unwrap_err();
+    assert_eq!(
+        miette::Diagnostic::code(&err).unwrap().to_string(),
+        "mds::name_collision"
+    );
+}
+
+#[test]
+fn interleaved_imports_and_defines_keep_one_capture_entry_per_write() {
+    use std::fmt::Write as _;
+
+    let mut library = String::new();
+    let mut source = String::new();
+    for i in 1..=128 {
+        writeln!(library, "@define i{i}():\nimported\n@end").unwrap();
+        writeln!(
+            source,
+            "@import {{ i{i} }} from \"./lib.mds\"\n@define f{i}():\n{{{{i{i}()}}}}\n@end"
+        )
+        .unwrap();
+    }
+    source.push_str("{{f128()}}");
+    let tokens = tokenize(&source, "entry.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "entry.mds", &source).unwrap();
+    let ctx = ModuleCtx {
+        key: "entry.mds",
+        file_str: "entry.mds",
+        source: &source,
+        base_dir: "",
+        runtime_vars: &Arc::default(),
+        origin: OnceCell::new(),
+    };
+    let mut scope = Scope::new();
+    let defs = virtual_cache(&[("lib.mds", &library)])
+        .collect_definitions_and_imports(&module.body, &mut scope, &ctx, &mut Vec::new())
+        .unwrap();
+    assert_eq!(defs.functions.len(), 128);
+    assert_eq!(
+        evaluate(
+            &module.body,
+            &mut scope,
+            &mut Vec::new(),
+            ctx.file_str,
+            &source
+        )
+        .unwrap(),
+        "imported"
+    );
+    assert_eq!(crate::scope::captured_entry_count(&scope), 256);
 }
 
 /// Helper: compile a VirtualFs entry and return the Markdown output string.
@@ -720,7 +1636,8 @@ fn f5_diamond_inheritance_cache_not_polluted() {
         "F5: B should compile: {:?}",
         b_resolved.err()
     );
-    let b_body = b_resolved.unwrap().prompt_body.clone().unwrap_or_default();
+    let b_resolved = b_resolved.unwrap();
+    let b_body = b_resolved.prompt_body.as_deref().unwrap_or_default();
     assert!(
         b_body.contains("From B."),
         "F5: B should contain its override: {b_body}"
@@ -733,7 +1650,8 @@ fn f5_diamond_inheritance_cache_not_polluted() {
         "F5: C should compile: {:?}",
         c_resolved.err()
     );
-    let c_body = c_resolved.unwrap().prompt_body.clone().unwrap_or_default();
+    let c_resolved = c_resolved.unwrap();
+    let c_body = c_resolved.prompt_body.as_deref().unwrap_or_default();
     assert!(
         c_body.contains("From A."),
         "F5: C should use A's default (not B's override): {c_body}"
@@ -2887,6 +3805,38 @@ fn p_block_sources_share_one_arc() {
     let _ = origins.pop(); // suppress unused warning
 }
 
+#[test]
+fn definitions_and_blocks_share_one_module_source() {
+    let source = "@define greet():\nHello\n@end\n@block content:\n{{greet()}}\n@end\n";
+    let child = "@extends \"./base.mds\"\n";
+    let files = [("base.mds", source), ("child.mds", child)];
+    for entry in ["base.mds", "child.mds"] {
+        let mut cache = virtual_cache(&files);
+        let vars = Default::default();
+        let mut warnings = Vec::new();
+        cache.resolve_key(entry, &vars, &mut warnings).unwrap();
+        let base = Arc::clone(&cache.modules["base.mds"]);
+        let module_origin = &base.skeleton_origin;
+        assert_eq!(module_origin.source.as_ref(), source);
+        assert_eq!(module_origin.display.as_ref(), "base.mds");
+        let origins = [
+            &base.effective_blocks["content"].origin,
+            base.functions["greet"].origin.as_ref().unwrap(),
+        ];
+        let shared = origins.map(|origin| Arc::ptr_eq(&module_origin.source, &origin.source));
+        assert_eq!(shared, [true, true], "entry: {entry}");
+        let upgraded = cache.resolve_key("base.mds", &vars, &mut warnings).unwrap();
+        assert!(Arc::ptr_eq(
+            &module_origin.source,
+            &upgraded.skeleton_origin.source
+        ));
+        assert!(Arc::ptr_eq(
+            &base.effective_skeleton,
+            &upgraded.effective_skeleton
+        ));
+    }
+}
+
 // ── PF-003 / #133: Windows verbatim-path parent_dir invariant ────────────────
 
 // Guards that `NativeFs::parent_dir` uses `Path::new(key).parent()` — the same
@@ -2961,7 +3911,7 @@ fn source_label_appears_in_string_source_diagnostics() {
 // ── Adversarial YAML-injection: core-level twin (#154) ───────────────────────
 //
 // These tests exercise the resolver's `raw_frontmatter` serialization path
-// (serialize_merged_frontmatter / serde_yaml_ng::to_string) to verify that values
+// (serialize_merged_frontmatter / serde_yaml_ng::to_writer) to verify that values
 // containing fence-like sequences, YAML document-end markers, or block-scalar
 // `type: mds` lines cannot escape the emitted frontmatter block and smuggle
 // additional top-level keys into the compiled output.
@@ -3411,13 +4361,14 @@ fn attach_import_span_valid_offset_spans_whole_directive_and_passes_other_errors
 }
 
 /// Build the borrowed module context the `@extends` helpers take.
-fn extends_ctx<'a>(source: &'a str, vars: &'a HashMap<String, Value>) -> ModuleCtx<'a> {
+fn extends_ctx<'a>(source: &'a str, vars: &'a Arc<VarLayer>) -> ModuleCtx<'a> {
     ModuleCtx {
         key: "<child>",
         file_str: "<child>",
         source,
         base_dir: ".",
         runtime_vars: vars,
+        origin: OnceCell::new(),
     }
 }
 
@@ -3425,7 +4376,7 @@ fn extends_ctx<'a>(source: &'a str, vars: &'a HashMap<String, Value>) -> ModuleC
 fn check_child_only_blocks_non_boundary_offset_degrades() {
     // Same shape as `attach_import_span`: offset 1 is inside the 2-byte "é".
     let caught = std::panic::catch_unwind(|| {
-        let vars = HashMap::new();
+        let vars = Arc::default();
         let ctx = extends_ctx("é\n", &vars);
         let body = vec![Node::EscapedBrace { offset: 1 }];
         check_child_only_blocks(&body, &ctx)
@@ -3464,7 +4415,7 @@ fn check_child_only_blocks_non_boundary_offset_degrades() {
 
 #[test]
 fn check_child_only_blocks_out_of_range_offset_on_empty_source_degrades() {
-    let vars = HashMap::new();
+    let vars = Arc::default();
     let ctx = extends_ctx("", &vars);
     let body = vec![Node::EscapedBrace { offset: 1 }];
     match check_child_only_blocks(&body, &ctx) {
@@ -3483,7 +4434,7 @@ fn check_child_only_blocks_valid_offset_spans_stray_line_and_accepts_blocks() {
     // Positive control: a trustworthy offset still underlines the stray line and still
     // carries the snippet; and a well-formed child body is still accepted.
     let source = "@block a:\n@end\n\\{{ x\n";
-    let vars = HashMap::new();
+    let vars = Arc::default();
     let ctx = extends_ctx(source, &vars);
 
     let stray = vec![
@@ -3861,6 +4812,7 @@ fn map_builder_shares_origin_arc_across_regions() {
         &mut scope,
         &mut vec![],
         Some(crate::sourcemap::MapBuilder::new(base.clone())),
+        &mut EvalBudget::default(),
     )
     .expect("regions must evaluate");
     let map = map.expect("the builder must be handed back");
@@ -4020,7 +4972,13 @@ fn region_first_registered_by_a_splice_names_its_display_path() {
     let [off, on] = [None, Some(importer)].map(|map| {
         let mut scope = Scope::new();
         scope.set_var("n", Value::String("hi".to_string()));
-        match ModuleCache::evaluate_regions_with_map(&regions, &mut scope, &mut vec![], map) {
+        match ModuleCache::evaluate_regions_with_map(
+            &regions,
+            &mut scope,
+            &mut vec![],
+            map,
+            &mut EvalBudget::default(),
+        ) {
             Ok(_) => panic!("a cross-type comparison must fail"),
             Err(err) => err,
         }
@@ -4346,4 +5304,1513 @@ fn check_module_type_judges_the_key_and_names_the_typed_path_escaped() {
         check("/abs/proj/page.md", "./page.md", "Hi\n"),
         Err("not an MDS file: ./page.md".to_string())
     );
+}
+
+// #423 directive coverage: import (alias/merge/selective), export-from
+// (named/wildcard), and extends: span yes. Include does not load a file; its
+// namespace import owns the span. Entry and frontmatter imports: span no.
+fn assert_not_mds_directive_span(directive: &str) {
+    let (_guard, root) = r3_project();
+    let entry = root.join("a.mds");
+    let importer = root.join("sub").join("b.mds");
+    let source = format!("\n\n{directive}\n");
+    std::fs::write(&entry, "@import \"./sub/b.mds\" as b\nEntry\n").unwrap();
+    std::fs::write(root.join("sub").join("c.txt"), "@import \"./never.mds\"\n").unwrap();
+    std::fs::write(
+        root.join("sub").join("c.mds"),
+        "@define f():\nOK\n@end\nBody\n",
+    )
+    .unwrap();
+
+    // The same directive accepts an MDS target before it refuses c.txt.
+    std::fs::write(&importer, source.replace("c.txt", "c.mds")).unwrap();
+    crate::compile(&entry, None).expect("control: the directive reaches an MDS target");
+    std::fs::write(&importer, &source).unwrap();
+    assert!(importer.canonicalize().unwrap().is_absolute());
+
+    let intrinsic = crate::compile(&entry, None).unwrap_err();
+    let cached = ModuleCache::native()
+        .resolve_path(entry.to_str().unwrap(), &HashMap::new(), &mut Vec::new())
+        .unwrap_err();
+    for err in [intrinsic, cached] {
+        let serialized = err.serialize();
+        assert_eq!(serialized.code, "mds::not_mds");
+        assert_eq!(serialized.message, "not an MDS file: ./c.txt");
+        let span = serialized
+            .span
+            .expect("the inner directive must carry a span");
+        assert_eq!(
+            (span.offset, span.length),
+            (2, directive.lines().next().unwrap().len())
+        );
+        assert_eq!((span.line, span.column), (Some(3), Some(1)));
+        assert_eq!(err.source_name(), Some("sub/b.mds"));
+        assert!(!std::path::Path::new(err.source_name().unwrap()).is_absolute());
+    }
+}
+
+#[test]
+fn not_mds_alias_import_keeps_inner_importer_span() {
+    assert_not_mds_directive_span("@import \"./c.txt\" as c");
+}
+
+#[test]
+fn not_mds_merge_import_keeps_inner_importer_span() {
+    assert_not_mds_directive_span("@import \"./c.txt\"");
+}
+
+#[test]
+fn not_mds_selective_import_keeps_inner_importer_span() {
+    assert_not_mds_directive_span("@import { f } from \"./c.txt\"");
+}
+
+#[test]
+fn not_mds_named_reexport_keeps_inner_importer_span() {
+    assert_not_mds_directive_span("@export f from \"./c.txt\"");
+}
+
+#[test]
+fn not_mds_wildcard_reexport_keeps_inner_importer_span() {
+    assert_not_mds_directive_span("@export * from \"./c.txt\"");
+}
+
+#[test]
+fn not_mds_extends_keeps_inner_importer_span() {
+    assert_not_mds_directive_span("@extends \"./c.txt\"");
+}
+
+#[test]
+fn not_mds_intermediate_extends_keeps_the_base_importer_span() {
+    let (_guard, root) = r3_project();
+    let entry = root.join("a.mds");
+    let importer = root.join("sub/c.mds");
+    let directive = "@extends \"./d.txt\"";
+    let source = format!("\n\n{directive}\n");
+    std::fs::write(&entry, "@import \"./sub/b.mds\" as b\nEntry\n").unwrap();
+    std::fs::write(root.join("sub/b.mds"), "@extends \"./c.mds\"\n").unwrap();
+    std::fs::write(root.join("sub/d.txt"), "@import \"./never.mds\"\n").unwrap();
+    std::fs::write(root.join("sub/d.mds"), "Body\n").unwrap();
+    std::fs::write(&importer, source.replace("d.txt", "d.mds")).unwrap();
+    crate::compile(&entry, None).expect("control: the intermediate base reaches an MDS target");
+    std::fs::write(&importer, &source).unwrap();
+
+    let intrinsic = crate::compile(&entry, None).unwrap_err();
+    let cached = ModuleCache::native()
+        .resolve_path(entry.to_str().unwrap(), &HashMap::new(), &mut Vec::new())
+        .unwrap_err();
+    for err in [intrinsic, cached] {
+        let serialized = err.serialize();
+        assert_eq!(serialized.code, "mds::not_mds");
+        assert_eq!(serialized.message, "not an MDS file: ./d.txt");
+        assert_eq!(err.source_name(), Some("sub/c.mds"));
+        let span = serialized
+            .span
+            .expect("the intermediate extends must carry a span");
+        assert_eq!((span.offset, span.length), (2, directive.len()));
+        assert_eq!((span.line, span.column), (Some(3), Some(1)));
+    }
+}
+
+#[test]
+fn not_mds_include_uses_its_namespace_import_span() {
+    assert_not_mds_directive_span("@import \"./c.txt\" as c\n@include c");
+}
+
+#[test]
+fn not_mds_frame_neutralizes_control_on_import_line() {
+    let source = "\n@import \x0b\"./c.txt\"\n";
+    assert!(
+        source.contains(char::from(0x0b)),
+        "control: source has a control byte"
+    );
+    let err = compile_virtual(&[("a.mds", source), ("c.txt", "Hi\n")], "a.mds").unwrap_err();
+    assert_eq!(err.serialize().code, "mds::not_mds");
+    let mut frame = String::new();
+    miette::NarratableReportHandler::new()
+        .render_report(&mut frame, &err)
+        .unwrap();
+    assert!(frame.contains("@import ?\"./c.txt\""), "{frame}");
+    assert!(!frame.contains(char::from(0x0b)), "{frame}");
+}
+
+#[test]
+fn not_mds_nested_frontmatter_imports_stay_spanless_like_missing_files() {
+    let (_guard, root) = r3_project();
+    let entry = root.join("a.mds");
+    let importer = root.join("sub").join("b.mds");
+    std::fs::write(root.join("sub").join("c.txt"), "Text\n").unwrap();
+    for directive in [
+        "@import \"./sub/b.mds\" as b",
+        "@import \"./sub/b.mds\"",
+        "@import { f } from \"./sub/b.mds\"",
+        "@export f from \"./sub/b.mds\"",
+        "@export * from \"./sub/b.mds\"",
+        "@extends \"./sub/b.mds\"",
+    ] {
+        std::fs::write(&entry, format!("\n\n{directive}\n")).unwrap();
+        for form in ["", "    as: c\n", "    names: [f]\n"] {
+            for (target, code) in [("missing.mds", "mds::import"), ("c.txt", "mds::not_mds")] {
+                let source = format!("---\nimports:\n  - path: ./{target}\n{form}---\nBody\n");
+                std::fs::write(&importer, source).unwrap();
+                let intrinsic = crate::compile(&entry, None).unwrap_err();
+                let cached = ModuleCache::native()
+                    .resolve_path(entry.to_str().unwrap(), &HashMap::new(), &mut Vec::new())
+                    .unwrap_err();
+                for err in [intrinsic, cached] {
+                    let serialized = err.serialize();
+                    assert_eq!(serialized.code, code, "{directive}: {serialized:?}");
+                    assert_eq!(serialized.span, None, "{directive}: {serialized:?}");
+                    assert_eq!(err.source_name(), None, "{directive}: {serialized:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn not_mds_entry_and_frontmatter_imports_keep_no_span() {
+    let entry = compile_virtual(&[("c.txt", "Hi\n")], "c.txt").unwrap_err();
+    for err in std::iter::once(entry).chain(["", "    as: c\n", "    names: [f]\n"].map(|form| {
+        let source = format!("---\nimports:\n  - path: ./c.txt\n{form}---\nBody\n");
+        compile_virtual(&[("a.mds", &source), ("c.txt", "Hi\n")], "a.mds").unwrap_err()
+    })) {
+        assert_eq!(err.serialize().code, "mds::not_mds");
+        assert!(err.serialize().span.is_none());
+        assert!(err.source_name().is_none());
+    }
+}
+
+fn limit_cache_headroom(cache: &mut ModuleCache, headroom: usize) {
+    let prior = MAX_COMPILE_MEMORY - headroom;
+    cache.budget.mem.charge(Part::Buffers, Some(prior)).unwrap();
+    cache.commit_retained(prior);
+}
+
+/// The tree estimate that a compile charges for `source`.
+fn tree_of(source: &str) -> usize {
+    tree_estimate(&tokenize(source, "tree.mds").unwrap(), source.len()).unwrap()
+}
+
+#[test]
+fn cached_module_moves_its_text_tree_and_fragment_to_retained() {
+    let key = "part.mds";
+    let raw = "label: value\n";
+    let body = "body\n";
+    let source = format!("---\n{raw}---\n{body}");
+    let mut cache = virtual_cache(&[(key, &source)]);
+    cache.source_map_mode = true;
+    let resolved = cache
+        .resolve_key(key, &Default::default(), &mut vec![])
+        .unwrap();
+    assert_eq!(resolved.raw_frontmatter.as_deref(), Some(raw));
+    assert_eq!(resolved.prompt_body.as_deref(), Some(body));
+    assert_eq!(
+        resolved.frontmatter_values.as_ref().unwrap()["label"],
+        "value"
+    );
+    let vars = Arc::default();
+    let ctx = extends_ctx(&source, &vars);
+    let mut builder = MapBuilder::new(ctx.make_origin());
+    builder.push_segment(0, 0, body.len() as u32);
+    assert!(resolved.prompt_map.is_some());
+    let origin_bytes = source.len() + 2 * key.len() + 6 * size_of::<usize>();
+    // The entry keeps its parsed frontmatter tree and its syntax tree estimate. The
+    // module defines no function, so it does not keep its scope layer.
+    let tree = parse_frontmatter_yaml_with(raw, Allowance::in_compile(&MemBudget::default()))
+        .unwrap()
+        .1;
+    assert_eq!(resolved.frontmatter_bytes, tree);
+    assert_eq!(
+        cache.retained,
+        origin_bytes + raw.len() + body.len() + builder.segments_bytes() + tree + tree_of(&source)
+    );
+    assert_eq!(
+        cache.budget.mem.headroom,
+        MAX_COMPILE_MEMORY - cache.retained
+    );
+    assert_eq!(cache.budget.mem.buffers, 0);
+}
+
+#[test]
+fn cached_modules_count_across_resolve_calls() {
+    let files = [("one.mds", "one\n"), ("two.mds", "two\n")];
+    let run =
+        |cache: &mut ModuleCache, key| cache.resolve_key(key, &Default::default(), &mut vec![]);
+    let cost = 2 * ("one\n".len() + "one.mds".len()) + 6 * size_of::<usize>() + tree_of("one\n");
+    let mut reused = virtual_cache(&files);
+    limit_cache_headroom(&mut reused, 2 * cost - 1);
+    run(&mut reused, "one.mds").unwrap();
+    let error = run(&mut reused, "two.mds").unwrap_err().serialize();
+    assert_eq!(error.code, "mds::resource_limit");
+    assert_eq!(
+        error.message,
+        "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
+    );
+    assert!(error.span.is_none());
+    assert!(error.help.is_none());
+    assert_eq!(reused.dependencies(), ["one.mds"]);
+    assert!(reused.resolving.is_empty());
+    let mut fresh = virtual_cache(&files);
+    limit_cache_headroom(&mut fresh, 2 * cost - 1);
+    assert_eq!(
+        run(&mut fresh, "two.mds").unwrap().prompt_body.as_deref(),
+        Some("two\n")
+    );
+}
+
+#[test]
+fn fragment_refusal_keeps_prompt_and_uses_existing_warning() {
+    let files = [("part.mds", "body\n")];
+    let mut control = virtual_cache(&files);
+    control.source_map_mode = true;
+    let key = "part.mds";
+    let control_part = control
+        .resolve_key(key, &Default::default(), &mut vec![])
+        .unwrap();
+    assert!(control_part.prompt_map.is_some());
+
+    let mut tight = virtual_cache(&files);
+    tight.source_map_mode = true;
+    // Leave enough for the read, the tree estimate and all retained text, but not
+    // the fragment.
+    let text = "body\n".len();
+    limit_cache_headroom(
+        &mut tight,
+        3 * text + 2 * key.len() + 6 * size_of::<usize>() + tree_of("body\n"),
+    );
+    let mut warnings = vec![];
+    let part = tight
+        .resolve_key(key, &Default::default(), &mut warnings)
+        .unwrap();
+    assert_eq!(
+        part.prompt_body.as_deref(),
+        control_part.prompt_body.as_deref()
+    );
+    assert!(part.prompt_map.is_none());
+    assert_eq!(warnings, ["source map segment cap (1000000 segments) exceeded in imported module 'part.mds'; text included from it is left unmapped in the source map"]);
+    assert_eq!(tight.budget.mem.buffers, 0);
+}
+
+/// Each read of `PaddedReads` has this capacity. It is more than the tree estimate
+/// and the output of a small string entry, so a refused read leaves room for one.
+const PADDED_READ: usize = 2048;
+
+struct PaddedReads(VirtualFs);
+
+impl FileSystem for PaddedReads {
+    fn resolve_entry(&self, path: &str) -> Result<String, MdsError> {
+        self.0.resolve_entry(path)
+    }
+
+    fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError> {
+        self.0.normalize_in_dir(dir, relative)
+    }
+
+    fn parent_dir(&self, key: &str) -> String {
+        self.0.parent_dir(key)
+    }
+
+    fn read(&self, key: &str) -> Result<String, MdsError> {
+        let source = self.0.read(key)?;
+        let mut padded = String::with_capacity(PADDED_READ);
+        padded.push_str(&source);
+        Ok(padded)
+    }
+
+    fn is_markdown(&self, key: &str) -> bool {
+        self.0.is_markdown(key)
+    }
+}
+
+#[test]
+fn module_reads_release_to_parent_and_inserts_keep_only_warnings() {
+    let files = [
+        (
+            "main.mds",
+            "@import \"./a.mds\" as a\n@import \"./b.mds\" as b\n@include b\n",
+        ),
+        (
+            "a.mds",
+            "@import \"./empty.mds\" as empty\n@include empty\n",
+        ),
+        ("b.mds", "body\n"),
+        ("empty.mds", "   \n"),
+    ];
+    let fs = VirtualFs::new(
+        files
+            .map(|(key, src)| (key.to_owned(), src.to_owned()))
+            .into(),
+    );
+    let mut cache = ModuleCache::with_fs(Box::new(PaddedReads(fs)));
+    let mut warnings = vec![];
+    let (output, _) = cache
+        .resolve_virtual_intrinsic_opts(
+            "main.mds",
+            &Default::default(),
+            &CompileOptions::default(),
+            &mut warnings,
+        )
+        .unwrap();
+    assert_eq!(output, crate::CompiledOutput::Markdown("body\n".to_owned()));
+    assert_eq!(warnings.len(), 1);
+    let [root, a, empty, b] = cache.module_probes.as_slice() else {
+        panic!("four modules")
+    };
+    // The intrinsic entry holds its tree estimate as a temporary while its imports
+    // resolve. A cached import keeps its tree, so `empty` sees only the read of `a`.
+    let root_tree = tree_of(files[0].1);
+    let read = PADDED_READ;
+    for (probe, outer) in [
+        (root, 0),
+        (a, read + root_tree),
+        (empty, 2 * read + root_tree),
+        (b, read + root_tree),
+    ] {
+        assert_eq!(probe.temporaries_before, outer);
+        assert_eq!(probe.temporaries_open, outer + read);
+        assert_eq!(probe.temporaries_closed, outer);
+    }
+    assert_eq!(
+        a.buffers_after_insert,
+        Some(a.buffers_before + warnings[0].len())
+    );
+    for probe in [empty, b] {
+        assert_eq!(probe.buffers_after_insert, Some(probe.buffers_before));
+    }
+    assert_eq!(cache.budget.mem.mark(), 0);
+}
+
+#[test]
+fn refused_root_read_releases_the_module_mark() {
+    let fs = VirtualFs::new(HashMap::from([("main.mds".to_owned(), "body".to_owned())]));
+    let mut cache = ModuleCache::with_fs(Box::new(PaddedReads(fs)));
+    limit_cache_headroom(&mut cache, PADDED_READ - 1);
+    let vars = Default::default();
+    let mut warnings = vec![];
+    let error = cache
+        .resolve_virtual_intrinsic("main.mds", &vars, &mut warnings)
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
+    );
+    assert!(cache.resolving.is_empty());
+    assert_eq!(cache.budget.mem.mark(), 0);
+    assert_eq!(
+        cache
+            .resolve_source_intrinsic("body", "", &vars, &mut warnings)
+            .unwrap(),
+        crate::CompiledOutput::Markdown("body\n".to_owned())
+    );
+}
+
+#[test]
+fn skeleton_upgrade_adds_to_the_old_retained_charge() {
+    let files = [
+        ("base.mds", "body\n"),
+        ("child.mds", "@extends \"./base.mds\"\n"),
+    ];
+    let mut cache = virtual_cache(&files);
+    let vars = Default::default();
+    let mut warnings = vec![];
+    cache
+        .resolve_key("child.mds", &vars, &mut warnings)
+        .unwrap();
+    assert!(cache.modules["base.mds"].is_skeleton);
+    let before = cache.retained;
+    let upgraded = cache.resolve_key("base.mds", &vars, &mut warnings).unwrap();
+    assert_eq!(upgraded.prompt_body.as_deref(), Some("body\n"));
+    let mut fresh = virtual_cache(&files);
+    fresh.resolve_key("base.mds", &vars, &mut warnings).unwrap();
+    // The skeleton entry counts the tree of the base. The upgrade counts it once,
+    // so it adds the charge of a fresh compile without that tree.
+    let tree = tree_of(files[0].1);
+    assert!(fresh.retained > tree);
+    assert_eq!(cache.retained, before + fresh.retained - tree);
+}
+
+#[test]
+fn finalize_refusal_keeps_output_and_releases_map_work() {
+    let mut cache = virtual_cache(&[]);
+    let source = "body\n";
+    let opts = CompileOptions::default()
+        .with_source_map(true)
+        .with_include_sources_content(true);
+    let compile = |cache: &mut ModuleCache, opts: &CompileOptions, warnings: &mut Vec<String>| {
+        cache
+            .resolve_source_intrinsic_opts(source, "", &Default::default(), opts, warnings)
+            .unwrap()
+    };
+    let (_, control_map) = compile(&mut cache, &opts, &mut vec![]);
+    assert_eq!(
+        control_map.unwrap().sources_content,
+        Some(vec![source.to_owned()])
+    );
+    let (plain, _) = compile(&mut cache, &CompileOptions::default(), &mut vec![]);
+    // Enough to charge the tree estimate, the work arrays and body, but not the
+    // retained map.
+    limit_cache_headroom(&mut cache, 230 + tree_of(source));
+    let mut warnings = vec![];
+    let (tight, dropped) = compile(&mut cache, &opts, &mut warnings);
+    assert_eq!(tight, plain);
+    assert!(dropped.is_none());
+    assert_eq!(
+        warnings,
+        ["source map segment cap (1000000 segments) exceeded; no source map will be generated"]
+    );
+    assert_eq!(cache.budget.mem.mark(), 0);
+    assert_eq!(cache.budget.mem.buffers, source.len());
+
+    // The failed map reservation must restore the parent's live bytes immediately.
+    let vars = Arc::default();
+    let ctx = extends_ctx(source, &vars);
+    let mut builder = MapBuilder::new(ctx.make_origin());
+    builder.push_segment(0, 0, source.len() as u32);
+    let mem = &mut cache.budget.mem;
+    // In a compile, the entry holds its tree estimate as a temporary at finalize.
+    mem.charge(Part::Temp, Some(3 + tree_of(source))).unwrap();
+    let before = *mem;
+    let costs = FinalizeCosts {
+        content: source.len(),
+        map_origin_bytes: ctx.origin_bytes(),
+        prefix_lines: 0,
+        label_base_bytes: 0,
+    };
+    assert!(!charge_finalize(mem, &builder, source, costs));
+    assert_eq!(*mem, before);
+}
+
+#[test]
+fn final_output_charges_prefix_and_growth_before_the_reserve() {
+    let cases = [
+        "body".to_owned(),
+        "body".to_owned() + &" ".repeat(50),
+        " ".repeat(50),
+    ];
+    let raw = "label: value\n";
+    // The parsed frontmatter and its scope layer stay charged while the module runs.
+    let spent = parse_frontmatter_yaml_with(raw, Allowance::in_compile(&MemBudget::default()))
+        .unwrap()
+        .1;
+    for body in cases {
+        let growth = raw.len() + 8 + usize::from(!body.trim_end().is_empty());
+        let source = format!("---\n{raw}---\n{body}");
+        // The entry holds its tree estimate as a temporary for the whole compile.
+        let tree = tree_of(&source);
+        let needed = body.len() + 2 * raw.len() + 9 + growth + 2 * spent + tree;
+        let compile = |headroom| {
+            let mut cache = virtual_cache(&[]);
+            limit_cache_headroom(&mut cache, headroom);
+            cache
+                .resolve_source_intrinsic_opts(
+                    &source,
+                    "",
+                    &Default::default(),
+                    &Default::default(),
+                    &mut vec![],
+                )
+                .map(|output| (output, cache.budget.mem))
+        };
+        let (output, mem) = compile(needed).unwrap();
+        let crate::CompiledOutput::Markdown(output) = output.0 else {
+            panic!("markdown output")
+        };
+        assert_eq!(
+            output,
+            format!(
+                "---\n{raw}---\n{}",
+                if body.trim_end().is_empty() {
+                    ""
+                } else {
+                    "body\n"
+                }
+            )
+        );
+        assert_eq!(mem.buffers, output.capacity());
+        assert_eq!(mem.mark(), 0);
+        assert_eq!(
+            compile(needed - 1).unwrap_err().to_string(),
+            "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
+        );
+        assert_eq!(
+            compile(body.len() + 2 * raw.len() + 8 + tree)
+                .unwrap_err()
+                .to_string(),
+            "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
+        );
+    }
+}
+
+#[test]
+fn only_commit_retained_updates_cache_headroom() {
+    fn writes(source: &str, field: &str) -> usize {
+        source
+            .match_indices(field)
+            .filter(|(pos, _)| {
+                let tail = &source[pos + field.len()..];
+                let first = tail.as_bytes().first().copied();
+                (tail.starts_with('=') && !tail.starts_with("=="))
+                    || (first.is_some_and(|byte| b"+-*/%&|^".contains(&byte))
+                        && tail.as_bytes().get(1) == Some(&b'='))
+            })
+            .count()
+    }
+
+    fn code(source: &str) -> String {
+        source
+            .lines()
+            .flat_map(|line| {
+                line.split_once("//")
+                    .map_or(line, |(code, _)| code)
+                    .split_whitespace()
+            })
+            .collect()
+    }
+
+    fn valid(resolver: &str, evaluator: &str) -> bool {
+        let resolver = code(resolver);
+        let evaluator = code(evaluator);
+        let Some((_, commit)) = resolver.split_once("fncommit_retained(") else {
+            return false;
+        };
+        let body = commit.split("}fn").next().unwrap_or_default();
+        [".retained", ".headroom"].iter().all(|field| {
+            writes(&resolver, field) == 1
+                && writes(body, field) == 1
+                && writes(&evaluator, field) == 0
+        }) && !evaluator.contains("ModuleCache")
+            && !evaluator.contains(".resolve_")
+    }
+
+    let resolver = include_str!("resolver.rs");
+    let evaluator = concat!(
+        include_str!("evaluator.rs"),
+        include_str!("evaluator/budget.rs")
+    );
+    assert!(valid(resolver, evaluator));
+    assert!(!valid(
+        &format!("{resolver}\nself.retained = 0;"),
+        evaluator
+    ));
+    assert!(!valid(&format!("{resolver}\nmem.headroom = 0;"), evaluator));
+    assert!(!valid(
+        resolver,
+        &format!("{evaluator}\nmem.headroom -= 1;")
+    ));
+    assert!(!valid(
+        resolver,
+        &format!("{evaluator}\nuse crate::resolver::ModuleCache;")
+    ));
+    assert!(!valid(
+        resolver,
+        &format!("{evaluator}\ncache.resolve_by_key(key);")
+    ));
+}
+
+pub(super) const TEMPORARIES_SEED_KEY: &str = "root-with-live-temporaries.mds";
+
+fn assert_internal(error: MdsError) {
+    let record = error.serialize();
+    assert_eq!(record.code, "mds::internal");
+    assert_eq!(record.message, "internal compiler error");
+    assert_eq!(record.help, None);
+    assert_eq!(record.span, None);
+    assert_eq!(error.source_name(), None);
+}
+
+#[test]
+fn resolve_source_refuses_to_return_output_with_live_temporaries() {
+    let mut cache = virtual_cache(&[]);
+    cache.temporaries_seed = 1;
+    let result = cache.resolve_source("Body", "", &HashMap::new(), &mut vec![]);
+    assert_eq!(cache.budget.mem.mark(), 1);
+    assert_internal(result.unwrap_err());
+}
+
+#[test]
+fn compile_virtual_refuses_to_return_output_with_live_temporaries() {
+    let modules = HashMap::from([(TEMPORARIES_SEED_KEY.into(), "Body".into())]);
+    assert_internal(crate::compile_virtual(modules, TEMPORARIES_SEED_KEY, None).unwrap_err());
+}
+
+#[test]
+fn finish_preserves_the_first_error_even_with_live_temporaries() {
+    let mut cache = virtual_cache(&[]);
+    let mut resolve = |seed| {
+        cache.temporaries_seed = seed;
+        cache
+            .resolve_source("{{missing}}", "", &HashMap::new(), &mut vec![])
+            .unwrap_err()
+            .serialize()
+    };
+    let original = resolve(0);
+    assert_eq!(original.code, "mds::undefined_var");
+    assert_eq!(resolve(1), original);
+    assert_eq!(cache.budget.mem.mark(), 1);
+}
+
+#[test]
+fn resolve_key_does_not_cache_output_when_temporaries_remain() {
+    let key = "part.mds";
+    let mut cache = virtual_cache(&[(key, "Body")]);
+    cache.temporaries_seed = 1;
+    assert_internal(
+        cache
+            .resolve_key(key, &HashMap::new(), &mut vec![])
+            .unwrap_err(),
+    );
+    assert!(cache.dependencies().is_empty());
+    cache.temporaries_seed = 0;
+    assert!(cache.resolve_key(key, &HashMap::new(), &mut vec![]).is_ok());
+}
+
+#[test]
+fn resolve_key_refuses_an_incomplete_retained_transfer() {
+    let key = "part.mds";
+    let mut cache = virtual_cache(&[(key, "Body")]);
+    cache.retained_transfer_seed = 1;
+    let result = cache.resolve_key(key, &HashMap::new(), &mut vec![]);
+    assert_eq!(cache.budget.mem.mark(), 0);
+    assert_eq!(cache.retained, 0);
+    assert!(cache.budget.mem.buffers > 0);
+    assert_internal(result.unwrap_err());
+    assert!(cache.dependencies().is_empty());
+    cache.retained_transfer_seed = 0;
+    cache
+        .resolve_key(key, &HashMap::new(), &mut vec![])
+        .unwrap();
+    assert!(cache.retained > 0);
+}
+
+#[test]
+fn resolution_funnel_has_one_pop_and_five_finish_calls() {
+    fn valid(source: &str) -> bool {
+        let body = |name| {
+            let (_, rest) = source.split_once(&format!("fn {name}("))?;
+            let (body, _) = rest.split_once("\n    }")?;
+            Some(body)
+        };
+        let Some(pop) = body("pop_resolving") else {
+            return false;
+        };
+        let bodies = [Some(pop), body("finish_root"), body("commit_retained")];
+        let code = |text: &str| {
+            text.lines()
+                .flat_map(|line| {
+                    line.split("//")
+                        .next()
+                        .unwrap_or_default()
+                        .split_whitespace()
+                })
+                .collect::<String>()
+        };
+        let all = code(source);
+        all.matches(".resolving.pop(").count() == 1
+            && code(pop).contains(".resolving.pop(")
+            && all.matches(".finish_root(").count() == 5
+            && all.matches("fnfinish_root(").count() == 1
+            && bodies.into_iter().all(|body| {
+                body.is_some_and(|body| {
+                    body.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                        .all(|token| {
+                            !matches!(token, "expect" | "unwrap" | "panic" | "RefCell")
+                                && !token.starts_with("assert")
+                                && !token.starts_with("debug_assert")
+                        })
+                })
+            })
+    }
+
+    let source = include_str!("resolver.rs");
+    assert!(valid(source));
+    assert!(!valid(&format!("{source}\nself.resolving . pop ();")));
+    assert!(!valid(&format!("{source}\nself.finish_root()?;")));
+    let with_assert = source.replacen(
+        "self.resolving.pop()",
+        "{ assert!(false); self.resolving.pop() }",
+        1,
+    );
+    assert!(!valid(&with_assert));
+}
+
+/// Parse `yaml` as a compile parse does. Returns the mapping and its spent bytes.
+fn parsed_mapping(yaml: &str) -> (serde_yaml_ng::Mapping, usize) {
+    let (tree, spent) =
+        parse_frontmatter_yaml_with(yaml, Allowance::in_compile(&MemBudget::default())).unwrap();
+    let serde_yaml_ng::Value::Mapping(mapping) = tree else {
+        panic!("expected a mapping");
+    };
+    (mapping, spent)
+}
+
+#[test]
+fn merged_frontmatter_text_matches_the_text_of_a_cloned_value() {
+    let (mapping, spent) = parsed_mapping(concat!(
+        "name: \"a: b\"\n",
+        "nested:\n  list: [1, two, \"3\", ~]\n  text: \"line one\\nline two\"\n",
+        "quote: \"it's\"\n",
+        "control: \"\\x01\\t\\u0085\\u2028\"\n",
+    ));
+    let cloned = serde_yaml_ng::to_string(&serde_yaml_ng::Value::Mapping(mapping.clone())).unwrap();
+    let mut cache = virtual_cache(&[]);
+    let text = cache
+        .serialize_merged_frontmatter(&mapping, spent)
+        .unwrap()
+        .unwrap();
+    assert_eq!(text, format!("{}\n", cloned.trim_end()));
+    // The text is kept at its capacity, and no temporary remains.
+    assert_eq!(cache.budget.mem.buffers, text.capacity());
+    assert_eq!(cache.kept, text.capacity());
+    assert_eq!(cache.budget.mem.mark(), 0);
+}
+
+#[test]
+fn a_control_character_scalar_serializes_within_its_charge() {
+    // Each control byte serializes as a four-byte escape.
+    let (mapping, spent) = parsed_mapping(&format!("k: \"{}\"\n", "\\x01".repeat(100_000)));
+    let mut cache = virtual_cache(&[]);
+    let text = cache
+        .serialize_merged_frontmatter(&mapping, spent)
+        .unwrap()
+        .unwrap();
+    assert!(text.len() > 3 * spent, "{} B", text.len());
+    // The bound sized the text, so the text did not grow past it.
+    assert_eq!(text.capacity(), 4 * spent + 1);
+}
+
+#[test]
+fn a_frontmatter_merge_charges_both_trees_first() {
+    let mut cache = virtual_cache(&[("base.mds", "---\na: 1\n---\nBase\n")]);
+    let base = cache
+        .resolve_key("base.mds", &HashMap::new(), &mut vec![])
+        .unwrap();
+    let (child, child_bytes) = parsed_mapping("b: 2\n");
+    let child = Some(child);
+    let charge = base.frontmatter_bytes + child_bytes;
+    let (merged, charged) = cache.merge_frontmatter(&base, &child, child_bytes).unwrap();
+    assert_eq!((merged.len(), charged), (2, charge));
+    assert_eq!(cache.budget.mem.mark(), charge);
+    // With one byte less left than both trees take, the merge is refused.
+    let left = cache.budget.mem.headroom - cache.budget.mem.buffers - charge;
+    cache
+        .budget
+        .mem
+        .charge(Part::Buffers, Some(left - charge + 1))
+        .unwrap();
+    assert_eq!(
+        cache
+            .merge_frontmatter(&base, &child, child_bytes)
+            .unwrap_err()
+            .to_string(),
+        "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
+    );
+}
+
+#[test]
+fn every_frontmatter_merge_goes_through_the_charged_helper() {
+    fn calls(code: &str) -> usize {
+        code.lines()
+            .map(|line| {
+                line.split("//")
+                    .next()
+                    .unwrap_or_default()
+                    .matches("deep_merge_yaml(")
+                    .count()
+            })
+            .sum()
+    }
+    fn valid(resolver: &str, frontmatter: &str) -> bool {
+        let helper = resolver
+            .split_once("fn merge_frontmatter(")
+            .and_then(|(_, rest)| rest.split_once("\n    }"));
+        // Outside its tests, frontmatter.rs holds the definition and its recursion.
+        let production = frontmatter.split_once("\n#[cfg(test)]\nmod tests {");
+        calls(resolver) == 1
+            && helper.is_some_and(|(body, _)| calls(body) == 1)
+            && production.is_some_and(|(code, _)| calls(code) == 2)
+    }
+
+    let resolver = include_str!("resolver.rs");
+    let frontmatter = include_str!("resolver/frontmatter.rs");
+    assert!(valid(resolver, frontmatter));
+    let planted = "let merged = deep_merge_yaml(&base, &child, 0)?;";
+    assert!(!valid(&format!("{resolver}\n{planted}"), frontmatter));
+    assert!(!valid(resolver, &format!("{planted}\n{frontmatter}")));
+}
+
+#[test]
+fn the_extends_scope_layer_is_charged_with_the_merge_charge() {
+    let mut cache = virtual_cache(&[("base.mds", "---\na: 1\n---\nBase\n")]);
+    let base = cache
+        .resolve_key("base.mds", &HashMap::new(), &mut vec![])
+        .unwrap();
+    let (child, child_bytes) = parsed_mapping("b: 2\n");
+    let vars = Arc::default();
+    let ctx = extends_ctx("", &vars);
+    let (scope, merged, charge) = cache
+        .build_merged_extends_scope(
+            &base,
+            &Some(child),
+            child_bytes,
+            "base.mds",
+            &ctx,
+            &mut vec![],
+        )
+        .unwrap();
+    assert_eq!(merged.len(), 2);
+    assert!(scope.get_slot("b").is_some());
+    // The merged mapping and the scope layer each hold the merge charge.
+    assert_eq!(charge, base.frontmatter_bytes + child_bytes);
+    assert_eq!(cache.budget.mem.mark(), 2 * charge);
+}
+
+/// The tree estimate assumes these type sizes on a 64-bit host. `tests/memory_bound.rs`
+/// counts tokens and expression bytes by the rules that the samples check. A type that
+/// grows, or a lexer that counts in a different way, fails this test, so the estimate
+/// factors are measured again.
+#[test]
+fn tree_estimate_inputs_keep_their_measured_sizes() {
+    use crate::ast::{Arg, Condition, ElseifBranch, Expr};
+    use crate::lexer::Token;
+    let sizes = [
+        ("Node", size_of::<Node>(), 256),
+        ("Token", size_of::<Token>(), 40),
+        ("Expr", size_of::<Expr>(), 72),
+        ("Condition", size_of::<Condition>(), 152),
+        ("Arg", size_of::<Arg>(), 56),
+        ("ElseifBranch", size_of::<ElseifBranch>(), 184),
+    ];
+    for (name, size, _) in sizes {
+        eprintln!("size_of::<{name}>() = {size} B");
+    }
+    if size_of::<usize>() == 8 {
+        for (name, size, measured) in sizes {
+            assert!(
+                size <= measured,
+                "{name} is {size} B; the estimate assumes {measured} B"
+            );
+        }
+    }
+
+    // (source, tokens, expression bytes): directive lines without their newline and
+    // trimmed interpolation text are expression bytes; each other text run is one token.
+    let samples = [
+        ("\\{{a\\{{a", 4, 0),
+        ("@define f():\n\\{{a\\{{a\n@end\n", 6, 16),
+        ("---\na: ''\n---\n{{a}}{{ a }}", 5, 2),
+        ("x\n@if a&&a:\n@end\n", 3, 13),
+        ("{{f(f(a))}}text{{a.a}}", 3, 10),
+        ("a@b\n@c", 2, 2),
+    ];
+    for (source, tokens, expr) in samples {
+        let lexed = tokenize(source, "sample.mds").unwrap();
+        let expr_bytes: usize = lexed
+            .iter()
+            .map(|token| match token {
+                Token::Interpolation(text, _) | Token::Directive(text, _) => text.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!((lexed.len(), expr_bytes), (tokens, expr), "{source:?}");
+        // The compile charges these counts with the factors from limits.rs.
+        let len = source.len();
+        assert_eq!(
+            tree_estimate(&lexed, len),
+            Some(TREE_PER_TOKEN * tokens + TREE_PER_EXPR_BYTE * expr + TREE_PER_TEXT_BYTE * len),
+            "{source:?}"
+        );
+    }
+}
+
+const COMPILE_MEMORY_REFUSAL: &str =
+    "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes";
+
+/// Dense syntax: each four bytes `\{{a` are two tokens. The tree estimate of 2^17
+/// repeats (512 KiB of source) is past the compile memory budget.
+fn dense_past_the_budget() -> String {
+    "\\{{a".repeat(1 << 17)
+}
+
+/// About 1 MiB of prose in lines of 80 bytes: one text token, so the tree estimate
+/// is mostly the text term. A prose source can not pass the budget alone, so the
+/// prose cases first fill the budget to `PROSE_HEADROOM`.
+fn prose_mib() -> String {
+    format!("{}\n", "a".repeat(79)).repeat((1 << 20) / 80)
+}
+
+/// More than the compile of `prose_mib` needs without its tree, and less than its
+/// tree estimate.
+const PROSE_HEADROOM: usize = 12 << 20;
+
+/// The cases that did not fail with the compile memory error, each with its result.
+/// Every case runs before the caller asserts, so a failure names all of them.
+fn missed_memory_refusals(cases: Vec<(String, Result<(), MdsError>)>) -> Vec<String> {
+    cases
+        .into_iter()
+        .filter_map(|(what, result)| match result {
+            Ok(()) => Some(format!("{what}: the compile passed")),
+            Err(error) => {
+                let record = error.serialize();
+                (record.code != "mds::resource_limit" || record.message != COMPILE_MEMORY_REFUSAL)
+                    .then(|| format!("{what}: {}: {}", record.code, record.message))
+            }
+        })
+        .collect()
+}
+
+fn assert_memory_refusal(result: Result<(), MdsError>, what: &str) {
+    let misses = missed_memory_refusals(vec![(what.to_owned(), result)]);
+    assert!(misses.is_empty(), "{misses:?}");
+}
+
+#[test]
+fn a_cached_import_whose_tree_estimate_passes_the_budget_is_refused() {
+    let root = "@import \"./part.mds\" as part\nroot\n";
+    let dense = dense_past_the_budget();
+    let prose = prose_mib();
+    let mut cases = vec![];
+    for (what, part, headroom) in [
+        ("dense import", &dense, MAX_COMPILE_MEMORY),
+        ("prose import", &prose, PROSE_HEADROOM),
+    ] {
+        let mut cache = virtual_cache(&[("main.mds", root), ("part.mds", part)]);
+        limit_cache_headroom(&mut cache, headroom);
+        let result = cache.resolve_key("main.mds", &HashMap::new(), &mut vec![]);
+        assert!(cache.resolving.is_empty(), "{what}");
+        assert_eq!(cache.budget.mem.mark(), 0, "{what}");
+        cases.push((what.to_owned(), result.map(drop)));
+    }
+    let misses = missed_memory_refusals(cases);
+    assert!(misses.is_empty(), "{misses:#?}");
+}
+
+type Entry = fn(&mut ModuleCache, &str) -> Result<(), MdsError>;
+
+/// The resolve functions of each entry kind. The entry is `main.mds`, or the string
+/// `source`; `child.mds` extends `main.mds`.
+const ENTRY_KINDS: [(&str, Entry); 6] = [
+    ("source intrinsic", |cache, source| {
+        cache
+            .resolve_source_intrinsic(source, "", &HashMap::new(), &mut vec![])
+            .map(drop)
+    }),
+    ("source intrinsic opts", |cache, source| {
+        let opts = CompileOptions::default();
+        cache
+            .resolve_source_intrinsic_opts(source, "", &HashMap::new(), &opts, &mut vec![])
+            .map(drop)
+    }),
+    ("resolve_source", |cache, source| {
+        cache
+            .resolve_source(source, "", &HashMap::new(), &mut vec![])
+            .map(drop)
+    }),
+    ("virtual intrinsic", |cache, _| {
+        cache
+            .resolve_virtual_intrinsic("main.mds", &HashMap::new(), &mut vec![])
+            .map(drop)
+    }),
+    ("resolve_key", |cache, _| {
+        cache
+            .resolve_key("main.mds", &HashMap::new(), &mut vec![])
+            .map(drop)
+    }),
+    ("extends base", |cache, _| {
+        cache
+            .resolve_key("child.mds", &HashMap::new(), &mut vec![])
+            .map(drop)
+    }),
+];
+
+const EXTENDS_MAIN: &str = "@extends \"./main.mds\"\n";
+
+#[test]
+fn every_entry_kind_refuses_a_tree_estimate_past_the_budget() {
+    let dense = dense_past_the_budget();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("main.mds");
+    std::fs::write(&path, &dense).unwrap();
+    let modules = || {
+        HashMap::from([
+            ("main.mds".to_owned(), dense.clone()),
+            ("child.mds".to_owned(), EXTENDS_MAIN.to_owned()),
+        ])
+    };
+    let public = [
+        ("compile_str", crate::compile_str(&dense).map(drop)),
+        (
+            "compile_str_with_deps_opts",
+            crate::compile_str_with_deps_opts(&dense, None, None, CompileOptions::default())
+                .map(drop),
+        ),
+        ("file entry", crate::compile(&path, None).map(drop)),
+        (
+            "virtual entry",
+            crate::compile_virtual(modules(), "main.mds", None).map(drop),
+        ),
+        (
+            "virtual extends base",
+            crate::compile_virtual(modules(), "child.mds", None).map(drop),
+        ),
+    ];
+    let mut cases: Vec<_> = public
+        .into_iter()
+        .map(|(what, result)| (what.to_owned(), result))
+        .collect();
+    let prose = prose_mib();
+    for (kind, source, headroom) in [
+        ("dense", &dense, MAX_COMPILE_MEMORY),
+        ("prose", &prose, PROSE_HEADROOM),
+    ] {
+        for (what, entry) in ENTRY_KINDS {
+            let mut cache = virtual_cache(&[("main.mds", source), ("child.mds", EXTENDS_MAIN)]);
+            limit_cache_headroom(&mut cache, headroom);
+            let result = entry(&mut cache, source);
+            assert!(cache.resolving.is_empty(), "{kind} {what}");
+            assert_eq!(cache.budget.mem.mark(), 0, "{kind} {what}");
+            cases.push((format!("{kind} {what}"), result));
+        }
+    }
+    let misses = missed_memory_refusals(cases);
+    assert!(misses.is_empty(), "{misses:#?}");
+}
+
+/// The least headroom with which `entry` compiles `source`.
+fn least_headroom(files: &[(&str, &str)], source: &str, entry: Entry) -> usize {
+    least_passing_headroom(|headroom| {
+        let mut cache = virtual_cache(files);
+        limit_cache_headroom(&mut cache, headroom);
+        entry(&mut cache, source)
+    })
+}
+
+/// The least headroom with which `run` passes. The search keeps a refused low end
+/// and a passing high end, so it ends at an at-cap pair.
+fn least_passing_headroom(run: impl Fn(usize) -> Result<(), MdsError>) -> usize {
+    let (mut refused, mut passed) = (0, MAX_COMPILE_MEMORY);
+    assert!(run(passed).is_ok(), "the full budget compiles");
+    for _ in 0..usize::BITS {
+        if passed - refused <= 1 {
+            break;
+        }
+        let mid = refused + (passed - refused) / 2;
+        match run(mid) {
+            Ok(()) => passed = mid,
+            Err(_) => refused = mid,
+        }
+    }
+    assert_eq!(passed - refused, 1);
+    assert!(run(passed).is_ok());
+    assert_memory_refusal(run(refused), "one byte under the least headroom");
+    passed
+}
+
+#[test]
+fn each_entry_kind_compiles_at_the_cap_that_includes_the_tree_estimate() {
+    let dense = "\\{{a".repeat((1 << 10) + 1);
+    let prose = format!("{}\n", "a".repeat(79)).repeat((1 << 16) / 80 + 1);
+    let cached_import: (&str, Entry) = ("cached import", |cache, _| {
+        cache
+            .resolve_key("root.mds", &HashMap::new(), &mut vec![])
+            .map(drop)
+    });
+    for source in [&dense, &prose] {
+        let files = [
+            ("main.mds", source.as_str()),
+            ("child.mds", EXTENDS_MAIN),
+            ("root.mds", "@import \"./main.mds\" as main\n"),
+        ];
+        let tree = tree_of(source);
+        for (what, entry) in ENTRY_KINDS.into_iter().chain([cached_import]) {
+            let least = least_headroom(&files, source, entry);
+            eprintln!(
+                "{what}: source={} B, tree estimate={tree} B, least headroom={least} B",
+                source.len()
+            );
+            assert!(least > tree, "{what}: {least} B, tree estimate {tree} B");
+        }
+    }
+}
+
+#[test]
+fn tree_estimate_counts_past_the_address_space_fail_closed() {
+    let wrapping = [
+        (usize::MAX / TREE_PER_TOKEN + 1, 0, 0),
+        (0, usize::MAX / TREE_PER_EXPR_BYTE + 1, 0),
+        (0, 0, usize::MAX / TREE_PER_TEXT_BYTE + 1),
+        // Each product fits, and their sum does not.
+        (
+            usize::MAX / TREE_PER_TOKEN,
+            0,
+            usize::MAX / TREE_PER_TEXT_BYTE,
+        ),
+        (
+            usize::MAX / TREE_PER_TOKEN,
+            usize::MAX / TREE_PER_EXPR_BYTE,
+            0,
+        ),
+    ];
+    for (tokens, expr, len) in wrapping {
+        let estimate = tree_bytes(tokens, expr, len);
+        assert_eq!(estimate, None, "({tokens}, {expr}, {len})");
+        let error = MemBudget::default()
+            .charge(Part::Temp, estimate)
+            .unwrap_err();
+        assert_eq!(
+            error.serialize(),
+            MdsError::compile_memory_exceeded().serialize()
+        );
+    }
+    // The largest counts that fit give the exact product.
+    let most = usize::MAX / TREE_PER_TOKEN;
+    assert_eq!(tree_bytes(most, 0, 0), Some(most * TREE_PER_TOKEN));
+    assert_eq!(
+        tree_bytes(1, 1, 1),
+        Some(TREE_PER_TOKEN + TREE_PER_EXPR_BYTE + TREE_PER_TEXT_BYTE)
+    );
+}
+
+#[test]
+fn each_entry_kind_holds_the_tree_estimate_in_its_own_budget_part() {
+    // "main.mds" and the string label "<source>" have the same length, so the two
+    // entries keep the same origin bytes.
+    assert_eq!("main.mds".len(), SOURCE_LABEL.len());
+    let part = "part\n";
+    let root = "@import \"./part.mds\" as part\nroot\n";
+    let files = [("main.mds", root), ("part.mds", part)];
+    let part_kept = kept_bytes(part, "part.mds", part);
+    let root_kept = kept_bytes(root, "main.mds", "root\n");
+    let vars = HashMap::new();
+
+    // The intrinsic entry holds its tree as a temporary while its import resolves.
+    let mut cache = virtual_cache(&files);
+    cache
+        .resolve_source_intrinsic(root, "", &vars, &mut vec![])
+        .unwrap();
+    let [entry, import] = cache.module_probes.as_slice() else {
+        panic!("two modules")
+    };
+    assert_eq!(import.temporaries_before, tree_of(root));
+    assert_eq!(entry.temporaries_closed, 0);
+    assert_eq!(cache.budget.mem.mark(), 0);
+    assert_eq!(cache.retained, part_kept);
+
+    // The string entry keeps its tree in buffers, never in the retained part.
+    let mut cache = virtual_cache(&files);
+    cache.resolve_source(root, "", &vars, &mut vec![]).unwrap();
+    assert_eq!(cache.retained, part_kept);
+    assert_eq!(cache.budget.mem.buffers, root_kept);
+
+    // A key entry and its cached import add their trees to the retained part.
+    let mut cache = virtual_cache(&files);
+    cache.resolve_key("main.mds", &vars, &mut vec![]).unwrap();
+    assert_eq!(cache.retained, part_kept + root_kept);
+    assert_eq!(cache.budget.mem.buffers, 0);
+}
+
+/// The bytes that a cached module of `source` keeps: its source, two copies of its
+/// key, its origin counts, its prompt `body` and its tree estimate.
+fn kept_bytes(source: &str, key: &str, body: &str) -> usize {
+    source.len() + 2 * key.len() + 6 * size_of::<usize>() + body.len() + tree_of(source)
+}
+
+type VarsEntry = fn(&mut ModuleCache, &str, &HashMap<String, Value>) -> Result<(), MdsError>;
+
+/// The nine resolve functions that copy the caller variables. Each compiles
+/// `main.mds`, or the string `source`.
+const VARS_ENTRIES: [(&str, VarsEntry); 9] = [
+    ("resolve_path", |cache, _, vars| {
+        cache.resolve_path("main.mds", vars, &mut vec![]).map(drop)
+    }),
+    ("resolve_path_intrinsic", |cache, _, vars| {
+        cache
+            .resolve_path_intrinsic("main.mds", vars, &mut vec![])
+            .map(drop)
+    }),
+    ("resolve_path_intrinsic_opts", |cache, _, vars| {
+        let opts = CompileOptions::default();
+        cache
+            .resolve_path_intrinsic_opts("main.mds", vars, &opts, &mut vec![])
+            .map(drop)
+    }),
+    ("resolve_key", |cache, _, vars| {
+        cache.resolve_key("main.mds", vars, &mut vec![]).map(drop)
+    }),
+    ("resolve_source", |cache, source, vars| {
+        cache
+            .resolve_source(source, "", vars, &mut vec![])
+            .map(drop)
+    }),
+    ("resolve_virtual_intrinsic", |cache, _, vars| {
+        cache
+            .resolve_virtual_intrinsic("main.mds", vars, &mut vec![])
+            .map(drop)
+    }),
+    ("resolve_virtual_intrinsic_opts", |cache, _, vars| {
+        let opts = CompileOptions::default();
+        cache
+            .resolve_virtual_intrinsic_opts("main.mds", vars, &opts, &mut vec![])
+            .map(drop)
+    }),
+    ("resolve_source_intrinsic", |cache, source, vars| {
+        cache
+            .resolve_source_intrinsic(source, "", vars, &mut vec![])
+            .map(drop)
+    }),
+    ("resolve_source_intrinsic_opts", |cache, source, vars| {
+        let opts = CompileOptions::default();
+        cache
+            .resolve_source_intrinsic_opts(source, "", vars, &opts, &mut vec![])
+            .map(drop)
+    }),
+];
+
+const IMPORT_ROOT: &str = "@import \"./part.mds\" as part\nroot\n";
+const IMPORT_FILES: [(&str, &str); 2] = [("main.mds", IMPORT_ROOT), ("part.mds", "part\n")];
+
+/// Run `entry` on a new cache with `headroom` left. Every run ends with no module
+/// on the stack and no temporary.
+fn run_with_vars(
+    entry: VarsEntry,
+    headroom: usize,
+    vars: &HashMap<String, Value>,
+) -> (ModuleCache, Result<(), MdsError>) {
+    let mut cache = virtual_cache(&IMPORT_FILES);
+    limit_cache_headroom(&mut cache, headroom);
+    let result = entry(&mut cache, IMPORT_ROOT, vars);
+    assert!(cache.resolving.is_empty());
+    assert_eq!(cache.budget.mem.mark(), 0);
+    (cache, result)
+}
+
+/// A 64 KiB text and 100 small variables, so the table, the names and the values
+/// all count.
+fn caller_vars() -> HashMap<String, Value> {
+    let mut vars: HashMap<_, _> = (0..100)
+        .map(|i| (format!("v{i:02}"), Value::Null))
+        .collect();
+    vars.insert("pad".to_owned(), Value::String("x".repeat(1 << 16)));
+    vars
+}
+
+#[test]
+fn each_entry_charges_the_caller_variable_layer_once_at_the_root() {
+    let vars = caller_vars();
+    let layer = runtime_layer(&vars).bytes().unwrap();
+    let names: usize = vars.keys().map(String::len).sum();
+    let per_var = size_of::<(String, crate::scope::Slot)>() + size_of::<Value>();
+    let floor = vars.len() * per_var + names + (1 << 16);
+    assert!(layer >= floor, "layer {layer} B, floor {floor} B");
+    let empty = HashMap::new();
+    let (mut cases, mut misses) = (vec![], vec![]);
+    for (what, entry) in VARS_ENTRIES {
+        // Exactly at the least headroom the compile passes, one byte under it is refused.
+        let least = |vars| least_passing_headroom(|room| run_with_vars(entry, room, vars).1);
+        let added = least(&vars).checked_sub(least(&empty));
+        if added != Some(layer) {
+            misses.push(format!(
+                "{what}: the variables add {added:?} B, not {layer} B"
+            ));
+        }
+        // The layer is the first charge of the compile, in buffers below the root mark.
+        // A layer exactly at the headroom is charged, and one byte more is refused.
+        for (headroom, charged) in [(layer, layer), (layer - 1, 0)] {
+            let (cache, result) = run_with_vars(entry, headroom, &vars);
+            let probes: Vec<_> = cache
+                .module_probes
+                .iter()
+                .map(|probe| (probe.buffers_before, probe.temporaries_before))
+                .collect();
+            if probes != [(charged, 0)] {
+                misses.push(format!("{what} at headroom {headroom}: {probes:?}"));
+            }
+            cases.push((format!("{what} at headroom {headroom}"), result));
+        }
+    }
+    misses.extend(missed_memory_refusals(cases));
+    assert!(misses.is_empty(), "{misses:#?}");
+}
+
+#[test]
+fn empty_caller_variables_charge_no_layer_bytes() {
+    assert_eq!(runtime_layer(&HashMap::new()).bytes(), Some(0));
+    for (what, entry) in VARS_ENTRIES {
+        let (cache, result) = run_with_vars(entry, MAX_COMPILE_MEMORY, &HashMap::new());
+        result.unwrap();
+        assert_eq!(cache.module_probes[0].buffers_before, 0, "{what}");
+    }
+}
+
+#[test]
+fn a_layer_changed_after_its_count_fails_the_root_charge() {
+    assert_eq!(VarLayer::new().bytes(), Some(0));
+    let mut layer = runtime_layer(&HashMap::from([("a".to_owned(), Value::Null)]));
+    assert!(layer.bytes().is_some());
+    // An insert after the collect makes the count unknown, never stale.
+    Arc::get_mut(&mut layer)
+        .unwrap()
+        .insert("b".to_owned(), Arc::new(Value::Null));
+    assert_eq!(layer.bytes(), None);
+    let mut cache = virtual_cache(&[]);
+    let (_, charged) = cache.begin_module("main.mds", &layer, 0);
+    assert_memory_refusal(charged, "a layer with no byte count");
+}
+
+#[test]
+fn a_reused_cache_retains_kept_bytes_and_never_the_caller_layer() {
+    let other = "other\n";
+    let mut cache = virtual_cache(&[IMPORT_FILES[0], IMPORT_FILES[1], ("other.mds", other)]);
+    let vars = caller_vars();
+    let layer = runtime_layer(&vars).bytes().unwrap();
+    let main_kept =
+        kept_bytes("part\n", "part.mds", "part\n") + kept_bytes(IMPORT_ROOT, "main.mds", "root\n");
+    let mut retained = 0;
+    for (key, kept) in [
+        ("main.mds", main_kept),
+        ("other.mds", kept_bytes(other, "other.mds", other)),
+    ] {
+        cache.resolve_key(key, &vars, &mut vec![]).unwrap();
+        retained += kept;
+        assert_eq!(cache.retained, retained, "{key}");
+        assert_eq!(cache.budget.mem.buffers, layer, "{key}");
+        assert_eq!(cache.budget.mem.mark(), 0, "{key}");
+    }
+}
+
+#[test]
+fn a_caller_value_past_the_counted_depth_is_refused_by_the_layer_charge() {
+    let nested =
+        |levels: usize| (0..levels).fold(Value::Null, |value, _| Value::Array(vec![value]));
+    let parsed = |levels: usize| {
+        let json = format!("{}null{}", "[".repeat(levels), "]".repeat(levels));
+        Value::from_json(serde_json::from_str(&json).unwrap())
+    };
+    // The JSON input of the bindings and the CLI admits 64 levels and refuses 65.
+    assert_eq!(parsed(64).unwrap(), nested(64));
+    assert!(parsed(65).is_err());
+    let compile = |levels| {
+        let vars = HashMap::from([("deep".to_owned(), nested(levels))]);
+        crate::compile_str_with("Body\n", None, Some(vars)).map(drop)
+    };
+    compile(64).unwrap();
+    assert_memory_refusal(compile(65), "a value nested 65 levels deep");
+}
+
+/// A compile refuses a value past 64 levels at the variable charge, so this test
+/// puts the value in a scope directly: the path checks past 64 steps still hold.
+#[test]
+fn a_path_past_64_steps_into_a_scope_value_keeps_its_errors() {
+    let nest = |levels: usize, inner| {
+        (0..levels).fold(inner, |value, _| {
+            Value::Object(HashMap::from([("a".to_owned(), value)]))
+        })
+    };
+    // `x` is 31 fields and one index deep. `y` is `fields` more fields and one index.
+    let run = |fields: usize, inner: Value, tail: &str| {
+        let value = nest(
+            31,
+            Value::Array(vec![nest(fields, Value::Array(vec![inner]))]),
+        );
+        let (x, y) = (".a".repeat(31), ".a".repeat(fields));
+        let source = format!("@for x in v{x}:\n@for y in x{y}:\n{tail}\n@end\n@end\n");
+        let tokens = tokenize(&source, "deep.mds").unwrap();
+        let module = parse_with_ctx(&tokens, "deep.mds", &source).unwrap();
+        let mut scope = Scope::new();
+        scope.set_var("v", value);
+        let error = evaluate(&module.body, &mut scope, &mut vec![], "deep.mds", &source);
+        let record = error.unwrap_err().serialize();
+        (record.code, record.message)
+    };
+    let leaf = || Value::String("leaf".into());
+    // `y` is 64 steps deep, so `y.a` is 65 steps deep.
+    assert_eq!(
+        run(31, nest(1, leaf()), "{{y.a}}"),
+        (
+            "mds::syntax".to_owned(),
+            "syntax error: internal error: an evaluated value has an invalid projection".to_owned()
+        )
+    );
+    // `y.a` is 64 steps deep, so the loop variable `z` is 65 steps deep.
+    let inner = nest(1, Value::Array(vec![leaf()]));
+    assert_eq!(
+        run(30, inner, "@for z in y.a:\n{{z}}\n@end"),
+        (
+            "mds::undefined_var".to_owned(),
+            "undefined variable 'z'".to_owned()
+        )
+    );
+}
+
+/// Sources one byte past the `sourcesContent` ceiling: the map drops `sourcesContent`
+/// with the ceiling warning and keeps every source and mapping. Sources at exactly the
+/// ceiling keep `sourcesContent` and do not warn (control).
+///
+/// A compile does not reach this ceiling: the compile memory budget refuses a smaller
+/// set of sources first, because each source byte costs at least 17 bytes of the
+/// budget. The ceiling stays as an extra guard, so this test drives the check itself.
+#[test]
+fn sources_content_one_byte_past_the_ceiling_is_dropped_with_its_warning() {
+    let body = "L1\nL2\n";
+    let opts = CompileOptions::default()
+        .with_source_map(true)
+        .with_include_sources_content(true);
+    let two_sources = || {
+        let mut builder = MapBuilder::from_parts("l1.mds".into(), "l1.mds".into(), "L1\n".into());
+        builder.push_segment(0, 0, 3);
+        builder.switch_to(&Origin {
+            file: Arc::from("l2.mds"),
+            display: Arc::from("l2.mds"),
+            source: Arc::from("L2\n"),
+        });
+        builder.push_segment(3, 0, 3);
+        builder
+    };
+    // Non-vacuity: with no check, each source owns one mapped line and embeds its text.
+    let full = two_sources().finalize_points(body).finish(body, 0, None);
+    assert_eq!(full.sources, ["l1.mds", "l2.mds"]);
+    assert_eq!(
+        full.sources_content,
+        Some(vec!["L1\n".to_string(), "L2\n".to_string()])
+    );
+    assert_eq!(
+        full.mappings.split(';').filter(|l| !l.is_empty()).count(),
+        2
+    );
+    for (total, over) in [
+        (MAX_SOURCES_CONTENT_BYTES + 1, true),
+        (MAX_SOURCES_CONTENT_BYTES, false),
+    ] {
+        let mut warnings = Vec::new();
+        let sm = apply_map_degradation(two_sources(), total, &opts, &mut warnings)
+            .expect("the ceiling never drops the whole map")
+            .finalize_points(body)
+            .finish(body, 0, None);
+        // The literal pins the ceiling at 50 MiB.
+        let expected_warnings = if over {
+            vec![format!(
+                "sourcesContent total size ({total} bytes) exceeds the 52428800 byte \
+                 ceiling; sourcesContent will be omitted from the source map"
+            )]
+        } else {
+            vec![]
+        };
+        assert_eq!(warnings, expected_warnings, "total={total}");
+        let expected_content = if over {
+            None
+        } else {
+            full.sources_content.clone()
+        };
+        assert_eq!(
+            sm.sources_content, expected_content,
+            "total={total}: sourcesContent is kept only up to the ceiling"
+        );
+        assert_eq!(
+            sm.sources, full.sources,
+            "total={total}: every source is kept"
+        );
+        assert_eq!(
+            sm.mappings, full.mappings,
+            "total={total}: every mapping is kept"
+        );
+    }
 }

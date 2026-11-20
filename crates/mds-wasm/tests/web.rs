@@ -1,5 +1,5 @@
 use serde::Serialize;
-use wasm_bindgen::JsValue;
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::*;
 
 // Tests run in Node.js via `wasm-pack test --node crates/mds-wasm`
@@ -41,6 +41,81 @@ fn modules_opts(modules: &serde_json::Value) -> JsValue {
 /// Build an options object with filename.
 fn filename_opts(filename: &str) -> JsValue {
     to_js_object(&serde_json::json!({ "filename": filename }))
+}
+
+// ── Virtual map and resolved graph limits ─────────────────────────────────────
+
+#[wasm_bindgen_test]
+fn virtual_map_accepts_257_entries_and_refuses_258() {
+    for imported in [false, true] {
+        let mut modules: serde_json::Map<String, serde_json::Value> = (0..257)
+            .map(|i| (format!("m{i}.mds"), "Body\n".into()))
+            .collect();
+        let imports: String = (1..257)
+            .map(|i| format!("@import \"./m{i}.mds\" as m{i}\n"))
+            .collect();
+        let source = if imported {
+            imports + "OK\n"
+        } else {
+            "OK\n".into()
+        };
+        modules.insert("m0.mds".into(), source.into());
+        let result = mds_wasm::lint_virtual(to_js_object(&modules), "m0.mds", JsValue::NULL)
+            .expect("the entry plus 256 modules must pass");
+        assert!(js_sys::Array::is_array(&get_prop(&result, "files")));
+        modules.insert("unused.mds".into(), "Body\n".into());
+        let err =
+            mds_wasm::lint_virtual(to_js_object(&modules), "m0.mds", JsValue::NULL).unwrap_err();
+        assert_eq!(get_str(&err, "code"), "mds::resource_limit");
+        assert_eq!(
+            get_str(&err, "message"),
+            "modules exceeds maximum module count of 257 (258 provided)"
+        );
+    }
+}
+
+#[wasm_bindgen_test]
+fn options_modules_map_accepts_257_entries_and_refuses_258() {
+    let mut modules: serde_json::Map<String, serde_json::Value> = (0..257)
+        .map(|i| (format!("m{i}.mds"), "Body\n".into()))
+        .collect();
+    for call in [mds_wasm::compile, mds_wasm::check, mds_wasm::lint] {
+        call("OK\n", modules_opts(&modules.clone().into()))
+            .expect("unused entries must not consume resolved graph slots");
+    }
+    modules.insert("unused.mds".into(), "Body\n".into());
+    for call in [mds_wasm::compile, mds_wasm::check, mds_wasm::lint] {
+        let err = call("OK\n", modules_opts(&modules.clone().into())).unwrap_err();
+        assert_eq!(get_str(&err, "code"), "mds::resource_limit");
+        assert_eq!(
+            get_str(&err, "message"),
+            "options.modules exceeds maximum module count of 257 (258 provided)"
+        );
+    }
+}
+
+#[wasm_bindgen_test]
+fn options_modules_graph_uses_the_shared_module_count_refusal() {
+    let mut modules: serde_json::Map<String, serde_json::Value> = (0..256)
+        .map(|i| (format!("m{i}.mds"), "Body\n".into()))
+        .collect();
+    let mut source: String = (0..256)
+        .map(|i| format!("@import \"./m{i}.mds\" as m{i}\n"))
+        .collect();
+    for call in [mds_wasm::compile, mds_wasm::check, mds_wasm::lint] {
+        call(&source, modules_opts(&modules.clone().into()))
+            .expect("the source entry plus 256 modules must pass");
+    }
+    modules.insert("m256.mds".into(), "Body\n".into());
+    source.push_str("@import \"./m256.mds\" as m256\n");
+    for call in [mds_wasm::compile, mds_wasm::check, mds_wasm::lint] {
+        let err = call(&source, modules_opts(&modules.clone().into())).unwrap_err();
+        assert_eq!(get_str(&err, "code"), "mds::resource_limit");
+        assert_eq!(
+            get_str(&err, "message"),
+            mds::module_count_exceeded().to_string()
+        );
+    }
 }
 
 // ── compile tests ─────────────────────────────────────────────────────────────
@@ -660,7 +735,7 @@ fn scan_import_records_carry_the_errors_context() {
     assert!(get_prop(&record(1), "frontmatterIndex").is_null());
     assert_eq!(
         fields(2),
-        ("./exp.mds".into(), "export-from".into(), None, true)
+        ("./exp.mds".into(), "export-from".into(), None, false)
     );
 
     // The engine's own error for the missing module: the same span object.
@@ -678,6 +753,17 @@ fn scan_import_records_carry_the_errors_context() {
     // Non-vacuity: the directive is past the frontmatter and a multi-byte line.
     assert_eq!(span[2].as_f64(), Some(6.0));
     assert_eq!(span[1].as_f64(), Some(28.0));
+
+    let err = mds_wasm::compile(
+        source,
+        modules_opts(&serde_json::json!({ "fm.mds": "F\n", "missing.mds": "M\n" })),
+    )
+    .unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::module_not_found");
+    let span = span_fields(&get_prop(&record(2), "span")).expect("a re-export has a span");
+    assert_eq!(span_fields(&get_prop(&err, "span")), Some(span.clone()));
+    assert_eq!(span[2].as_f64(), Some(7.0));
+    assert_eq!(span[1].as_f64(), Some(26.0));
 }
 
 /// `asBase` places a template's `@extends` base where the resolver resolves it: before
@@ -709,6 +795,35 @@ fn scan_import_records_returns_error_for_malformed_source() {
     for as_base in [false, true] {
         let err = mds_wasm::scan_import_records("Hello {{name\n", as_base).unwrap_err();
         assert_eq!(get_str(&err, "code"), "mds::syntax");
+    }
+}
+
+/// #488: an import scan counts the syntax tree against the compile memory budget
+/// before it builds the tree, as a compile does. 2^17 repeats of `\{{a` (512 KiB, under
+/// the 10 MiB size cap) are two tokens each, and their estimate is past the budget. The
+/// scan refuses them with native's coded error, not an uncoded trap. Half as many repeats
+/// pass.
+#[wasm_bindgen_test]
+fn import_scans_refuse_a_dense_source_with_a_coded_resource_limit() {
+    let refusal = "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes";
+    let dense = "\\{{a".repeat(1 << 17);
+    let mut errors = vec![mds_wasm::scan_imports(&dense).unwrap_err()];
+    for as_base in [false, true] {
+        errors.push(mds_wasm::scan_import_records(&dense, as_base).unwrap_err());
+    }
+    for err in &errors {
+        assert_eq!(get_str(err, "code"), "mds::resource_limit");
+        assert_eq!(get_str(err, "message"), refusal);
+    }
+
+    let half = "\\{{a".repeat(1 << 16);
+    assert_eq!(
+        js_sys::Array::from(&mds_wasm::scan_imports(&half).unwrap()).length(),
+        0
+    );
+    for as_base in [false, true] {
+        let records = mds_wasm::scan_import_records(&half, as_base).unwrap();
+        assert_eq!(js_sys::Array::from(&records).length(), 0);
     }
 }
 
@@ -2146,4 +2261,158 @@ fn wasm_options_conversion_error_text_is_wire_escaped() {
             "{prefix}: raw ESC or LF in {message:?}"
         );
     }
+}
+
+// ── vars and rules: one read, BigInt refused (#483) ───────────────────────────
+
+/// A plain JS object with these own properties.
+fn js_object(entries: &[(&str, &JsValue)]) -> JsValue {
+    let obj = js_sys::Object::new();
+    for (key, value) in entries {
+        js_sys::Reflect::set(&obj, &JsValue::from_str(key), value).expect("set a property");
+    }
+    obj.into()
+}
+
+/// A JS object whose enumerable property `key` is read through `get`.
+fn object_with_getter(key: &str, get: &js_sys::Function) -> JsValue {
+    let obj = js_sys::Object::new();
+    let descriptor = js_object(&[("get", get), ("enumerable", &JsValue::TRUE)]);
+    js_sys::Object::define_property(&obj, &JsValue::from_str(key), descriptor.unchecked_ref());
+    obj.into()
+}
+
+/// `compile` with `{ vars: value }`, or `lint` with `{ rules: value }`.
+fn convert_option(field: &str, value: &JsValue) -> Result<JsValue, JsValue> {
+    let opts = js_object(&[(field, value)]);
+    if field == "vars" {
+        mds_wasm::compile("Hello {{name}}!\n", opts)
+    } else {
+        mds_wasm::lint("Hello!\n", opts)
+    }
+}
+
+/// Assert an `mds::invalid_options` error with exactly this message.
+fn assert_options_error(result: Result<JsValue, JsValue>, expected: &str) {
+    let err = result.expect_err(expected);
+    assert_eq!(get_str(&err, "code"), "mds::invalid_options", "{expected}");
+    assert_eq!(get_str(&err, "message"), expected);
+}
+
+#[wasm_bindgen_test]
+fn wasm_vars_and_rules_refuse_a_bigint_with_the_native_message() {
+    // The direct exports, not the facade: a BigInt is refused in the words of the
+    // native binding, and a clean value of each option still converts.
+    let bigint = JsValue::from(js_sys::BigInt::from(1_u32));
+    for field in ["vars", "rules"] {
+        assert_options_error(
+            convert_option(field, &js_object(&[("bad", &bigint)])),
+            &format!("invalid options.{field}: InvalidArg, typeof BigInt value could not be deserialized"),
+        );
+    }
+    let out = convert_option("vars", &js_object(&[("name", &JsValue::from_str("World"))]))
+        .expect("clean vars compile");
+    assert_eq!(get_str(&out, "output"), "Hello World!\n");
+    convert_option(
+        "rules",
+        &js_object(&[("unused-variable", &JsValue::from_str("off"))]),
+    )
+    .expect("clean rules lint");
+}
+
+#[wasm_bindgen_test]
+fn wasm_vars_and_rules_give_a_coded_error_for_a_read_that_throws() {
+    // A getter or a Proxy trap that throws is refused with mds::invalid_options:
+    // never `undefined`, and never the caller's own uncoded exception.
+    let throws = js_sys::Function::new_no_args("throw new Error('boom')");
+    let proxy = js_sys::Proxy::new(
+        &js_sys::Object::new(),
+        js_object(&[("ownKeys", &throws)]).unchecked_ref(),
+    );
+    for field in ["vars", "rules"] {
+        for (label, value) in [
+            ("getter", object_with_getter("bad", &throws)),
+            ("proxy", proxy.clone().into()),
+        ] {
+            let result = convert_option(field, &value);
+            assert!(
+                result.is_err(),
+                "{field} {label}: a read that throws must fail"
+            );
+            assert_options_error(
+                result,
+                &format!("invalid options.{field}: InvalidArg, a value could not be read"),
+            );
+        }
+    }
+    // Control: a getter that returns a string is read as that string.
+    let world = js_sys::Function::new_no_args("return 'World'");
+    let out = convert_option("vars", &object_with_getter("name", &world))
+        .expect("a getter that returns a string");
+    assert_eq!(get_str(&out, "output"), "Hello World!\n");
+}
+
+/// `levels` nested objects, each holding the next one under the key `value`.
+fn nested_objects(levels: usize) -> JsValue {
+    let mut value = JsValue::from(0);
+    for _ in 0..levels {
+        value = js_object(&[("value", &value)]);
+    }
+    value
+}
+
+/// The depth refusal of the native binding, for `field`.
+fn depth_refusal(field: &str) -> String {
+    format!("invalid options.{field}: InvalidArg, value nesting exceeds maximum depth of 1024")
+}
+
+/// A value nested `levels` deep must give a result or a coded error on wasm32,
+/// never a runtime trap, and the depth check must not refuse it.
+fn assert_nested_value_converts(levels: usize) {
+    let value = nested_objects(levels);
+    for field in ["vars", "rules"] {
+        if let Err(err) = convert_option(field, &value) {
+            assert!(
+                get_prop(&err, "code").as_string().is_some(),
+                "{field}: uncoded error {err:?}"
+            );
+            assert_ne!(get_str(&err, "message"), depth_refusal(field));
+        }
+    }
+}
+
+#[wasm_bindgen_test]
+fn wasm_vars_and_rules_nested_256_levels_convert_without_a_trap() {
+    assert_nested_value_converts(256);
+}
+
+// The debug build overflows the stack at 1024 levels, in the serde-wasm-bindgen
+// recursion that reads the value. It does so without the copy as well. The
+// release build is the one that ships, and it passes: only it runs this case.
+// The 256-level case above keeps the debug job on the same path.
+#[cfg(not(debug_assertions))]
+#[wasm_bindgen_test]
+fn wasm_vars_and_rules_at_the_depth_limit_convert_without_a_trap() {
+    // 1024 nested objects is the deepest value the walk admits.
+    assert_nested_value_converts(1024);
+}
+
+#[wasm_bindgen_test]
+fn wasm_vars_and_rules_one_level_past_the_depth_limit_are_refused() {
+    for field in ["vars", "rules"] {
+        assert_options_error(
+            convert_option(field, &nested_objects(1025)),
+            &depth_refusal(field),
+        );
+    }
+}
+
+#[wasm_bindgen_test]
+fn wasm_vars_keep_an_own_proto_key() {
+    // JSON.parse makes `__proto__` an own key. The copy must keep it as a key, and
+    // not set the prototype of the copy with it.
+    let opts = js_sys::JSON::parse(r#"{"vars":{"__proto__":"own"}}"#).expect("parse the options");
+    let out =
+        mds_wasm::compile("{{__proto__}}\n", opts).expect("an own __proto__ key is a variable");
+    assert_eq!(get_str(&out, "output"), "own\n");
 }

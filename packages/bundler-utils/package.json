@@ -1,6 +1,6 @@
 {
   "name": "@mdscript/bundler-utils",
-  "version": "0.4.4",
+  "version": "0.5.1",
   "description": "Shared utilities for MDS bundler plugins",
   "license": "MIT",
   "repository": {
@@ -21,7 +21,7 @@
   ],
   "type": "module",
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.12.0"
   },
   "main": "./dist-cjs/index.js",
   "exports": {
@@ -47,7 +47,7 @@
     "test": "node --test __test__/*.spec.mjs"
   },
   "peerDependencies": {
-    "@mdscript/mds": "^0.4.4"
+    "@mdscript/mds": "^0.5.1"
   },
   "devDependencies": {
     "@mdscript/mds": "file:../mds",

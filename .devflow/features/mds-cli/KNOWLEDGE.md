@@ -17,10 +17,16 @@ referencedFiles:
   - crates/mds-cli/tests/cli_watch.rs
   - crates/mds-cli/Cargo.toml
 created: 2026-06-26
-updated: 2026-09-28
+updated: 2026-11-18
 ---
 
 # MDS CLI (mds-cli)
+
+## Rules
+
+- **KB-AP-1** Never `expect`/index the walk result for a walked file's pin: a missing entry must fail only that file through `walked_pin`'s `Result` (see Walked entries and source readers).
+- **KB-AP-2** Never name the canonical absolute path in a `read_canonical_source` refusal: it can leak a hostile ancestor name; use the typed path via `safe_path`.
+- **KB-INV-1** A directory rewrite (`fmt`, `lint --fix`) lands in the directory held before the replace, whatever the path leads to by then (see Gotchas).
 
 ## Overview
 
@@ -117,10 +123,19 @@ struct WatchedPath {
 }
 ```
 
-- `ensure_unmoved()` re-resolves `typed` before every compile and compares its **parent** with `canonical`'s parent (or, for the root, the whole canonical form) — never text-compares the two paths (#408). A retarget (a symlink on the typed path swapped, or a directory replaced) is refused as `watched {entry|directory|file} now resolves to a different {file|directory}: "<typed>"; restart mds watch to follow it`. This is non-fatal for a directory-mode source: the compile errors and `mds watch` keeps running (`state.errored` marks it, retried on the next real change).
-- `compile()` calls `ensure_unmoved()` first, then compiles by `typed` (so errors name the file the user reaches, never its canonical absolute path).
-- `walked(src)` turns a canonical path below the root into its typed form (`root.typed.join(src.strip_prefix(&root.canonical))`) — an out-of-root dependency has no walked form and keeps its canonical path.
-- `compile_source(src, ...)` is every directory-mode compile's entry point: an out-of-root path compiles directly (no `WatchedPath` wrapping — DD3); an in-root path re-checks the root itself is unmoved, then builds a `Watched::Source` `WatchedPath` and calls `compile()`.
+- `ensure_unmoved()` resolves `typed` before each compile. Entries and sources compare canonical parents; the root compares the full canonical directory.
+- Every lookup error refuses the compile, including NotFound. Entry and source errors pass through from `NativeFs::check_symlink`.
+- A missing root returns FileNotFound with the escaped typed root. Other root lookup errors return `mds::io` with that root and escaped cause.
+- A successful lookup with a different root or parent returns `watched {entry|directory|file} now resolves to a different {file|directory}: "<typed>"; restart mds watch to follow it`.
+- A case-only file-name change within the same canonical parent is not a move. A save by rename can supply another file identity.
+- File mode's `event_is_relevant` also matches an event after a case-only rename (#481). After the canonical lookup, it takes the watched paths in the event's canonical parent and compares `w.canonicalize()` with the event's canonical path, canonical with canonical. It never folds case or compares text. It is a trigger only: `WatchedPath.canonical`, `foi`, the graph keys and the baselines keep the startup spelling. A case-only rename of the parent directory is still refused as a move.
+- `compile()` calls `ensure_unmoved()`, then forwards both path forms to `compile_caught`. Errors name the typed path.
+- `compile_caught` creates a fresh `NativeFs` with `EntryPin::parent_dir(effective_parent(canonical))`. It calls `build::compile_native_to_content` inside one compile catch.
+- `walked(src)` derives the typed source path below the root. An out-of-root dependency keeps its canonical path.
+- `compile_source(src, ...)` checks the root, then calls the source's `compile()` for an in-root path.
+- An out-of-root dependency calls `compile_caught(src, src, ...)` and receives the same parent pin.
+- A directory-mode refusal records that source as errored. The session stays active and retries on a later change.
+- The pin compares a parent path, not a file identity. Same-parent replacements remain possible; imported modules keep their path-based lookup limits.
 
 ### watch.rs — `compile_and_write`/`CompileWriteOutcome` (moved from build.rs)
 
@@ -151,7 +166,7 @@ impl WorkingDir {
 }
 ```
 
-When the working directory `mds watch` started in is deleted and recreated at the same canonical path (e.g. a `git checkout` that removes and restores it), `restore_if_recreated` `set_current_dir`s back into it before the rebuild reads anything typed relative to it (a relative `--vars`, `-o`, or the directory argument). Comparison is canonical-with-canonical; a directory swapped in between the check and the move is the same check-then-open window every path-based read has, left to the compile's own `ensure_unmoved`/existence checks.
+If the startup working directory exists again at the same canonical path, `restore_if_recreated` calls `set_current_dir` before a rebuild uses relative paths. Source compiles then use `ensure_unmoved`, the entry parent pin and the opened-file comparison. These checks compare separate path lookups. Imported modules and the watch vars path can still read a same-named file from another directory.
 
 ### Directory-mode retarget and route refusals
 
@@ -168,7 +183,23 @@ When the working directory `mds watch` started in is deleted and recreated at th
 
 ## Dependency Patterns
 
-The CLI uses `mds::compile_with_deps`/`compile_str_with_deps` (never bare `std::fs::read_to_string`). All file reads go through `mds-core`'s resolver, which enforces `MAX_FILE_SIZE` and the symlink guard.
+File-mode build uses `mds::compile_with_deps`; stdin uses `mds::compile_str_with_deps`. Directory build and watch use `build::compile_native_to_content`, which takes a caller-built `NativeFs` and calls `mds::compile_native_fs`.
+
+### Walked entries and source readers
+
+- `collect_mds_files_detailed` returns `WalkResult`: file paths, their no-follow metadata, and the default-exclusion count.
+- `output::walked_pin(walk, file, typed_dir, canonical_dir)` derives the expected canonical key from the same walk. It adds the walked device and inode on Unix. It returns `Result`: a file outside the typed root, or without walk metadata, gives `mds::io` ("missing or invalid walk metadata"), never a panic. Build, check, fmt and lint each fail only that file (per-file failure path, `fail_count`/`FileTally::Error`); the compile-only catch boundaries are unchanged.
+- Directory build and check pass `NativeFs::with_entry_pin(walked_pin(...))` to `compile_native_fs` and `check_native_fs`, respectively.
+- Directory lint reports use `lint_native_fs` with that pin. Core lint applies its rules to the check gate's entry text; it performs no entry re-read.
+- Directory fmt and lint fix/preview paths pass the pin through `lint::read_source_file` to `read_canonical_source`.
+- `read_canonical_source` anchors the display root, resolves the entry, then reads its key through the same `NativeFs`. It returns any anchor error. A resolve refusal (`FileNotFound`, `ImportError`, `Io`) names the **typed** path via `safe_path`, never the canonical absolute path; variants and exit codes are unchanged. It serves fmt and lint JSON output too.
+- A walked entry must match its expected key and, on Unix, its walked device and inode. A different result returns `mds::io`.
+- A save by rename during a directory command can fail that file; the next run can accept it. Windows accepts same-path regular-file replacements.
+- Watch uses `EntryPin::parent_dir`, not the walk's full-key or identity pin, so saves by rename remain valid.
+- `load_vars_file_reporting_duplicates` uses `VarsFile::resolve` and the shared verified capped reader. Regular files receive the opened-file comparison.
+- A vars named pipe must be a FIFO at lookup and open. Its identity is not compared; the 10 MiB cap still applies.
+- Other vars types and type mismatches return the fixed changed-file `mds::io` error. Process substitution remains valid on macOS.
+- Config and output-sidecar reads have their own bounded readers; they do not pass through the module resolver.
 
 ## Error Handling
 
@@ -206,14 +237,18 @@ Exit codes:
 - Status-line and error-message paths go through `output::safe_path`/`safe_file_display`, which apply `mds::display_native_path` (strips a lossless Windows `\\?\` prefix, #409) then `mds::escape_path_for_message` (WIRE plus `\t`). `output::safe_inline` (general single-line-value escaper) stays WIRE-only, no TAB addition.
 - Debounce is a quiet period, not a fixed window (#379, `watch.rs`): the first relevant content event opens a `--debounce` window and every further content event restarts it; bounded by `debounce_cap = max(10 × window, 1s)`, `--debounce` clamped to `MAX_DEBOUNCE_MS = 60_000`, plus `MAX_DEBOUNCE_MESSAGES = 10_000`.
 - Every write funnels through `atomic_write_file` (`output.rs`, #227): temp-file + rename, refusing a symlink at the target. `Durability::Fsync` for source rewrites (`fmt`, `lint --fix`); `Durability::RenameOnly` for reproducible derived artifacts (`build`/`watch`/`init`, #386). `tests/write_funnel.rs` is a lexical guard against a new raw `fs::write`/`File::create` site. An empty directory, or one whose only `.mds` files are partials, is a hard failure (not silent success) for `build`/`check`/`fmt`/`lint` (#204, #387).
-- `mds build`'s single-file path and `mds watch` file mode both hold only the TYPED path as their entry — `file_identity` (inside `admit_output`) canonicalizes it itself when comparing with the output. Directory mode never needs this check: sources are `.mds`, outputs are `.md`/`.json`, so they can never collide.
+- KB-INV-1: rewrite writer contract (`write.rs` `read_stamped`/`replace_if_unchanged`): a rewrite lands in the directory the writer holds, whatever its path leads to by the replace. `tests/anchored_writes.rs` covers `fmt <dir>` and `lint --fix <dir>` with a folder swapped for a symlink between read and replace (debug-assertions pause hook, Unix only): the held file gets the rewrite, the victim keeps its bytes and entries, and a test-side edit must change the victim snapshot (control). The separate "swapped before its read" tests expect a refusal.
+- `tests/panic_hook.rs` `build_entry_points_leave_debug_panics_off` scans the python, napi, wasm (`packages/mds-wasm/package.json`) and release-workflow build inputs, and asserts the wasm input is present so the gate cannot omit it.
+- Walk-handshake waits in `tests/common/mod.rs` (`run_after_walk`) derive their poll bounds from `READY_TIMEOUT` (`WALK_POLL`, `WALK_MAX_POLLS`); `after_walk_wait_covers_the_readiness_timeout` pins that.
+- File-mode build holds the typed entry path; watch holds both typed and canonical forms in `WatchedPath`. `file_identity` canonicalizes the entry for output comparison. Directory sources use `.mds`; compiled outputs use `.md` or `.json`.
 
 ## Key Files
 
 - `crates/mds-cli/src/main.rs` — clap argument parsing; `run_check`/`run_check_directory`/`run_init` defined here; dispatches to `build::run_build` and `watch::run_watch`; `mod input`, `mod output`
 - `crates/mds-cli/src/input.rs` — `resolve_directory_argument` (#413), the one directory-argument resolver for `build`/`check`/`fmt`/`lint`/`watch`
 - `crates/mds-cli/src/build.rs` — `OutputKind`, `compile_to_content`, `run_build`, `run_build_directory`, `load_config`, `ensure_existing_mds_file` (fmt/lint only), `read_stdin`/`read_stdin_from` (bounded, source-only), `EntryPaths`/`file_identity`/`resolve_dir_as_created`/`refuse_output_over_entry`/`admit_output` (#425), `has_sidecar_head`/`verify_then_delete_map` (bounded stale-sourcemap cleanup), all output-path helpers for single-file mode
-- `crates/mds-cli/src/output.rs` — `OutputBase`, `resolve_output_base`, `output_path_for`, `collect_mds_files`, `is_partial`, `probe_and_remove_stale`, `canonicalize_out_dir`, `output_base_no_ext`, `reject_forbidden_output_path`/`reject_forbidden_resolved_output_path` (thin wrappers over `mds::reject_forbidden_path`), `resolve_existing_prefix`, `safe_path`/`safe_file_display`/`safe_inline`, `atomic_write_file`
+- `crates/mds-cli/src/output.rs` — `OutputBase`, `resolve_output_base`, `output_path_for`, `collect_mds_files`, `is_partial`, `probe_and_remove_stale`, `canonicalize_out_dir`, `output_base_no_ext`, `reject_forbidden_output_path`/`reject_forbidden_resolved_output_path` (thin wrappers over `mds::reject_forbidden_path`), `resolve_existing_prefix`, `safe_path`/`safe_file_display`/`safe_inline`, `atomic_write_file`, `WalkResult`, `walked_pin`
+- `crates/mds-cli/src/lint.rs` — `read_source_file`, `read_canonical_source`, pinned report and fix/preview paths
 - `crates/mds-cli/src/watch.rs` — `WatchedPath`/`Watched` (typed-vs-canonical duality), `WorkingDir`, `compile_and_write`/`CompileWriteOutcome`, `FileCompileCtx`, `DirWatchState` (`forget`/`forget_graph`), `compile_one_source`, `dir_watch_startup`, `rebuild_dir_batch`/`process_dir_batch_incremental`
 - `crates/mds-cli/tests/forbidden_paths.rs` — #265 walker matrix (build/check/fmt/lint/watch), single-file-argument refusals, output-location (typed and resolved) and `mds init` refusals
 - `crates/mds-cli/tests/dir_build.rs` — directory-mode integration tests

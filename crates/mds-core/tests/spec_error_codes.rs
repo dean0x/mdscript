@@ -6,18 +6,15 @@
 //! next to it. This test converts "is every code documented?" into a machine-checked
 //! invariant: every `code(mds::<name>)` attribute in `crates/mds-core/src/error.rs` must
 //! appear as a backticked `` `mds::<name>` `` cell inside the spec's "### Error Codes"
-//! section, and so must the four binding-only codes that `mds-core` never raises itself
-//! (napi, WASM and Python synthesise them at their own boundary).
+//! section. The same section must list the codes that only the bindings return.
 //!
 //! Both files are read `CARGO_MANIFEST_DIR`-relative, the same pattern used by
 //! `yaml_funnel.rs` and `assert_promotions.rs`.
 
 use std::path::Path;
 
-/// The four codes synthesised by the napi/WASM/Python bindings that have no
-/// `code(mds::…)` attribute in `error.rs` because `mds-core` never raises them itself.
+/// Codes the napi, WASM, or Python bindings return but `mds-core` does not declare.
 const BINDING_ONLY_CODES: &[&str] = &[
-    "mds::internal",
     "mds::invalid_options",
     "mds::filename_collision",
     "mds::invalid_backend_result",
@@ -150,6 +147,20 @@ fn core_codes_are_documented_in_spec() {
         missing.is_empty(),
         "code(mds::…) attributes in error.rs with no matching `mds::<name>` cell in \
          spec.md's \"### Error Codes\" section: {missing:?}"
+    );
+}
+
+#[test]
+fn core_codes_are_not_binding_only() {
+    let core = extract_codes(&read_error_rs());
+    assert!(core.iter().any(|code| code == "mds::internal"));
+    let overlap: Vec<_> = core
+        .iter()
+        .filter(|code| BINDING_ONLY_CODES.contains(&code.as_str()))
+        .collect();
+    assert!(
+        overlap.is_empty(),
+        "core codes listed as binding-only: {overlap:?}"
     );
 }
 

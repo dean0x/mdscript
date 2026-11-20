@@ -70,6 +70,18 @@ function buildModulesMap(entryPath, scan, options) {
   return buildModulesMapWith(entryPath, { scanImportRecords: importRecordsOf(scan), preflightModule }, options);
 }
 
+/** Reach the core graph guard without exceeding the separate 257-entry map guard. */
+function coreModuleCountFixture() {
+  assert.notEqual(wasmEngine, null, 'the current WASM build is required');
+  const modules = Object.fromEntries(Array.from({ length: 257 }, (_, i) => [`m${i}.mds`, 'Leaf\n']));
+  const importsOf = (n) => Array.from({ length: n }, (_, i) => `@import "./m${i}.mds" as m${i}\n`).join('');
+  assert.equal(wasmEngine.compile(`${importsOf(256)}OK\n`, { modules }).output, 'OK\n');
+  const source = `${importsOf(257)}OK\n`;
+  const core = thrownBy(() => wasmEngine.compile(source, { modules }), 'the core graph limit');
+  assert.equal(core.code, 'mds::resource_limit');
+  return { modules, source, core };
+}
+
 // A minimal scanImports implementation using the napi addon.
 function scanImports(source) {
   // The napi addon doesn't expose scanImports directly, so we use
@@ -409,18 +421,43 @@ describe('buildModulesMap', () => {
     assert.ok(Object.keys(result.modules).length >= 3, 'should resolve all modules in shallow chain');
   });
 
-  test('U-SM5: rejects when module count exceeds maxModules', async () => {
-    // The fixtures/imports chain has 3+ modules. Setting maxModules=1 means even
-    // the first import discovered triggers the resource-limit guard, confirming
-    // that path works. The depth guard (MAX_IMPORT_DEPTH=64) is structurally
-    // verified: depth is incremented on every recursive call and compared against
-    // the constant before filesystem access. True depth-limit testing would require
-    // 65 unique real files (too heavyweight for unit tests).
-    const entryPath = path.join(FIXTURES, 'imports', 'entry.mds');
-    await assert.rejects(
-      () => buildModulesMap(entryPath, scanImports, { maxModules: 1 }),
-      /resource limit/,
-    );
+  test('U-SM5: maxModules counts distinct imports, including in-flight modules, but not the entry', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'mds-scanner-count-'));
+    try {
+      const entry = path.join(root, 'entry.mds');
+      await writeFile(path.join(root, '.mdsroot'), '');
+      await writeFile(entry, 'OK\n');
+      const alone = await buildModulesMap(entry, scanImports, { maxModules: 0 })
+        .then(({ modules }) => Object.keys(modules), errorShape);
+      assert.deepEqual(alone, ['entry.mds']);
+
+      await writeFile(path.join(root, 'child.mds'), 'Child\n');
+      await writeFile(path.join(root, 'leaf.mds'), 'Leaf\n');
+      await writeFile(entry, '@import "./child.mds" as a\n@import "./child.mds" as b\nOK\n');
+      const repeated = await buildModulesMap(entry, scanImports, { maxModules: 1 });
+      assert.deepEqual(Object.keys(repeated.modules).sort(), ['child.mds', 'entry.mds']);
+
+      await writeFile(path.join(root, 'child.mds'), '@import "./leaf.mds" as leaf\nChild\n');
+      const err = await rejectionOf(buildModulesMap(entry, scanImports, { maxModules: 1 }), 'in-flight modules');
+      assert.equal(err.code, 'mds::resource_limit');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('the scanner module-count message equals the core message from the WASM build', async () => {
+    const { modules, source, core } = coreModuleCountFixture();
+    const root = await mkdtemp(path.join(os.tmpdir(), 'mds-scanner-message-'));
+    try {
+      await writeFile(path.join(root, '.mdsroot'), '');
+      for (const [name, text] of Object.entries(modules)) await writeFile(path.join(root, name), text);
+      const entry = path.join(root, 'entry.mds');
+      await writeFile(entry, source);
+      const scanner = await rejectionOf(buildModulesMap(entry, scanImports), 'the scanner graph limit');
+      assert.deepEqual(errorShape(scanner), errorShape(core));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test('U-SM6: rejects when aggregate size exceeds maxAggregateSize', async () => {
@@ -1336,7 +1373,7 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
         }],
         ['import: one module too many', await write('count-258.mds', `${importsOf(257)}\nhi\n`), {
           code: 'mds::resource_limit',
-          message: 'resource limit exceeded: module count exceeds maximum of 256 (256 modules resolved)',
+          message: coreModuleCountFixture().core.message,
           help: null,
           span: null,
         }],
@@ -1414,8 +1451,11 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
     const engines = await loadEngines();
     if (!requireEngines(t, engines, 'U-SM33b')) return;
     await withNestedProject(async (proj) => {
-      // Each module is under the per-file cap; together they are over 10 MiB.
-      const half = 'x'.repeat(6 * 1024 * 1024);
+      // Each module is under the per-file cap; together they are over 10 MiB. Native
+      // admits two imported prose modules of at most about 11.3 MB in total inside its
+      // compile memory budget (about 18.5 budget bytes per source byte), so 2 x 5.2 MiB
+      // (10.9 MB) is about 0.4 MB from each limit.
+      const half = 'x'.repeat(Math.floor(5.2 * 1024 * 1024));
       await writeFile(path.join(proj, 'a.mds'), half);
       await writeFile(path.join(proj, 'b.mds'), half);
       const main = path.join(proj, 'main.mds');
@@ -1429,6 +1469,38 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
         help: null,
         span: null,
       });
+    });
+  });
+
+  test('U-SM33c: a dense module is refused by the import scan, before the compile (#488)', async (t) => {
+    if (!requireEngines(t, { wasm: wasmEngine }, 'U-SM33c')) return;
+    await withNestedProject(async (proj) => {
+      // 2^17 repeats of `\{{a` (512 KiB, under every size cap) are two tokens each, and
+      // their syntax tree estimate is past the compile memory budget. Half as many pass.
+      const dense = path.join(proj, 'dense.mds');
+      const half = path.join(proj, 'half.mds');
+      await writeFile(dense, '\\{{a'.repeat(1 << 17));
+      await writeFile(half, '\\{{a'.repeat(1 << 16));
+      const refusal = {
+        code: 'mds::resource_limit',
+        message: 'resource limit exceeded: compile memory exceeds maximum of 209715200 bytes',
+        help: null,
+        span: null,
+      };
+      const engine = {
+        scanImportRecords: (source, asBase) => wasmEngine.scanImportRecords(source, asBase),
+        preflightModule,
+      };
+
+      // The file walk scans each module with the engine before any compile.
+      assert.deepEqual(errorShape(await rejectionOf(buildModulesMapWith(dense, engine), dense)), refusal);
+      const { modules } = await buildModulesMapWith(half, engine);
+      assert.deepEqual(Object.keys(modules), ['half.mds']);
+
+      // The public API on the WASM backend gives the same refusal.
+      const [refused, passed] = await compileFileOutcomes('wasm', [dense, half]);
+      assert.deepEqual(refused, refusal);
+      assert.equal(typeof passed.output, 'string');
     });
   });
 
@@ -1621,7 +1693,9 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       // Each project crosses the 10 MiB aggregate at its last module, `c`, which native
       // refuses on its own. In `walk-*` the read-ahead budget is spent on `a`, so the
       // walk reads `c` itself; in `race-*` `a` and `c` are read ahead side by side, and
-      // which of them the budget admits depends on which read gets there first.
+      // which of them the budget admits depends on which read gets there first. Each
+      // project holds 10.4 MiB (10.9 MB) of prose: over the 10 MiB guard, and inside
+      // native's compile memory budget, which admits about 11.3 MB of imported prose.
       const rows = [
         // [label, name of c, content of c, native's refusal of c]
         ['invalid UTF-8', 'c.mds', invalidUtf8, 'mds::io'],
@@ -1634,14 +1708,14 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
         const slug = label.replace(/\W+/g, '-');
         const walkDir = path.join(proj, `walk-${slug}`);
         await mkdir(walkDir);
-        await writeFile(path.join(walkDir, 'e.mds'), `@import "./a.mds" as a\nhi\n${text(MiB)}`);
+        await writeFile(path.join(walkDir, 'e.mds'), `@import "./a.mds" as a\nhi\n${text(Math.floor(0.3 * MiB))}`);
         await writeFile(path.join(walkDir, 'a.mds'), `@import "./${name}" as c\nA\n${text(8.5 * MiB)}`);
         await writeFile(path.join(walkDir, name), content(Math.floor(1.6 * MiB)));
         const raceDir = path.join(proj, `race-${slug}`);
         await mkdir(raceDir);
         await writeFile(path.join(raceDir, 'e.mds'), `@import "./a.mds" as a\n@import "./${name}" as c\nhi\n`);
-        await writeFile(path.join(raceDir, 'a.mds'), text(6 * MiB));
-        await writeFile(path.join(raceDir, name), content(6 * MiB));
+        await writeFile(path.join(raceDir, 'a.mds'), text(Math.floor(5.2 * MiB)));
+        await writeFile(path.join(raceDir, name), content(Math.floor(5.2 * MiB)));
         entries.push(path.join(walkDir, 'e.mds'), path.join(raceDir, 'e.mds'));
       }
       const native = await compileFileOutcomes('native', entries);
@@ -1689,10 +1763,14 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
           importError('import path escapes project directory: "../outside.mds" (in frontmatter imports[0])')],
         ['fm-link.mds', frontmatterImports('./ok.mds', './link.mds'),
           importError('symlinks are not allowed in imports: ./link.mds (in frontmatter imports[1])')],
-        // Raised below a frontmatter import with no span: the index of the import that
-        // reached it is added, whatever the module that names the missing file.
-        ['fm-nested.mds', frontmatterImports('./mid.mds'),
-          importError('file not found: "./gone.mds" (in frontmatter imports[0])')],
+        // A re-export already points at its own directive. An outer frontmatter
+        // import keeps that location and does not add its index.
+        ['fm-nested.mds', frontmatterImports('./mid.mds'), {
+          code: 'mds::file_not_found',
+          message: 'file not found: ./gone.mds',
+          help: FILE_NOT_FOUND_HELP,
+          span: firstLineSpan('@export x from "./gone.mds"'),
+        }],
         // Already placed in a frontmatter: nothing more is added.
         ['fm-fm.mds', frontmatterImports('./fmid.mds'),
           importError('file not found: "./nope.mds" (in frontmatter imports[1])')],
@@ -1734,12 +1812,10 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
         ['bom.mds', `${bom}hi\n@import "./missing.mds"\nhi\n`, 'file not found: ./missing.mds', 2],
         ['selective.mds', 'ünï\n@import { a } from "./missing.mds"\nhi\n', 'file not found: ./missing.mds', 2],
         ['extends.mds', '---\nx: é\n---\n@extends "./missing.mds"\n', 'file not found: ./missing.mds', 4],
-        // `@export … from` adds no span.
-        ['export-from.mds', '@export x from "./missing.mds"\nhi\n', 'file not found: ./missing.mds', null],
-        ['wildcard.mds', 'ü\n@export * from "./missing.mds"\nhi\n', 'file not found: ./missing.mds', null],
-        // Raised below an @import with no span: native names the import that reached it
-        // and points at its directive.
-        ['body-nested.mds', 'ü\n@import "./mid.mds" as m\nhi\n', 'file not found: ./mid.mds', 2],
+        ['export-from.mds', '@export x from "./missing.mds"\nhi\n', 'file not found: ./missing.mds', 1],
+        ['wildcard.mds', 'ü\n@export * from "./missing.mds"\nhi\n', 'file not found: ./missing.mds', 2],
+        // An inner re-export keeps its own path and directive through an outer import.
+        ['body-nested.mds', 'ü\n@import "./mid.mds" as m\nhi\n', 'file not found: ./gone.mds', 1],
       ];
       for (const [name, content] of rows) {
         await writeFile(path.join(proj, name), content);
@@ -2130,6 +2206,9 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
     const engine = { scanImportRecords: engines.wasm.scanImportRecords, preflightModule };
     await withNestedProject(async (proj, parent) => {
       await writeFile(path.join(parent, 'outside.mds'), 'OUT\n');
+      await writeFile(path.join(proj, 'c.txt'), '@import "./never.mds"\n');
+      await writeFile(path.join(proj, 'b.mds'), frontmatterImports('./c.txt'));
+      await writeFile(path.join(proj, 'leaf.mds'), 'Leaf\n');
       // [label, entry source, scan options, the refusal's code, its own enumerable fields].
       // The frontmatter rows are rebuilt with the context the resolver adds to them; a
       // missing module there becomes `mds::import`, which has no `help`.
@@ -2139,10 +2218,13 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
         ['a frontmatter import out of the project', frontmatterImports('../outside.mds'), {}, 'mds::import', ['code']],
         ['a missing frontmatter import', frontmatterImports('./gone.mds'), {}, 'mds::import', ['code']],
         ["the importing module's own directory", '@import "./" as o\nhi\n', {}, 'mds::io', ['code']],
-        ['one module too many', 'hi\n', { maxModules: 0 }, 'mds::resource_limit', ['code']],
+        ['one module too many', '@import "./leaf.mds" as leaf\nhi\n', { maxModules: 0 }, 'mds::resource_limit', ['code']],
         // Controls (PF-013): the engine gives `mds::file_not_found` a `help`, and a
         // missing `@import` a `span` too.
         ['a missing import', '@import "./gone.mds" as g\nhi\n', {}, 'mds::file_not_found', ['code', 'help', 'span']],
+        ['a not-MDS import', '@import "./c.txt" as c\nhi\n', {}, 'mds::not_mds', ['code', 'help', 'span']],
+        ['a not-MDS frontmatter import', frontmatterImports('./c.txt'), {}, 'mds::not_mds', ['code', 'help']],
+        ['a nested not-MDS frontmatter import', '@import "./b.mds" as b\nhi\n', {}, 'mds::not_mds', ['code', 'help']],
       ];
       for (const [i, [label, source, options, code, fields]] of rows.entries()) {
         const entry = path.join(proj, `e${i}.mds`);
@@ -2155,6 +2237,12 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       const missing = await rejectionOf(buildModulesMapWith(path.join(proj, 'gone.mds'), engine), 'a missing entry');
       assert.equal(missing.code, 'mds::file_not_found', missing.message);
       assert.deepEqual(Object.keys(missing).sort(), ['code', 'help']);
+      const notMdsEntry = await rejectionOf(buildModulesMapWith(path.join(proj, 'c.txt'), engine), 'a not-MDS entry');
+      assert.equal(notMdsEntry.code, 'mds::not_mds', notMdsEntry.message);
+      assert.deepEqual(Object.keys(notMdsEntry).sort(), ['code', 'help']);
+      const preflight = thrownBy(() => preflightModule(Buffer.from('Text\n'), 'c.txt', './c.txt'), 'a not-MDS preflight');
+      assert.equal(preflight.code, 'mds::not_mds', preflight.message);
+      assert.deepEqual(Object.keys(preflight).sort(), ['code', 'help']);
     });
   });
 

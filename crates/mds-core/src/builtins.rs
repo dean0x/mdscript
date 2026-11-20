@@ -16,6 +16,7 @@
 use std::collections::HashSet;
 
 use crate::error::MdsError;
+use crate::evaluator::budget::{display_len, format_exact, render_prefixed_value, render_value};
 use crate::limits::{MAX_ARRAY_ELEMENTS, MAX_OUTPUT_SIZE};
 use crate::value::Value;
 
@@ -29,6 +30,25 @@ pub(crate) struct BuiltinMeta {
     pub min_args: usize,
     pub max_args: usize,
     pub handler: fn(&[Value]) -> Result<Value, MdsError>,
+    pub bound: Bound,
+}
+
+/// The memory a built-in call can make, which the compile budget charges before
+/// the call (`invoke_builtin` in `evaluator.rs`).
+#[derive(Clone, Copy)]
+pub(crate) enum Bound {
+    /// A result of one fixed-size value.
+    Scalar,
+    /// A string result with a capacity of at most the count. `None` charges
+    /// nothing: the result does not fit or an argument has the wrong type, and
+    /// the handler refuses the call before it allocates.
+    Exact(fn(&[Value]) -> Option<usize>),
+    /// A result built from the first argument. Before the call: twice its bytes
+    /// plus 32 bytes per element (`unique` also counts its keys). After the call:
+    /// the bytes of the result.
+    Input,
+    /// The parts of a split string and the array that holds them.
+    Split,
 }
 
 /// All built-in function definitions.
@@ -47,54 +67,63 @@ static BUILTINS: &[BuiltinMeta] = &[
         min_args: 1,
         max_args: 1,
         handler: builtin_upper,
+        bound: Bound::Exact(upper_result_len),
     },
     BuiltinMeta {
         name: "lower",
         min_args: 1,
         max_args: 1,
         handler: builtin_lower,
+        bound: Bound::Exact(lower_capacity),
     },
     BuiltinMeta {
         name: "trim",
         min_args: 1,
         max_args: 1,
         handler: builtin_trim,
+        bound: Bound::Exact(trim_result_len),
     },
     BuiltinMeta {
         name: "replace",
         min_args: 3,
         max_args: 3,
         handler: builtin_replace,
+        bound: Bound::Exact(replace_output_len),
     },
     BuiltinMeta {
         name: "split",
         min_args: 2,
         max_args: 2,
         handler: builtin_split,
+        bound: Bound::Split,
     },
     BuiltinMeta {
         name: "starts_with",
         min_args: 2,
         max_args: 2,
         handler: builtin_starts_with,
+        bound: Bound::Scalar,
     },
     BuiltinMeta {
         name: "ends_with",
         min_args: 2,
         max_args: 2,
         handler: builtin_ends_with,
+        bound: Bound::Scalar,
     },
     BuiltinMeta {
         name: "slice",
         min_args: 2,
         max_args: 3,
         handler: builtin_slice,
+        bound: Bound::Input,
     },
     BuiltinMeta {
         name: "contains",
         min_args: 2,
         max_args: 2,
         handler: builtin_contains,
+        bound: Bound::Scalar,
     },
     // Array operations
     BuiltinMeta {
@@ -102,42 +131,49 @@ static BUILTINS: &[BuiltinMeta] = &[
         min_args: 2,
         max_args: 2,
         handler: builtin_join,
+        bound: Bound::Exact(join_result_len),
     },
     BuiltinMeta {
         name: "length",
         min_args: 1,
         max_args: 1,
         handler: builtin_length,
+        bound: Bound::Scalar,
     },
     BuiltinMeta {
         name: "first",
         min_args: 1,
         max_args: 1,
         handler: builtin_first,
+        bound: Bound::Input,
     },
     BuiltinMeta {
         name: "last",
         min_args: 1,
         max_args: 1,
         handler: builtin_last,
+        bound: Bound::Input,
     },
     BuiltinMeta {
         name: "reverse",
         min_args: 1,
         max_args: 1,
         handler: builtin_reverse,
+        bound: Bound::Input,
     },
     BuiltinMeta {
         name: "sort",
         min_args: 1,
         max_args: 1,
         handler: builtin_sort,
+        bound: Bound::Input,
     },
     BuiltinMeta {
         name: "unique",
         min_args: 1,
         max_args: 1,
         handler: builtin_unique,
+        bound: Bound::Input,
     },
     // Type conversion
     BuiltinMeta {
@@ -145,12 +181,14 @@ static BUILTINS: &[BuiltinMeta] = &[
         min_args: 1,
         max_args: 1,
         handler: builtin_string,
+        bound: Bound::Exact(string_result_len),
     },
     BuiltinMeta {
         name: "number",
         min_args: 1,
         max_args: 1,
         handler: builtin_number,
+        bound: Bound::Scalar,
     },
 ];
 
@@ -214,17 +252,122 @@ fn require_string_at<'a>(
 
 fn builtin_upper(args: &[Value]) -> Result<Value, MdsError> {
     let s = require_string(args, "upper")?;
-    Ok(Value::String(s.to_uppercase()))
+    let mut out = case_output(upper_result_len(args), "upper")?;
+    if s.is_ascii() {
+        out.push_str(s);
+        out.make_ascii_uppercase();
+    } else {
+        out.extend(s.chars().flat_map(char::to_uppercase));
+    }
+    Ok(Value::String(out))
 }
 
 fn builtin_lower(args: &[Value]) -> Result<Value, MdsError> {
     let s = require_string(args, "lower")?;
-    Ok(Value::String(s.to_lowercase()))
+    let len = case_output_len(lower_result_len(args), "lower")?;
+    let ascii = s.is_ascii();
+    if !ascii && s.contains('Σ') {
+        // A string with capital sigma uses the standard library mapping.
+        // Its capacity can exceed its length.
+        return Ok(Value::String(s.to_lowercase()));
+    }
+
+    let mut out = String::with_capacity(len);
+    if ascii {
+        out.push_str(s);
+        out.make_ascii_lowercase();
+    } else {
+        for c in s.chars() {
+            out.extend(c.to_lowercase());
+        }
+    }
+    Ok(Value::String(out))
+}
+
+fn upper_result_len(args: &[Value]) -> Option<usize> {
+    case_result_len(args, |c| c.to_uppercase().map(char::len_utf8).sum())
+        .filter(|&len| len <= MAX_OUTPUT_SIZE)
+}
+
+fn lower_result_len(args: &[Value]) -> Option<usize> {
+    // Both forms of lowercase sigma use the same two bytes as uppercase sigma.
+    case_result_len(args, |c| c.to_lowercase().map(char::len_utf8).sum())
+}
+
+fn lower_capacity(args: &[Value]) -> Option<usize> {
+    let len = lower_result_len(args).filter(|&len| len <= MAX_OUTPUT_SIZE)?;
+    let Value::String(s) = args.first()? else {
+        return None;
+    };
+    // For sigma, std starts at the input byte length. If that space is too
+    // small, it can grow to about twice the result length. Charge for the
+    // larger capacity in advance, for at most one capped result allocation.
+    if s.contains('Σ') {
+        let input = s.len();
+        return if len <= input {
+            Some(input)
+        } else {
+            input.checked_mul(2).map(|grown| grown.max(len))
+        };
+    }
+    Some(len)
+}
+
+/// Count the bytes of a case mapping. `width` is the byte width of the mapping
+/// of one char. The count stops at the first char past `MAX_OUTPUT_SIZE`.
+#[inline(never)]
+fn case_result_len(args: &[Value], width: fn(char) -> usize) -> Option<usize> {
+    let Value::String(s) = args.first()? else {
+        return None;
+    };
+    if s.is_ascii() {
+        return Some(s.len());
+    }
+    s.chars().try_fold(0usize, |len, c| {
+        len.checked_add(width(c))
+            .filter(|&len| len <= MAX_OUTPUT_SIZE)
+    })
+}
+
+fn case_output(len: Option<usize>, name: &str) -> Result<String, MdsError> {
+    case_output_len(len, name).map(String::with_capacity)
+}
+
+fn case_output_len(len: Option<usize>, name: &str) -> Result<usize, MdsError> {
+    len.filter(|&len| len <= MAX_OUTPUT_SIZE)
+        .ok_or_else(|| builtin_output_too_large(name))
+}
+
+#[cold]
+#[inline(never)]
+fn builtin_output_too_large(name: &str) -> MdsError {
+    MdsError::builtin_error(format!(
+        "{name}() output exceeds maximum size of {MAX_OUTPUT_SIZE} bytes"
+    ))
 }
 
 fn builtin_trim(args: &[Value]) -> Result<Value, MdsError> {
-    let s = require_string(args, "trim")?;
-    Ok(Value::String(s.trim().to_string()))
+    // `to_string` allocates exactly the trimmed length, which the charge counted.
+    Ok(Value::String(
+        require_string(args, "trim")?.trim().to_string(),
+    ))
+}
+
+fn trim_result_len(args: &[Value]) -> Option<usize> {
+    let Value::String(s) = args.first()? else {
+        return None;
+    };
+    Some(s.trim().len())
+}
+
+fn replace_output_len(args: &[Value]) -> Option<usize> {
+    let [Value::String(s), Value::String(from), Value::String(to)] = args else {
+        return None;
+    };
+    if from.is_empty() {
+        return None;
+    }
+    replace_result_len(s, from, to).filter(|&len| len <= MAX_OUTPUT_SIZE)
 }
 
 fn builtin_replace(args: &[Value]) -> Result<Value, MdsError> {
@@ -240,7 +383,7 @@ fn builtin_replace(args: &[Value]) -> Result<Value, MdsError> {
     // replaced by a long string on large input asks for a result far exceeding
     // MAX_OUTPUT_SIZE, so the result's length is computed first and an over-cap result
     // is never built. A fitting result is built at exactly that length.
-    match replace_result_len(s, from, to).filter(|&len| len <= MAX_OUTPUT_SIZE) {
+    match replace_output_len(args) {
         Some(len) => {
             let mut result = String::with_capacity(len);
             replace_pieces(s, from, to, &mut |piece| result.push_str(piece));
@@ -339,22 +482,21 @@ fn builtin_slice(args: &[Value]) -> Result<Value, MdsError> {
         Value::String(s) => {
             // Character-based indexing: indices refer to Unicode scalar values,
             // not bytes. slice("café", 0, 4) == "café" (4 chars), not "caf".
-            let char_count = s.chars().count();
             let start_idx = require_number_index(&args[1], "slice", "second")?;
-            let start_idx = start_idx.min(char_count);
+            let mut offsets = s.char_indices().map(|(offset, _)| offset);
+            let start = offsets.nth(start_idx).unwrap_or(s.len());
+            let mut end = s.len();
             if args.len() == 3 {
                 let end_idx = require_number_index(&args[2], "slice", "third")?;
-                let end_idx = end_idx.clamp(start_idx, char_count);
-                let result: String = s
-                    .chars()
-                    .skip(start_idx)
-                    .take(end_idx - start_idx)
-                    .collect();
-                Ok(Value::String(result))
-            } else {
-                let result: String = s.chars().skip(start_idx).collect();
-                Ok(Value::String(result))
+                end = if end_idx > start_idx {
+                    offsets.nth(end_idx - start_idx - 1).unwrap_or(s.len())
+                } else {
+                    start
+                };
             }
+            let mut result = String::with_capacity(end - start);
+            result.push_str(&s[start..end]);
+            Ok(Value::String(result))
         }
         Value::Array(arr) => {
             let start = require_number_index(&args[1], "slice", "second")?;
@@ -411,39 +553,62 @@ fn builtin_join(args: &[Value]) -> Result<Value, MdsError> {
         other => return Err(type_err("join", "first", "array", other.type_name())),
     };
     let sep = require_string_at(args, 1, "join", "second")?;
-    // Single-pass fold: validate element types and build output string without
-    // an intermediate Vec<String> allocation, halving transient memory use.
-    // Pre-estimate capacity (10 chars/element + separator) capped at the output
-    // limit so we avoid reallocations on typical arrays without over-allocating
-    // for pathological inputs.
-    let estimated = arr.len().saturating_mul(10 + sep.len());
-    let mut out = String::with_capacity(estimated.min(MAX_OUTPUT_SIZE));
+    // On failure, get the first error from the same walk as the size count.
+    let len = join_result_len(args)
+        .map_or_else(|| join_len(arr, sep).map_err(JoinError::diagnostic), Ok)?;
+    let mut out = String::with_capacity(len);
     for (i, v) in arr.iter().enumerate() {
-        match v {
-            Value::String(s) => {
-                if i > 0 {
-                    out.push_str(sep);
-                }
-                out.push_str(s);
-                // Guard against amplification: large arrays with long elements
-                // can produce a value far exceeding MAX_OUTPUT_SIZE before the
-                // evaluator's capped append ever sees it.
-                if out.len() > MAX_OUTPUT_SIZE {
-                    return Err(MdsError::builtin_error(format!(
-                        "join() output exceeds maximum size of {} bytes",
-                        MAX_OUTPUT_SIZE
-                    )));
-                }
-            }
-            other => {
-                return Err(MdsError::builtin_error(format!(
-                    "join() requires an array of strings, but found {} in array",
-                    other.type_name()
-                )));
-            }
+        let Value::String(s) = v else {
+            return Err(JoinError::Element(v.type_name()).diagnostic());
+        };
+        if i > 0 {
+            out.push_str(sep);
         }
+        out.push_str(s);
     }
     Ok(Value::String(out))
+}
+
+// One copy serves the charge and the handler.
+#[inline(never)]
+fn join_result_len(args: &[Value]) -> Option<usize> {
+    let [Value::Array(arr), Value::String(sep)] = args else {
+        return None;
+    };
+    join_len(arr, sep).ok()
+}
+
+enum JoinError {
+    Element(&'static str),
+    Size,
+}
+
+impl JoinError {
+    #[cold]
+    fn diagnostic(self) -> MdsError {
+        match self {
+            Self::Element(kind) => MdsError::builtin_error(format!(
+                "join() requires an array of strings, but found {kind} in array"
+            )),
+            Self::Size => builtin_output_too_large("join"),
+        }
+    }
+}
+
+fn join_len(arr: &[Value], sep: &str) -> Result<usize, JoinError> {
+    let mut len = 0usize;
+    for (i, v) in arr.iter().enumerate() {
+        let Value::String(s) = v else {
+            return Err(JoinError::Element(v.type_name()));
+        };
+        let separator = if i == 0 { 0 } else { sep.len() };
+        len = len
+            .checked_add(separator)
+            .and_then(|n| n.checked_add(s.len()))
+            .filter(|&n| n <= MAX_OUTPUT_SIZE)
+            .ok_or(JoinError::Size)?;
+    }
+    Ok(len)
 }
 
 fn builtin_length(args: &[Value]) -> Result<Value, MdsError> {
@@ -476,7 +641,11 @@ fn builtin_reverse(args: &[Value]) -> Result<Value, MdsError> {
         // grapheme clusters. This means combining diacriticals and multi-codepoint
         // sequences such as flag emoji (e.g. "🇺🇸" = U+1F1FA U+1F1F8) will be
         // reversed incorrectly. This is a documented limitation — see spec §4.5.
-        Value::String(s) => Ok(Value::String(s.chars().rev().collect())),
+        Value::String(s) => {
+            let mut reversed = String::with_capacity(s.len());
+            reversed.extend(s.chars().rev());
+            Ok(Value::String(reversed))
+        }
         Value::Array(a) => {
             let mut reversed = a.clone();
             reversed.reverse();
@@ -577,19 +746,27 @@ fn sort_numbers(arr: &[Value]) -> Result<Value, MdsError> {
 /// element count. The total cost for an array of n nested values is therefore
 /// O(n*m). This is bounded in practice by `MAX_FILE_SIZE` (10 MB), so no
 /// additional guard is needed here.
-fn unique_key(v: &Value) -> String {
-    match v {
-        Value::String(s) => format!("s:{s}"),
-        Value::Number(n) => format!("n:{n}"),
-        Value::Boolean(b) => format!("b:{b}"),
-        Value::Null => "null:".to_string(),
-        // Arrays and objects are stringified with their type prefix. Two
-        // structurally identical nested values will collide only if they
-        // produce the same Display output, which is the correct semantic for
-        // equality-based deduplication of these types.
-        Value::Array(_) => format!("a:{v}"),
-        Value::Object(_) => format!("o:{v}"),
-    }
+fn unique_key(v: &Value) -> Result<String, MdsError> {
+    let prefix = match v {
+        Value::String(_) => "s:",
+        // Match the ordinary f64 display used for numeric keys, which differs
+        // from Value's display at the i64 boundary and for negative zero.
+        Value::Number(n) => return render_number_key(*n),
+        Value::Boolean(_) => "b:",
+        Value::Null => "null:",
+        Value::Array(_) => "a:",
+        Value::Object(_) => "o:",
+    };
+    let len = display_len(v).ok_or_else(MdsError::compile_memory_exceeded)?;
+    render_prefixed_value(v, len, prefix)
+}
+
+fn render_number_key(n: f64) -> Result<String, MdsError> {
+    format_exact(number_key_len(n), format_args!("n:{n}"))
+}
+
+pub(crate) fn number_key_len(n: f64) -> Option<usize> {
+    crate::evaluator::budget::format_len(format_args!("n:{n}"))
 }
 
 fn builtin_unique(args: &[Value]) -> Result<Value, MdsError> {
@@ -600,10 +777,10 @@ fn builtin_unique(args: &[Value]) -> Result<Value, MdsError> {
     // Order-preserving deduplication in O(n) time.
     // Value does not implement Hash, so we use a type-discriminated string key
     // derived from each element's display representation.
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::with_capacity(arr.len());
     let mut result: Vec<Value> = Vec::with_capacity(arr.len());
     for item in arr {
-        if seen.insert(unique_key(item)) {
+        if seen.insert(unique_key(item)?) {
             result.push(item.clone());
         }
     }
@@ -613,7 +790,14 @@ fn builtin_unique(args: &[Value]) -> Result<Value, MdsError> {
 // ── Type conversion ───────────────────────────────────────────────────────────
 
 fn builtin_string(args: &[Value]) -> Result<Value, MdsError> {
-    Ok(Value::String(args[0].to_string()))
+    let len = string_result_len(args).ok_or_else(MdsError::compile_memory_exceeded)?;
+    render_value(&args[0], len).map(Value::String)
+}
+
+// One copy serves the charge and the handler.
+#[inline(never)]
+fn string_result_len(args: &[Value]) -> Option<usize> {
+    display_len(args.first()?)
 }
 
 fn builtin_number(args: &[Value]) -> Result<Value, MdsError> {
@@ -688,9 +872,120 @@ mod tests {
     }
 
     #[test]
+    fn case_mapping_matches_unicode_and_uses_exact_capacity() {
+        for input in [
+            "ASCII",
+            "é漢🙂",
+            "ßﬃİ\u{0390}",
+            "Σ AΣ AΣB AΣ. AΣ.B AΣ\u{0301}B ǅΣ AΣ𐐀 İΣ",
+            "\u{0345}Σ AΣ\u{0345} AΣ\u{0345}B A\u{0301}Σ",
+            "",
+        ] {
+            for (name, expected) in [
+                ("upper", input.to_uppercase()),
+                ("lower", input.to_lowercase()),
+            ] {
+                let Value::String(result) = call_builtin(name, &[s(input)]).unwrap() else {
+                    panic!("{name} must return a string");
+                };
+                assert_eq!(result, expected, "{name}({input:?})");
+                if !input.contains('Σ') {
+                    assert_eq!(result.capacity(), result.len(), "{name}({input:?})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lower_with_sigma_caps_the_result_not_the_input() {
+        let input = "AΣ AΣB";
+        assert_eq!(
+            call_builtin("lower", &[s(input)]).unwrap(),
+            Value::String(input.to_lowercase())
+        );
+
+        let mut input = "İ".repeat(MAX_OUTPUT_SIZE / 3);
+        input.push('Σ');
+        let mut args = [Value::String(input)];
+        let Value::String(result) = call_builtin("lower", &args).unwrap() else {
+            panic!("lower must return a string");
+        };
+        assert_eq!(result.len(), MAX_OUTPUT_SIZE);
+        assert!(result.ends_with("i\u{0307}ς"));
+        drop(result);
+
+        if let Value::String(input) = &mut args[0] {
+            input.push('a');
+        }
+        let error = call_builtin("lower", &args).unwrap_err().serialize();
+        assert_eq!(error.code, "mds::builtin");
+        assert_eq!(
+            error.message,
+            "lower() output exceeds maximum size of 52428800 bytes"
+        );
+    }
+
+    #[test]
+    fn case_mapping_caps_the_result_not_the_input() {
+        for (name, input, mapped) in [
+            ("upper", "\u{0390}", "Ι\u{0308}\u{0301}"),
+            ("lower", "İ", "i\u{0307}"),
+        ] {
+            let repeats = MAX_OUTPUT_SIZE / mapped.len();
+            let mut input = input.repeat(repeats);
+            input.push_str(&"a".repeat(MAX_OUTPUT_SIZE % mapped.len()));
+            let mut args = [Value::String(input)];
+            let Value::String(result) = call_builtin(name, &args).unwrap() else {
+                panic!("{name} must return a string");
+            };
+            assert_eq!(result.len(), MAX_OUTPUT_SIZE);
+            assert!(result.starts_with(mapped));
+            drop(result);
+
+            if let Value::String(input) = &mut args[0] {
+                input.push('a');
+            }
+            let Err(error) = call_builtin(name, &args) else {
+                panic!("{name} must refuse a result over the cap");
+            };
+            let error = error.serialize();
+            assert_eq!(error.code, "mds::builtin");
+            assert_eq!(
+                error.message,
+                format!("{name}() output exceeds maximum size of 52428800 bytes")
+            );
+        }
+    }
+
+    #[test]
+    fn case_mapping_stops_at_the_first_char_over_the_cap() {
+        let mapped_width: usize = 'ΐ'.to_uppercase().map(char::len_utf8).sum();
+        let mut input = "ΐ".repeat(MAX_OUTPUT_SIZE / mapped_width + 1);
+        input.push('!');
+        let len = case_result_len(&[Value::String(input)], |c| {
+            assert_ne!(c, '!', "must not map the suffix past the cap");
+            c.to_uppercase().map(char::len_utf8).sum()
+        });
+        let error = case_output_len(len, "upper").unwrap_err().serialize();
+        assert_eq!(
+            error.message,
+            "upper() output exceeds maximum size of 52428800 bytes"
+        );
+    }
+
+    #[test]
     fn trim_removes_whitespace() {
         let result = call_builtin("trim", &[s("  hello  ")]).unwrap();
         assert_eq!(result, s("hello"));
+    }
+
+    #[test]
+    fn trim_allocates_exactly_the_charged_length() {
+        let args = [s(" \t hello \n ")];
+        let Value::String(result) = call_builtin("trim", &args).unwrap() else {
+            panic!("trim must return a string");
+        };
+        assert_eq!(Some(result.capacity()), trim_result_len(&args));
     }
 
     #[test]
@@ -913,6 +1208,26 @@ mod tests {
     }
 
     #[test]
+    fn slice_string_clamps_the_end_and_empties_a_reversed_range() {
+        for (start, end, expected) in [
+            (1.0, 100.0, "éllo"),
+            (0.0, 5.0, "héllo"),
+            (0.0, 4.0, "héll"),
+            (3.0, 1.0, ""),
+            (2.0, 2.0, ""),
+            (5.0, 9.0, ""),
+            (6.0, 9.0, ""),
+        ] {
+            let args = [s("héllo"), Value::Number(start), Value::Number(end)];
+            let Value::String(result) = call_builtin("slice", &args).unwrap() else {
+                panic!("slice must return a string");
+            };
+            assert_eq!(result, expected, "slice with start {start} and end {end}");
+            assert_eq!(result.capacity(), result.len(), "start {start}, end {end}");
+        }
+    }
+
+    #[test]
     fn slice_infinity_index_rejected() {
         let err = call_builtin("slice", &[s("hello"), Value::Number(f64::INFINITY)]).unwrap_err();
         assert!(
@@ -985,6 +1300,50 @@ mod tests {
         let mixed = Value::Array(vec![s("a"), Value::Number(1.0)]);
         let err = call_builtin("join", &[mixed, s(",")]).unwrap_err();
         assert!(err.to_string().contains("number") || err.to_string().contains("string"));
+    }
+
+    #[test]
+    fn join_checks_the_type_before_the_size_of_each_element() {
+        let at_cap = Value::String("a".repeat(MAX_OUTPUT_SIZE));
+        let Value::String(result) =
+            call_builtin("join", &[Value::Array(vec![at_cap.clone(), s("")]), s("")]).unwrap()
+        else {
+            panic!("join must return a string");
+        };
+        assert_eq!(result.len(), MAX_OUTPUT_SIZE);
+        assert_eq!(result.capacity(), result.len());
+        drop(result);
+
+        let mut items = Value::Array(vec![at_cap, Value::Null, s("b")]);
+        let error = call_builtin("join", &[items.clone(), s(",")])
+            .unwrap_err()
+            .serialize();
+        assert_eq!(error.code, "mds::builtin");
+        assert_eq!(
+            error.message,
+            "join() requires an array of strings, but found null in array"
+        );
+        if let Value::Array(values) = &mut items {
+            values.swap(1, 2);
+        }
+        let error = call_builtin("join", &[items, s(",")])
+            .unwrap_err()
+            .serialize();
+        assert_eq!(error.code, "mds::builtin");
+        assert_eq!(
+            error.message,
+            "join() output exceeds maximum size of 52428800 bytes"
+        );
+    }
+
+    #[test]
+    fn join_uses_exact_capacity_for_a_small_result() {
+        let Value::String(result) = call_builtin("join", &[arr(&["a", "é"]), s("/")]).unwrap()
+        else {
+            panic!("join must return a string");
+        };
+        assert_eq!(result, "a/é");
+        assert_eq!(result.capacity(), result.len());
     }
 
     #[test]
@@ -1065,6 +1424,24 @@ mod tests {
     fn reverse_string() {
         let result = call_builtin("reverse", &[s("abc")]).unwrap();
         assert_eq!(result, s("cba"));
+    }
+
+    #[test]
+    fn reverse_and_slice_strings_use_exact_capacity() {
+        for (name, args, expected) in [
+            ("reverse", vec![s("aé🙂b🙂")], "🙂b🙂éa"),
+            (
+                "slice",
+                vec![s("aé🙂b🙂"), Value::Number(1.0), Value::Number(3.0)],
+                "é🙂",
+            ),
+        ] {
+            let Value::String(result) = call_builtin(name, &args).unwrap() else {
+                panic!("{name} must return a string");
+            };
+            assert_eq!(result, expected);
+            assert_eq!(result.capacity(), result.len());
+        }
     }
 
     #[test]

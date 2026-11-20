@@ -833,9 +833,7 @@ fn rewrite_with_sub_swapped(
     (dir, code, stderr)
 }
 
-/// What a rewrite with `src/sub` swapped for a link must come to: refused by the path the
-/// user knows the link by, nothing written through it, and nothing written into the
-/// directory it replaced either.
+/// A changed source is refused before its rewrite. Both files keep their original bytes.
 ///
 /// Unix-only: so are the tests that call it.
 #[cfg(unix)]
@@ -848,8 +846,10 @@ fn assert_refused_after_the_swap(dir: &Path, code: Option<i32>, stderr: &str, fi
     assert_eq!(code, Some(2), "stderr: {stderr}");
     assert!(
         stderr.contains("mds::io")
-            && squash(stderr).contains(&squash(&refused("src/sub/b.mds", "src/sub"))),
-        "the refusal names the file and the link as typed; stderr: {stderr}"
+            && squash(stderr).contains(&squash(
+                "cannot read b.mds: the file changed while it was opened",
+            )),
+        "the reader refuses the changed source; stderr: {stderr}"
     );
     assert_eq!(
         read(&dir.join("src/sub.moved/b.mds")),
@@ -858,13 +858,13 @@ fn assert_refused_after_the_swap(dir: &Path, code: Option<i32>, stderr: &str, fi
     );
 }
 
-/// `mds fmt <dir>` refuses to rewrite a file below a directory that was swapped for a
+/// `mds fmt <dir>` refuses to read a file below a directory that was swapped for a
 /// symlink after the walk found it. Control: the file before it was rewritten.
 ///
 /// Unix-only: it runs [`rewrite_with_sub_swapped`].
 #[cfg(unix)]
 #[test]
-fn fmt_refuses_a_directory_swapped_for_a_symlink_before_its_rewrite() {
+fn fmt_refuses_a_directory_swapped_for_a_symlink_before_its_read() {
     let files = Rewrite {
         first: "Alpha\r\n",
         first_rewritten: "Alpha\n",
@@ -875,13 +875,13 @@ fn fmt_refuses_a_directory_swapped_for_a_symlink_before_its_rewrite() {
     assert_refused_after_the_swap(dir.path(), code, &stderr, &files);
 }
 
-/// `mds lint --fix <dir>` refuses to rewrite a file below a directory that was swapped for
+/// `mds lint --fix <dir>` refuses to read a file below a directory that was swapped for
 /// a symlink after the walk found it. Control: the file before it was fixed.
 ///
 /// Unix-only: it runs [`rewrite_with_sub_swapped`].
 #[cfg(unix)]
 #[test]
-fn lint_fix_refuses_a_directory_swapped_for_a_symlink_before_its_rewrite() {
+fn lint_fix_refuses_a_directory_swapped_for_a_symlink_before_its_read() {
     let files = Rewrite {
         first: "@if \"x\" == \"y\":\nhidden\n@end\nAlpha\n",
         first_rewritten: "Alpha\n",
@@ -973,6 +973,69 @@ fn rewrite_paused(root: &Path, args: &[&str], meanwhile: impl FnOnce()) -> (Opti
         std::thread::sleep(Duration::from_millis(5));
     };
     (code, tap.finish_text(&mut child))
+}
+
+/// A directory rewrite keeps the directory held before the replace pause. Its no-swap
+/// control rewrites the same source. A test-side edit must change the victim snapshot.
+#[cfg(all(unix, debug_assertions))]
+fn directory_rewrite_uses_its_held_directory(args: &[&str], source: &Source) {
+    const VICTIM: &str = "Victim\r\n";
+    for swapped in [true, false] {
+        let dir = scratch();
+        let root = dir.path();
+        put(root, "src/sub/a.mds", source.written);
+        let victim = put(root, "victim/a.mds", VICTIM);
+        let (code, stderr) = rewrite_paused(root, args, || {
+            if swapped {
+                std::fs::rename(root.join("src/sub"), root.join("src/sub.moved")).unwrap();
+                std::os::unix::fs::symlink("../victim", root.join("src/sub")).unwrap();
+            }
+        });
+        assert_eq!(
+            code,
+            Some(0),
+            "{args:?}, swapped {swapped}; stderr: {stderr}"
+        );
+        let rewritten = if swapped {
+            "src/sub.moved/a.mds"
+        } else {
+            "src/sub/a.mds"
+        };
+        assert_eq!(
+            read(&root.join(rewritten)),
+            source.rewritten,
+            "{args:?}, swapped {swapped}: the held source gets the rewrite"
+        );
+        let victim_state = || (read(&victim), entries(&root.join("victim")));
+        let expected = (VICTIM.to_owned(), vec!["a.mds".to_owned()]);
+        assert_eq!(
+            victim_state(),
+            expected,
+            "{args:?}, swapped {swapped}: the victim keeps its bytes and entries"
+        );
+
+        // The same snapshot detects a test-side change after the product checks pass.
+        std::fs::write(&victim, "Changed by the test\n").unwrap();
+        assert_ne!(
+            victim_state(),
+            expected,
+            "the victim check must detect an edit"
+        );
+    }
+}
+
+/// Unix-only: the fixture uses a Unix symlink. The pause hook needs debug assertions.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn fmt_rewrites_the_held_directory_when_it_is_swapped_for_a_symlink_before_the_replace() {
+    directory_rewrite_uses_its_held_directory(&["fmt", "src"], &UNFORMATTED);
+}
+
+/// Unix-only: the fixture uses a Unix symlink. The pause hook needs debug assertions.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn lint_fix_rewrites_the_held_directory_when_it_is_swapped_for_a_symlink_before_the_replace() {
+    directory_rewrite_uses_its_held_directory(&["lint", "--fix", "src"], &UNFIXED);
 }
 
 /// The refusal of a rewrite whose file changed after it was read, the file as typed:

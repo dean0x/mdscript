@@ -604,6 +604,7 @@ pub(crate) fn parse_cli_value(val: String) -> mds::Value {
 /// - 1: logical/syntax error (undefined variable, arity mismatch, recursion, etc.)
 /// - 2: I/O or file-system error (file not found, not an MDS file, I/O failure)
 /// - 3: resource limit exceeded (output too large, too many iterations)
+/// - 101: internal compiler error
 ///
 /// Errors created via `miette::miette!()` do NOT downcast to `MdsError`
 /// and correctly fall through to exit code 1. Only `MdsError` values converted via
@@ -621,6 +622,7 @@ pub(crate) fn exit_code(err: &miette::Error) -> i32 {
         match mds_err {
             MdsError::Io { .. } | MdsError::FileNotFound { .. } | MdsError::NotMdsFile { .. } => 2,
             MdsError::ResourceLimit { .. } => 3,
+            MdsError::Internal => crate::output::PANIC_EXIT,
             // R4: --set/--set-string collision is a usage error over runtime
             // VARIABLES — the logical/content error class (exit 1).  Explicit
             // arm so the classification is a decision, not an accident of the
@@ -666,9 +668,7 @@ pub(crate) fn ensure_existing_mds_file(path: &Path) -> Result<(), MdsError> {
         });
     }
     if path.extension().and_then(|e| e.to_str()) != Some("mds") {
-        return Err(MdsError::NotMdsFile {
-            path: shown.into_owned(),
-        });
+        return Err(MdsError::not_mds_file(shown.into_owned()));
     }
     Ok(())
 }
@@ -691,11 +691,18 @@ pub(crate) struct RuntimeVarArgs {
 /// Load vars from an optional file path, returning None if no file was given.
 ///
 /// A file that is a symlink is refused through [`vars_file_error`], as `mds watch`
-/// refuses it at startup (#157).
-pub(crate) fn load_optional_vars_file(path: Option<PathBuf>) -> Result<Option<mds::VarsLoad>> {
+/// refuses it at startup (#157). With a `log`, the file's byte count is recorded in it
+/// ([`mds::load_vars_file_logged`]).
+fn load_optional_vars_file(
+    path: Option<PathBuf>,
+    log: Option<&mds::ReadLog>,
+) -> Result<Option<mds::VarsLoad>> {
     path.map(|p| {
-        mds::load_vars_file_reporting_duplicates(&p)
-            .map_err(|e| miette::Error::from(vars_file_error(&p, e)))
+        match log {
+            Some(log) => mds::load_vars_file_logged(&p, log),
+            None => mds::load_vars_file_reporting_duplicates(&p),
+        }
+        .map_err(|e| miette::Error::from(vars_file_error(&p, e)))
     })
     .transpose()
 }
@@ -766,6 +773,23 @@ fn duplicate_keys(pairs: &[(String, String)]) -> Vec<String> {
 /// are allowed; the last value wins, and the caller is responsible for warning via
 /// [`emit_duplicate_var_warnings`].
 pub(crate) fn build_runtime_vars(args: RuntimeVarArgs) -> Result<RuntimeVars> {
+    build_runtime_vars_into(args, None)
+}
+
+/// [`build_runtime_vars`], and record the `--vars` file's byte count in `log`
+/// ([`mds::load_vars_file_logged`]): `mds watch` learns from it whether the load read the
+/// file empty (#380).
+pub(crate) fn build_runtime_vars_logged(
+    args: RuntimeVarArgs,
+    log: &mds::ReadLog,
+) -> Result<RuntimeVars> {
+    build_runtime_vars_into(args, Some(log))
+}
+
+fn build_runtime_vars_into(
+    args: RuntimeVarArgs,
+    log: Option<&mds::ReadLog>,
+) -> Result<RuntimeVars> {
     let RuntimeVarArgs {
         vars,
         set_vars,
@@ -793,9 +817,9 @@ pub(crate) fn build_runtime_vars(args: RuntimeVarArgs) -> Result<RuntimeVars> {
     let duplicate_set_keys = duplicate_keys(&set_vars);
     let duplicate_set_string_keys = duplicate_keys(&set_string_vars);
 
-    // Clone the path BEFORE load_optional_vars_file(vars) moves it (#326).
+    // Clone the path BEFORE load_optional_vars_file(vars, log) moves it (#326).
     let vars_file = vars.clone();
-    let loaded = load_optional_vars_file(vars)?;
+    let loaded = load_optional_vars_file(vars, log)?;
     let (mut runtime_vars, duplicate_vars_file_keys, duplicate_vars_file_keys_omitted) =
         match loaded {
             Some(mds::VarsLoad {
@@ -1148,7 +1172,24 @@ pub(crate) fn compile_to_content(
         // MAX_FILE_SIZE and check_symlink (PF-004 compliance).
         mds::compile_with_deps_opts(input, runtime_vars, opts).map_err(miette::Error::from)?
     };
+    compiled_content(result, quiet)
+}
 
+/// Compile a native entry through the caller's filesystem and entry pin.
+pub(crate) fn compile_native_to_content(
+    fs: mds::NativeFs,
+    input: &Path,
+    runtime_vars: Option<HashMap<String, mds::Value>>,
+    quiet: bool,
+    opts: mds::CompileOptions,
+) -> Result<CompileOutput> {
+    let result =
+        mds::compile_native_fs(fs, input, runtime_vars, opts).map_err(miette::Error::from)?;
+    compiled_content(result, quiet)
+}
+
+/// Emit compile warnings and convert a core result to the CLI output format.
+fn compiled_content(result: mds::CompileResult, quiet: bool) -> Result<CompileOutput> {
     if !quiet {
         for w in &result.warnings {
             crate::output::eprint_warning(w);
@@ -2110,13 +2151,9 @@ fn run_build_directory(
     // is the out-dir as typed (#390).
     let output_base = resolve_output_base(out_dir.as_ref(), &config)?;
 
-    // Canonicalize dir for the starts_with comparison (issue 4): the out-dir's canonical
-    // form (d) is canonical, but `dir` may be a raw relative or pre-resolved-but-not-canonical path.
-    // Mismatch (e.g. /private/tmp vs /tmp on macOS) causes the exclusion to silently fail
-    // and includes the out-dir in the collection — not a security issue (only .mds are
-    // gathered) but causes redundant scanning. Fall back to raw dir when canonicalize fails
-    // (dir may not exist yet in unusual configurations).
-    let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    // Keep the canonical directory for output exclusion and the walk-time entry pins.
+    let canonical_dir =
+        crate::input::resolve_directory_argument(dir).map_err(miette::Error::from)?;
 
     // Exclude the out-dir from collection when it is nested inside the source root.
     let exclude_prefix: Option<PathBuf> = match &output_base {
@@ -2125,7 +2162,7 @@ fn run_build_directory(
     };
 
     let walk = collect_mds_files_detailed(dir, MAX_DEPTH, exclude_prefix.as_deref());
-    let files = walk.files;
+    let files = &walk.files;
 
     if files.is_empty() {
         if walk.excluded_by_default > 0 {
@@ -2159,7 +2196,7 @@ fn run_build_directory(
     // #204 closed for the empty tree. Same shape as the all-excluded arm: count-carrying,
     // emitted even under --quiet, exit 1. fmt and lint operate on partials and keep their
     // behaviour; `mds watch <dir>` still starts.
-    if let Some(partials_only_count) = crate::output::partials_only(&files) {
+    if let Some(partials_only_count) = crate::output::partials_only(files) {
         crate::output::ewriteln!(
             "{partials_only_count} .mds file(s) found in {} but all are _-prefixed partials; \
              nothing was built",
@@ -2177,7 +2214,7 @@ fn run_build_directory(
     // implies N useful artifacts (PF-034-adjacent).
     let mut empty_count: usize = 0;
 
-    for file in &files {
+    for file in files {
         // Skip partials: they contribute to imports but produce no standalone output.
         if is_partial(file) {
             continue;
@@ -2196,9 +2233,20 @@ fn run_build_directory(
 
         // Compile (all reads go through mds-core which enforces MAX_FILE_SIZE — PF-004).
         // A panic in it fails this file alone, and the batch goes on (#389).
+        let pin = match crate::output::walked_pin(&walk, file, dir, &canonical_dir) {
+            Ok(pin) => pin,
+            Err(e) => {
+                crate::output::eprint_file_failure(e.into());
+                fail_count += 1;
+                continue;
+            }
+        };
+        let fs = mds::NativeFs::new().with_entry_pin(pin);
         let compiled = crate::output::catch_compile(
             file,
-            AssertUnwindSafe(|| compile_to_content(file, runtime_vars.clone(), quiet, opts)),
+            AssertUnwindSafe(|| {
+                compile_native_to_content(fs, file, runtime_vars.clone(), quiet, opts)
+            }),
         );
         match compiled {
             Ok(Ok(mut compiled)) => {
@@ -3224,6 +3272,17 @@ mod tests {
             }
             self.served += n as u64;
             Ok(n)
+        }
+    }
+
+    #[test]
+    fn exit_code_maps_internal_failures_to_101() {
+        let error = MdsError::Internal;
+        for report in [
+            miette::Report::new(error.clone()),
+            crate::output::relabel_stdin_error(&error, ""),
+        ] {
+            assert_eq!(exit_code(&report), 101);
         }
     }
 

@@ -1,6 +1,6 @@
 {
   "name": "@mdscript/mds",
-  "version": "0.4.4",
+  "version": "0.5.1",
   "description": "Universal JavaScript/TypeScript bindings for the MDS (Markdown Script) compiler — native addon with WASM fallback",
   "license": "MIT",
   "repository": {
@@ -20,7 +20,7 @@
   ],
   "type": "module",
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.12.0"
   },
   "exports": {
     ".": {
@@ -44,10 +44,10 @@
     "test:perf": "node --test __test__/perf.spec.mjs"
   },
   "dependencies": {
-    "@mdscript/mds-wasm": "^0.4.4"
+    "@mdscript/mds-wasm": "^0.5.1"
   },
   "optionalDependencies": {
-    "@mdscript/mds-napi": "^0.4.4"
+    "@mdscript/mds-napi": "^0.5.1"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",

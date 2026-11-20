@@ -1,6 +1,6 @@
 {
   "name": "@mdscript/mds-wasm",
-  "version": "0.4.4",
+  "version": "0.5.1",
   "description": "WebAssembly build of the MDS (Markdown Script) compiler — used as the portable fallback by @mdscript/mds",
   "license": "MIT",
   "repository": {
@@ -21,7 +21,7 @@
     "webassembly"
   ],
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.12.0"
   },
   "exports": {
     ".": {
@@ -45,6 +45,6 @@
     "README.md"
   ],
   "scripts": {
-    "build": "wasm-pack build ../../crates/mds-wasm --target nodejs --out-dir ../../packages/mds-wasm/dist/node --out-name mds_wasm && wasm-pack build ../../crates/mds-wasm --target web --out-dir ../../packages/mds-wasm/dist/web --out-name mds_wasm && rm -f dist/node/.gitignore dist/web/.gitignore dist/node/LICENSE dist/web/LICENSE"
+    "build": "wasm-pack build ../../crates/mds-wasm --target nodejs --out-dir ../../packages/mds-wasm/dist/node --out-name mds_wasm -- --config profile.release.codegen-units=1 && wasm-pack build ../../crates/mds-wasm --target web --out-dir ../../packages/mds-wasm/dist/web --out-name mds_wasm -- --config profile.release.codegen-units=1 && rm -f dist/node/.gitignore dist/web/.gitignore dist/node/LICENSE dist/web/LICENSE"
   }
 }

@@ -4,7 +4,7 @@
 //! machinery that later phases thread through the evaluator:
 //!
 //! - [`vlq_encode`] — hand-rolled Base64-VLQ encoding (zero external deps,
-//!   protecting the 800 KiB WASM budget).
+//!   to keep the WASM binary small).
 //! - [`LineTable`] — byte-offset → `(line, utf16_col)` resolver with an
 //!   ASCII fast-path.
 //! - [`encode_mappings`] — delta-encodes a sorted list of point mappings
@@ -32,7 +32,9 @@
 //! `@define` function body has no known `Origin`, `MapBuilder`
 //! increments `suppress` for the body's duration; individual body
 //! nodes are not recorded.  Only the `Interpolation` point for the
-//! call site in the parent output is mapped.
+//! call site in the parent output is mapped.  A call in a condition,
+//! an iterable or a call argument also takes this path, because the
+//! evaluator holds the map there: that text is not output.
 //!
 //! **S6** — `@include` fragment splice carrying foreign source
 //! indices.  `splice_fragment` on `MapBuilder` inserts rebased
@@ -162,7 +164,7 @@ impl std::fmt::Debug for Origin {
 ///
 /// Every source a `MapBuilder` registers — its seed, a region or function-body
 /// origin, a spliced fragment's sources — enters through `SourceTable::intern`,
-/// which indexes it under `map_source_label` of its key, and `MapBuilder::finalize`
+/// which indexes it under `map_source_label` of its key, and `PendingMap::finish`
 /// emits that same label, so the diagnostic sentinel `"<source>"` can never appear
 /// in `sources[]`.
 ///
@@ -184,7 +186,7 @@ pub const STRING_SOURCE_MAP_LABEL: &str = "input.mds";
 ///   so `"<source>"` and `"input.mds"` can never coexist as two distinct
 ///   `sources[]` entries even if S8 or spliced-region paths pass the sentinel
 ///   separately — and
-/// - [`MapBuilder::finalize`], to each emitted `sources[]` entry (the stored
+/// - [`PendingMap::finish`], to each emitted `sources[]` entry (the stored
 ///   `Origin` keeps its raw key).
 ///
 /// References `crate::resolver::SOURCE_LABEL` (now `pub(crate)`) so that a change
@@ -751,8 +753,8 @@ pub(crate) struct SourceIndex(u32);
 // MapBuilder — accumulates segments during evaluation
 // ---------------------------------------------------------------------------
 
-/// Accumulates [`RawSegment`] records during evaluator traversal, then
-/// finalizes them into a [`SourceMap`] via [`MapBuilder::finalize`].
+/// Collects [`RawSegment`] records during evaluation. [`Self::finalize_points`]
+/// prepares them for [`PendingMap::finish`].
 ///
 /// # Cursor invariant
 ///
@@ -771,6 +773,11 @@ pub(crate) struct SourceIndex(u32);
 /// `Origin` (S8 path) suppression is skipped and the body is recorded
 /// directly with the current source switched to the definition file.
 ///
+/// `suppress > 0` also while the evaluator holds the map for a region whose text
+/// is not output: a condition, an iterable or a call argument. A call there takes
+/// the S3 path, an `@include` there splices nothing, and the release puts back
+/// `cursor` and the segment count.
+///
 /// # Sources
 ///
 /// The source table and the current source are private: sources are registered
@@ -783,14 +790,15 @@ pub(crate) struct MapBuilder {
     pub(crate) segments: Vec<RawSegment>,
     /// Current absolute byte position in the compiled output.
     pub(crate) cursor: u32,
-    /// Suppression depth: >0 means we are inside a function body (S3 path).
+    /// Suppression depth: >0 inside a function body on the S3 path, or inside a
+    /// held region whose text is not output.
     pub(crate) suppress: u32,
     /// The source currently being recorded.
     current_src: SourceIndex,
     /// The registered sources, each the [`Origin`] that first registered its key.
     ///
     /// `Origin::file` becomes the Source Map v3 `sources[]` entry — it may be absolute;
-    /// the caller relativizes it after [`Self::finalize`] (ADR-005). `Origin::display`
+    /// the caller relativizes it after [`PendingMap::finish`]. `Origin::display`
     /// is the root-relative path for diagnostics (R3 / CWE-209), and `Origin::source`
     /// resolves segment offsets and feeds `sourcesContent`.
     sources: SourceTable,
@@ -808,10 +816,9 @@ pub(crate) struct MapBuilder {
     /// When true, the caller should degrade to `source_map: None` + warning
     /// rather than emitting a partial map.
     pub(crate) segments_dropped: bool,
-    /// When true, [`MapBuilder::finalize`] omits `sourcesContent` from the
-    /// emitted [`SourceMap`] (AC-SEC-04 ceiling degradation).
+    /// When true, [`PendingMap::finish`] omits `sourcesContent` from the map.
     ///
-    /// Set by the caller before calling `finalize` when the total embedded
+    /// The caller sets this flag before [`Self::finalize_points`] if the total
     /// source bytes exceed [`crate::limits::MAX_SOURCES_CONTENT_BYTES`].
     pub(crate) no_sources_content: bool,
 }
@@ -912,11 +919,26 @@ impl MapBuilder {
 
     /// Total byte size of every registered source (the future `sourcesContent`).
     ///
-    /// Called by the resolver before [`finalize`][Self::finalize] to check whether the
-    /// AC-SEC-04 ceiling is exceeded, so the degradation flag is set before
-    /// `finalize` copies any source text.
+    /// The resolver checks the ceiling before [`Self::finalize_points`] so
+    /// [`PendingMap::finish`] can omit the source text when it exceeds the limit.
     pub(crate) fn sources_content_bytes(&self) -> usize {
         self.sources.iter().map(|origin| origin.source.len()).sum()
+    }
+
+    pub(crate) fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub(crate) fn segments_bytes(&self) -> usize {
+        self.segments.capacity() * size_of::<RawSegment>()
+    }
+
+    pub(crate) fn source_labels_bytes(&self, base_bytes: usize) -> Option<usize> {
+        // A relative label can add a "../" for each base component.
+        let extra = base_bytes.checked_mul(3)?.checked_mul(self.sources.len())?;
+        self.sources.iter().try_fold(extra, |total, origin| {
+            total.checked_add(map_source_label(&origin.file).len().max(6))
+        })
     }
 
     /// Push a new segment, capping at [`crate::limits::MAX_SOURCEMAP_SEGMENTS`].
@@ -1003,67 +1025,68 @@ impl MapBuilder {
         }
     }
 
-    /// Finalize into a [`SourceMap`], consuming the builder.
-    ///
-    /// Runs the 5-stage pipeline:
-    /// 1. `expand_per_line` — resolve source-side byte offsets to `(line, col)`.
-    /// 2. `compensate_cr` — subtract `\r` count from output offsets.
-    /// 3. `clamp_trailing_trim` — drop segments in the trailing-trimmed suffix.
-    /// 4. `shift_frontmatter` — shift output offsets by frontmatter prefix length.
-    /// 5. `encode_vlq` — call [`SourceMap::from_points`].
-    ///
-    /// # Parameters
-    ///
-    /// - `body_raw` — pre-`clean_output` raw evaluator output; segment `out`
-    ///   values are byte offsets into this string.
-    /// - `final_body` — fully finalized output (after `clean_output` and
-    ///   `prepend_frontmatter`); passed to `from_points` for output-side line
-    ///   resolution.
-    /// - `fm_prefix_len` — byte length of the frontmatter prefix in
-    ///   `final_body` (`0` when there is no frontmatter).
-    /// - `file` — optional SMv3 `file` field (name of the generated file).
-    pub(crate) fn finalize(
-        self,
-        body_raw: &str,
-        final_body: &str,
-        fm_prefix_len: usize,
-        file: Option<String>,
-    ) -> SourceMap {
-        let body_clean_len = final_body.len().saturating_sub(fm_prefix_len);
-
-        // Destructure to allow independent moves/borrows of each field.
+    /// Resolve source offsets and compensate for CR removal before the body changes.
+    /// `body_raw` is the evaluator output that the raw segment offsets refer to.
+    pub(crate) fn finalize_points(self, body_raw: &str) -> PendingMap {
         let MapBuilder {
             segments,
-            sources: table,
+            sources,
             no_sources_content,
+            remap_cache,
             ..
         } = self;
+        drop(remap_cache);
+        let sources = sources.into_origins();
 
         // Stage 1: resolve source-side byte offsets to (line, col).
-        // The source text is needed here for LineTable resolution even when
-        // AC-SEC-04 degradation drops it from the final artifact.
-        // debug_assert: the segment count must never exceed the cap (AC-PERF-03).
+        // This needs the source text even when the final map omits it.
         debug_assert!(
             segments.len() <= crate::limits::MAX_SOURCEMAP_SEGMENTS,
             "segments.len() {} exceeds cap at finalize; segments_dropped should have been set",
             segments.len(),
         );
-        let contents: Vec<&str> = table.iter().map(|origin| &*origin.source).collect();
+        let contents: Vec<&str> = sources.iter().map(|origin| &*origin.source).collect();
         let points = expand_per_line(segments, &contents);
         // Stage 2: adjust output offsets for \r stripping.
-        let points = compensate_cr(points, body_raw);
-        // Stage 3: drop segments beyond the trailing-trim boundary.
-        let points = clamp_trailing_trim(points, body_clean_len);
+        PendingMap {
+            sources,
+            no_sources_content,
+            points: compensate_cr(points, body_raw),
+        }
+    }
+}
 
-        // The public arrays are built here, once: `sources` always, labelled like the
-        // key index; `sourcesContent` only when the caller keeps it (AC-SEC-04 ceiling
-        // or opt-out) — resolution above already used the text either way.
-        let sources: Vec<String> = table
+/// Map points after CR compensation, before trailing trim and frontmatter shift.
+pub(crate) struct PendingMap {
+    sources: Vec<Origin>,
+    no_sources_content: bool,
+    points: Vec<(u32, u32, u32, u32)>,
+}
+
+impl PendingMap {
+    /// Encode against `final_body`, with the first `fm_prefix_len` bytes of frontmatter.
+    /// `file`, if present, names the generated file in the map.
+    pub(crate) fn finish(
+        self,
+        final_body: &str,
+        fm_prefix_len: usize,
+        file: Option<String>,
+    ) -> SourceMap {
+        let body_clean_len = final_body.len().saturating_sub(fm_prefix_len);
+        // Stage 3: drop segments beyond the trailing-trim boundary.
+        let points = clamp_trailing_trim(self.points, body_clean_len);
+
+        let sources = self
+            .sources
             .iter()
             .map(|origin| map_source_label(&origin.file).to_string())
             .collect();
-        let opt_sources_content = (!no_sources_content)
-            .then(|| contents.iter().map(|text| (*text).to_string()).collect());
+        let opt_sources_content = (!self.no_sources_content).then(|| {
+            self.sources
+                .iter()
+                .map(|origin| origin.source.to_string())
+                .collect()
+        });
 
         // Empty body: return a SourceMap with an empty mappings string.
         if body_clean_len == 0 {
@@ -1277,42 +1300,34 @@ pub(crate) fn expand_per_line<S: AsRef<str>>(
 ///
 /// Input/output format: `(out, src_index, src_line, src_col)` — all 0-based.
 pub(crate) fn compensate_cr(
-    points: Vec<(u32, u32, u32, u32)>,
+    mut points: Vec<(u32, u32, u32, u32)>,
     body_raw: &str,
 ) -> Vec<(u32, u32, u32, u32)> {
+    const BLOCK: usize = 64;
     let raw_bytes = body_raw.as_bytes();
-
-    // Fast path: no CRs anywhere in the body (the common LF-only case, ADR-002).
-    // Avoids both the prefix-sum build and any per-point work.
     if !raw_bytes.contains(&b'\r') {
         return points;
     }
 
-    // Build a prefix-sum table: `cr_prefix[i]` = number of `\r` bytes in
-    // `raw_bytes[..i]`.  Length = `raw_bytes.len() + 1` so the lookup
-    // `cr_prefix[up_to]` is valid for any `out` in `0..=raw_bytes.len()`.
-    //
-    // This is O(M) where M = body length, and reduces the per-point work to
-    // an O(1) index — total cost O(M + N) vs the previous O(M × N).
-    //
-    // NOTE: the lookup is order-independent: each point is adjusted using only
-    // its own `out` value, so unsorted or out-of-order `out` values (produced
-    // by the splice/S8 paths) are handled correctly.
-    let mut cr_prefix: Vec<u32> = Vec::with_capacity(raw_bytes.len() + 1);
-    cr_prefix.push(0);
-    for &b in raw_bytes {
-        let prev = *cr_prefix.last().unwrap();
-        cr_prefix.push(if b == b'\r' { prev + 1 } else { prev });
+    // Store a count at every block start, also at the end if it aligns with a
+    // block boundary. The evaluator's output cap keeps the counts within u32.
+    let mut cr_prefix = Vec::with_capacity(raw_bytes.len() / BLOCK + 1);
+    let count_cr = |bytes: &[u8]| bytes.iter().filter(|&&b| b == b'\r').count() as u32;
+    let mut total = 0;
+    cr_prefix.push(total);
+    for block in raw_bytes.as_chunks::<BLOCK>().0 {
+        total += count_cr(block);
+        cr_prefix.push(total);
     }
 
+    // Read at most 63 more bytes per point. Each lookup is independent, so
+    // out-of-order points need no sort before compensation.
+    for (out, ..) in &mut points {
+        let up_to = (*out as usize).min(raw_bytes.len());
+        let block = up_to / BLOCK;
+        *out -= cr_prefix[block] + count_cr(&raw_bytes[block * BLOCK..up_to]);
+    }
     points
-        .into_iter()
-        .map(|(out, src, src_line, src_col)| {
-            let up_to = (out as usize).min(raw_bytes.len());
-            let cr_count = cr_prefix[up_to];
-            (out - cr_count, src, src_line, src_col)
-        })
-        .collect()
 }
 
 /// Stage 3 — Drop segments that fall in the trailing-trimmed suffix.
@@ -1337,8 +1352,8 @@ pub(crate) fn clamp_trailing_trim(
 
 /// Stage 4 — Shift output offsets by the frontmatter prefix byte length.
 ///
-/// After `prepend_frontmatter`, the body starts at byte `fm_prefix_len` in the
-/// final output string. Adding this offset to each `out` value aligns segment
+/// The body starts at byte `fm_prefix_len` in the final output string.
+/// Add this offset to each `out` value to align segment
 /// positions with the string that [`SourceMap::from_points`] receives.
 ///
 /// Input/output format: `(out, src_index, src_line, src_col)` — all 0-based.
@@ -2081,7 +2096,7 @@ mod tests {
             ],
             "stored origins are kept as registered, never relabelled"
         );
-        let sm = b.finalize("", "", 0, None);
+        let sm = b.finalize_points("").finish("", 0, None);
         assert_eq!(sm.sources, vec!["input.mds", "b.mds", "c.mds"]);
     }
 
@@ -2297,7 +2312,7 @@ mod tests {
             let mut b = MapBuilder::new(origin("<source>", "<source>", "seed"));
             b.source_index(&origin("b.mds", "b.mds", "text b"));
             b.no_sources_content = no_sources_content;
-            let sm = b.finalize("", "", 0, None);
+            let sm = b.finalize_points("").finish("", 0, None);
             assert_eq!(sm.sources, vec!["input.mds", "b.mds"]);
             assert_eq!(sm.sources_content, expected);
         }
@@ -2430,6 +2445,26 @@ mod tests {
         assert_eq!(result[0].0, 0, "\\r at or after point → no adjustment");
     }
 
+    #[test]
+    fn compensate_cr_keeps_point_order_across_blocks() {
+        let body_raw = format!("{}\r\rabc", "a".repeat(63));
+        let points = vec![(67, 0, 0, 0), (63, 0, 0, 1), (64, 0, 0, 2), (65, 0, 0, 3)];
+        assert_eq!(
+            compensate_cr(points, &body_raw),
+            [(65, 0, 0, 0), (63, 0, 0, 1), (63, 0, 0, 2), (63, 0, 0, 3)]
+        );
+    }
+
+    #[test]
+    fn compensate_cr_counts_last_block_at_aligned_end() {
+        let body_raw = format!("{}\r", "a".repeat(127));
+        let points = vec![(128, 0, 0, 0), (129, 0, 0, 1)];
+        assert_eq!(
+            compensate_cr(points, &body_raw),
+            [(127, 0, 0, 0), (128, 0, 0, 1)]
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Stage 3: clamp_trailing_trim
     // -----------------------------------------------------------------------
@@ -2483,7 +2518,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // MapBuilder::finalize (end-to-end integration)
+    // MapBuilder::finalize_points and PendingMap::finish
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2503,7 +2538,7 @@ mod tests {
 
         let body_raw = "Hello World!\n";
         let final_body = "Hello World!\n"; // no frontmatter
-        let sm = b.finalize(body_raw, final_body, 0, None);
+        let sm = b.finalize_points(body_raw).finish(final_body, 0, None);
 
         assert_eq!(sm.version, 3);
         assert_eq!(sm.sources, vec!["t.mds"]);
@@ -2535,7 +2570,7 @@ mod tests {
 
         let body_raw = "  \n  ";
         let final_body = ""; // clean_output → ""
-        let sm = b.finalize(body_raw, final_body, 0, None);
+        let sm = b.finalize_points(body_raw).finish(final_body, 0, None);
 
         assert_eq!(sm.mappings, "", "empty body → empty mappings");
     }
@@ -2554,18 +2589,12 @@ mod tests {
         let body_raw = "Hello\n";
         let final_body = "---\nfm: v\n---\nHello\n"; // 14 byte prefix + 6 body
         let fm_prefix_len = 14;
-        let sm = b.finalize(body_raw, final_body, fm_prefix_len, None);
+        let sm = b
+            .finalize_points(body_raw)
+            .finish(final_body, fm_prefix_len, None);
 
-        assert!(!sm.mappings.is_empty());
-        // The output side point should be on line 3 (0-based), col 0
-        // "---\n" = line 0, "fm: v\n" = line 1, "---\n" = line 2, "Hello\n" = line 3
-        let lines: Vec<&str> = sm.mappings.split(';').collect();
-        // Lines 0, 1, 2 are frontmatter (empty segments), line 3 has the segment
-        assert_eq!(lines.len(), 4, "output has 4 lines (0-indexed: 0..3)");
-        assert!(
-            lines[3].contains('A') || !lines[3].is_empty(),
-            "line 3 has segment"
-        );
+        // Only the fourth line has a segment, at column 0.
+        assert_eq!(sm.mappings, ";;;AAAA");
     }
 
     #[test]
@@ -2581,12 +2610,9 @@ mod tests {
 
         let body_raw = "Hello\r\nWorld\r\n";
         let final_body = "Hello\nWorld\n"; // clean_output result
-        let sm = b.finalize(body_raw, final_body, 0, None);
+        let sm = b.finalize_points(body_raw).finish(final_body, 0, None);
 
-        assert!(!sm.mappings.is_empty());
-        // Should have 2 segments across 2 output lines
-        let parts: Vec<&str> = sm.mappings.split(';').collect();
-        assert_eq!(parts.len(), 2, "two output lines");
+        assert_eq!(sm.mappings, "AAAA;AAAA");
     }
 
     // ── rebase_trim unit tests ──────────────────────────────────────────────

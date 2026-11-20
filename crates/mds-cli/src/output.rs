@@ -98,6 +98,8 @@ impl OutputState {
     /// A file of a run that carries on past it was refused for a resource limit: the
     /// run exits 3 ([`ExitPolicy::Batch`]), as that file alone would (#157).
     const RESOURCE_LIMITED: u8 = 1 << 6;
+    /// A file returned an internal compiler error. A batch exits 101.
+    const INTERNAL_FAILED: u8 = 1 << 7;
 
     pub(crate) const fn new() -> Self {
         Self {
@@ -181,6 +183,14 @@ impl OutputState {
 
     pub(crate) fn resource_limited(&self) -> bool {
         self.has(Self::RESOURCE_LIMITED)
+    }
+
+    fn note_internal_failed(&self) {
+        self.set(Self::INTERNAL_FAILED);
+    }
+
+    fn internal_failed(&self) -> bool {
+        self.has(Self::INTERNAL_FAILED)
     }
 
     /// Ask for a terminal clear before the next byte this process prints (#380): the
@@ -285,10 +295,9 @@ pub(crate) fn eprint_io_failure(e: mds::MdsError) {
 /// A failure in the I/O and file-system class — exit 2 for the same file given alone:
 /// `mds::io` (a source that cannot be read, a forbidden path character),
 /// `mds::file_not_found`, `mds::not_mds` — is recorded for the exit code, so the run
-/// exits 2 as that file alone would. So is a resource limit, `mds::resource_limit`, exit
-/// 3 for the same file alone: the run exits 3, the worse of the two when both happen
-/// (#157). Any other failure, a template error, leaves the exit code to the caller's
-/// count of failed files (1).
+/// exits 2 as that file alone would. A resource limit lifts the exit code to 3.
+/// An internal compiler error lifts it to 101. A template error leaves the exit code
+/// to the caller's count of failed files (1).
 pub(crate) fn eprint_file_failure(report: miette::Report) {
     note_file_failure(&OUTPUT_STATE, &report);
     eprint_error(report);
@@ -301,6 +310,7 @@ fn note_file_failure(state: &OutputState, report: &miette::Report) {
     match crate::build::exit_code(report) {
         IO_FAILURE_EXIT => state.note_io_failure(),
         RESOURCE_LIMIT_EXIT => state.note_resource_limited(),
+        PANIC_EXIT => state.note_internal_failed(),
         _ => {}
     }
 }
@@ -458,8 +468,8 @@ fn write_stdout_to<W: std::io::Write + ?Sized>(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExitPolicy {
     /// A run that ends on its own — build, check, fmt, lint, init, and a watch session
-    /// that never went live: an output failure lifts the exit code to at least 2, and a
-    /// file refused for a resource limit to at least 3.
+    /// that never went live. An output failure lifts the exit code to at least 2.
+    /// A resource limit lifts it to at least 3. An internal compiler error sets it to 101.
     Batch,
     /// A watch session after it went live ([`note_watch_session_live`]): its per-rebuild
     /// failures were reported as they happened, and they do not change the exit code.
@@ -477,16 +487,16 @@ const RESOURCE_LIMIT_EXIT: i32 = 3;
 ///
 /// A panic comes first: a run that panicked exits 101 ([`PANIC_EXIT`]) under either
 /// policy, whatever its verdict (#389). Otherwise a closed stdout or stderr pipe never
-/// changes the code. Under [`ExitPolicy::Batch`], any other output failure lifts it to
-/// `max(verdict, 2)`, and a file refused for a resource limit to `max(verdict, 3)`, so
-/// the run exits with the worst class of its files (#157). [`ExitPolicy::WatchSession`]
-/// returns `verdict` unchanged.
+/// changes the code. A batch exits 101 after an internal compiler error in any file.
+/// Otherwise, an output failure lifts the batch code to at least 2. A resource limit
+/// lifts it to at least 3. [`ExitPolicy::WatchSession`] returns `verdict` unchanged.
 #[must_use]
 pub(crate) fn final_exit_code(verdict: i32, state: &OutputState, policy: ExitPolicy) -> i32 {
     if state.panicked() {
         return PANIC_EXIT;
     }
     match policy {
+        ExitPolicy::Batch if state.internal_failed() => PANIC_EXIT,
         ExitPolicy::Batch => {
             let after_io = if state.io_failed() {
                 verdict.max(IO_FAILURE_EXIT)
@@ -1565,6 +1575,8 @@ fn flat_output(source: &Path, ext: &str) -> (PathBuf, bool) {
 pub(crate) struct WalkResult {
     /// Files that were collected and are eligible for processing.
     pub files: Vec<PathBuf>,
+    /// No-follow metadata from the walk for each collected file.
+    metadata: std::collections::HashMap<PathBuf, std::fs::Metadata>,
     /// Count of `.mds` files found inside default-excluded directories.
     pub excluded_by_default: usize,
 }
@@ -1581,21 +1593,75 @@ pub(crate) fn collect_mds_files_detailed(
     max_depth: usize,
     exclude_prefix: Option<&Path>,
 ) -> WalkResult {
-    let mut files = Vec::new();
-    let mut excluded_by_default = 0;
-    collect_mds_files_inner(
-        root,
-        0,
-        max_depth,
-        exclude_prefix,
-        &mut files,
-        &mut excluded_by_default,
-    );
-    WalkResult {
-        files,
-        excluded_by_default,
+    let mut walk = WalkResult {
+        files: Vec::new(),
+        metadata: std::collections::HashMap::new(),
+        excluded_by_default: 0,
+    };
+    collect_mds_files_inner(root, 0, max_depth, exclude_prefix, &mut walk);
+    pause_after_walk();
+    walk
+}
+
+/// Pin a collected file to its walk-time location and no-follow metadata.
+/// The file and typed root must come from the same walk.
+pub(crate) fn walked_pin(
+    walk: &WalkResult,
+    file: &Path,
+    typed_dir: &Path,
+    canonical_dir: &Path,
+) -> std::result::Result<mds::EntryPin, mds::MdsError> {
+    let invalid = || mds::MdsError::Io {
+        message: format!(
+            "cannot read {}: missing or invalid walk metadata",
+            safe_path(file)
+        ),
+    };
+    let relative = file.strip_prefix(typed_dir).map_err(|_| invalid())?;
+    let metadata = walk.metadata.get(file).ok_or_else(invalid)?;
+    Ok(mds::EntryPin::key(canonical_dir.join(relative)).with_walked(metadata))
+}
+
+#[cfg(debug_assertions)]
+mod walk_pause_trigger {
+    use super::*;
+    use crate::write::{atomic_write_file, Durability, Parents};
+
+    const VARIABLE: &str = "MDS_TEST_PAUSE_AFTER_WALK";
+    const POLL: std::time::Duration = std::time::Duration::from_millis(5);
+    const MAX_POLLS: u32 = 2_000;
+
+    pub(crate) fn pause_after_walk() {
+        let Some(go) = std::env::var_os(VARIABLE).map(PathBuf::from) else {
+            return;
+        };
+        let mut paused = go.clone().into_os_string();
+        paused.push(".paused");
+        // If the marker fails, the test reports that the walk did not pause.
+        if atomic_write_file(
+            &WriteTarget::as_typed(PathBuf::from(paused)),
+            "",
+            Durability::RenameOnly,
+            Parents::Existing,
+        )
+        .is_err()
+        {
+            return;
+        }
+        for _ in 0..MAX_POLLS {
+            if go.exists() {
+                return;
+            }
+            std::thread::sleep(POLL);
+        }
     }
 }
+
+#[cfg(debug_assertions)]
+use walk_pause_trigger::pause_after_walk;
+
+#[cfg(not(debug_assertions))]
+pub(crate) fn pause_after_walk() {}
 
 /// Recursively collect all `.mds` files under `root`, bounded by `max_depth`.
 ///
@@ -1672,13 +1738,22 @@ pub(crate) fn is_within_default_excluded_dir(root: &Path, path: &Path) -> bool {
     false
 }
 
+/// The entries of one directory, sorted by file name: the walk visits a tree in the same
+/// order on every platform. `read_dir` gives no set order (hash or creation order on most
+/// Linux filesystems), and a run that processes files one by one — `mds fmt` of a
+/// directory — shows its results in the order it visits them.
+fn by_name(read_dir: std::fs::ReadDir) -> Vec<std::fs::DirEntry> {
+    let mut entries: Vec<_> = read_dir.flatten().collect();
+    entries.sort_by_cached_key(std::fs::DirEntry::file_name);
+    entries
+}
+
 fn collect_mds_files_inner(
     dir: &Path,
     depth: usize,
     max_depth: usize,
     exclude_prefix: Option<&Path>,
-    results: &mut Vec<PathBuf>,
-    excluded_count: &mut usize,
+    results: &mut WalkResult,
 ) {
     if depth > max_depth {
         // The directory name is discovered by the walk — the user never types it — so it
@@ -1697,7 +1772,7 @@ fn collect_mds_files_inner(
         Ok(rd) => rd,
         Err(_) => return,
     };
-    for entry in read_dir.flatten() {
+    for entry in by_name(read_dir) {
         let path = entry.path();
 
         // Skip the output directory when it is nested inside the root.
@@ -1728,20 +1803,25 @@ fn collect_mds_files_inner(
                 if is_default_excluded_dir(name) {
                     // Count the .mds files we're skipping so callers can emit a
                     // meaningful diagnostic when all candidates are excluded.
-                    count_mds_in_excluded_dir(&path, depth + 1, max_depth, excluded_count);
+                    count_mds_in_excluded_dir(
+                        &path,
+                        depth + 1,
+                        max_depth,
+                        &mut results.excluded_by_default,
+                    );
                     continue;
                 }
             }
-            collect_mds_files_inner(
-                &path,
-                depth + 1,
-                max_depth,
-                exclude_prefix,
-                results,
-                excluded_count,
-            );
+            collect_mds_files_inner(&path, depth + 1, max_depth, exclude_prefix, results);
         } else if file_type.is_file() && path.extension().and_then(|e| e.to_str()) == Some("mds") {
-            results.push(path);
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            results.metadata.insert(path.clone(), metadata);
+            results.files.push(path);
         }
     }
 }
@@ -2869,6 +2949,35 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    #[test]
+    fn walked_pin_reports_missing_metadata_without_a_panic() {
+        let file = Path::new("src").join("a.mds");
+        let walk = WalkResult {
+            files: vec![file.clone()],
+            metadata: std::collections::HashMap::new(),
+            excluded_by_default: 0,
+        };
+        let error = walked_pin(&walk, &file, Path::new("src"), Path::new("canonical")).unwrap_err();
+        assert!(matches!(error, mds::MdsError::Io { .. }));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "cannot read {}: missing or invalid walk metadata",
+                safe_path(&file)
+            )
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("a.mds");
+        std::fs::write(&source, "Hello\n").unwrap();
+        let mut complete = walk;
+        complete
+            .metadata
+            .insert(file.clone(), std::fs::symlink_metadata(source).unwrap());
+        assert!(walked_pin(&complete, &file, Path::new("src"), dir.path()).is_ok());
+        assert!(walked_pin(&complete, &file, Path::new("other"), dir.path()).is_err());
+    }
+
     /// An out-dir written at `/out` and typed as `out`, so every assertion tells the two
     /// forms apart.
     fn out_base() -> OutputBase {
@@ -3532,6 +3641,30 @@ mod tests {
         // Non-vacuity: the inverted name IS collected.
         std::fs::write(dir.path().join(".tmp-4242-8.t.mds"), "wrong shape").unwrap();
         assert_eq!(collect_mds_files(dir.path(), 64, None).len(), 2);
+    }
+
+    /// The walk visits each directory's entries by name, on every platform: a file beside a
+    /// directory comes before the directory's files when its name sorts first, and after
+    /// them when it sorts last. `read_dir` order is not sorted on most Linux filesystems,
+    /// and `mds fmt` of a directory rewrites and reports in walk order.
+    #[test]
+    fn collect_mds_files_visits_each_directory_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // Created in reverse name order, so creation order is not name order.
+        for name in ["z.mds", "m/b.mds", "m/a.mds", "a.mds"] {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x\n").unwrap();
+        }
+        let names: Vec<_> = collect_mds_files(dir.path(), 64, None)
+            .iter()
+            .map(|path| path.strip_prefix(dir.path()).unwrap().to_path_buf())
+            .collect();
+        let want: Vec<PathBuf> = ["a.mds", "m/a.mds", "m/b.mds", "z.mds"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(names, want);
     }
 
     #[test]
@@ -5290,6 +5423,17 @@ mod tests {
                 c.policy
             );
         }
+        // An internal error is a file failure, not a panic. Watch keeps its verdict.
+        let report = miette::Report::new(mds::MdsError::Internal);
+        for (verdict, policy, want) in [(1, Batch, 101), (0, WatchSession, 0), (1, WatchSession, 1)]
+        {
+            let state = OutputState::new();
+            state.note_io_failure();
+            state.note_resource_limited();
+            note_file_failure(&state, &report);
+            assert!(!state.panicked());
+            assert_eq!(final_exit_code(verdict, &state, policy), want, "{policy:?}");
+        }
     }
 
     /// A run exits under the batch rule until a watch session goes live, and under the
@@ -5390,9 +5534,7 @@ mod tests {
                 false,
             ),
             (
-                miette::Report::new(MdsError::NotMdsFile {
-                    path: "a.txt".to_owned(),
-                }),
+                miette::Report::new(MdsError::not_mds_file("a.txt")),
                 true,
                 false,
             ),

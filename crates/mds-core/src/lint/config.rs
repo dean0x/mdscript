@@ -143,8 +143,8 @@ pub fn find_unknown_rule_names(rules: &HashMap<String, Severity>) -> Option<Unkn
 #[must_use]
 pub fn format_unknown_rule_names_warning(unknown: &UnknownRuleNames) -> String {
     // Assembled with `push_str` rather than `format!` + `join`, to keep this function's
-    // code small: it is reachable from the WASM binary, which runs against a hard
-    // 850,000-byte guard (AC-224-18). `join` itself is in that binary regardless —
+    // code small: it is reachable from the WASM binary, which runs against the CI
+    // WASM size limit (ci.yml, AC-224-18). `join` itself is in that binary regardless —
     // `format_unknown_keys_error` (options.rs), also WASM-reachable, uses
     // `[&str]::join` and `Vec<String>::join`. The output is byte-identical to the
     // `format!` form.

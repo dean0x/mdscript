@@ -655,3 +655,122 @@ def test_e14_conversion_error_text_is_wire_escaped(
     assert message.startswith(prefix), message
     assert shown in message, f"shown form missing: {message!r}"
     assert chr(0x1B) not in message and chr(0x0A) not in message, repr(message)
+
+
+# Unknown keywords (#421).
+
+
+class _KeywordWithoutStr(str):
+    str_calls: int = 0
+
+    def __str__(self) -> str:
+        self.str_calls += 1
+        raise AssertionError("keyword __str__ must not run")
+
+
+@pytest.mark.parametrize(
+    "fn,args",
+    [
+        (m.compile, ("ok",)),
+        (m.compile_file, ()),
+        (m.compile_virtual, ({"main.mds": "ok"}, "main.mds")),
+        (m.check, ("ok",)),
+        (m.check_file, ()),
+        (m.check_virtual, ({"main.mds": "ok"}, "main.mds")),
+        (m.scan_imports, ("ok",)),
+        (m.lint, ("ok",)),
+        (m.lint_file, ()),
+        (m.lint_virtual, ({"main.mds": "ok"}, "main.mds")),
+    ],
+    ids=lambda value: getattr(value, "__name__", None),
+)
+@pytest.mark.parametrize(
+    "codepoints,shown,subclass",
+    [
+        ((0x6B, 0x1B), "k" + "\\u" + "001B", False),
+        ((0x6B, 0x0A), "k" + "\\u" + "000A", False),
+        ((0x6B, 0x09), "k" + chr(0x09), False),
+        ((0x6B, 0x202E), "k" + "\\u" + "202E", False),
+        # PyO3 0.29.2 replaces each invalid UTF-8 surrogatepass byte with U+FFFD.
+        ((0x6B, 0xD800), "k" + chr(0xFFFD) * 3, False),
+        (
+            (0x6B, 0x1B, 0x0A, 0x202E),
+            "k" + "\\u" + "001B" + "\\u" + "000A" + "\\u" + "202E",
+            True,
+        ),
+        ((0x6B, 0x65, 0x79), "key", False),
+        ((0x6B, 0x27, 0xE9), "k'" + chr(0xE9), False),
+    ],
+    ids=["esc", "lf", "tab", "bidi", "surrogate", "str-subclass", "plain", "quote-unicode"],
+)
+def test_unknown_keyword_is_wire_escaped_on_every_function(
+    fn: Callable[..., object],
+    args: tuple[object, ...],
+    codepoints: tuple[int, ...],
+    shown: str,
+    subclass: bool,
+    tmp_path: pathlib.Path,
+) -> None:
+    key = "".join(chr(codepoint) for codepoint in codepoints)
+    if subclass:
+        key = _KeywordWithoutStr(key)
+    if fn.__name__.endswith("_file"):
+        source = tmp_path / "main.mds"
+        source.write_text("ok", encoding="utf-8")
+        args = (source,)
+    fn(*args)  # Without the unknown keyword, the same call succeeds.
+    with pytest.raises(TypeError) as ei:
+        fn(*args, **{key: True})
+    assert str(ei.value) == f"{fn.__name__}() got an unexpected keyword argument '{shown}'"
+    if isinstance(key, _KeywordWithoutStr):
+        assert key.str_calls == 0
+
+
+def test_first_leftover_keyword_keeps_call_order() -> None:
+    first = chr(0x7A) + chr(0x1B)
+    second = chr(0x61) + chr(0x0A)
+    with pytest.raises(TypeError) as ei:
+        m.compile("ok", vars={}, **{first: 1, second: 2})
+    assert str(ei.value) == "compile() got an unexpected keyword argument 'z" + "\\u" + "001B'"
+
+
+@pytest.mark.parametrize("duplicate", [False, True], ids=["missing", "duplicate"])
+def test_missing_and_duplicate_messages_precede_unknown_keyword(duplicate: bool) -> None:
+    expected = (
+        "compile() got multiple values for argument 'source'"
+        if duplicate
+        else "compile() missing 1 required positional argument: 'source'"
+    )
+    for extra in ({}, {chr(0x6B): True}):
+        with pytest.raises(TypeError) as ei:
+            if duplicate:
+                m.compile("ok", source="again", **extra)  # type: ignore[call-arg]
+            else:
+                m.compile(**extra)  # type: ignore[arg-type]
+        assert str(ei.value) == expected
+
+
+def test_scan_imports_requires_positional_source_with_keyword_source() -> None:
+    key = "".join(chr(codepoint) for codepoint in (0x73, 0x6F, 0x75, 0x72, 0x63, 0x65))
+    with pytest.raises(TypeError) as ei:
+        m.scan_imports(**{key: "ok"})
+    assert str(ei.value) == "scan_imports() missing 1 required positional argument: 'source'"
+
+
+def test_typed_argument_error_precedes_unknown_keyword() -> None:
+    with pytest.raises(TypeError) as original:
+        m.compile(42)  # type: ignore[arg-type]
+    assert str(original.value) == "'int' object is not an instance of 'str'"
+    with pytest.raises(TypeError) as ei:
+        m.compile(42, **{chr(0x6B): True})  # type: ignore[arg-type]
+    assert str(ei.value) == str(original.value)
+
+
+def test_unknown_keyword_precedes_missing_file_error(tmp_path: pathlib.Path) -> None:
+    missing = tmp_path / "missing.mds"
+    with pytest.raises(m.MdsError) as original:
+        m.compile_file(missing)
+    assert original.value.code == "mds::file_not_found"
+    with pytest.raises(TypeError) as ei:
+        m.compile_file(missing, **{chr(0x6B) + chr(0x1B): True})
+    assert str(ei.value) == "compile_file() got an unexpected keyword argument 'k" + "\\u" + "001B'"

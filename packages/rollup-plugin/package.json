@@ -1,6 +1,6 @@
 {
   "name": "@mdscript/rollup-plugin",
-  "version": "0.4.4",
+  "version": "0.5.1",
   "description": "Rollup plugin for importing MDS templates as ES modules",
   "license": "MIT",
   "repository": {
@@ -21,7 +21,7 @@
   ],
   "type": "module",
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.12.0"
   },
   "exports": {
     ".": {
@@ -37,10 +37,10 @@
     "test": "node --test __test__/*.spec.mjs"
   },
   "dependencies": {
-    "@mdscript/bundler-utils": "^0.4.4"
+    "@mdscript/bundler-utils": "^0.5.1"
   },
   "peerDependencies": {
-    "@mdscript/mds": "^0.4.4",
+    "@mdscript/mds": "^0.5.1",
     "rollup": "^3.0.0 || ^4.0.0"
   },
   "devDependencies": {

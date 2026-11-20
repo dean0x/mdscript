@@ -3,7 +3,7 @@ use std::sync::Arc;
 use miette::{Diagnostic, SourceSpan};
 use thiserror::Error;
 
-use crate::limits::MAX_OUTPUT_SIZE;
+use crate::limits::{MAX_COMPILE_MEMORY, MAX_OUTPUT_SIZE};
 use crate::lint::{named_source_for_render, sanitize_control_chars, sanitize_control_chars_wire};
 
 // ── Serializable error types ──────────────────────────────────────────────────
@@ -418,7 +418,13 @@ pub enum MdsError {
         code(mds::not_mds),
         help("use .mds extension or add 'type: mds' to frontmatter")
     )]
-    NotMdsFile { path: String },
+    NotMdsFile {
+        path: String,
+        #[label("imported here")]
+        span: Option<SourceSpan>,
+        #[source_code]
+        src: Option<Arc<miette::NamedSource<String>>>,
+    },
 
     #[error("{message}")]
     #[diagnostic(code(mds::io))]
@@ -562,9 +568,28 @@ pub enum MdsError {
         help("this indicates a bug in `mds fmt` itself; please file an issue")
     )]
     FormatterInvariant { message: String },
+
+    /// The compiler found an inconsistent memory count.
+    #[error("internal compiler error")]
+    #[diagnostic(code(mds::internal))]
+    Internal,
+}
+
+/// The module-count refusal shared by the resolver and binding input guards.
+///
+/// A compile permits the entry plus at most 256 distinct modules, including
+/// modules still being resolved.
+pub fn module_count_exceeded() -> MdsError {
+    MdsError::resource_limit("module count exceeds maximum of 256 modules besides the entry")
 }
 
 impl MdsError {
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn internal() -> Self {
+        Self::Internal
+    }
+
     pub(crate) fn syntax(message: impl Into<String>) -> Self {
         MdsError::Syntax {
             message: message.into(),
@@ -939,6 +964,23 @@ impl MdsError {
         ))
     }
 
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn compile_memory_exceeded() -> Self {
+        Self::resource_limit(format!(
+            "compile memory exceeds maximum of {MAX_COMPILE_MEMORY} bytes"
+        ))
+    }
+
+    /// A frontmatter parse expanded past its `MAX_OUTPUT_SIZE` byte allowance.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn frontmatter_expansion_exceeded() -> Self {
+        Self::resource_limit(format!(
+            "frontmatter YAML expands beyond maximum of {MAX_OUTPUT_SIZE} bytes"
+        ))
+    }
+
     /// Upgrade a spanless `Syntax` error with a span; no-op for other variants or if
     /// the error already carries a span (B2 — spanless syntax-error upgrades at call sites
     /// that hold the directive offset but cannot thread it into the low-level helper).
@@ -996,8 +1038,35 @@ impl MdsError {
         }
     }
 
-    pub(crate) fn not_mds_file(path: impl Into<String>) -> Self {
-        MdsError::NotMdsFile { path: path.into() }
+    /// Construct a spanless [`NotMdsFile`][MdsError::NotMdsFile] error.
+    ///
+    /// `path` is display text escaped with [`crate::escape_path_for_message`].
+    pub fn not_mds_file(path: impl Into<String>) -> Self {
+        MdsError::NotMdsFile {
+            path: path.into(),
+            span: None,
+            src: None,
+        }
+    }
+
+    /// Construct a [`NotMdsFile`][MdsError::NotMdsFile] error at an importing directive.
+    ///
+    /// `path` is the target's display text, escaped with [`crate::escape_path_for_message`].
+    /// `file` is the importer's root-relative label; `offset` and `len` index its `source`.
+    /// The shared span constructor sanitizes the label and source for display.
+    pub fn not_mds_file_at(
+        path: impl Into<String>,
+        file: &str,
+        source: &str,
+        offset: usize,
+        len: usize,
+    ) -> Self {
+        let (span, src) = at(file, source, offset, len);
+        MdsError::NotMdsFile {
+            path: path.into(),
+            span,
+            src,
+        }
     }
 
     /// Construct a `FormatterInvariant` error, signaling that the formatter's
@@ -1058,6 +1127,7 @@ impl MdsError {
             | MdsError::TypeMismatch { span, src, .. }
             | MdsError::CircularImport { span, src, .. }
             | MdsError::FileNotFound { span, src, .. }
+            | MdsError::NotMdsFile { span, src, .. }
             | MdsError::ModuleNotFound { span, src, .. }
             | MdsError::ImportError { span, src, .. }
             | MdsError::NameCollision { span, src, .. }
@@ -1084,8 +1154,7 @@ impl MdsError {
                     }
                 })
             }
-            MdsError::NotMdsFile { .. }
-            | MdsError::Io { .. }
+            MdsError::Io { .. }
             | MdsError::ResourceLimit { .. }
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }
@@ -1093,7 +1162,8 @@ impl MdsError {
             | MdsError::VarConflict { .. }
             | MdsError::ExpectedMarkdown
             | MdsError::ExpectedMessages
-            | MdsError::FormatterInvariant { .. } => None,
+            | MdsError::FormatterInvariant { .. }
+            | MdsError::Internal => None,
         };
 
         SerializedError {
@@ -1169,6 +1239,7 @@ impl MdsError {
             | MdsError::TypeMismatch { src, .. }
             | MdsError::CircularImport { src, .. }
             | MdsError::FileNotFound { src, .. }
+            | MdsError::NotMdsFile { src, .. }
             | MdsError::ModuleNotFound { src, .. }
             | MdsError::ImportError { src, .. }
             | MdsError::NameCollision { src, .. }
@@ -1177,8 +1248,7 @@ impl MdsError {
             | MdsError::BuiltinError { src, .. }
             | MdsError::Extends { src, .. }
             | MdsError::MixedContent { src, .. } => src.as_deref(),
-            MdsError::NotMdsFile { .. }
-            | MdsError::Io { .. }
+            MdsError::Io { .. }
             | MdsError::ResourceLimit { .. }
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }
@@ -1186,7 +1256,8 @@ impl MdsError {
             | MdsError::VarConflict { .. }
             | MdsError::ExpectedMarkdown
             | MdsError::ExpectedMessages
-            | MdsError::FormatterInvariant { .. } => None,
+            | MdsError::FormatterInvariant { .. }
+            | MdsError::Internal => None,
         };
         src.map(|ns| ns.name())
     }

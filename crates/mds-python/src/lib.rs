@@ -31,13 +31,15 @@
 //!
 //! Every failure raises [`MdsError`] (a native, catchable `markdown_script.MdsError`) with a
 //! `.code`. Codes originating in `mds-core` (e.g. `"mds::syntax"`) are defined by
-//! [`mds::MdsError`]. Three codes are **binding-only** — synthesised here:
+//! [`mds::MdsError`]. Three codes are synthesised here. Only `mds::invalid_options`
+//! is **binding-only**: the core crate also returns `mds::internal` and
+//! `mds::resource_limit`.
 //!
-//! | Code                   | Meaning                                        |
-//! |------------------------|------------------------------------------------|
-//! | `mds::internal`        | Unexpected panic caught at the Python boundary  |
-//! | `mds::invalid_options` | Malformed / type-incorrect `vars` or `modules`  |
-//! | `mds::resource_limit`  | Input exceeds an enforced size / count limit    |
+//! | Code                   | Meaning                                                                          |
+//! |------------------------|----------------------------------------------------------------------------------|
+//! | `mds::internal`        | Unexpected panic caught at the Python boundary, or a failed memory-counter check |
+//! | `mds::invalid_options` | Malformed / type-incorrect `vars` or `modules`                                   |
+//! | `mds::resource_limit`  | Input exceeds an enforced size / count limit                                     |
 //!
 //! ## Concurrency
 //!
@@ -49,14 +51,14 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use std::collections::HashMap;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 
 use mds::{json_type_name, parse_json_vars, Value, VarsError};
 use pyo3::create_exception;
-use pyo3::exceptions::PyException;
+use pyo3::exceptions::{PyException, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyType};
+use pyo3::types::{PyDict, PyString, PyType};
 use pythonize::{depythonize, pythonize};
 
 // ── Resource limits ───────────────────────────────────────────────────────────
@@ -68,10 +70,12 @@ use pythonize::{depythonize, pythonize};
 /// included.
 const MAX_SOURCE_SIZE: usize = mds::MAX_FILE_SIZE as usize;
 
-/// Maximum number of entries in a `compile_virtual` / `check_virtual` `modules` map.
+/// Maximum number of entries in a virtual `modules` map.
 ///
-/// Mirrors the WASM binding. 256 modules is well above any realistic template graph.
-const MAX_MODULE_COUNT: usize = 256;
+/// Mirrors the WASM and napi bindings: the entry plus 256 other modules.
+/// This input-size bound counts unused entries too. The core separately bounds
+/// the resolved graph, including modules still being resolved.
+const MAX_MODULE_COUNT: usize = 256 + 1;
 
 /// Maximum aggregate byte size of all module values combined (same ceiling as a
 /// single source input).
@@ -1115,7 +1119,7 @@ enum Outcome<T> {
 /// Run a fallible core closure, trapping panics. Call this **inside**
 /// `Python::detach` so the GIL is released for the duration.
 fn guard<T>(f: impl FnOnce() -> Result<T, mds::MdsError>) -> Outcome<T> {
-    match catch_unwind(AssertUnwindSafe(f)) {
+    match mds::host_panic::catching(AssertUnwindSafe(f)) {
         Ok(Ok(v)) => Outcome::Ok(v),
         Ok(Err(e)) => Outcome::Mds(e),
         Err(payload) => Outcome::Panic(panic_detail(&*payload)),
@@ -1373,6 +1377,22 @@ fn extract_compile_options(
     Ok(opts)
 }
 
+/// Reject the first leftover keyword without invoking a key's Python methods.
+fn reject_unknown_kwargs(fn_name: &str, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
+    let Some((key, _)) = kwargs.and_then(|kwargs| kwargs.iter().next()) else {
+        return Ok(());
+    };
+    let key_text = match key.cast::<PyString>() {
+        Ok(key) => key.to_string_lossy(),
+        // Python call syntax requires string keys. Refuse any other key as well.
+        Err(_) => "?".into(),
+    };
+    let shown = mds::sanitize_control_chars_wire(&key_text);
+    Err(PyTypeError::new_err(format!(
+        "{fn_name}() got an unexpected keyword argument '{shown}'"
+    )))
+}
+
 // ── Public functions ────────────────────────────────────────────────────────────
 
 /// Compile an MDS template source string.
@@ -1384,7 +1404,7 @@ fn extract_compile_options(
 /// Source Map v3 document to the result; `sources_content=True` embeds original source
 /// text in the map (requires `source_map=True`). All are keyword-only.
 #[pyfunction]
-#[pyo3(signature = (source, *, vars=None, base_path=None, source_map=false, sources_content=false))]
+#[pyo3(signature = (source, *, vars=None, base_path=None, source_map=false, sources_content=false, **kwargs))]
 fn compile(
     py: Python<'_>,
     source: String,
@@ -1392,7 +1412,9 @@ fn compile(
     base_path: Option<PathBuf>,
     source_map: bool,
     sources_content: bool,
+    kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<CompileResult> {
+    reject_unknown_kwargs("compile", kwargs)?;
     check_source_size(py, &source)?;
     check_base_path(py, &base_path)?;
     let vars = extract_vars(py, vars.as_ref())?;
@@ -1411,14 +1433,16 @@ fn compile(
 /// `base_path` argument. `vars`, `source_map`, and `sources_content` are keyword-only.
 /// Dependencies are absolute paths.
 #[pyfunction]
-#[pyo3(signature = (path, *, vars=None, source_map=false, sources_content=false))]
+#[pyo3(signature = (path, *, vars=None, source_map=false, sources_content=false, **kwargs))]
 fn compile_file(
     py: Python<'_>,
     path: PathBuf,
     vars: Option<Bound<'_, PyAny>>,
     source_map: bool,
     sources_content: bool,
+    kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<CompileResult> {
+    reject_unknown_kwargs("compile_file", kwargs)?;
     let vars = extract_vars(py, vars.as_ref())?;
     let compile_opts = extract_compile_options(py, source_map, sources_content)?;
     let result = run_catching(py, move || {
@@ -1436,7 +1460,7 @@ fn compile_file(
 /// keyword-only. No source injection occurs — all modules (entry included) are
 /// supplied by the caller.
 #[pyfunction]
-#[pyo3(signature = (modules, entry, *, vars=None, source_map=false, sources_content=false))]
+#[pyo3(signature = (modules, entry, *, vars=None, source_map=false, sources_content=false, **kwargs))]
 fn compile_virtual(
     py: Python<'_>,
     modules: Bound<'_, PyAny>,
@@ -1444,7 +1468,9 @@ fn compile_virtual(
     vars: Option<Bound<'_, PyAny>>,
     source_map: bool,
     sources_content: bool,
+    kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<CompileResult> {
+    reject_unknown_kwargs("compile_virtual", kwargs)?;
     let modules = parse_modules(py, &modules)?;
     let vars = extract_vars(py, vars.as_ref())?;
     let compile_opts = extract_compile_options(py, source_map, sources_content)?;
@@ -1465,7 +1491,7 @@ fn compile_virtual(
 /// `MdsError(code="mds::invalid_options")` immediately (mirrors the WASM and
 /// `packages/mds` `CheckOptions` split, B5/F9).
 #[pyfunction]
-#[pyo3(signature = (source, *, vars=None, base_path=None, source_map=None, sources_content=None))]
+#[pyo3(signature = (source, *, vars=None, base_path=None, source_map=None, sources_content=None, **kwargs))]
 fn check(
     py: Python<'_>,
     source: String,
@@ -1473,7 +1499,9 @@ fn check(
     base_path: Option<PathBuf>,
     source_map: Option<bool>,
     sources_content: Option<bool>,
+    kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<CheckResult> {
+    reject_unknown_kwargs("check", kwargs)?;
     check_source_size(py, &source)?;
     check_base_path(py, &base_path)?;
     if source_map.is_some() || sources_content.is_some() {
@@ -1491,12 +1519,14 @@ fn check(
 
 /// Check (validate) an MDS template file without rendering output.
 #[pyfunction]
-#[pyo3(signature = (path, *, vars=None))]
+#[pyo3(signature = (path, *, vars=None, **kwargs))]
 fn check_file(
     py: Python<'_>,
     path: PathBuf,
     vars: Option<Bound<'_, PyAny>>,
+    kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<CheckResult> {
+    reject_unknown_kwargs("check_file", kwargs)?;
     let vars = extract_vars(py, vars.as_ref())?;
     let ((), warnings) = run_catching(py, move || mds::check_collecting_warnings(&path, vars))?;
     Ok(CheckResult { warnings })
@@ -1504,13 +1534,15 @@ fn check_file(
 
 /// Check (validate) a module from an in-memory virtual filesystem.
 #[pyfunction]
-#[pyo3(signature = (modules, entry, *, vars=None))]
+#[pyo3(signature = (modules, entry, *, vars=None, **kwargs))]
 fn check_virtual(
     py: Python<'_>,
     modules: Bound<'_, PyAny>,
     entry: String,
     vars: Option<Bound<'_, PyAny>>,
+    kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<CheckResult> {
+    reject_unknown_kwargs("check_virtual", kwargs)?;
     let modules = parse_modules(py, &modules)?;
     let vars = extract_vars(py, vars.as_ref())?;
     let ((), warnings) = run_catching(py, move || {
@@ -1524,8 +1556,13 @@ fn check_virtual(
 /// Returns a deduplicated `list[str]` in resolution order (frontmatter and
 /// `@extends` paths first), or `[]` when there are none. `source` is positional-only.
 #[pyfunction]
-#[pyo3(signature = (source, /))]
-fn scan_imports(py: Python<'_>, source: String) -> PyResult<Vec<String>> {
+#[pyo3(signature = (source, /, **kwargs))]
+fn scan_imports(
+    py: Python<'_>,
+    source: String,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Vec<String>> {
+    reject_unknown_kwargs("scan_imports", kwargs)?;
     check_source_size(py, &source)?;
     run_catching(py, move || mds::scan_imports(&source))
 }
@@ -1538,14 +1575,16 @@ fn scan_imports(py: Python<'_>, source: String) -> PyResult<Vec<String>> {
 ///
 /// `vars`, `base_path`, and `rules` are all keyword-only.
 #[pyfunction]
-#[pyo3(signature = (source, *, vars=None, base_path=None, rules=None))]
+#[pyo3(signature = (source, *, vars=None, base_path=None, rules=None, **kwargs))]
 fn lint(
     py: Python<'_>,
     source: String,
     vars: Option<Bound<'_, PyAny>>,
     base_path: Option<PathBuf>,
     rules: Option<Bound<'_, PyAny>>,
+    kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<LintResult> {
+    reject_unknown_kwargs("lint", kwargs)?;
     check_source_size(py, &source)?;
     check_base_path(py, &base_path)?;
     let vars = extract_vars(py, vars.as_ref())?;
@@ -1568,13 +1607,15 @@ fn lint(
 /// The base directory is derived from the file's own directory. `vars` and `rules`
 /// are keyword-only. No `base_path` argument — mirrors [`compile_file`].
 #[pyfunction]
-#[pyo3(signature = (path, *, vars=None, rules=None))]
+#[pyo3(signature = (path, *, vars=None, rules=None, **kwargs))]
 fn lint_file(
     py: Python<'_>,
     path: PathBuf,
     vars: Option<Bound<'_, PyAny>>,
     rules: Option<Bound<'_, PyAny>>,
+    kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<LintResult> {
+    reject_unknown_kwargs("lint_file", kwargs)?;
     let vars = extract_vars(py, vars.as_ref())?;
     let (lint_config, lint_warnings) = extract_rules(py, rules.as_ref())?;
     let result = run_catching(py, move || mds::lint(&path, vars, &lint_config))?;
@@ -1593,14 +1634,16 @@ fn lint_file(
 /// `modules` maps module key → source string; `entry` is the key to lint. `vars` and
 /// `rules` are keyword-only. Mirrors [`compile_virtual`] for the virtual-FS surface.
 #[pyfunction]
-#[pyo3(signature = (modules, entry, *, vars=None, rules=None))]
+#[pyo3(signature = (modules, entry, *, vars=None, rules=None, **kwargs))]
 fn lint_virtual(
     py: Python<'_>,
     modules: Bound<'_, PyAny>,
     entry: String,
     vars: Option<Bound<'_, PyAny>>,
     rules: Option<Bound<'_, PyAny>>,
+    kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<LintResult> {
+    reject_unknown_kwargs("lint_virtual", kwargs)?;
     let modules = parse_modules(py, &modules)?;
     let vars = extract_vars(py, vars.as_ref())?;
     let (lint_config, lint_warnings) = extract_rules(py, rules.as_ref())?;
