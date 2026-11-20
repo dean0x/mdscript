@@ -43,6 +43,7 @@ pub(crate) mod arity;
 pub(crate) mod ast;
 pub(crate) mod builtins;
 pub(crate) mod error;
+pub(crate) mod escape_class;
 pub(crate) mod evaluator;
 pub(crate) mod formatter;
 pub(crate) mod fs;
