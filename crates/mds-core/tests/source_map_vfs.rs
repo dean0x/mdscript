@@ -3158,3 +3158,56 @@ fn builtin_around_a_define_call_maps_to_one_call_site_segment() {
         ]
     );
 }
+
+/// The lib of TP-21. `f` holds an `@if` whose condition is `CONDITION`; `yes` is the
+/// define of the other #486 templates, so the lib text keeps one shape for both runs.
+const DEFINE_IF_LIB: &str =
+    "@define yes():\na,b\n@end\n@define f():\n@if CONDITION:\nTHEN\n@end\nTAIL\n@end\n";
+
+/// TP-21 (#486): a define call in an `@if` inside the body of a mapped `@define` maps as
+/// the same define with a plain variable in the condition. The entry calls `f` in an
+/// interpolation, so the source is already lib.mds and the segments of the body are
+/// already pushed when the condition is held.
+#[test]
+fn define_call_in_the_condition_of_a_mapped_define_body_keeps_the_plain_template_map() {
+    let entry = "@import { f } from \"./lib.mds\"\nA {{f()}} B\n";
+    let lib = |condition: &str| DEFINE_IF_LIB.replace("CONDITION", condition);
+    let (called_text, called) = define_map(&lib(DEFINE_CALL), entry, "");
+    let (plain_text, plain) = define_map(&lib(PLAIN_VAR), entry, "");
+    assert_eq!(
+        DEFINE_CALL.len(),
+        PLAIN_VAR.len(),
+        "the control must have the same length"
+    );
+    assert_eq!(called_text, "A THEN\nTAIL B\n", "output with the call");
+    assert_eq!(
+        plain_text, "A THEN\nTAIL B\n",
+        "output with the plain variable"
+    );
+    // Lib lines: 1 is the body of `yes`, 5 is `THEN` and 7 is `TAIL`; entry line 2 is
+    // `A {{f()}} B`. The body of `yes` is not output, so no point may map to it.
+    let expected = vec![
+        (0, 0, "entry.mds".to_string(), 2, 0),
+        (0, 2, "lib.mds".to_string(), 5, 0),
+        (1, 0, "lib.mds".to_string(), 7, 0),
+        (1, 4, "entry.mds".to_string(), 2, 9),
+    ];
+    assert_eq!(mapped_points(&plain), expected, "the plain-variable map");
+    assert_eq!(mapped_points(&called), expected, "the map with the call");
+    assert_eq!(called.mappings, plain.mappings, "mappings");
+    assert_eq!(called.sources, plain.sources, "sources");
+    assert_eq!(called.sources, vec!["entry.mds", "lib.mds"], "sources");
+
+    // Control: the same call as an interpolation in the body of `f` does map the body
+    // of `yes`, so the held call above would leave a point if its hold were missing.
+    let output_lib = "@define yes():\na,b\n@end\n@define f():\n{{yes()}}\n@end\n";
+    let (control_text, control) = define_map(output_lib, entry, "");
+    assert_eq!(control_text, "A a,b B\n", "output of the control");
+    assert!(
+        mapped_points(&control)
+            .iter()
+            .any(|point| point.2 == "lib.mds" && point.3 == 1),
+        "control: a body call must map the body of yes; got {:?}",
+        mapped_points(&control)
+    );
+}
