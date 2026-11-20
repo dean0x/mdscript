@@ -481,6 +481,41 @@ fn empty_block_fix_inside_an_opted_in_fence_passes_reverify() {
 }
 
 #[test]
+fn fmt_preserves_the_file_key_and_round_trips_indented_directives() {
+    let source = "---\r\nindented-directives: true\r\n---\r\n    @if 1 == 1: \t\r\n  keep  \r\n\t@end \t\r\nAfter\r\n";
+    let formatted = format_str(source).unwrap();
+    assert_eq!(
+        formatted,
+        "---\nindented-directives: true\n---\n    @if 1 == 1:\n  keep  \n\t@end\nAfter\n"
+    );
+    assert_eq!(format_str(&formatted).unwrap(), formatted);
+    let expected = Some("  keep  \nAfter\n".to_owned());
+    assert_eq!(compiled_markdown(source), expected);
+    assert_eq!(compiled_markdown(&formatted), expected);
+}
+
+#[test]
+fn check_lint_and_fmt_report_file_key_yaml_disagreement() {
+    let valid = "---\nindented-directives: true\n---\n  @if 1 == 1:\nkeep\n  @end\n";
+    mds::check_str(valid).unwrap();
+    assert!(mds::lint_str(valid).unwrap().diagnostics.is_empty());
+    assert_eq!(format_str(valid).unwrap(), valid);
+
+    let source = valid.replace("indented-directives:", "\"indented-directives\":");
+    for error in [
+        mds::check_str(&source).unwrap_err(),
+        mds::lint_str(&source).unwrap_err(),
+        format_str(&source).unwrap_err(),
+    ] {
+        let diagnostic = error.serialize();
+        assert_eq!(diagnostic.code, "mds::yaml");
+        assert!(matches!(error, MdsError::YamlError { message }
+            if message == "expected indented-directives: true or indented-directives: false"));
+        assert!(diagnostic.span.is_none());
+    }
+}
+
+#[test]
 fn gate_full_check_runs_when_base_dir_resolves_imports() {
     let dir = tempfile::tempdir().unwrap();
     let lib_path = dir.path().join("lib.mds");

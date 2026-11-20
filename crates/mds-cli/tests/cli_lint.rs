@@ -924,6 +924,50 @@ fn fix_removes_an_empty_in_fence_if_and_preserves_the_other_bytes() {
     );
 }
 
+#[test]
+fn fix_removes_an_indented_empty_if_and_preserves_the_other_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("indented.mds");
+    let frontmatter = "---\r\nindented-directives: true\r\n---\r\n";
+    fs::write(
+        &target,
+        format!("{frontmatter}  @if 1 == 1: \t\r\n\t@end \t\r\n keep\r\n"),
+    )
+    .unwrap();
+    let (json, _) = lint_json(&target, "before fix");
+    let findings = json_diagnostics(&json, "before fix");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0]["rule"], "empty-block");
+
+    let out = lint_path(&target, &["--fix"]);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("Fixed:"), "{stderr}");
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        format!("{frontmatter} keep\r\n").as_bytes()
+    );
+}
+
+#[test]
+fn the_file_key_suppresses_literal_directive_only_outside_plain_fences() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("indented.mds");
+    let prefix = "---\nindented-directives: true\n---\n  @if 1 == 1:\nkeep\n  @end\n```txt\n";
+    let example = "  @if demo:\nexample\n";
+    fs::write(&target, format!("{prefix}{example}  @end\n```\n")).unwrap();
+    let (json, _) = lint_json(&target, "under the file key");
+    let findings = json_diagnostics(&json, "under the file key");
+    assert_eq!(findings.len(), 2, "{findings:?}");
+    for (finding, offset) in findings
+        .into_iter()
+        .zip([prefix.len(), prefix.len() + example.len()])
+    {
+        assert_eq!(finding["rule"], "literal-directive");
+        assert_eq!(finding["span"]["offset"], offset);
+    }
+}
+
 // ── L-CLI-RESOURCE: exit code 3 for ResourceLimit (TEST-4) ──────────────────
 //
 // Verifies that a template causing a ResourceLimit in the RESOLVER causes

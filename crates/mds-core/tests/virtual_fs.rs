@@ -1362,7 +1362,7 @@ fn issue_149_indented_fence_inside_list_item_with_braces() {
     );
 }
 
-fn fence_markdown(source: &str) -> String {
+fn entry_markdown(source: &str) -> String {
     compile_vfs(
         HashMap::from([("main.mds".into(), source.into())]),
         "main.mds",
@@ -1370,7 +1370,7 @@ fn fence_markdown(source: &str) -> String {
     .unwrap()
 }
 
-fn assert_fence_syntax(err: &MdsError, message: &str, offset: usize) -> SerializedSpan {
+fn assert_syntax(err: &MdsError, message: &str, offset: usize) -> SerializedSpan {
     let diagnostic = err.serialize();
     assert_eq!(diagnostic.code, "mds::syntax", "{err}");
     assert_eq!(diagnostic.message, format!("syntax error: {message}"));
@@ -1384,7 +1384,7 @@ fn example_04_keeps_its_literal_fence_byte_for_byte() {
     let source = include_str!("../../../examples/edge-cases/04_escaped_and_code.mds");
     let expected = "```\n@if condition:\nThis is literal text inside a code fence.\n@end\n{this_is_also_literal}\n```\n";
     assert!(source.contains(expected));
-    assert!(fence_markdown(source).contains(expected));
+    assert!(entry_markdown(source).contains(expected));
 }
 
 #[test]
@@ -1412,8 +1412,8 @@ fn opted_in_fence_preserves_its_label_and_kept_indentation_with_lf_or_crlf() {
         );
         let expected =
             format!("- Item\n\n{prefix}\n  first\n  second\n    \tkeep\n{closer}\n\nAfter\n");
-        assert_eq!(fence_markdown(&source), expected);
-        assert_eq!(fence_markdown(&source.replace('\n', "\r\n")), expected);
+        assert_eq!(entry_markdown(&source), expected);
+        assert_eq!(entry_markdown(&source.replace('\n', "\r\n")), expected);
     }
 }
 
@@ -1453,7 +1453,7 @@ fn lint_counts_a_frontmatter_variable_used_only_in_a_fence_condition() {
 fn braces_and_non_keywords_stay_literal_inside_an_opted_in_fence() {
     let literal = "{{missing}} \\{{missing}}\n@for example\n@define example\n@endnote\n@ifdef\n@Endpoint\n@end_2\n@if3\n@else-help\n";
     let source = format!("```+mds\n@if 1 == 1:\n{literal}@end\n```\n");
-    assert_eq!(fence_markdown(&source), format!("```\n{literal}```\n"));
+    assert_eq!(entry_markdown(&source), format!("```\n{literal}```\n"));
 
     let err = mds::compile_str("{{missing}}\n").unwrap_err().serialize();
     assert_eq!(err.code, "mds::undefined_var");
@@ -1470,31 +1470,31 @@ fn interpolation_does_not_re_scan_a_value_with_a_marked_fence() {
         .into_markdown()
         .unwrap();
     assert_eq!(output, value);
-    assert_eq!(fence_markdown(value), "```\n```\n");
+    assert_eq!(entry_markdown(value), "```\n```\n");
 }
 
 #[test]
 fn only_the_outer_fence_loses_its_marker() {
     let source = "````+mds\n```+mds\n@if 1 == 1:\nkeep\n@else:\ndrop\n@end\n```\n````\n";
-    assert_eq!(fence_markdown(source), "````\n```+mds\nkeep\n```\n````\n");
+    assert_eq!(entry_markdown(source), "````\n```+mds\nkeep\n```\n````\n");
 }
 
 #[test]
 fn a_closer_refuses_the_innermost_open_if_even_in_an_arm() {
     let start = "Before\n```+mds\n@if 1 == 1:\n  @if 1 == 0:\nkeep\n";
     let balanced = format!("{start}  @end\n@end\n```\n");
-    assert_eq!(fence_markdown(&balanced), "Before\n```\n```\n");
+    assert_eq!(entry_markdown(&balanced), "Before\n```\n```\n");
 
     for suffix in ["```\n", "```\n@end\n@end\n"] {
         let err = mds::compile_str(&format!("{start}{suffix}")).unwrap_err();
-        assert_fence_syntax(
+        assert_syntax(
             &err,
             "conditional directive must end before the code fence closes",
             start.find("  @if").unwrap(),
         );
     }
     let err = mds::compile_str(start).unwrap_err();
-    assert_fence_syntax(&err, "unclosed code fence", start.find("```").unwrap());
+    assert_syntax(&err, "unclosed code fence", start.find("```").unwrap());
 }
 
 #[test]
@@ -1527,7 +1527,7 @@ fn in_fence_controls_cannot_continue_or_close_any_enclosing_block() {
         for control in ["  @end", "\t@else:", " @elseif 1 == 1:"] {
             let source = format!("{start}{control}\n```\n{tail}");
             let err = mds::compile_str(&source).unwrap_err();
-            assert_fence_syntax(
+            assert_syntax(
                 &err,
                 "conditional directive needs an open if in this code fence",
                 start.len(),
@@ -1542,7 +1542,7 @@ fn a_balanced_outer_if_can_wrap_an_unmarked_or_opted_in_fence() {
     let marked = "```mds +mds\n@if upper(\"yes\") == \"NO\":\ndrop\n@else:\nkeep\n@end\n```\n";
     for (fence, expected) in [(unmarked, unmarked), (marked, "```mds\nkeep\n```\n")] {
         let source = format!("@if 1 == 1:\n{fence}@end\n");
-        assert_eq!(fence_markdown(&source), expected);
+        assert_eq!(entry_markdown(&source), expected);
     }
 }
 
@@ -1563,7 +1563,7 @@ fn stray_control_names_the_imported_partial_and_its_line() {
     );
 
     let err = compile_vfs_err(modules(partial), "main.mds");
-    let span = assert_fence_syntax(
+    let span = assert_syntax(
         &err,
         "conditional directive needs an open if in this code fence",
         partial.find("  @end").unwrap(),
@@ -1580,9 +1580,13 @@ fn stray_control_names_the_imported_partial_and_its_line() {
 
 #[test]
 fn conditional_near_misses_fail_at_their_own_line() {
-    let start = "```+mds\n  @if 1 == 1:\nkeep\n";
-    let valid = format!("{start}  @elseif 1 == 0:\ndrop\n  @else:\ndrop\n  @end\n```\n");
-    assert_eq!(fence_markdown(&valid), "```\nkeep\n```\n");
+    let contexts = [("```+mds\n", "```\n"), (INDENTED_ON, "")];
+    let start = "  @if 1 == 1:\nkeep\n";
+    for (prefix, close) in contexts {
+        let valid =
+            format!("{prefix}{start}  @elseif 1 == 0:\ndrop\n  @else:\ndrop\n  @end\n{close}");
+        assert_eq!(entry_markdown(&valid), format!("{close}keep\n{close}"));
+    }
 
     const VALID_DIRECTIVES: &str = "Valid directives: @if, @elseif, @else:, @end, @for, @define, @import, @export, @include, @message, @block, @extends";
     let unknown = |word| format!("unknown directive: {word}. {VALID_DIRECTIVES}");
@@ -1598,9 +1602,11 @@ fn conditional_near_misses_fail_at_their_own_line() {
         ("@end.", "", unknown("@end.")),
         ("@if(x):", "@end\n@end\n", unknown("@if(x):")),
     ] {
-        let source = format!("{start}  {line}\n{tail}```\n");
-        let err = mds::compile_str(&source).unwrap_err();
-        assert_fence_syntax(&err, &message, start.len());
+        for (prefix, close) in contexts {
+            let source = format!("{prefix}{start}  {line}\n{tail}{close}");
+            let err = mds::compile_str(&source).unwrap_err();
+            assert_syntax(&err, &message, prefix.len() + start.len());
+        }
     }
 }
 
@@ -1609,12 +1615,12 @@ fn invalid_indent_is_refused_after_two_content_lines() {
     let start = "```+mds\nfirst\nsecond\n";
     let source = |indent| format!("{start}{indent} @if 1 == 1:\nkeep\n{indent} @end\n```\n");
     assert_eq!(
-        fence_markdown(&source(' ')),
+        entry_markdown(&source(' ')),
         "```\nfirst\nsecond\nkeep\n```\n"
     );
     for codepoint in [0x00a0, 0x3000, 0xfeff, 0x1b, 0x202e, 0x0d] {
         let err = mds::compile_str(&source(char::from_u32(codepoint).unwrap())).unwrap_err();
-        assert_fence_syntax(
+        assert_syntax(
             &err,
             "invalid indent for a conditional directive",
             start.len(),
@@ -1626,7 +1632,7 @@ fn invalid_indent_is_refused_after_two_content_lines() {
 fn malformed_or_unsupported_openers_fail_at_the_opener_line() {
     let source = |opener: &str| format!("Intro\n{opener}\n@if 1 == 1:\nkeep\n@end\n```\n");
     assert_eq!(
-        fence_markdown(&source("```js +mds")),
+        entry_markdown(&source("```js +mds")),
         "Intro\n```js\nkeep\n```\n"
     );
     for opener in [
@@ -1638,10 +1644,10 @@ fn malformed_or_unsupported_openers_fail_at_the_opener_line() {
         "```+ MdS",
     ] {
         let err = mds::compile_str(&source(opener)).unwrap_err();
-        assert_fence_syntax(&err, "invalid code fence info word", "Intro\n".len());
+        assert_syntax(&err, "invalid code fence info word", "Intro\n".len());
     }
     let err = mds::compile_str(&source("> ```+mds")).unwrap_err();
-    assert_fence_syntax(
+    assert_syntax(
         &err,
         "conditional code fence cannot have a blockquote prefix",
         "Intro\n".len(),
@@ -1649,7 +1655,7 @@ fn malformed_or_unsupported_openers_fail_at_the_opener_line() {
     for codepoint in [0x1b, 0x7f, 0x85, 0x202e, 0x2028, 0xfeff] {
         let opener = format!("```js{} +mds", char::from_u32(codepoint).unwrap());
         let err = mds::compile_str(&source(&opener)).unwrap_err();
-        assert_fence_syntax(
+        assert_syntax(
             &err,
             "conditional code fence info contains a control character",
             "Intro\n".len(),
@@ -1658,7 +1664,7 @@ fn malformed_or_unsupported_openers_fail_at_the_opener_line() {
     let nbsp = char::from_u32(0x00a0).unwrap();
     for opener in [format!("```js{nbsp}+mds"), format!("```+{nbsp}mds")] {
         let err = mds::compile_str(&source(&opener)).unwrap_err();
-        assert_fence_syntax(&err, "invalid code fence info word", "Intro\n".len());
+        assert_syntax(&err, "invalid code fence info word", "Intro\n".len());
     }
 }
 
@@ -1678,7 +1684,7 @@ fn legal_plus_words_and_a_bidi_look_alike_keep_the_fence_literal() {
         &look_alike,
     ] {
         let source = format!("```js {info}\n@if 1 == 0:\nliteral\n@end\n```\n");
-        assert_eq!(fence_markdown(&source), source);
+        assert_eq!(entry_markdown(&source), source);
     }
 }
 
@@ -1702,6 +1708,92 @@ fn compile_variable_reaches_if_in_imported_define() {
             .into_markdown()
             .unwrap();
         assert_eq!(output, expected);
+    }
+}
+
+const INDENTED_ON: &str = "---\nindented-directives: true\n---\n";
+
+#[test]
+fn the_file_key_selects_indented_arms_but_leaves_quotes_and_plain_fences_literal() {
+    let conditional = "    @if 1 == 0:\ndrop\n\t@elseif 1 == 1:\n  keep\n  @else:\ndrop\n \t@end\n";
+    let literal = "> @if 1 == 0:\nquoted\n> @end\n```txt\n  @if 1 == 0:\nfenced\n  @end\n```\n";
+    for (prefix, expected) in [
+        (INDENTED_ON, "  keep\n"),
+        ("---\nindented-directives: false\n---\n", conditional),
+        ("", conditional),
+    ] {
+        assert_eq!(
+            entry_markdown(&format!("{prefix}{conditional}{literal}")),
+            format!("{expected}{literal}")
+        );
+    }
+}
+
+#[test]
+fn indented_ends_follow_mds_blocks_across_list_items() {
+    let source = format!("{INDENTED_ON}- First\n  @if 1 == 1:\n- Second\n@for word in words:\n  {{{{word}}}}\n  @end\n  @end\nAfter\n");
+    let vars = HashMap::from([(
+        "words".into(),
+        Value::Array(vec![Value::String("keep".into())]),
+    )]);
+    let output = mds::compile_str_with(&source, None, Some(vars))
+        .unwrap()
+        .into_markdown()
+        .unwrap();
+    assert_eq!(output, "- First\n- Second\n  keep\nAfter\n");
+}
+
+#[test]
+fn indented_keywords_after_interpolation_evaluate_without_re_scanning_the_value() {
+    let value = "  @if 1 == 0:\nliteral\n  @end";
+    let vars = HashMap::from([("body".into(), Value::String(value.into()))]);
+    let source = format!("{INDENTED_ON}{{{{body}}}}\n  @if 1 == 1:\nkeep\n  @end\n");
+    let output = mds::compile_str_with(&source, None, Some(vars))
+        .unwrap()
+        .into_markdown()
+        .unwrap();
+    assert_eq!(output, format!("{value}\nkeep\n"));
+}
+
+#[test]
+fn non_ascii_indent_errors_after_plain_lines_only_with_the_file_key() {
+    let lead = "first\nsecond\n";
+    assert_eq!(
+        entry_markdown(&format!("{INDENTED_ON}{lead}  @if 1 == 0:\ndrop\n  @end\n")),
+        lead
+    );
+    for codepoint in [0x00a0, 0x3000, 0xfeff] {
+        let indent = char::from_u32(codepoint).unwrap();
+        let literal = format!("{lead}{indent}@if 1 == 0:\nkeep\n{indent}@end\n");
+        assert_eq!(entry_markdown(&literal), literal);
+        let err = mds::compile_str(&format!("{INDENTED_ON}{literal}")).unwrap_err();
+        assert_syntax(
+            &err,
+            "invalid indent for a conditional directive",
+            INDENTED_ON.len() + lead.len(),
+        );
+    }
+}
+
+#[test]
+fn includes_and_imported_defines_use_their_own_file_key() {
+    for helper_on in [true, false] {
+        let entry = format!(
+            "---\nindented-directives: {}\n---\n@import \"./helper.mds\" as h\n  @if 1 == 0:\nentry\n  @end\n@include h\n{{{{h.pick()}}}}\n",
+            !helper_on
+        );
+        let helper = format!("---\nindented-directives: {helper_on}\n---\n@define pick():\nstart\n  @if 1 == 0:\ndefine\n  @end\n@end\n  @if 1 == 0:\ninclude\n  @end\n");
+        let output = compile_vfs(
+            HashMap::from([("main.mds".into(), entry), ("helper.mds".into(), helper)]),
+            "main.mds",
+        )
+        .unwrap();
+        let expected = if helper_on {
+            "  @if 1 == 0:\nentry\n  @end\nstart\n"
+        } else {
+            "  @if 1 == 0:\ninclude\n  @end\nstart\n  @if 1 == 0:\ndefine\n  @end\n"
+        };
+        assert_eq!(output, expected, "helper key: {helper_on}");
     }
 }
 

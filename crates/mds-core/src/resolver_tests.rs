@@ -1289,6 +1289,20 @@ fn check_virtual(files: &[(&str, &str)], entry: &str) -> Result<(), MdsError> {
     crate::check_virtual(map, entry, None)
 }
 
+#[test]
+fn extends_lexes_the_base_and_child_with_their_own_file_keys() {
+    let base_body = "  @if 1 == 0:\nbase text\n  @end\n";
+    let child_body = "  @if 1 == 0:\nchild text\n  @end\n";
+    for base_on in [true, false] {
+        let base = format!("---\ntitle: Base\nindented-directives: {base_on}\n---\n{base_body}@block section:\ndefault\n@end\n");
+        let child = format!("---\nindented-directives: {}\n---\n@extends \"./base.mds\"\n@block section:\n{child_body}@end\n", !base_on);
+        let output =
+            compile_virtual(&[("base.mds", &base), ("child.mds", &child)], "child.mds").unwrap();
+        let literal = if base_on { child_body } else { base_body };
+        assert_eq!(output, format!("---\ntitle: Base\n---\n{literal}"));
+    }
+}
+
 const INDENTED_DIRECTIVES_FORM: &str =
     "expected indented-directives: true or indented-directives: false";
 
