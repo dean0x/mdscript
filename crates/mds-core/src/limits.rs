@@ -84,7 +84,7 @@ pub(crate) const MAX_COMPILE_MEMORY: usize = 4 * MAX_OUTPUT_SIZE;
 /// refused tree is never built. A cached module keeps its estimate charged. A skeleton
 /// entry that is upgraded keeps one estimate.
 ///
-/// The three factors are measured on a 64-bit host: for each of the 64 shapes in
+/// The three factors are measured on a 64-bit host: for each of the 65 shapes in
 /// `tests/memory_bound.rs`, the estimate is at least the compile peak and the bytes
 /// that a cached module keeps. On wasm32 the estimate is high, so a compile refuses
 /// early. For a module compiled alone, the largest sources that pass are about: 484,330 B

@@ -6331,6 +6331,7 @@ fn tree_estimate_inputs_keep_their_measured_sizes() {
         ("{{f(f(a))}}text{{a.a}}", 3, 10),
         ("a@b\n@c", 2, 2),
         ("```\n{{a}}\n```\n``` +mds\n @if a:\n@end\n```\n", 7, 11),
+        ("---\nindented-directives: true\n---\n\t@if a:", 4, 7),
     ];
     for (source, tokens, expr) in samples {
         let lexed = tokenize(source, "sample.mds").unwrap();

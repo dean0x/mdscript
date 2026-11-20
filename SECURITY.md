@@ -292,7 +292,7 @@ parse, so it never builds a tree that does not fit. An import scan (`scan_import
 estimate against its own new budget, so a scan of a very large or dense module stops
 with `mds::resource_limit`. A cached module keeps its estimate
 charged. A module resolved first as an `@extends` base and then as an import keeps one
-estimate. The factors are measured on a 64-bit host: for each of the 64 shapes in
+estimate. The factors are measured on a 64-bit host: for each of the 65 shapes in
 `crates/mds-core/tests/memory_bound.rs`, the estimate is at least the compile peak and
 the bytes that a cached module keeps. On wasm32 the estimate is high, so a compile is
 refused earlier. The table gives about the largest source of each shape for a module

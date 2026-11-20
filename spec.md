@@ -978,7 +978,7 @@ charged, and the entry holds its estimate until it resolves. A module that a com
 resolves first as an `@extends` base and then as an import keeps one estimate. The
 estimate counts the tokens during the parse, the syntax tree, and the copy of a
 `@define` or `@block` body that the compiler keeps. Its factors are measured on a
-64-bit host: for each of the 64 source shapes that `crates/mds-core/tests/memory_bound.rs`
+64-bit host: for each of the 65 source shapes that `crates/mds-core/tests/memory_bound.rs`
 measures, the estimate is at least the peak heap of a compile and at least the bytes
 that a cached module keeps. On wasm32 the estimate is higher than the memory that it
 counts, so a compile there is refused earlier.

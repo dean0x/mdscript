@@ -127,7 +127,7 @@ fn tree_factors() -> (usize, usize, usize) {
 /// `tree_estimate_inputs_keep_their_measured_sizes` in `resolver_tests.rs` checks the
 /// lexer against these counts; `compile_peak_heap_stays_within_each_bound` checks
 /// `token_stats` against them and checks that `resolver_tests.rs` holds the same list.
-const LEXER_SAMPLES: [(&str, usize, usize); 7] = [
+const LEXER_SAMPLES: [(&str, usize, usize); 8] = [
     ("\\{{a\\{{a", 4, 0),
     ("@define f():\n\\{{a\\{{a\n@end\n", 6, 16),
     ("---\na: ''\n---\n{{a}}{{ a }}", 5, 2),
@@ -135,20 +135,26 @@ const LEXER_SAMPLES: [(&str, usize, usize); 7] = [
     ("{{f(f(a))}}text{{a.a}}", 3, 10),
     ("a@b\n@c", 2, 2),
     ("```\n{{a}}\n```\n``` +mds\n @if a:\n@end\n```\n", 7, 11),
+    ("---\nindented-directives: true\n---\n\t@if a:", 4, 7),
 ];
 
 /// Count tokens and expression bytes for the test shapes, not arbitrary MDS.
 /// Frontmatter is three tokens. Outside a fence, a line that starts with `@` is
 /// one directive, `\{{` is one escape, and `{{x}}` is one interpolation.
 /// The backtick fence shapes have one token per delimiter line. Their contents are
-/// raw text, except for `@if` and `@end` lines in marked fences.
+/// raw text, except for `@if` and `@end` lines in marked fences. The file key makes
+/// the same indented lines directives outside fences.
 /// Each text run is one token. Full directive lines and trimmed interpolation
 /// contents add expression bytes. `LEXER_SAMPLES` checks these counts.
 fn token_stats(source: &str) -> (usize, usize) {
     let mut rest = source;
     let mut tokens = 0;
+    let mut indented = false;
     if let Some(body) = source.strip_prefix("---\n") {
         let close = body.find("\n---\n").expect("closed frontmatter") + 1;
+        indented = body[..close]
+            .lines()
+            .any(|line| line == "indented-directives: true");
         rest = &body[close + "---\n".len()..];
         tokens = 3;
     }
@@ -167,13 +173,13 @@ fn token_stats(source: &str) -> (usize, usize) {
                 (tokens, in_text, i) = (tokens + 1, false, next);
                 continue;
             }
+            let conditional = || {
+                let trimmed = line.trim_start_matches([' ', '\t']);
+                trimmed.starts_with("@if ") || trimmed == "@end"
+            };
             let directive = match fence {
-                None => line.starts_with('@'),
-                Some(false) => false,
-                Some(true) => {
-                    let trimmed = line.trim_start_matches([' ', '\t']);
-                    trimmed.starts_with("@if ") || trimmed == "@end"
-                }
+                None => line.starts_with('@') || indented && conditional(),
+                Some(marked) => marked && conditional(),
             };
             if directive {
                 (tokens, expr, in_text, i) = (tokens + 1, expr + line.len(), false, next);
@@ -1142,6 +1148,14 @@ fn assert_syntax_tree_peaks() {
         assert_lexer_peak(label, &format!("@x\n{fence}"));
         shapes.push((label.to_owned(), true, format!("{falsy}{fence}")));
     }
+
+    let indented_prefix = "---\na: ''\nindented-directives: true\n---\n";
+    let indent = " ".repeat(64);
+    let pairs = format!("{indent}@if a:\n{indent}@end\n").repeat((1 << 11) + 1);
+    let label = "dense indented conditionals";
+    assert_lexer_peak(label, &format!("{indented_prefix}@x\n{pairs}"));
+    shapes.push((label.to_owned(), true, format!("{indented_prefix}{pairs}")));
+    assert_eq!(shapes.len(), 65);
 
     // One compile charges the estimate and the read text (one byte per source byte)
     // together before the parse; the source file cap also applies. A reused cache keeps
