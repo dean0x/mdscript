@@ -123,12 +123,25 @@ fn tree_factors() -> (usize, usize, usize) {
     )
 }
 
+/// Sources with the token count and the expression bytes that the real lexer gives.
+/// `tree_estimate_inputs_keep_their_measured_sizes` in `resolver_tests.rs` checks the
+/// lexer against these counts; `compile_peak_heap_stays_within_each_bound` checks
+/// `token_stats` against them and checks that `resolver_tests.rs` holds the same list.
+const LEXER_SAMPLES: [(&str, usize, usize); 6] = [
+    ("\\{{a\\{{a", 4, 0),
+    ("@define f():\n\\{{a\\{{a\n@end\n", 6, 16),
+    ("---\na: ''\n---\n{{a}}{{ a }}", 5, 2),
+    ("x\n@if a&&a:\n@end\n", 3, 13),
+    ("{{f(f(a))}}text{{a.a}}", 3, 10),
+    ("a@b\n@c", 2, 2),
+];
+
 /// The lexer's token count and expression bytes for the shapes of this test (ASCII
 /// or wide prose, no code fence). A frontmatter block is three tokens. A line that
 /// starts with `@` is one token, and its text without the newline is expression bytes.
 /// `\{{` is one token. `{{x}}` is one token, and its trimmed inner text is expression
-/// bytes. Each other run of text is one token. A test in `resolver_tests.rs` checks
-/// these rules against the lexer.
+/// bytes. Each other run of text is one token. `compile_peak_heap_stays_within_each_bound`
+/// compares these rules with the lexer's counts for `LEXER_SAMPLES`.
 fn token_stats(source: &str) -> (usize, usize) {
     let mut rest = source;
     let mut tokens = 0;
@@ -1156,6 +1169,19 @@ fn compile_peak_heap_stays_within_each_bound() {
     assert_eq!(const_value(planted, "OTHER"), None);
     let (k_tok, k_expr, k_text) = tree_factors();
     assert!(k_tok > 0 && k_expr > 0 && k_text > 0);
+
+    // The tree estimate proof counts tokens with `token_stats`, so it must agree with
+    // the lexer. `resolver_tests.rs` checks the lexer against these samples; its text
+    // must hold each sample with the same counts.
+    let resolver_tests = include_str!("../src/resolver_tests.rs");
+    for (sample, tokens, expr) in LEXER_SAMPLES {
+        assert_eq!(token_stats(sample), (tokens, expr), "{sample:?}");
+        let entry = format!("({sample:?}, {tokens}, {expr}),");
+        assert!(
+            resolver_tests.contains(&entry),
+            "resolver_tests.rs must hold the sample {entry}"
+        );
+    }
 
     // Supply the text through a variable to stay below the source file cap.
     let modules = HashMap::from([("main.mds".to_string(), "{{body}}".to_string())]);
