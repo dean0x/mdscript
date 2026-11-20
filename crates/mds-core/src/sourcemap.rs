@@ -4,7 +4,7 @@
 //! machinery that later phases thread through the evaluator:
 //!
 //! - [`vlq_encode`] — hand-rolled Base64-VLQ encoding (zero external deps,
-//!   protecting the 800 KiB WASM budget).
+//!   to keep the WASM binary small).
 //! - [`LineTable`] — byte-offset → `(line, utf16_col)` resolver with an
 //!   ASCII fast-path.
 //! - [`encode_mappings`] — delta-encodes a sorted list of point mappings

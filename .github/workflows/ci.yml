@@ -131,11 +131,13 @@ jobs:
       # One codegen unit for every crate in the WASM build (#491). The release
       # profile sets it for mds-wasm only, so mds-core and the dependencies kept
       # 16 units. Then a new helper can regroup the units and move the size by
-      # about 1 KB. With one unit the binary is about 56 KB smaller and the size
+      # about 1 KB. With one unit the binary is about 55 KB smaller and the size
       # is stable. The `--config` applies to this command only, so the napi,
-      # Python and CLI release builds keep their build time. Keep these commands
-      # equal to the `build` script in packages/mds-wasm/package.json, which
-      # release.yml runs: this job measures the size that the release ships.
+      # Python and CLI release builds keep their build time. The `build` script
+      # in packages/mds-wasm/package.json, which release.yml runs, passes the
+      # same setting, so this job measures a binary built as the release builds
+      # it. `wasm-pack test --release` below builds a test binary that is not
+      # shipped, so it does not take the setting.
       - name: Build (nodejs + web targets)
         run: |
           wasm-pack build crates/mds-wasm --target nodejs --out-dir pkg -- --config profile.release.codegen-units=1
