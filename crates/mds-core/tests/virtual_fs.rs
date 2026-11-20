@@ -1381,10 +1381,13 @@ fn assert_syntax(err: &MdsError, message: &str, offset: usize) -> SerializedSpan
 
 #[test]
 fn example_04_keeps_its_literal_fence_byte_for_byte() {
-    let source = include_str!("../../../examples/edge-cases/04_escaped_and_code.mds");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/edge-cases/04_escaped_and_code.mds");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
     let expected = "```\n@if condition:\nThis is literal text inside a code fence.\n@end\n{this_is_also_literal}\n```\n";
     assert!(source.replace("\r\n", "\n").contains(expected));
-    assert!(entry_markdown(source).contains(expected));
+    assert!(entry_markdown(&source).contains(expected));
 }
 
 #[test]
@@ -1551,6 +1554,38 @@ fn a_balanced_outer_if_can_wrap_an_unmarked_or_opted_in_fence() {
         let source = format!("@if 1 == 1:\n{fence}@end\n");
         assert_eq!(entry_markdown(&source), expected);
     }
+}
+
+fn fence_with_outer_ifs(outer_depth: usize) -> String {
+    let fence = "```txt +mds\n@if 1 == 1:\nkeep\n@else:\ndrop\n@end\n```\n";
+    format!(
+        "{}{fence}{}",
+        "@if 1 == 1:\n".repeat(outer_depth),
+        "@end\n".repeat(outer_depth)
+    )
+}
+
+#[test]
+fn opted_in_fence_compiles_at_total_block_depth_64() {
+    assert_eq!(
+        entry_markdown(&fence_with_outer_ifs(63)),
+        "```txt\nkeep\n```\n"
+    );
+}
+
+#[test]
+fn opted_in_fence_rejects_total_block_depth_65() {
+    let error = mds::compile_str(&fence_with_outer_ifs(64))
+        .unwrap_err()
+        .serialize();
+    assert_eq!(error.code, "mds::syntax");
+    assert!(
+        error
+            .message
+            .contains("nesting depth exceeds maximum of 64"),
+        "got: {}",
+        error.message
+    );
 }
 
 #[test]

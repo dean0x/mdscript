@@ -253,7 +253,8 @@ Debug mode is off.
   The indent before a conditional cannot contain other whitespace or control characters.
   A backslash before the `@` makes the line literal. The compiler keeps the backslash in selected content.
   To show a conditional line as text without a prefix, omit `+mds`.
-- Close each in-fence `@if` before the fence closes. The lexer permits up to 64 open conditionals per fence.
+- Close each in-fence `@if` before the fence closes.
+  The compiler limits total block depth to 64. Outer blocks and in-fence `@if` blocks count together.
   At the closer, an open conditional causes a syntax error at the innermost open `@if`.
   If the fence does not close, the compiler reports the unclosed fence at its opener instead.
 - An in-fence `@elseif`, `@else:` or `@end` cannot continue or close a block outside the fence.

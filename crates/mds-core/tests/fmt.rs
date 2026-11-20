@@ -498,10 +498,16 @@ fn fmt_preserves_the_file_key_and_round_trips_indented_directives() {
 fn shared_fence_opt_in_fixture_has_the_same_directives_across_rust_surfaces() {
     use mds::{check_str, compile_str, lint_str, scan_import_records, ResolveAs};
 
-    let source = include_str!("../../../packages/mds/__test__/fixtures/fence_optin.mds")
-        .replace("\r\n", "\n");
-    let expected = include_str!("../../../packages/mds/__test__/fixtures/fence_optin.expected.md")
-        .replace("\r\n", "\n");
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../packages/mds/__test__/fixtures");
+    let read_fixture = |name| {
+        let path = fixtures.join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+            .replace("\r\n", "\n")
+    };
+    let source = read_fixture("fence_optin.mds");
+    let expected = read_fixture("fence_optin.expected.md");
     assert_eq!(
         compile_str(&source).unwrap().into_markdown().unwrap(),
         expected
