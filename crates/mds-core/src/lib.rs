@@ -66,7 +66,7 @@ pub(crate) mod verbatim;
 pub use formatter::{format_str, format_str_named, format_str_with};
 pub use fs::{
     check_module_bytes, effective_parent, read_at_most, reject_forbidden_path, EntryPin,
-    FileSystem, ModuleAliasError, NativeFs, VirtualFs,
+    FileSystem, ModuleAliasError, NativeFs, ReadLog, VirtualFs,
 };
 pub use lint::{
     escape_path_for_message, find_unknown_rule_names, fix, format_unknown_rule_names_warning,
@@ -642,18 +642,22 @@ fn path_to_str(path: &Path) -> Result<&str, MdsError> {
 /// each is rewritten to its conventional form where that is lossless. Keys stay
 /// verbatim inside the resolver, where containment compares canonical paths.
 /// Virtual keys never come through here: they are the caller's own module names.
-#[cfg(windows)]
 fn native_dependencies(keys: impl IntoIterator<Item = String>) -> Vec<String> {
-    keys.into_iter()
-        .map(|key| verbatim::simplify_verbatim(&key).unwrap_or(key))
-        .collect()
+    keys.into_iter().map(|key| user_visible_key(&key)).collect()
 }
 
-/// The user-visible form of a native compile's module keys: off Windows a
-/// canonical path is never verbatim, so the keys are the dependencies as they are.
+/// The user-visible form of one native module key ([`native_dependencies`]): on Windows
+/// the conventional form of a verbatim path, where that is lossless.
+#[cfg(windows)]
+pub(crate) fn user_visible_key(key: &str) -> String {
+    verbatim::simplify_verbatim(key).unwrap_or_else(|| key.to_owned())
+}
+
+/// The user-visible form of one native module key: off Windows a canonical path is
+/// never verbatim, so the key is as it is.
 #[cfg(not(windows))]
-fn native_dependencies(keys: impl IntoIterator<Item = String>) -> Vec<String> {
-    keys.into_iter().collect()
+pub(crate) fn user_visible_key(key: &str) -> String {
+    key.to_owned()
 }
 
 /// The user-visible form of a filesystem path (#409).
@@ -2045,8 +2049,31 @@ pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
 /// ```
 #[must_use = "the loaded variables and duplicate keys should be used"]
 pub fn load_vars_file_reporting_duplicates(path: &Path) -> Result<VarsLoad, MdsError> {
+    load_vars_file_into(path, None)
+}
+
+/// [`load_vars_file_reporting_duplicates`], and record the file's byte count in `log`
+/// ([`ReadLog`]) when its bytes are read — also when the load then fails on them, as it
+/// does on an empty file, which holds no JSON object. The key is the file's canonical
+/// path, spelled as [`ReadLog::sizes`] spells a key.
+///
+/// # Errors
+///
+/// The same as [`load_vars_file_reporting_duplicates`].
+#[must_use = "the loaded variables and duplicate keys should be used"]
+pub fn load_vars_file_logged(path: &Path, log: &ReadLog) -> Result<VarsLoad, MdsError> {
+    load_vars_file_into(path, Some(log))
+}
+
+fn load_vars_file_into(path: &Path, log: Option<&ReadLog>) -> Result<VarsLoad, MdsError> {
     let path_str = path_to_str(path)?;
-    let bytes = match fs::VarsFile::resolve(path, path_str)?.read(MAX_FILE_SIZE)? {
+    let file = fs::VarsFile::resolve(path, path_str)?;
+    let key = file.key().map(str::to_owned);
+    let read = file.read(MAX_FILE_SIZE)?;
+    if let (Some(log), Some(key), fs::Capped::Bytes(bytes)) = (log, &key, &read) {
+        log.record(key, bytes.len() as u64);
+    }
+    let bytes = match read {
         fs::Capped::Bytes(bytes) if bytes.len() as u64 <= MAX_FILE_SIZE => bytes,
         fs::Capped::Bytes(_) | fs::Capped::TooLarge(_) => {
             return Err(MdsError::resource_limit(format!(

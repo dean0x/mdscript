@@ -769,6 +769,146 @@ fn the_vars_file_truncated_after_its_rebuild_read_it_triggers_nothing_until_writ
     );
 }
 
+// ── A save that ends between a rebuild's read and its late look ─────────────
+
+/// A save that truncates a file and writes it again, and ends between a rebuild's read and
+/// its late look, never publishes the empty read (#380): the rebuild read the file empty,
+/// so it is held, whatever the file holds when the late look runs, and the next rebuild
+/// publishes what was written. A `stat` at the late look would find the bytes written and
+/// let the empty read through. The debug build's pause after the look
+/// (`MDS_TEST_PAUSE_AFTER_LOOK`) lets the test empty the file before the read, and its
+/// pause before the late look (`MDS_TEST_PAUSE_BEFORE_LATE_LOOK`) lets it write the file
+/// before the check; outside a test, an editor's truncate-then-write save that ends in
+/// that window opens it.
+#[cfg(debug_assertions)]
+fn a_save_ending_between_the_read_and_the_late_look(case: &DependencyCase<'_>, saved: &Path) {
+    let what = case.what;
+    let out = case.output;
+    // Outside every watched directory, so the pauses' files raise no event.
+    let gate = tempfile::tempdir().unwrap();
+    let (look_go, look_paused) = (gate.path().join("look"), gate.path().join("look.paused"));
+    let (late_go, late_paused) = (gate.path().join("late"), gate.path().join("late.paused"));
+    let (mut child, tap) = spawn_ready(
+        mds_bin()
+            .arg("watch")
+            .arg(case.watched)
+            .args(case.extra)
+            .args(["--debounce", "0", "--poll-interval", "0"])
+            .env("MDS_TEST_PAUSE_AFTER_LOOK", &look_go)
+            .env("MDS_TEST_PAUSE_BEFORE_LATE_LOOK", &late_go)
+            .stdout(Stdio::null()),
+    );
+    let mut log = OutputLog::default();
+    log.wait_for(out, case.before, TIMEOUT);
+
+    // The file saved as it is: its rebuild looks, finds every file full, and pauses.
+    let content = std::fs::read_to_string(saved).unwrap();
+    write_atomic(saved, &content);
+    wait_for_the_pause(&look_paused, &tap, what);
+    // The save begins: the file is emptied before the rebuild reads it.
+    File::create(case.dependency).expect("truncate the file");
+    std::fs::write(&look_go, "").unwrap();
+    wait_for_the_pause(&late_paused, &tap, what);
+    // The save ends after the read, before the late look.
+    std::fs::write(case.dependency, case.rewrite).expect("write the file again");
+    std::fs::write(&late_go, "").unwrap();
+    log.wait_for(out, case.after, TIMEOUT);
+
+    let stderr = stderr_through_the_marker(case.source, tap, &mut child);
+    assert!(
+        !log.contents().contains(&""),
+        "{what}: the empty read is never published; states read: {:?}; stderr:\n{stderr}",
+        log.contents()
+    );
+    assert!(
+        !before_the_marker(&stderr).contains(EMPTY_OUTPUT_NOTICE),
+        "{what}: no empty output is written; stderr:\n{stderr}"
+    );
+    assert_holding_printed_nothing(&stderr, 1, what);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn the_entry_saved_between_its_rebuild_s_read_and_late_look_never_publishes_an_empty_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("t.mds");
+    std::fs::write(&entry, "Entry one\n").unwrap();
+
+    a_save_ending_between_the_read_and_the_late_look(
+        &DependencyCase {
+            test: "the_entry_saved_between_its_rebuild_s_read_and_late_look_never_publishes_an_empty_output",
+            what: "the entry, saved between its rebuild's read and late look",
+            watched: &entry,
+            source: &entry,
+            output: &dir.path().join("t.md"),
+            dependency: &entry,
+            rewrite: "Entry two\n",
+            extra: &[],
+            before: "Entry one",
+            after: "Entry two",
+        },
+        &entry,
+    );
+}
+
+/// The `--vars` file read empty by a file rebuild's load, which refuses it, and written
+/// again before the late look: the rebuild is held and reports nothing.
+#[cfg(debug_assertions)]
+#[test]
+fn the_vars_file_saved_between_its_rebuild_s_read_and_late_look_reports_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&vars, r#"{"v": "one"}"#).unwrap();
+    let entry = dir.path().join("t.mds");
+    std::fs::write(&entry, "Vars {{v}}\n").unwrap();
+
+    a_save_ending_between_the_read_and_the_late_look(
+        &DependencyCase {
+            test: "the_vars_file_saved_between_its_rebuild_s_read_and_late_look_reports_nothing",
+            what: "the vars file, saved between its rebuild's read and late look",
+            watched: &entry,
+            source: &entry,
+            output: &dir.path().join("t.md"),
+            dependency: &vars,
+            rewrite: r#"{"v": "two"}"#,
+            extra: &["--vars", vars.to_str().unwrap()],
+            before: "Vars one",
+            after: "Vars two",
+        },
+        &entry,
+    );
+}
+
+/// In directory mode, a source read empty by its batch's compile and written again before
+/// the late look: the source is held, and the next batch publishes what was written.
+#[cfg(debug_assertions)]
+#[test]
+fn dir_mode_a_source_saved_between_its_batch_s_read_and_late_look_never_publishes_an_empty_output()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("src");
+    std::fs::create_dir(&root).unwrap();
+    let source = root.join("t.mds");
+    std::fs::write(&source, "Source one\n").unwrap();
+    let out = dir.path().join("out");
+
+    a_save_ending_between_the_read_and_the_late_look(
+        &DependencyCase {
+            test: "dir_mode_a_source_saved_between_its_batch_s_read_and_late_look_never_publishes_an_empty_output",
+            what: "directory mode, a source saved between its batch's read and late look",
+            watched: &root,
+            source: &source,
+            output: &out.join("t.md"),
+            dependency: &source,
+            rewrite: "Source two\n",
+            extra: &["--out-dir", out.to_str().unwrap()],
+            before: "Source one",
+            after: "Source two",
+        },
+        &source,
+    );
+}
+
 // ── A file truncated while a directory batch runs ───────────────────────────
 
 /// In directory mode, the `--vars` file truncated while a batch runs — after the batch read

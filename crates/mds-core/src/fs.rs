@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use crate::error::MdsError;
 use crate::limits::{
@@ -561,6 +561,11 @@ impl<'a> VarsFile<'a> {
                 typed,
             },
         })
+    }
+
+    /// The file's canonical path as a [`ReadLog`] key; `None` when it is not UTF-8.
+    pub(crate) fn key(&self) -> Option<&str> {
+        self.canonical.to_str()
     }
 
     pub(crate) fn read(self, cap: u64) -> Result<Capped, MdsError> {
@@ -1188,6 +1193,51 @@ pub struct NativeFs {
     root_dir: OnceLock<PathBuf>,
     ids: Mutex<HashMap<String, FileId>>,
     entry_pin: Option<EntryPin>,
+    read_log: Option<Arc<ReadLog>>,
+}
+
+/// The byte count of each file a [`NativeFs`] read, by key: what a caller needs to know
+/// what a compile saw, after it ended, without reading or `stat`ing the files again.
+///
+/// Give the same log to [`NativeFs::with_read_log`] and keep a clone of the `Arc`. Every
+/// read that gets the file's bytes records their count, a compile that fails included; a
+/// read that fails records nothing. A file read more than once keeps the smallest count,
+/// so a file read empty once is recorded as read empty.
+///
+/// `mds watch` uses it to tell whether a compile read a file empty: a later `stat` can
+/// find the file written again and miss the empty read (#380).
+#[derive(Debug, Default)]
+pub struct ReadLog {
+    sizes: Mutex<HashMap<String, u64>>,
+}
+
+impl ReadLog {
+    /// An empty log.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that the file at `key` was read, `bytes` long.
+    pub(crate) fn record(&self, key: &str, bytes: u64) {
+        let mut sizes = self.sizes.lock().unwrap_or_else(PoisonError::into_inner);
+        sizes
+            .entry(key.to_owned())
+            .and_modify(|seen| *seen = (*seen).min(bytes))
+            .or_insert(bytes);
+    }
+
+    /// Each file read and its byte count, in no set order. A key is spelled as
+    /// [`crate::CompileResult::dependencies`] spells it: the file's absolute path, the
+    /// Windows verbatim prefix dropped where the conventional form names the same file.
+    #[must_use]
+    pub fn sizes(&self) -> Vec<(String, u64)> {
+        let sizes = self.sizes.lock().unwrap_or_else(PoisonError::into_inner);
+        sizes
+            .iter()
+            .map(|(key, &bytes)| (crate::user_visible_key(key), bytes))
+            .collect()
+    }
 }
 
 /// Return the effective parent directory of `path`, always resolving to
@@ -1226,6 +1276,7 @@ impl NativeFs {
             root_dir: OnceLock::new(),
             ids: Mutex::new(HashMap::new()),
             entry_pin: None,
+            read_log: None,
         }
     }
 
@@ -1234,6 +1285,15 @@ impl NativeFs {
     pub fn with_entry_pin(self, pin: EntryPin) -> Self {
         Self {
             entry_pin: Some(pin),
+            ..self
+        }
+    }
+
+    /// Record the byte count of every file this filesystem reads in `log` ([`ReadLog`]).
+    #[must_use]
+    pub fn with_read_log(self, log: Arc<ReadLog>) -> Self {
+        Self {
+            read_log: Some(log),
             ..self
         }
     }
@@ -1591,6 +1651,9 @@ impl FileSystem for NativeFs {
             .cloned()
             .ok_or_else(|| not_resolved(&display))?;
         let read = read_verified_capped(path, &display, &id, MAX_FILE_SIZE, ReadRule::Module)?;
+        if let (Some(log), Capped::Bytes(bytes)) = (&self.read_log, &read) {
+            log.record(normalized, bytes.len() as u64);
+        }
         module_text(read, &display)
     }
 

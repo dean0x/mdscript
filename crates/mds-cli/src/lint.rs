@@ -1794,7 +1794,8 @@ impl<'a> LintDirCtx<'a> {
 /// Lint every `.mds` file under `dir`, INCLUDING `_`-prefixed partials.
 ///
 /// Accumulate-and-continue past per-file failures. Exit = max severity across files.
-/// Output is path-sorted (`collect_mds_files` does NOT sort).
+/// Output is path-sorted (`collect_mds_files` sorts each directory's entries by name,
+/// which is not a sort of the full paths).
 ///
 /// **Directory summary:** after processing all files, emits one summary
 /// line to stderr in the form

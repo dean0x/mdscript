@@ -691,11 +691,18 @@ pub(crate) struct RuntimeVarArgs {
 /// Load vars from an optional file path, returning None if no file was given.
 ///
 /// A file that is a symlink is refused through [`vars_file_error`], as `mds watch`
-/// refuses it at startup (#157).
-pub(crate) fn load_optional_vars_file(path: Option<PathBuf>) -> Result<Option<mds::VarsLoad>> {
+/// refuses it at startup (#157). With a `log`, the file's byte count is recorded in it
+/// ([`mds::load_vars_file_logged`]).
+fn load_optional_vars_file(
+    path: Option<PathBuf>,
+    log: Option<&mds::ReadLog>,
+) -> Result<Option<mds::VarsLoad>> {
     path.map(|p| {
-        mds::load_vars_file_reporting_duplicates(&p)
-            .map_err(|e| miette::Error::from(vars_file_error(&p, e)))
+        match log {
+            Some(log) => mds::load_vars_file_logged(&p, log),
+            None => mds::load_vars_file_reporting_duplicates(&p),
+        }
+        .map_err(|e| miette::Error::from(vars_file_error(&p, e)))
     })
     .transpose()
 }
@@ -766,6 +773,23 @@ fn duplicate_keys(pairs: &[(String, String)]) -> Vec<String> {
 /// are allowed; the last value wins, and the caller is responsible for warning via
 /// [`emit_duplicate_var_warnings`].
 pub(crate) fn build_runtime_vars(args: RuntimeVarArgs) -> Result<RuntimeVars> {
+    build_runtime_vars_into(args, None)
+}
+
+/// [`build_runtime_vars`], and record the `--vars` file's byte count in `log`
+/// ([`mds::load_vars_file_logged`]): `mds watch` learns from it whether the load read the
+/// file empty (#380).
+pub(crate) fn build_runtime_vars_logged(
+    args: RuntimeVarArgs,
+    log: &mds::ReadLog,
+) -> Result<RuntimeVars> {
+    build_runtime_vars_into(args, Some(log))
+}
+
+fn build_runtime_vars_into(
+    args: RuntimeVarArgs,
+    log: Option<&mds::ReadLog>,
+) -> Result<RuntimeVars> {
     let RuntimeVarArgs {
         vars,
         set_vars,
@@ -793,9 +817,9 @@ pub(crate) fn build_runtime_vars(args: RuntimeVarArgs) -> Result<RuntimeVars> {
     let duplicate_set_keys = duplicate_keys(&set_vars);
     let duplicate_set_string_keys = duplicate_keys(&set_string_vars);
 
-    // Clone the path BEFORE load_optional_vars_file(vars) moves it (#326).
+    // Clone the path BEFORE load_optional_vars_file(vars, log) moves it (#326).
     let vars_file = vars.clone();
-    let loaded = load_optional_vars_file(vars)?;
+    let loaded = load_optional_vars_file(vars, log)?;
     let (mut runtime_vars, duplicate_vars_file_keys, duplicate_vars_file_keys_omitted) =
         match loaded {
             Some(mds::VarsLoad {
