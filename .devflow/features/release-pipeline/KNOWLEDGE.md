@@ -190,7 +190,7 @@ Steps (in order):
 1. Verify publish credentials (npm `whoami` + cargo token non-empty + PyPI OIDC mint-token exchange).
 2. Assert synchronized versions, no `file:` refs.
 3. Assert no hazardous codepoints in tracked source.
-4. Run `npm run test:gates` — all six spec files, 237 tests (grew from four spec files / 212 tests after `verify-pack-contents.spec.mjs` was added in PR #402), including pin-shape specs (S16), per-leg cache key spec (S20), Alpine load test job spec (S21), the cargo-zigbuild musl-leg spec (S22), and the hermetic pack-contents helper tests (see the pack-contents gate subsection below).
+4. Run `npm run test:gates` — all six spec files, 240 tests (grew from four spec files / 212 tests after `verify-pack-contents.spec.mjs` was added in PR #402), including pin-shape specs (S16), the publish-pin floor v1.14.3 (S23), per-leg cache key spec (S20), Alpine load test job spec (S21), the cargo-zigbuild musl-leg spec (S22), and the hermetic pack-contents helper tests (see the pack-contents gate subsection below).
 5. Assert tagged SHA has green CI history (step-skipped on `pull_request`).
 
 Because `npm run test:gates` runs inside `version-gate`, a malformed pin (e.g. a commit SHA
@@ -218,7 +218,7 @@ Four gates, each with an in-step positive control:
 3. **`docker pull`** (`Gate 3/4`): control tag must fail with manifest-unknown; real pull
    bounded to 3 attempts.
 4. **`twine check`** (`Gate 4/4`): all 8 distributions checked via `docker run --rm --network
-   none --entrypoint twine <image> check` using the image's own twine (7.0.0 at v1.14.2; no
+   none --entrypoint twine <image> check` using the image's own twine (7.0.0 at v1.14.2 and v1.14.3; no
    `--strict`). Includes a corrupt-wheel positive control.
 
 The gate asserts 7 wheels + 1 sdist are present before running (non-vacuity guard).
@@ -226,7 +226,7 @@ The gate asserts 7 wheels + 1 sdist are present before running (non-vacuity guar
 ### GHCR image rule for pypa/gh-action-pypi-publish (PF-040)
 
 This action resolves `github.action_ref` to `ghcr.io/pypa/gh-action-pypi-publish:<ref>`.
-GHCR holds images for release tags (`v1.14.2`) and commit SHAs on release branches, but
+GHCR holds images for release tags (`v1.14.3`) and commit SHAs on release branches, but
 **never** for annotated tag objects (the v0.4.1 failure: `a892a5a6` was the tag object sha,
 not the commit sha `dc37677b`). Both look like valid git refs but only one resolves to a
 Docker image.
@@ -560,7 +560,7 @@ belongs in a built CI job (here, `ci.yml`'s `js` job), never in `test:gates`.
 - `scripts/__test__/verify-pr-checks.spec.mjs` — specs for the verifier (M10c, S13, S18 rules;
   length assertion for `EXPECTED_CONTEXTS`).
 - `scripts/__test__/release-auth-probe.spec.mjs` — specs for release.yml structure: pin shape
-  (S16), set equality S10, guard detection, no `${{ }}` literal (S19), `uses:` count
+  (S16), pin floor v1.14.3 (S23), set equality S10, guard detection, no `${{ }}` literal (S19), `uses:` count
   (S14), per-leg cache key (S20), cargo token -z guard (S3 extension), Alpine load test
   job structure and wiring (S21), cargo-zigbuild musl build: `-x` flag, install-before-cache
   ordering, `fallback: none`, no musl linker exports, no-op detector, post-build wrapper
