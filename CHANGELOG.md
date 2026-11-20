@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Add `+mds` as the last info word of a code fence to evaluate conditional lines. The compiler removes the marker and keeps other content literal (#452).
+  In a `+mds` fence, a backslash before `@` keeps the conditional line literal. The output keeps the backslash.
 - `literal-directive` warns about conditional lines that stay literal. It offers no automatic fix (#452).
 - Set `indented-directives: true` in a file's frontmatter to evaluate indented conditional lines outside fences (#452).
 
