@@ -3091,7 +3091,9 @@ const PAUSE_TRIGGER: DebugGate = DebugGate {
 /// `MDS_TEST_PAUSE_AFTER_BATCH_SPLIT`, the pause between a watch rebuild's look and its
 /// reads (#380), `MDS_TEST_PAUSE_AFTER_LOOK`, and the pause between a file rebuild's reads
 /// and its baseline (#380), `MDS_TEST_PAUSE_AFTER_READ`, all in `mod batch_pause_trigger`.
-/// The same module holds `MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE` before entry resolution.
+/// The same module holds `MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE` before entry resolution. It also
+/// holds `MDS_TEST_PAUSE_BEFORE_LATE_LOOK`, between a rebuild's reads and its late empty-file
+/// check (#380).
 const BATCH_PAUSE_TRIGGER: DebugGate = DebugGate {
     module: "batch_pause_trigger",
     needles: &[
@@ -3099,12 +3101,14 @@ const BATCH_PAUSE_TRIGGER: DebugGate = DebugGate {
         ("MDS_TEST_PAUSE_AFTER_LOOK", true),
         ("MDS_TEST_PAUSE_AFTER_READ", true),
         ("MDS_TEST_PAUSE_BEFORE_WATCH_COMPILE", true),
+        ("MDS_TEST_PAUSE_BEFORE_LATE_LOOK", true),
     ],
     fns: &[
         "pause_after_batch_split",
         "pause_after_look",
         "pause_after_read",
         "pause_before_compile",
+        "pause_before_late_look",
     ],
 };
 

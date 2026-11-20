@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `mds::ReadLog`, `mds::NativeFs::with_read_log` and `mds::load_vars_file_logged`: record the byte count of each file that a native compile or a `--vars` load reads, a failed one included. A caller can then tell what a read saw without a second look at the file, which a later save can change (#380).
+
+### Fixed
+
+- `mds watch` no longer writes an empty output when a truncating save ends between a rebuild's read and its check for emptied files. The rebuild read the file empty, but the check looked at the file again, found the new content, and let the empty read through: the empty output was written once, with `Wrote an empty output: <file>`. Now the byte count that the read gave decides, so that rebuild waits as the others do, and the rebuild for the save writes the content. This removes the known limit stated for 0.5.0. The same applies to a `--vars` file that the rebuild read empty: it is no longer reported as an error (#380).
+- A command given a directory (for example `mds build` or `mds fmt`) visits the files of each directory in name order on every platform. Before, the order came from the file system, and on Linux `mds fmt` of a directory rewrote and reported files in a different order from run to run.
+
 ## [0.5.0] — 2026-11-20
 
 ### Added
