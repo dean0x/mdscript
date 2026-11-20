@@ -89,7 +89,7 @@ Hello {{name}}!
 - Escaping: `\{{` produces a literal `{{` in output (no `\}}` escape — a lone `}}` is just two `}` characters)
 - Non-recursive: interpolated values are never re-scanned — the output of `{{x}}` is always plain text, never further interpreted as MDS
 - Escape adjacency: `\` immediately before `{{` is claimed by the `\{{` escape — `\{{x}}` emits literal `{{` followed by the text `x}}`. To get a backslash followed by an interpolated value, write `\ {{x}}` (backslash, space, then `{{x}}`).
-- Inside fenced code blocks (triple backtick or tilde; also indented or blockquoted fences): no interpolation occurs (raw passthrough)
+- Fences pass through as literal text unless they opt in to [conditionals](#conditionals-inside-a-fence).
 - Undefined variable → compilation error (not silent empty string)
 
 **Migration from single-brace syntax:** run `mds lint --fix` (applies the `legacy-interpolation` rule to auto-convert `{x}` → `{{x}}`), then `mds fmt` to normalize formatting.
@@ -225,6 +225,46 @@ Free tier.
 | `"false"` | **truthy** (non-empty string) | requires `x == "false"` |
 
 **`--set-string` truthiness footgun:** `--set-string count=0` sets `count` to the string `"0"`, not the number `0`. The string `"0"` is truthy (`@if count:` is true) even though the number `0` is falsy. Similarly, `--set-string flag=false` sets `flag` to the string `"false"` which is truthy. Compare with string literals explicitly when using `--set-string`: `@if count == "0":`.
+
+#### Conditionals inside a fence
+
+Add `+mds` as the last or only word of a backtick or tilde fence's info string.
+Only the exact ASCII word opts in. Separate info words with spaces or tabs.
+The compiler removes the marker and its adjacent blanks from the opener.
+
+````mds
+```txt +mds
+@if upper("dev") == "DEV":
+Debug mode is on.
+@else:
+Debug mode is off.
+@end
+```
+````
+
+- Use `@if`, `@elseif`, `@else:` and `@end` on their own lines. Spaces and tabs can precede them.
+  Conditions use the same expressions as outside the fence, with function calls permitted.
+- The compiler removes the directive lines and keeps the selected content with its indent.
+  Text in that content stays literal, such as `{{x}}`, `\{{` and other directives such as `@include`.
+  An inner opener with its own marker stays literal. Conditional lines after it still belong to the outer fence.
+- The lexer checks the four keywords without regard to ASCII letter case. An ASCII letter,
+  digit, underscore or hyphen after a keyword makes it part of a longer word, such as `@endnote`.
+  Invalid forms such as `@Else:`, `@end.` and `@if(x):` cause syntax errors.
+  The indent before a conditional cannot contain other whitespace or control characters.
+  There is no escape for a conditional line. To show that line as text, omit `+mds`.
+- Close each in-fence `@if` before the fence closes. The lexer permits up to 64 open conditionals per fence.
+  At the closer, an open conditional causes a syntax error at the innermost open `@if`.
+  If the fence does not close, the compiler reports the unclosed fence at its opener instead.
+- An in-fence `@elseif`, `@else:` or `@end` cannot continue or close a block outside the fence.
+  It causes a syntax error at its own line if there is no open `@if` in that fence.
+  An outer `@if` can enclose a complete fence.
+- A marked opener cannot have a blockquote prefix or a control character in its info string.
+  An embedded carriage return counts as a control character, but a CRLF line end does not.
+
+**Reserved info words:** On any fence opener, a word that starts with `+` and an ASCII letter
+or a non-ASCII character causes a syntax error. So does a word that contains `+mds` in any ASCII
+letter case, or a `+` word just before `mds` in any ASCII letter case. The only exception is
+the exact final marker. Words such as `+5`, `+=` and `++` stay valid.
 
 ---
 
@@ -1096,7 +1136,7 @@ and I/O failures are described below the table.
 | `mds::expected_markdown` | Rust API only: `CompileResult::into_markdown()` on a messages result | `mds-core` API | n/a | Rust |
 | `mds::expected_messages` | Rust API only: `CompileResult::into_messages()` on a markdown result | `mds-core` API | n/a | Rust |
 | `mds::formatter_invariant` | The formatter's rewrite failed the compile-equivalence gate — a formatter defect; nothing is written | formatter | 1 / n/a | CLI (`fmt`), Rust |
-| `mds::internal` | A failed memory-counter check at the end of a compile (§5 "Compile memory budget"), with the message `internal compiler error`, no help and no span; a panic caught at a binding boundary, or a result that could not be serialised; the raw payload is attached as `detail` only under the off-by-default `debug-panics` feature (`SECURITY.md`). On the CLI, also the error `mds lint --format json` records for an input whose analysis panicked, with the fixed message `internal compiler error` and nothing of the panic (§5 "Panics on the CLI") | resolver (the counter check); napi, WASM, Python; `mds lint` | 101 / 101 | all |
+| `mds::internal` | A lexer step that does not advance or a failed memory-counter check at the end of a compile (§5 "Compile memory budget"). Both give `internal compiler error` with no help and no span. Also: a panic caught at a binding boundary, or a result that could not be serialised; the raw payload is attached as `detail` only under the off-by-default `debug-panics` feature (`SECURITY.md`). On the CLI, also the error `mds lint --format json` records for an input whose analysis panicked, with the fixed message `internal compiler error` and nothing of the panic (§5 "Panics on the CLI") | lexer (the progress check); resolver (the counter check); napi, WASM, Python; `mds lint` | 101 / 101 | all |
 | `mds::invalid_options` | Malformed or type-incorrect options: unknown keys, wrong types, `basePath` on file methods or on the WASM backend, source-map options on `check`, an empty `basePath`, a WASM `moduleAliases` entry that is not a normalized module key or names no module (`options.moduleAliases["<alias>"]: <reason>`) | napi, WASM, Python, `@mdscript/mds` | n/a | napi, WASM, Python, `@mdscript/mds` |
 | `mds::filename_collision` | `options.modules` already contains the entry `filename` | WASM (surfaced through `@mdscript/mds`) | n/a | WASM, `@mdscript/mds` |
 | `mds::invalid_backend_result` | The selected backend returned a result of an unexpected shape | `@mdscript/mds` | n/a | `@mdscript/mds` |
@@ -1916,6 +1956,8 @@ Rules default to the severities shown below — **not all rules default to `warn
 | `unreachable-branch` | **error** | yes (A)³ | A | A branch condition (`@if`/`@elseif`) is always-true (with later branches) or always-false, making some code dead. |
 | `duplicate-import` | **error** | yes (A) | A | The same file is imported more than once in a single file (modulo alias). |
 | `duplicate-export` | **error** | yes (A) | A | The same export name is defined more than once in a single file. |
+| `legacy-interpolation` | warn | yes (A) | A | A legacy `{x}` interpolation can use `{{x}}` instead. |
+| `literal-directive` | warn | no | C | A conditional line stays literal: an indented line outside a fence, or a line in an unmarked fence with `@if …:` before `@end`. The rule skips fences with `mds` as the first info word. |
 
 ¹ **`unused-import` is report-only in practice**: `fixable` is always `false` for this rule. A file that triggers `unused-import` contains at least one `@import` directive, making it non-*structural-standalone* (see below); Tier B fixes require a structural-standalone file. The rule is still useful — the warning clears as a side effect of applying other fixes (e.g. removing a duplicate import that was also the unused one). To silence it, set `"unused-import": "off"` in `mds.json`.
 
@@ -2139,6 +2181,7 @@ text          := (raw_text | interpolation | escaped_open)*
 raw_text      := <any run containing no "{{" and no "\{{"; single "{"/"}" is ordinary text>
 interpolation := "{{" ws (qualified_call | member_access | function_call | identifier) ws "}}"
 escaped_open  := "\{{"        (* emits literal "{{" *)
+fence_marker  := "+mds"       (* exact last or only word of a fence info string; see §4.3 *)
 qualified_call  := identifier "." identifier "(" arguments? ")"
 member_access   := identifier ("." identifier)+
 function_call   := identifier "(" arguments? ")"

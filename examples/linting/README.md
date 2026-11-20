@@ -1,9 +1,7 @@
 # Linting demo
 
-`mds lint` runs ten static-analysis rules over a template *without executing it*,
-catching correctness and style problems that `mds check` does not. This directory
-demonstrates the rules, the JSON output, the auto-fixer, and per-rule severity
-configuration via `mds.json`.
+`mds lint` checks a template against eleven static-analysis rules. This directory
+shows lint reports, automatic fixes and rule severity overrides in `mds.json`.
 
 `demo.mds` compiles cleanly (`mds build examples/linting/demo.mds`) but deliberately
 trips four lint rules: **duplicate-import** (error, auto-fixable), **unused-import**,
@@ -11,16 +9,20 @@ trips four lint rules: **duplicate-import** (error, auto-fixable), **unused-impo
 module it imports twice. `config-demo/` is a self-contained sub-example showing
 `mds.json` rule overrides (see [Config demo](#config-demo-config-demo)).
 
-`rules-tour.mds` is a second fixture that covers the five rules not demonstrated by
-`demo.mds`: **duplicate-export** (error), **unreachable-branch** (error), **empty-block**
+`rules-tour.mds` shows five more rules: **duplicate-export** (error),
+**unreachable-branch** (error), **empty-block**
 (warn), **unused-function** (warn), and **legacy-interpolation** (warn). Because it trips
 two error-severity rules, `mds lint rules-tour.mds` exits **`2`** by design. It also
 demonstrates `fix_edits` in a non-null state — visible in the JSON output for the
 `legacy-interpolation` finding (see [rules-tour.mds](#rules-tour-rules-tourmds)).
 
-All commands below are run from the repository root.
+[Example 04](../edge-cases/04_escaped_and_code.mds) shows `literal-directive`.
+Its `@if` and `@end` lines stay literal in the unmarked fence. Use `mds` as the first info word to keep them literal without this warning.
+Use [`+mds`](../../spec.md#conditionals-inside-a-fence) instead to evaluate fence conditionals.
 
-## The ten rules
+Run the commands below from the repository root.
+
+## The eleven rules
 
 | Rule | Default severity | Tier | `--fix` behavior |
 |------|------------------|------|------------------|
@@ -33,6 +35,7 @@ All commands below are run from the repository root.
 | `unused-function`       | warn  | B | Fixable only on a *standalone* file.† |
 | `unused-variable`       | warn  | C | Never auto-fixed (report-only). |
 | `redundant-else`        | warn  | C | Never auto-fixed (report-only). |
+| `literal-directive`     | warn  | C | Never auto-fixed (report-only). |
 | `shadow-variable`       | off   | C | Never auto-fixed; off by default (see config demo). |
 
 **Tiers.** Tier **A** fixes apply always (gated by a re-verify recompile); Tier **B**
@@ -158,7 +161,7 @@ it could reach.
 
 ## rules-tour (`rules-tour.mds`)
 
-`rules-tour.mds` deliberately trips the five rules that `demo.mds` does not exercise.
+`rules-tour.mds` shows five rules that `demo.mds` does not show.
 It compiles cleanly (`mds build` exit `0`) and passes `mds fmt --check` (exit `0`).
 
 ### Human output

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add `+mds` as the last info word of a code fence to evaluate conditional lines. The compiler removes the marker and keeps other content literal (#452).
+- `literal-directive` warns about conditional lines that stay literal. It offers no automatic fix (#452).
+
+### Changed
+
+- Fence info words that start with `+` and an ASCII letter or a non-ASCII character are reserved. Words that contain `+mds` and the split form `+ mds` are also reserved, regardless of ASCII letter case. Only the exact final `+mds` is valid among these forms (#452).
+
 ### Internal
 
 - **PyPI publish action v1.14.3.** `release.yml` pins `pypa/gh-action-pypi-publish` at `v1.14.3` (was `v1.14.2`) at all three sites: the `rehearse-publish-python` `PIN_REF` and the `publish-python` and `publish-testpypi` steps. v1.14.3 updates the certifi and sigstore releases that the upload and its attestations use. Spec S23 fails `Version gate` when any of the three pins is below `v1.14.3`.
