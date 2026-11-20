@@ -1,7 +1,7 @@
 ---
 feature: mds-lint
 name: mds lint — Static Analysis Engine and Tiered --fix
-description: "Use when adding or modifying lint rules, extending the --fix pipeline, changing the JSON wire format, wiring lint into a binding layer, debugging unexpected exit codes and reverify gate refusals, or working on the ESC/bidi/newline injection defences. Keywords: mds lint, LintDiagnostic, fix_removals, fix_edits, TextEdit, FixLineSpan, diag_to_edits, LintResult, LintConfig, to_canonical_json, fix tier, reverify gate, FixOutcome, PartiallyFixed, apply_fixes_incremental, preview_fixes, PreviewOutcome, set_diag_display_path, AnalysisContext, ElseifBranch, end_offset, DefineFact, assertKnownKeys, CheckOptions, unreachable-branch, unused-variable, duplicate-import, empty-block, legacy-interpolation, is_output_neutral, all_output_neutral, Tier A Tier B Tier C, structural-standalone, compile-clean, is_standalone, sanitize_control_chars, sanitize_control_chars_wire, named_source_for_render, neutralize_source_for_render, SanitizedReport, SanitizedNode, MAX_AUX_DEPTH, EscapeMode, HUMAN WIRE, eprint_warning, safe_path, safe_inline, safe_file_display, escape_path_for_message, preview_text_for, print_discipline, reverify_failure_reason, precheck, RegressionGate, Verdict, splice_edit, apply_per_edit, summarize_rejections, fallback_cap_rejected, FALLBACK_MAX_EDITS, check_if_block, check_primary, check_elseifs, LintDirCtx, config_cache, dedup_contained_or_identical, EXIT 0 1 2 3, render_error_sanitized, eprint_error, display_sanitized, MdsError::display_sanitized, ESC-injection, CWE-150, CWE-117, bidi, Trojan-Source, CVE-2021-42574, U+061C, U+202E, U+FEFF, U+2028, U+2029, PF-014, PF-005, construction-time sanitization, per-field rule, Cow, #176, ADR-008, ResultSink, from_rules_checked, relative_display, write_bytes, PF-020, #309, emit-ordering, Severity FromStr, ParseSeverityError, SeveritySpellings, parse_rule_severities, deserialize_lint_rules, sanitizeControlCharsWire, assertKnownKeys, format_unknown_keys_error, read_verified_capped, resolve_path_intrinsic_source, lint_native_fs, EntryPin, VarsFile, #175, #418, #428, #414, #417, #413."
+description: "Use when adding or modifying lint rules, extending the --fix pipeline, changing the JSON wire format, wiring lint into a binding layer, debugging unexpected exit codes and reverify gate refusals, or working on the ESC/bidi/newline injection defences. Keywords: mds lint, LintDiagnostic, fix_removals, fix_edits, TextEdit, FixLineSpan, diag_to_edits, LintResult, LintConfig, to_canonical_json, fix tier, reverify gate, FixOutcome, PartiallyFixed, apply_fixes_incremental, preview_fixes, PreviewOutcome, set_diag_display_path, AnalysisContext, ElseifBranch, end_offset, DefineFact, assertKnownKeys, CheckOptions, unreachable-branch, unused-variable, duplicate-import, empty-block, legacy-interpolation, literal-directive, is_output_neutral, all_output_neutral, Tier A Tier B Tier C, structural-standalone, compile-clean, is_standalone, sanitize_control_chars, sanitize_control_chars_wire, named_source_for_render, neutralize_source_for_render, SanitizedReport, SanitizedNode, MAX_AUX_DEPTH, EscapeMode, HUMAN WIRE, eprint_warning, safe_path, safe_inline, safe_file_display, escape_path_for_message, preview_text_for, print_discipline, reverify_failure_reason, precheck, RegressionGate, Verdict, splice_edit, apply_per_edit, summarize_rejections, fallback_cap_rejected, FALLBACK_MAX_EDITS, check_if_block, check_primary, check_elseifs, LintDirCtx, config_cache, dedup_contained_or_identical, EXIT 0 1 2 3, render_error_sanitized, eprint_error, display_sanitized, MdsError::display_sanitized, ESC-injection, CWE-150, CWE-117, bidi, Trojan-Source, CVE-2021-42574, U+061C, U+202E, U+FEFF, U+2028, U+2029, PF-014, PF-005, construction-time sanitization, per-field rule, Cow, #176, ADR-008, ResultSink, from_rules_checked, relative_display, write_bytes, PF-020, #309, emit-ordering, Severity FromStr, ParseSeverityError, SeveritySpellings, parse_rule_severities, deserialize_lint_rules, sanitizeControlCharsWire, assertKnownKeys, format_unknown_keys_error, read_verified_capped, resolve_path_intrinsic_source, lint_native_fs, EntryPin, VarsFile, #175, #418, #428, #414, #417, #413."
 category: domain-knowledge
 directories:
   - crates/mds-core/src/lint
@@ -11,14 +11,20 @@ directories:
   - crates/mds-python/src
   - packages/mds/src
 created: 2026-07-11
-updated: 2026-11-18
+updated: 2026-11-21
 ---
 
 # mds lint — Static Analysis Engine and Tiered --fix
 
+## Rules
+
+- **KB-INV-1** `literal-directive` is Tier C and has no fix: it sets neither `fix_removals` nor `fix_edits`. It is registered after `legacy-interpolation` in `ALL_RULE_NAMES` and in `run_rules`. The tier table test pins the rule count (`registry_and_tier_table_are_bidirectionally_consistent`). Details: Rule Semantics.
+- **KB-INV-2** The JSON lint output carries no source excerpt: a diagnostic holds the rule, severity, `message`, `help`, `fixable`, a byte `span` (offset and length) and `fix_edits`. A consumer reads the flagged text by slicing the source with the span. Details: Canonical JSON Wire Format.
+- **KB-AP-1** Expect `literal-directive` to fire on a line the lexer already treats as a directive: it reads only `Token::Text` and unmarked-fence `Token::CodeContent`, never `Token::Directive`. With `indented-directives: true` indented conditionals are directives and are not flagged. Details: Rule Semantics.
+
 ## Overview
 
-`mds lint` is a phase-3.5 static analysis pass: it runs AFTER `mds check` (resolve+validate) confirms the template compiles, then applies 10 rules over the raw AST and token stream. The engine lives entirely in `crates/mds-core/src/lint/` and is exposed unchanged via all five surfaces: CLI, WASM, napi, Python, and the `packages/mds` universal wrapper.
+`mds lint` is a phase-3.5 static analysis pass: it runs AFTER `mds check` (resolve+validate) confirms the template compiles, then applies 11 rules over the raw AST and token stream. The engine lives entirely in `crates/mds-core/src/lint/` and is exposed unchanged via all five surfaces: CLI, WASM, napi, Python, and the `packages/mds` universal wrapper.
 
 The feature has two key design invariants that touch every layer: (1) `LintResult::to_canonical_json()` is the ONE serializer for all surfaces — byte-parity across surfaces is enforced by goldens; (2) `tier.rs` is the single source of truth for which rules are auto-fixable — both `diagnostic.rs` and `fix.rs` import from it to break what would otherwise be a circular dependency.
 
@@ -32,7 +38,7 @@ Issue #61 closes the v0.4.0 gate. Users are prompt-library authors (dead `@defin
 
 ### Rule Catalog
 
-Ten rules across three severities. Defaults are built-in and overridable per-rule in `mds.json`.
+Eleven rules across three severities (3 Error, 7 Warn, 1 Info that is default-off). Defaults are built-in and overridable per-rule in `mds.json`.
 
 | Rule | Default Severity | Fix Tier | Notes |
 |------|-----------------|----------|-------|
@@ -41,6 +47,7 @@ Ten rules across three severities. Defaults are built-in and overridable per-rul
 | `unreachable-branch` | Error | A | Literal↔literal Eq/NotEq + duplicate structural @elseif only; variable compares never flagged |
 | `empty-block` | Warn | A | Empty OR whitespace-only-Text bodies; NEVER @block (intentional placeholder); fires on @if/@elseif/@else/@for/@define/@message |
 | `legacy-interpolation` | Warn | A | TOKEN-based (Token::Text + @message directives, structurally skips fences); detects old `{x}` single-brace syntax + `\{`/`\}` remnants + `@message {expr}:`; `${...}` skipped; fix via `fix_edits` (atomic TextEdit replacement, not FixLineSpan) |
+| `literal-directive` | Warn | C | TOKEN-based, registered after `legacy-interpolation`; report-only (no `fix_removals`, no `fix_edits`); flags a conditional line that stays literal text (see Rule Semantics) |
 | `unused-import` | Warn | B | Merge imports always "used"; selective flagged per-name; re-export (Named/ReExport) exempts; `fix_removals: None` (report-only in practice) |
 | `unused-function` | Warn | B | Only fires when `has_explicit_exports`; self-recursion treated as used; `fix_removals = Some([whole-@define block])` |
 | `unused-variable` | Warn | C | Frontmatter keys with no body reference; Tier C = report-only |
@@ -53,7 +60,7 @@ Tier classification is the central safety contract for `--fix`. `tier.rs` is a d
 
 - **Tier A**: Auto-fixable via `fix_removals` (line-removal) or `fix_edits` (text-replacement) + gated by the reverify pipeline. Currently: duplicate-import, duplicate-export, unreachable-branch, empty-block, legacy-interpolation.
 - **Tier B**: Fixable only when the file is "structural-standalone" (no `@import` or `@extends`). Currently: `unused-function` (has `fix_removals = Some([whole-@define block])`, applied when standalone); `unused-import` has `fix_removals: None` — partial-name removal from an import list is structurally ambiguous and unsafe, so the rule is Tier B but never emits an edit (report-only in practice). A file that triggers `unused-import` is, by definition, not structural-standalone.
-- **Tier C**: Never fixed — report-only. Currently: unused-variable, redundant-else, shadow-variable.
+- **Tier C**: Never fixed — report-only. Currently: literal-directive, unused-variable, redundant-else, shadow-variable.
 
 **Terminology (spec §7.5)**:
 - **Structural-standalone**: a file with no `@import`, `@extends`, or use as a partial target. Gates Tier B `--fix`.
@@ -66,7 +73,7 @@ pub fn rule_tier(rule: &str) -> FixTier {
         "duplicate-import" | "duplicate-export" | "unreachable-branch"
         | "empty-block" | "legacy-interpolation" => FixTier::A,
         "unused-import" | "unused-function" => FixTier::B,
-        _ => FixTier::C, // all others, including unknown rules
+        _ => FixTier::C, // literal-directive, unused-variable, redundant-else, shadow-variable, unknown rules
     }
 }
 
@@ -85,6 +92,11 @@ The `fixable` flag in the canonical JSON output is computed as `(fix_removals.is
 ### Rule Semantics — Key Edge Cases
 
 **legacy-interpolation**: Token-based scan over `Token::Text` (skips fences/frontmatter/directives automatically) and `Token::Directive` (for `@message {expr}:` patterns). Detects: `\{`/`\}` remnants (fix = delete backslash), `${...}` (skip, never flagged), `{expr}` (fix = atomic TextEdit replacing entire `{expr}` with `{{expr}}`), `@message {expr}:` dynamic role (same fix). Edits are always single atomic TextEdits — never split open/close. Suppressible via `mds.json`.
+
+**literal-directive** (`rules/literal_directive.rs`): a token rule with default severity Warn. It returns at once when the severity is `off`. It matches the SHAPE of a conditional line, not the expression: after it trims leading space/tab and trailing space/tab/CR, the line is `@else:`, `@end`, `@if <non-empty>:` or `@elseif <non-empty>:`. Two sources:
+- `Token::Text`: only whole source lines (`complete_lines` drops a token's partial first or last line), and only a line that starts with a space or tab. An unindented line is a real directive and never reaches the rule. `Token::Directive` is never inspected.
+- Unmarked fences: a `CodeFence` token followed by exactly one `CodeContent` and the closing `CodeFence` (a fence with content). The opener must end at a CR or LF in the source (a `+mds` opener is cut before its marker, so it is excluded), and its first info word must not be `mds` (exact, lowercase). `check_fence` reports every conditional-shaped line of the fence, but only if the fence has an `@if` line and a later `@end` line; otherwise it reports none.
+- Each finding has a fixed message and fixed help text (the help names the `indented-directives: true` key, the `+mds` marker and the `mds` label) and a `span` of the line without its CR/LF, with `line` and `column` as `None`. The rule stops when the diagnostic cap refuses a push (`findings_stop_at_the_diagnostic_cap`). The file key does not silence warnings in unmarked fences; it only removes the indented-text warnings by making those lines directives. Pinned by tests in `literal_directive.rs` (`message_and_help_do_not_use_source_text`, `off_suppresses_the_rule_and_findings_have_no_fix`).
 
 **Suppression configs**: `examples/edge-cases/mds.json`, `examples/stress-test/edge/mds.json`, and `crates/mds-cli/tests/fixtures/mds.json` all set `"legacy-interpolation": "off"` — these directories intentionally contain literal-brace teaching content.
 
@@ -200,7 +212,7 @@ pub(crate) fn lint_source(source, filename, config) -> Result<LintResult, MdsErr
     // Step 3: standalone detection for Tier B eligibility
     let is_standalone = !ctx.is_partial_or_extends && ctx.imports.is_empty();
 
-    // Step 4: non-generic rule dispatch (10 plain fn calls).
+    // Step 4: non-generic rule dispatch (11 plain fn calls).
     // Token-based rules (Step 6) receive &tokens + source; AST rules receive &module + &ctx.
     run_rules(&module, &ctx, &tokens, source, filename, config, &mut builder);
 
@@ -211,7 +223,7 @@ pub(crate) fn lint_source(source, filename, config) -> Result<LintResult, MdsErr
 Key invariants:
 - The check gate (resolve+validate) runs ONCE in the public `mds::lint()` wrapper before calling `lint_source`. The engine never calls the resolver again.
 - Per-file fresh resolve is intentional (v1). There is NO cross-file `ModuleCache` — it would be unsafe under per-file runtime vars.
-- `run_rules` threads both `&[Token]` (the raw token stream) and `source: &str` through so token-based rules (currently `legacy-interpolation`) can operate without re-tokenizing.
+- `run_rules` threads both `&[Token]` (the raw token stream) and `source: &str` through so token-based rules (`legacy-interpolation`, `literal-directive`) can operate without re-tokenizing.
 
 ### AST: ElseifBranch, IfBlock, ForBlock, DefineBlock
 
@@ -364,7 +376,9 @@ A config-load failure for a nested `mds.json` is a per-file error: it emits the 
 }
 ```
 
-**SPAN-1**: `span.line` and `span.column` are NOT part of the stable wire format. All 10 lint rules pass `None` for `line`/`column`.
+**No source excerpt in the JSON**: `to_canonical_json()` builds each diagnostic from `rule`, `severity`, `message`, `help`, `fixable`, `span` and `fix_edits` only. No field holds the text of the flagged source. For `literal-directive` the message and help are fixed text (`message_and_help_do_not_use_source_text`), so the line itself appears nowhere in the JSON; the span gives its offset and length. Only the human renderer (`render_diag_human`) shows a source frame.
+
+**SPAN-1**: `span.line` and `span.column` are NOT part of the stable wire format. All 11 lint rules pass `None` for `line`/`column`.
 
 **`fix_edits` field**: emitted unconditionally on every diagnostic — `null` when the rule uses `fix_removals` or has no fix, `[{start,end,new_text}]` when populated. Because `to_canonical_json()` builds its map via `serde_json::json!` and serde_json's `Map` defaults to `BTreeMap`, keys are sorted alphabetically: `fix_edits` appears before `fixable`. File ordering in `files` is deterministic (BTreeMap sorted by filename). `fixable` is NOT stored on the diagnostic struct.
 
@@ -610,9 +624,9 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 **Containment coalescing resolves same-block multi-rule conflicts**: When two rules fire on the same block (e.g. `unreachable-branch` spans the full dead `@if`/`@end`, `empty-block` spans only the inner `@else` body), the containment step keeps only the wider edit.
 
-**Partial-overlap from 10 real rules is structurally impossible via CLI**: All current rules emit spans that are disjoint or containment-related. The `overlap_rejected` path is only reachable with synthetic diagnostics. Regression anchors: `fix.rs::a4_partial_overlap_still_rejected_after_dedup` and `lint.rs::preview_fixes_surfaces_rejected_on_overlap`.
+**Partial-overlap from the 11 real rules is structurally impossible via CLI**: All current rules emit spans that are disjoint or containment-related. The `overlap_rejected` path is only reachable with synthetic diagnostics. Regression anchors: `fix.rs::a4_partial_overlap_still_rejected_after_dedup` and `lint.rs::preview_fixes_surfaces_rejected_on_overlap`.
 
-**span.line / span.column are never in lint diagnostic JSON**: All 10 rules pass `None` for `line`/`column`.
+**span.line / span.column are never in lint diagnostic JSON**: All 11 rules pass `None` for `line`/`column`.
 
 **examples/stress-test/errors/ fixtures contain intentional errors**: Running `mds lint examples/` will exit 2 by design.
 
@@ -685,12 +699,13 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 - `crates/mds-core/src/error.rs` — `MdsError`: `serialize()` (WIRE message/help); `display_sanitized()` (HUMAN Display for TTY); raw `Display` documented as unsanitized; `at()` (uses `named_source_for_render` — inherited by all `*_at` constructors)
 - `crates/mds-core/src/lib.rs` — `CompileResult::to_canonical_json()` (WIRE warnings, distinct from `LintResult::to_canonical_json`); `emit_warnings()` (HUMAN for prose; identifiers WIRE at construction)
 - `crates/mds-core/src/lint/fix.rs` — `plan_fixes_with_options`, `diag_to_edits`, `ByteEdit`, `apply_plan_unchecked`, `splice_edit`, `dedup_contained_or_identical`, `apply_fixes_incremental` and its private helpers (`precheck`, `RegressionGate`, `Verdict`, `apply_one`, `apply_per_edit`, `summarize_rejections`, `fallback_cap_rejected`), `FALLBACK_MAX_EDITS`, `FixOutcome`; `reverify_failure_reason()` (WIRE; the only reason that embeds an `MdsError`)
+- `crates/mds-core/src/lint/rules/literal_directive.rs` — Tier C token-based rule: conditional lines that stay literal (indented text without the file key, unmarked fences); no fix
 - `crates/mds-core/src/lint/rules/legacy_interpolation.rs` — Tier A token-based rule; atomic single TextEdit per finding; two-pass artifact for backslash-escape fixing
 - `crates/mds-core/src/lint/facts.rs` — `collect_facts()`, `AnalysisContext`, `DefineFact { name, offset, end_offset }`
 - `crates/mds-core/src/lint/config.rs` — `LintConfig` (lives in mds-core; CLI converts to it)
 - `crates/mds-core/src/options.rs` — `parse_rule_severities` (the one `rules`-map reader shared by napi, WASM, Python and the CLI's `mds.json` `lint.rules`), `format_unknown_keys_error`, `reject_unknown_json_keys` (#418)
 - `crates/mds-core/src/ast.rs` — `ElseifBranch { offset }`, `IfBlock { else_offset, end_offset }`, `ForBlock/DefineBlock { end_offset }`
-- `crates/mds-core/src/lint/rules/` — 10 rule modules + `structural_eq.rs`
+- `crates/mds-core/src/lint/rules/` — 11 rule modules + `structural_eq.rs`
 - `crates/mds-cli/src/lint.rs` — CLI subcommand; `render_diag_human` (HUMAN for message/help; filename+source via `named_source_for_render`; all status lines via `safe_path`); `set_diag_display_path`, `LintDirCtx`; the rule-name list lives in `mds::KNOWN_LINT_RULES`, not in this crate (#224)
 - `crates/mds-cli/src/output.rs` — `atomic_write_file`; `eprint_error` (single CLI stderr choke-point, wraps in `SanitizedReport`); `SanitizedReport` / `SanitizedNode` / `MAX_AUX_DEPTH`; `render_error_sanitized` (private, plain `format!("{report:?}")` on sanitized wrapper); `eprint_warning` (HUMAN, new); `safe_path` / `safe_file_display` (WIRE + `\t`, via `mds::escape_path_for_message`) / `safe_inline` (WIRE only); `preview_text_for` (TTY-gated source neutralization for `--diff`); `render_unified_diff` / `colorize_unified_diff`
 - `crates/mds-cli/src/build.rs` — `LintCliConfig` struct, `into_core_config()`, `MdsConfig.lint` field; `deserialize_lint_rules` (`mds.json` `lint.rules` via `mds::parse_rule_severities`, #175)
