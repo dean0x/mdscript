@@ -909,6 +909,65 @@ fn build_mds_error_message_escapes_control_bytes() {
     );
 }
 
+#[test]
+fn fence_syntax_reports_use_fixed_messages_and_safe_source_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fence.mds");
+    let esc = char::from(0x1b);
+    let bidi = char::from_u32(0x202e).unwrap();
+    let sample = format!("tag{esc}{bidi}tail");
+    let safe_sample = format!("tag?{}tail", char::REPLACEMENT_CHARACTER);
+    let opener = "```js +mds\n";
+
+    for (before, line, message) in [
+        (
+            opener,
+            format!("  @end {sample}"),
+            "conditional directive needs an open if in this code fence",
+        ),
+        (
+            opener,
+            format!("  @if x == \"{sample}\":"),
+            "conditional directive must end before the code fence closes",
+        ),
+        (
+            "",
+            format!("```js +{sample}"),
+            "invalid code fence info word",
+        ),
+    ] {
+        std::fs::write(&path, format!("{before}{line}\n```\n")).unwrap();
+        let human = mds_bin().arg("lint").arg(&path).output().unwrap();
+        let stderr = String::from_utf8(human.stderr).unwrap();
+        assert_eq!(human.status.code(), Some(2), "{stderr}");
+        assert!(stderr.contains("mds::syntax"), "{stderr}");
+        assert!(
+            stderr.contains(&format!("syntax error: {message}")),
+            "{stderr}"
+        );
+        assert!(stderr.contains(&safe_sample), "{stderr:?}");
+        assert!(!stderr.contains([esc, bidi]), "{stderr:?}");
+
+        // The wire keeps the fixed message and byte span, not the source excerpt.
+        let json = mds_bin()
+            .args(["lint", "--format", "json"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        let wire = String::from_utf8(json.stdout).unwrap();
+        assert_eq!(json.status.code(), Some(2), "{wire}");
+        assert!(!wire.contains([esc, bidi]), "{wire:?}");
+        let document: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(document["version"], 1);
+        let error = &document["error"];
+        assert_eq!(error["code"], "mds::syntax");
+        assert_eq!(error["message"], format!("syntax error: {message}"));
+        assert_eq!(error["help"], serde_json::Value::Null);
+        assert_eq!(error["span"]["offset"], before.len());
+        assert_eq!(error["span"]["length"], line.len());
+    }
+}
+
 /// T-ESC-MSG-2 [security-11 / CWE-150 / PF-004 / #176]: a CLI-authored
 /// `miette::miette!()` error that interpolates attacker-controlled text must reach
 /// stderr escaped too.

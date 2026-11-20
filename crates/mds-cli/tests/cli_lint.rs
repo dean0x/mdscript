@@ -899,6 +899,31 @@ fn fix_applied_for_block_spanning_empty_define_and_file_changed() {
     );
 }
 
+#[test]
+fn fix_removes_an_empty_in_fence_if_and_preserves_the_other_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("marked.mds");
+    fs::write(
+        &target,
+        "```js +mds\r\n  @if 1 == 1: \t\r\n\t@end\r\n keep\r\n```\r\n",
+    )
+    .unwrap();
+
+    let (json, _) = lint_json(&target, "before fix");
+    let findings = json_diagnostics(&json, "before fix");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0]["rule"], "empty-block");
+
+    let out = lint_path(&target, &["--fix"]);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("Fixed:"), "{stderr}");
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        b"```js +mds\r\n keep\r\n```\r\n"
+    );
+}
+
 // ── L-CLI-RESOURCE: exit code 3 for ResourceLimit (TEST-4) ──────────────────
 //
 // Verifies that a template causing a ResourceLimit in the RESOLVER causes
@@ -3149,6 +3174,46 @@ fn json_diagnostics<'a>(json: &'a serde_json::Value, label: &str) -> Vec<&'a ser
             })
         })
         .collect()
+}
+
+#[test]
+fn literal_directive_reports_a_fixed_message_and_a_safe_source_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("literal.mds");
+    let esc = char::from(0x1b);
+    let bidi = char::from_u32(0x202e).unwrap();
+    let line = format!("  @if tag{esc}{bidi}tail:");
+    let source = format!("{line}\n");
+    fs::write(&path, &source).unwrap();
+    let message = "This conditional line is literal text.";
+
+    let out = lint_path(&path, &[]);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("literal-directive"), "{stderr}");
+    assert!(stderr.contains(message), "{stderr}");
+    let safe_line = format!("@if tag?{}tail:", char::REPLACEMENT_CHARACTER);
+    assert!(stderr.contains(&safe_line), "{stderr:?}");
+    assert!(!stderr.contains([esc, bidi]), "{stderr:?}");
+
+    let (json, wire) = lint_json(&path, "literal directive");
+    assert!(!wire.contains([esc, bidi]), "{wire:?}");
+    let findings = json_diagnostics(&json, "literal directive");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0]["rule"], "literal-directive");
+    assert_eq!(findings[0]["message"], message);
+    assert_eq!(findings[0]["span"]["offset"], 0);
+    assert_eq!(findings[0]["span"]["length"], line.len());
+
+    let build = mds_bin()
+        .arg("build")
+        .arg(&path)
+        .args(["-o", "-"])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "{:?}", build.stderr);
+    assert_eq!(build.stdout, source.as_bytes());
+    assert!(build.stderr.is_empty(), "{:?}", build.stderr);
 }
 
 /// T-9 [AC-C3]: `mds lint --format json` on a source whose diagnostic message embeds a

@@ -6219,7 +6219,8 @@ fn tree_estimate_inputs_keep_their_measured_sizes() {
     }
 
     // (source, tokens, expression bytes): directive lines without their newline and
-    // trimmed interpolation text are expression bytes; each other text run is one token.
+    // trimmed interpolation text are expression bytes. Fence lines and raw content
+    // runs count as tokens but do not add expression bytes.
     let samples = [
         ("\\{{a\\{{a", 4, 0),
         ("@define f():\n\\{{a\\{{a\n@end\n", 6, 16),
@@ -6227,6 +6228,7 @@ fn tree_estimate_inputs_keep_their_measured_sizes() {
         ("x\n@if a&&a:\n@end\n", 3, 13),
         ("{{f(f(a))}}text{{a.a}}", 3, 10),
         ("a@b\n@c", 2, 2),
+        ("```\n{{a}}\n```\n``` +mds\n @if a:\n@end\n```\n", 7, 11),
     ];
     for (source, tokens, expr) in samples {
         let lexed = tokenize(source, "sample.mds").unwrap();

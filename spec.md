@@ -938,7 +938,7 @@ charged, and the entry holds its estimate until it resolves. A module that a com
 resolves first as an `@extends` base and then as an import keeps one estimate. The
 estimate counts the tokens during the parse, the syntax tree, and the copy of a
 `@define` or `@block` body that the compiler keeps. Its factors are measured on a
-64-bit host: for each of the 62 source shapes that `crates/mds-core/tests/memory_bound.rs`
+64-bit host: for each of the 64 source shapes that `crates/mds-core/tests/memory_bound.rs`
 measures, the estimate is at least the peak heap of a compile and at least the bytes
 that a cached module keeps. On wasm32 the estimate is higher than the memory that it
 counts, so a compile there is refused earlier.
@@ -955,7 +955,7 @@ in its life share about the same ceiling.
 |---|---|---|
 | The densest syntax, `\{{a` repeated | 484,330 bytes | 484,610 bytes |
 | `{{a}}` repeated | 952,385 bytes | 956,729 bytes |
-| The densest measured expression shape | 678,735 bytes | 680,939 bytes |
+| The densest measured expression shape (alternating fence content and directives) | 616,935 bytes | 618,527 bytes |
 | Prose with one `{{a}}` in each 80 bytes | 5,229,805 bytes | 5,237,969 bytes |
 | Prose | 10,485,760 bytes: the 10 MiB file cap applies first, and the budget alone admits 12,336,188 | 12,336,188 bytes |
 
