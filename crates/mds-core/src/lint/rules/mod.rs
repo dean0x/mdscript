@@ -17,11 +17,13 @@
 //! | `unused-function`       | Warn     | B    | @define not exported and not called           |
 //! | `shadow-variable`       | Info     | C    | Inner scope name hides outer binding          |
 //! | `legacy-interpolation`  | Warn     | A    | Single-brace `{x}` syntax (migrates to `{{x}}`) |
+//! | `literal-directive`     | Warn     | C    | Conditional line stays literal text           |
 
 pub(crate) mod duplicate_export;
 pub(crate) mod duplicate_import;
 pub(crate) mod empty_block;
 pub(crate) mod legacy_interpolation;
+pub(crate) mod literal_directive;
 pub(crate) mod redundant_else;
 pub(crate) mod shadow_variable;
 pub(crate) mod unreachable_branch;
@@ -37,12 +39,13 @@ pub(crate) mod structural_eq;
 /// is the single source of truth. This does NOT close the *omission* risk — a
 /// new module whose `RULE` is never listed here compiles fine. The mechanical
 /// closure is the bidirectional tier table in `tier.rs` plus an explicit
-/// `ALL_RULE_NAMES.len() == 10` pin in that table's test.
+/// `ALL_RULE_NAMES.len() == 11` pin in that table's test.
 pub(crate) const ALL_RULE_NAMES: &[&str] = &[
     duplicate_export::RULE,
     duplicate_import::RULE,
     empty_block::RULE,
     legacy_interpolation::RULE,
+    literal_directive::RULE,
     redundant_else::RULE,
     shadow_variable::RULE,
     unreachable_branch::RULE,
