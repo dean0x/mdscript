@@ -2,6 +2,10 @@ use crate::error::MdsError;
 use crate::escape_class::is_control_char;
 use crate::limits::MAX_NESTING_DEPTH;
 
+pub(crate) const INDENTED_DIRECTIVES: &str = "indented-directives";
+pub(crate) const FILE_KEY_FORM: &str =
+    "expected indented-directives: true or indented-directives: false";
+const DUPLICATE_FILE_KEY: &str = "indented-directives must appear only once";
 const BAD_INDENT: &str = "invalid indent for a conditional directive";
 const STRAY_CONDITIONAL: &str = "conditional directive needs an open if in this code fence";
 const UNCLOSED_CONDITIONAL: &str = "conditional directive must end before the code fence closes";
@@ -137,6 +141,69 @@ pub enum Token {
     CodeContent(String, usize),
 }
 
+/// A rejected key-shaped line in the lexer's frontmatter text.
+pub(crate) struct FileKeyError {
+    line: usize,
+    message: &'static str,
+}
+
+/// Read the file key from normalized frontmatter, not from the module body or YAML tree.
+pub(crate) fn probe_file_key(raw: &str) -> Result<Option<bool>, FileKeyError> {
+    locate_file_key(raw).map(|key| key.map(|(_, enabled)| enabled))
+}
+
+fn locate_file_key(raw: &str) -> Result<Option<(usize, bool)>, FileKeyError> {
+    let mut key = None;
+    let mut offset = 0;
+    for (line, text) in raw.split_inclusive('\n').enumerate() {
+        let start = offset;
+        offset += text.len();
+        let text = text.strip_suffix('\n').unwrap_or(text);
+        let Some(tail) = text.strip_prefix(INDENTED_DIRECTIVES) else {
+            continue;
+        };
+        if !tail.starts_with(|ch| ch == ':' || is_blank(ch)) {
+            continue;
+        }
+        if key.is_some() {
+            return Err(FileKeyError {
+                line,
+                message: DUPLICATE_FILE_KEY,
+            });
+        }
+        let invalid = || FileKeyError {
+            line,
+            message: FILE_KEY_FORM,
+        };
+        let value = tail
+            .strip_prefix(':')
+            .ok_or_else(invalid)?
+            .trim_start_matches(is_blank);
+        let end = value.find(is_blank).unwrap_or(value.len());
+        let enabled = match &value[..end] {
+            "true" => true,
+            "false" => false,
+            _ => return Err(invalid()),
+        };
+        let suffix = value[end..].trim_start_matches(is_blank);
+        if !suffix.is_empty() && !suffix.starts_with('#') {
+            return Err(invalid());
+        }
+        key = Some((start + text.len() - value.len(), enabled));
+    }
+    Ok(key)
+}
+
+/// Replace the probe's value with a same-width YAML null. This lets the resolver
+/// prove that YAML reads this line, not a different key with the same value.
+pub(crate) fn mask_file_key(raw: &str) -> Option<String> {
+    let (offset, enabled) = locate_file_key(raw).ok()??;
+    let null = if enabled { "null" } else { "null " };
+    let mut masked = raw.to_owned();
+    masked.replace_range(offset..offset + null.len(), null);
+    Some(masked)
+}
+
 /// Tokenize MDS source text into tokens.
 pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
     Lexer::new(source, file).run()
@@ -154,6 +221,7 @@ struct Lexer<'a> {
     pos: usize,
     tokens: Vec<Token>,
     code_fence: Option<OpenFence>,
+    indented_directives: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -172,6 +240,7 @@ impl<'a> Lexer<'a> {
             pos: 0,
             tokens: Vec::new(),
             code_fence: None,
+            indented_directives: false,
         }
     }
 
@@ -189,7 +258,7 @@ impl<'a> Lexer<'a> {
             || !self
                 .code_fence
                 .as_ref()
-                .is_some_and(|fence| fence.conditionals)
+                .map_or(self.indented_directives, |fence| fence.conditionals)
         {
             return LineClass::Plain;
         }
@@ -245,6 +314,16 @@ impl<'a> Lexer<'a> {
                         .filter(|&&c| c != '\r')
                         .collect();
                     let fm_byte_offset = self.byte_pos(fm_start);
+                    self.indented_directives = probe_file_key(&content)
+                        .map_err(|err| {
+                            let prefix_len: usize = self.source[fm_byte_offset..bp]
+                                .split_inclusive('\n')
+                                .take(err.line)
+                                .map(str::len)
+                                .sum();
+                            self.syntax_line(err.message, fm_byte_offset + prefix_len)
+                        })?
+                        .unwrap_or(false);
                     self.tokens
                         .push(Token::FrontmatterContent(content, fm_byte_offset));
                     self.tokens
@@ -995,6 +1074,104 @@ mod tests {
         }
     }
 
+    #[test]
+    fn indented_directives_file_key_selects_only_conditionals_outside_plain_fences() {
+        let body = "lead\n    @if enabled:\n\t@elseif fallback:\n  @else:\n @end\n  @import lib\n\t@include lib\n  > @if enabled:\n```\n  @if enabled:\n  @end\n```\n";
+        for (raw, count) in [
+            ("enabled: true", 0),
+            ("indented-directives: false \t # off", 0),
+            ("indented-directives: \ttrue  # on", 4),
+        ] {
+            let source = format!("---\n{raw}\n---\n{body}");
+            let tokens = tokenize(&source, "test.mds").unwrap();
+            let lines: Vec<_> = tokens
+                .iter()
+                .filter_map(|token| match token {
+                    Token::Directive(line, _) => Some(line.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                lines,
+                [
+                    "    @if enabled:",
+                    "\t@elseif fallback:",
+                    "  @else:",
+                    " @end"
+                ][..count]
+            );
+        }
+    }
+
+    #[test]
+    fn indented_directives_classifies_near_misses_for_the_parser_to_reject() {
+        for line in [
+            "  @IF enabled:",
+            "  @if.",
+            "  @elseif:",
+            "  @else",
+            "  @end!",
+        ] {
+            let prefix = "---\nindented-directives: true\n---\nlead\n";
+            let source = format!("{prefix}{line}\n");
+            assert_eq!(
+                tokenize(&source, "test.mds").unwrap().last(),
+                Some(&Token::Directive(line.to_owned(), prefix.len())),
+            );
+        }
+    }
+
+    #[test]
+    fn indented_directives_bad_indent_errors_only_with_the_key() {
+        for indent in ["\u{a0}", " \r ", "\t\x1b"] {
+            let line = format!("{indent}@if enabled:");
+            let prefix = "---\nindented-directives: true\n---\nlead\n";
+            assert_lexer_error(
+                &format!("{prefix}{line}\n"),
+                prefix.len(),
+                &line,
+                BAD_INDENT,
+            );
+            assert_eq!(
+                tokenize(&line, "test.mds").unwrap(),
+                [Token::Text(line.clone(), 0)],
+            );
+        }
+    }
+
+    #[test]
+    fn indented_directives_malformed_key_reports_the_original_line() {
+        let prefix = "---\r\nname: café\r\n";
+        for line in [
+            "indented-directives: True",
+            "indented-directives: yes",
+            "indented-directives: 'true'",
+            "indented-directives : true",
+            "indented-directives\t: true",
+            "indented-directives: true text",
+            "indented-directives: true#comment",
+        ] {
+            assert_lexer_error(
+                &format!("{prefix}{line}\r\n---\r\n"),
+                prefix.len(),
+                line,
+                "expected indented-directives: true or indented-directives: false",
+            );
+        }
+    }
+
+    #[test]
+    fn indented_directives_duplicate_key_reports_the_second_line() {
+        let prefix = "---\r\nindented-directives: true\r\n";
+        let line = "indented-directives: false";
+        assert_lexer_error(
+            &format!("{prefix}{line}\r\n---\r\n"),
+            prefix.len(),
+            line,
+            "indented-directives must appear only once",
+        );
+    }
+
     const ALPHABET: [&str; 20] = [
         " ", "\t", "@", "if", "elseif", "else", "end", ":", "\r", "\n", "```", ">", "\u{a0}",
         "\u{202e}", "+mds", "+x", "{{", "}}", "\\", "x",
@@ -1048,6 +1225,7 @@ mod tests {
         for path in [
             "plain line",
             "conditional line",
+            "indented conditional line",
             "bad indent",
             "frontmatter",
             "fence opener",
@@ -1082,6 +1260,12 @@ mod tests {
 
     fn probe_progress_states(body: &str, hits: &mut ProgressHits) {
         probe_progress(body, hits);
+        for enabled in [true, false] {
+            probe_progress(
+                &format!("---\nindented-directives: {enabled}\n---\n{body}"),
+                hits,
+            );
+        }
         probe_progress(&format!("``` +mds\n{body}\n```\n"), hits);
     }
 
@@ -1138,6 +1322,11 @@ mod tests {
                         "ordinary code became a directive: {source:?}"
                     );
                     (offset, "conditional line")
+                }
+                Token::Directive(line, offset) if line.starts_with([' ', '\t']) => {
+                    assert!(source.starts_with("---\nindented-directives: true\n---\n"));
+                    assert!(is_keyword_line(&line));
+                    (offset, "indented conditional line")
                 }
                 Token::Directive(_, offset) => (offset, "plain directive"),
                 Token::CodeFence(_, offset) if fence.is_some() => {

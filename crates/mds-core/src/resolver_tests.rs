@@ -768,6 +768,28 @@ fn scope_layer_precedence_keeps_imports_reserved_only_for_mds() {
 }
 
 #[test]
+fn indented_directives_never_enters_scope_from_frontmatter() {
+    let frontmatter = crate::ast::Frontmatter {
+        raw: "indented-directives: true\nname: World\n".to_owned(),
+    };
+    let mut mem = MemBudget::default();
+    let (mapping, spent) = parse_frontmatter_mapping(Some(&frontmatter), &mut mem).unwrap();
+    for is_md in [false, true] {
+        let (scope, _) = build_scope_from_frontmatter(
+            Some(&frontmatter),
+            mapping.as_ref(),
+            spent,
+            is_md,
+            &runtime_layer(&HashMap::new()),
+            &mut mem,
+        )
+        .unwrap();
+        assert!(scope.get_slot("name").is_some());
+        assert!(scope.get_slot("indented-directives").is_none());
+    }
+}
+
+#[test]
 fn runtime_layer_is_shared_by_module_scopes() {
     let vars = HashMap::from([("x".into(), Value::String("runtime".into()))]);
     let vars = runtime_layer(&vars);
@@ -1265,6 +1287,72 @@ fn check_virtual(files: &[(&str, &str)], entry: &str) -> Result<(), MdsError> {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
     crate::check_virtual(map, entry, None)
+}
+
+const INDENTED_DIRECTIVES_FORM: &str =
+    "expected indented-directives: true or indented-directives: false";
+
+#[test]
+fn indented_directives_yaml_agreement_covers_all_module_kinds() {
+    let entry_routes = [
+        "@import { word } from \"./dep.mds\"\n{{word()}}\n",
+        "@import \"./dep.mds\" as dep\n@include dep\n",
+        "@extends \"./dep.mds\"\n",
+    ];
+    let body = "@define word():\nword\n@end\nbody\n";
+    let compile_error = |files: &[(&str, &str)]| {
+        let err = compile_virtual(files, "entry.mds").unwrap_err();
+        assert_eq!(err.serialize().code, "mds::yaml");
+        assert!(
+            matches!(err, MdsError::YamlError { message } if message == INDENTED_DIRECTIVES_FORM)
+        );
+    };
+    for raw in [
+        "\"indented-directives\": true",
+        "{indented-directives: true}",
+        "? indented-directives\n: true",
+        "# comment\u{2028}indented-directives: true",
+        "{indented-directives: 'true'}",
+    ] {
+        let source = format!("---\n{raw}\n---\n{body}");
+        compile_error(&[("entry.mds", &source)]);
+        for entry in entry_routes {
+            compile_error(&[("entry.mds", entry), ("dep.mds", &source)]);
+        }
+    }
+}
+
+#[test]
+fn indented_directives_yaml_agreement_rejects_a_matching_value_from_another_line() {
+    let src = "---\n\"indented-directives\": true\ntext: \"start\nindented-directives: true\nend\"\n---\nbody\n";
+    let err = compile_virtual(&[("entry.mds", src)], "entry.mds").unwrap_err();
+    assert!(matches!(err, MdsError::YamlError { message } if message == INDENTED_DIRECTIVES_FORM));
+}
+
+#[test]
+fn indented_directives_yaml_agreement_accepts_a_key_after_other_values() {
+    let body = "  @if enabled:\nyes\n  @end\n";
+    for (key, expected) in [("true", "yes\n"), ("false", body)] {
+        let metadata = "title: 'one\ntwo'\nenabled: true\n";
+        let source =
+            format!("---\n{metadata}indented-directives: \t{key} \t # option\n---\n{body}");
+        let output = compile_virtual(&[("entry.mds", &source)], "entry.mds").unwrap();
+        assert_eq!(output, format!("---\n{metadata}---\n{expected}"));
+    }
+}
+
+#[test]
+fn indented_directives_yaml_agreement_rejects_a_probe_hit_in_a_scalar() {
+    let src = "---\nindented-directives:true\n---\nbody\n";
+    let err = compile_virtual(&[("entry.mds", src)], "entry.mds").unwrap_err();
+    assert!(matches!(err, MdsError::YamlError { message } if message == INDENTED_DIRECTIVES_FORM));
+}
+
+#[test]
+fn indented_directives_yaml_agreement_rejects_a_value_changed_by_folding() {
+    let src = "---\nindented-directives: true\n  more\n---\nbody\n";
+    let err = compile_virtual(&[("entry.mds", src)], "entry.mds").unwrap_err();
+    assert!(matches!(err, MdsError::YamlError { message } if message == INDENTED_DIRECTIVES_FORM));
 }
 
 // ── F1: issue worked example (headline test) ──────────────────────────────

@@ -77,13 +77,15 @@ pub(super) fn deep_merge_yaml(
     // recursive calls (depth > 0).  A nested key like `config.type` is not a
     // top-level directive; filtering it would silently discard user data.
     //
-    // SYNC POINT: when this constant changes, also audit `RESERVED_OUTPUT_KEYS` in lib.rs.
-    // The two constants serve different purposes and are intentionally not identical:
-    // `RESERVED_MERGE_KEYS` prevents reserved keys from propagating as FM variables at merge
-    // time; `RESERVED_OUTPUT_KEYS` lists keys removed from raw YAML before re-emitting output.
-    // `extends` is in RESERVED_MERGE_KEYS only — it is consumed as a directive during
-    // inheritance and is never emitted as an output FM key.
-    const RESERVED_MERGE_KEYS: &[&str] = &["imports", "type", "extends"];
+    // SYNC POINT: also audit `RESERVED_OUTPUT_KEYS` and `strip_reserved_keys` in lib.rs,
+    // `build_scope_from_frontmatter` in resolver.rs, and `RESERVED` in lint/facts.rs.
+    // Each site reserves keys for its own purpose. Only the merge sees `extends`.
+    const RESERVED_MERGE_KEYS: &[&str] = &[
+        "imports",
+        "type",
+        "extends",
+        crate::lexer::INDENTED_DIRECTIVES,
+    ];
 
     let mut result = serde_yaml_ng::Mapping::new();
 
@@ -748,6 +750,17 @@ mod tests {
         );
         assert_eq!(mapping_get_str(&result, "model"), Some("gpt-4"));
         assert_eq!(mapping_get_str(&result, "role"), Some("system"));
+    }
+
+    #[test]
+    fn indented_directives_never_merges_as_a_top_level_key() {
+        let with_key =
+            mapping_from_str("indented-directives: true\nconfig:\n  indented-directives: custom\n");
+        let keep = mapping_from_str("config:\n  indented-directives: custom\n");
+        let empty = serde_yaml_ng::Mapping::new();
+        for (base, child) in [(&with_key, &empty), (&empty, &with_key)] {
+            assert_eq!(deep_merge_yaml(base, child, 0).unwrap(), keep);
+        }
     }
 
     /// Nested keys named `type`, `imports`, or `extends` inside a sub-mapping must
