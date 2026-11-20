@@ -1,5 +1,5 @@
 use serde::Serialize;
-use wasm_bindgen::JsValue;
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::*;
 
 // Tests run in Node.js via `wasm-pack test --node crates/mds-wasm`
@@ -2232,4 +2232,158 @@ fn wasm_options_conversion_error_text_is_wire_escaped() {
             "{prefix}: raw ESC or LF in {message:?}"
         );
     }
+}
+
+// ── vars and rules: one read, BigInt refused (#483) ───────────────────────────
+
+/// A plain JS object with these own properties.
+fn js_object(entries: &[(&str, &JsValue)]) -> JsValue {
+    let obj = js_sys::Object::new();
+    for (key, value) in entries {
+        js_sys::Reflect::set(&obj, &JsValue::from_str(key), value).expect("set a property");
+    }
+    obj.into()
+}
+
+/// A JS object whose enumerable property `key` is read through `get`.
+fn object_with_getter(key: &str, get: &js_sys::Function) -> JsValue {
+    let obj = js_sys::Object::new();
+    let descriptor = js_object(&[("get", get), ("enumerable", &JsValue::TRUE)]);
+    js_sys::Object::define_property(&obj, &JsValue::from_str(key), descriptor.unchecked_ref());
+    obj.into()
+}
+
+/// `compile` with `{ vars: value }`, or `lint` with `{ rules: value }`.
+fn convert_option(field: &str, value: &JsValue) -> Result<JsValue, JsValue> {
+    let opts = js_object(&[(field, value)]);
+    if field == "vars" {
+        mds_wasm::compile("Hello {{name}}!\n", opts)
+    } else {
+        mds_wasm::lint("Hello!\n", opts)
+    }
+}
+
+/// Assert an `mds::invalid_options` error with exactly this message.
+fn assert_options_error(result: Result<JsValue, JsValue>, expected: &str) {
+    let err = result.expect_err(expected);
+    assert_eq!(get_str(&err, "code"), "mds::invalid_options", "{expected}");
+    assert_eq!(get_str(&err, "message"), expected);
+}
+
+#[wasm_bindgen_test]
+fn wasm_vars_and_rules_refuse_a_bigint_with_the_native_message() {
+    // The direct exports, not the facade: a BigInt is refused in the words of the
+    // native binding, and a clean value of each option still converts.
+    let bigint = JsValue::from(js_sys::BigInt::from(1_u32));
+    for field in ["vars", "rules"] {
+        assert_options_error(
+            convert_option(field, &js_object(&[("bad", &bigint)])),
+            &format!("invalid options.{field}: InvalidArg, typeof BigInt value could not be deserialized"),
+        );
+    }
+    let out = convert_option("vars", &js_object(&[("name", &JsValue::from_str("World"))]))
+        .expect("clean vars compile");
+    assert_eq!(get_str(&out, "output"), "Hello World!\n");
+    convert_option(
+        "rules",
+        &js_object(&[("unused-variable", &JsValue::from_str("off"))]),
+    )
+    .expect("clean rules lint");
+}
+
+#[wasm_bindgen_test]
+fn wasm_vars_and_rules_give_a_coded_error_for_a_read_that_throws() {
+    // A getter or a Proxy trap that throws is refused with mds::invalid_options:
+    // never `undefined`, and never the caller's own uncoded exception.
+    let throws = js_sys::Function::new_no_args("throw new Error('boom')");
+    let proxy = js_sys::Proxy::new(
+        &js_sys::Object::new(),
+        js_object(&[("ownKeys", &throws)]).unchecked_ref(),
+    );
+    for field in ["vars", "rules"] {
+        for (label, value) in [
+            ("getter", object_with_getter("bad", &throws)),
+            ("proxy", proxy.clone().into()),
+        ] {
+            let result = convert_option(field, &value);
+            assert!(
+                result.is_err(),
+                "{field} {label}: a read that throws must fail"
+            );
+            assert_options_error(
+                result,
+                &format!("invalid options.{field}: InvalidArg, a value could not be read"),
+            );
+        }
+    }
+    // Control: a getter that returns a string is read as that string.
+    let world = js_sys::Function::new_no_args("return 'World'");
+    let out = convert_option("vars", &object_with_getter("name", &world))
+        .expect("a getter that returns a string");
+    assert_eq!(get_str(&out, "output"), "Hello World!\n");
+}
+
+/// `levels` nested objects, each holding the next one under the key `value`.
+fn nested_objects(levels: usize) -> JsValue {
+    let mut value = JsValue::from(0);
+    for _ in 0..levels {
+        value = js_object(&[("value", &value)]);
+    }
+    value
+}
+
+/// The depth refusal of the native binding, for `field`.
+fn depth_refusal(field: &str) -> String {
+    format!("invalid options.{field}: InvalidArg, value nesting exceeds maximum depth of 1024")
+}
+
+/// A value nested `levels` deep must give a result or a coded error on wasm32,
+/// never a runtime trap, and the depth check must not refuse it.
+fn assert_nested_value_converts(levels: usize) {
+    let value = nested_objects(levels);
+    for field in ["vars", "rules"] {
+        if let Err(err) = convert_option(field, &value) {
+            assert!(
+                get_prop(&err, "code").as_string().is_some(),
+                "{field}: uncoded error {err:?}"
+            );
+            assert_ne!(get_str(&err, "message"), depth_refusal(field));
+        }
+    }
+}
+
+#[wasm_bindgen_test]
+fn wasm_vars_and_rules_nested_256_levels_convert_without_a_trap() {
+    assert_nested_value_converts(256);
+}
+
+// The debug build overflows the stack at 1024 levels, in the serde-wasm-bindgen
+// recursion that reads the value. It does so without the copy as well. The
+// release build is the one that ships, and it passes: only it runs this case.
+// The 256-level case above keeps the debug job on the same path.
+#[cfg(not(debug_assertions))]
+#[wasm_bindgen_test]
+fn wasm_vars_and_rules_at_the_depth_limit_convert_without_a_trap() {
+    // 1024 nested objects is the deepest value the walk admits.
+    assert_nested_value_converts(1024);
+}
+
+#[wasm_bindgen_test]
+fn wasm_vars_and_rules_one_level_past_the_depth_limit_are_refused() {
+    for field in ["vars", "rules"] {
+        assert_options_error(
+            convert_option(field, &nested_objects(1025)),
+            &depth_refusal(field),
+        );
+    }
+}
+
+#[wasm_bindgen_test]
+fn wasm_vars_keep_an_own_proto_key() {
+    // JSON.parse makes `__proto__` an own key. The copy must keep it as a key, and
+    // not set the prototype of the copy with it.
+    let opts = js_sys::JSON::parse(r#"{"vars":{"__proto__":"own"}}"#).expect("parse the options");
+    let out =
+        mds_wasm::compile("{{__proto__}}\n", opts).expect("an own __proto__ key is a variable");
+    assert_eq!(get_str(&out, "output"), "own\n");
 }

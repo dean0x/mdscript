@@ -5,7 +5,7 @@
  * Shape tests use stub backends. Conversion parity tests require current native
  * and WASM builds and fail if either backend is absent.
  */
-import { test, describe } from 'node:test';
+import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
@@ -55,6 +55,165 @@ test('native and WASM conversion errors share their code and field prefix', asyn
     () => assertClean({ compile: () => ({ output: 'wrong' }) }),
     assert.AssertionError,
   );
+});
+
+// #483: both backends refuse a BigInt in `vars` or `rules`, and the values that pass
+// the depth and count limits convert alike. Each case runs on both live backends,
+// and the test compares the two outcomes, the full message included. The cases that
+// differ by design pin the result of each backend.
+describe('#483: native and WASM convert vars and rules alike', () => {
+  const require = createRequire(import.meta.url);
+  let native;
+  let wasm;
+  before(async () => {
+    native = createNativeBackend(require('../../../crates/mds-napi/mds-napi.node'));
+    wasm = createWasmBackend(await initWasmNode());
+  });
+  const outcome = (backend, field, value, source = 'ok') => {
+    try {
+      return field === 'vars'
+        ? { output: backend.compile(source, { vars: value }).output }
+        : { version: backend.lint(source, { rules: value }).version };
+    } catch (err) {
+      return { code: err.code, message: err.message };
+    }
+  };
+  // `make` builds a new value for each backend, so that a getter counts its own reads.
+  const outcomes = (field, make, source) =>
+    [native, wasm].map((backend) => outcome(backend, field, make(), source));
+  const refusal = (field, detail) => ({
+    code: 'mds::invalid_options',
+    message: `invalid options.${field}: InvalidArg, ${detail}`,
+  });
+  const bigintDetail = 'typeof BigInt value could not be deserialized';
+  const depthDetail = 'value nesting exceeds maximum depth of 1024';
+  const countDetail = 'value has more than 1000000 entries';
+  const nested = (levels) => {
+    let value = 0;
+    for (let level = 0; level < levels; level += 1) value = { value };
+    return value;
+  };
+
+  for (const field of ['vars', 'rules']) {
+    for (const [label, make] of [
+      ['a BigInt value', () => ({ bad: 1n })],
+      ['a BigInt in an array', () => ({ bad: [1, [2n]] })],
+      ['a large BigInt in a nested object', () => ({ bad: { inner: { deep: 2n ** 70n } } })],
+    ]) {
+      test(`${field} holding ${label} is refused with one full message on both backends`, () => {
+        const expected = refusal(field, bigintDetail);
+        assert.deepEqual(outcomes(field, make), [expected, expected]);
+      });
+    }
+
+    test(`${field} set to a BigInt is refused on both backends, each in its own words`, () => {
+      // napi checks the type of the option before its walk and names a BigInt
+      // "unknown". The WASM walk checks the BigInt first, the root included.
+      assert.deepEqual(outcomes(field, () => 1n), [
+        { code: 'mds::invalid_options', message: `options.${field} must be a plain object, got unknown` },
+        refusal(field, bigintDetail),
+      ]);
+    });
+
+    test(`${field} with a getter that gives a BigInt on its first read is refused on both backends`, () => {
+      const make = () => {
+        let reads = 0;
+        return { get bad() { reads += 1; return reads === 1 ? 1n : 'off'; } };
+      };
+      const expected = refusal(field, bigintDetail);
+      assert.deepEqual(outcomes(field, make), [expected, expected]);
+    });
+
+    test(`${field} with a getter that gives a string first and a BigInt later: native refuses it, WASM reads it once`, () => {
+      const counted = () => {
+        const state = { reads: 0 };
+        const value = { get bad() { state.reads += 1; return state.reads === 1 ? 'off' : 1n; } };
+        return { state, value };
+      };
+      const onNative = counted();
+      assert.deepEqual(
+        outcome(native, field, onNative.value),
+        refusal(field, 'a value changed while it was read and could not be deserialized'),
+      );
+      const onWasm = counted();
+      outcome(wasm, field, onWasm.value);
+      assert.equal(onWasm.state.reads, 1, 'WASM must read each value once');
+    });
+
+    test(`${field} with a read that throws: WASM gives a coded error, native passes the exception through`, () => {
+      const boom = new Error('boom');
+      const getter = () => ({ get bad() { throw boom; } });
+      const proxy = () => new Proxy({}, { ownKeys() { throw boom; } });
+      for (const make of [getter, proxy]) {
+        const [onNative, onWasm] = outcomes(field, make);
+        assert.deepEqual(onNative, { code: undefined, message: 'boom' });
+        assert.deepEqual(onWasm, refusal(field, 'a value could not be read'));
+      }
+    });
+
+    test(`${field} nested past 1024 levels, or holding itself, is refused on both backends`, () => {
+      const expected = refusal(field, depthDetail);
+      const cyclic = () => {
+        const value = {};
+        value.self = value;
+        return value;
+      };
+      assert.deepEqual(outcomes(field, () => nested(1025)), [expected, expected]);
+      assert.deepEqual(outcomes(field, cyclic), [expected, expected]);
+    });
+
+    test(`${field} nested 1024 levels deep passes the depth check on both backends`, () => {
+      const [onNative, onWasm] = outcomes(field, () => nested(1024));
+      assert.notDeepEqual(onNative, refusal(field, depthDetail));
+      assert.deepEqual(onWasm, onNative);
+    });
+
+    test(`${field} with more than 1000000 values is refused on both backends`, () => {
+      const expected = refusal(field, countDetail);
+      assert.deepEqual(outcomes(field, () => ({ bad: new Array(1_000_001).fill(0) })), [expected, expected]);
+      const [onNative, onWasm] = outcomes(field, () => ({ bad: new Array(999_998).fill(0) }));
+      assert.notDeepEqual(onNative, expected);
+      assert.deepEqual(onWasm, onNative);
+    });
+
+    test(`${field} holding a Map with a BigInt is read as an empty object on both backends`, () => {
+      // A Map has no own enumerable keys: neither backend reads its entries or
+      // refuses the BigInt in one.
+      const entry = () => new Map([['a', 1n]]);
+      const clean = field === 'vars' ? { output: 'ok\n' } : { version: 1 };
+      assert.deepEqual(outcomes(field, entry), [clean, clean]);
+      // As a value inside `vars` or `rules`, the Map is an empty object. Under
+      // `rules`, an object is not a severity string.
+      const nestedMap = field === 'vars'
+        ? clean
+        : { code: 'mds::invalid_options', message: 'options.rules["m"] must be a severity string, got object' };
+      assert.deepEqual(outcomes(field, () => ({ m: entry() })), [nestedMap, nestedMap]);
+      if (field === 'vars') {
+        const [onNative, onWasm] = outcomes(field, () => ({ m: entry() }), '{{m.a}}');
+        assert.deepEqual(onWasm, onNative);
+        assert.equal(onWasm.code, 'mds::syntax', 'the entry is not a field of the value');
+      }
+    });
+
+    test(`${field} with an inherited BigInt key: native refuses it, WASM reads own keys only`, () => {
+      assert.deepEqual(outcomes(field, () => Object.create({ bad: 1n })), [
+        refusal(field, bigintDetail),
+        field === 'vars' ? { output: 'ok\n' } : { version: 1 },
+      ]);
+    });
+  }
+
+  test('clean vars and rules give the same result on both backends', () => {
+    const vars = {
+      v: { s: 'x', n: 2.5, i: -3, t: true, f: false, z: null, o: { b: 'deep' }, a: [1, 'two', true, [4]] },
+    };
+    const source = '{{v.s}}|{{v.n}}|{{v.i}}|{{v.t}}|{{v.f}}|{{v.o.b}}\n' +
+      '@for item in v.a:\n- {{item}}\n@end\n@if v.z == null:\nnull ok\n@end\n';
+    const rendered = { output: 'x|2.5|-3|true|false|deep\n- 1\n- two\n- true\n- 4\nnull ok\n' };
+    assert.deepEqual(outcomes('vars', () => vars, source), [rendered, rendered]);
+    const linted = { version: 1 };
+    assert.deepEqual(outcomes('rules', () => ({ 'unused-variable': 'off' })), [linted, linted]);
+  });
 });
 
 test('native and WASM import refusals share code, message, span and importer source', async (t) => {
