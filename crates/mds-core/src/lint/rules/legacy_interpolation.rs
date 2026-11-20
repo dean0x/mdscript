@@ -399,6 +399,12 @@ mod tests {
     }
 
     #[test]
+    fn does_not_flag_single_braces_in_opted_in_fence() {
+        let diags = check_src("```+mds\n@if show:\n{x}\n@end\n```\n");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
     fn detects_message_dynamic_role_directive() {
         // `@message {role}:` (single-brace dynamic role) → flagged with atomic fix.
         let diags = check_src("@message {role}:\nhi\n@end\n");
