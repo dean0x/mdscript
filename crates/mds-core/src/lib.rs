@@ -1697,7 +1697,9 @@ pub fn compile_file(path: &str) -> Result<CompileResult, MdsError> {
 /// The `@extends` path comes first, then the frontmatter paths, then the body's: the
 /// order [`scan_import_records`] gives a module [`ResolveAs::Standalone`].
 /// Duplicate paths are deduplicated while preserving insertion order.
-/// Returns an error if the source has a syntax error.
+/// Returns an error if the source has a syntax error. A source whose syntax tree
+/// estimate does not fit the compile memory budget (`mds::resource_limit`, as a
+/// compile of it) is refused before its tree is built.
 ///
 /// The returned paths are exactly as written in the source and are not
 /// validated — including against the forbidden-path-character class (#265).
@@ -1819,8 +1821,8 @@ pub enum ResolveAs {
 ///
 /// # Errors
 ///
-/// A syntax error in the source, or a frontmatter over a resource limit — as
-/// [`scan_imports`].
+/// A syntax error in the source, a frontmatter over a resource limit, or a source whose
+/// syntax tree estimate does not fit the compile memory budget — as [`scan_imports`].
 ///
 /// # Examples
 ///
@@ -1859,6 +1861,7 @@ pub fn scan_import_records(
     }
 
     let tokens = lexer::tokenize(source, "")?;
+    resolver::charge_scan_tree(&tokens, source.len())?;
     let module = parser::parse_with_ctx(&tokens, "", source)?;
 
     // The @extends base, recorded on its own. Then path → (kind, placement) for the
@@ -3223,5 +3226,63 @@ mod tests {
         );
         let paths = scan_imports(source).expect("frontmatter + imports should succeed");
         assert_eq!(paths, vec!["./lib.mds".to_string()]);
+    }
+
+    // ── the import scan counts the syntax tree (#488) ─────────────────────────
+
+    const COMPILE_MEMORY_REFUSAL: &str =
+        "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes";
+
+    /// The tree estimate that a compile charges for `source`.
+    fn tree_of(source: &str) -> usize {
+        let tokens = lexer::tokenize(source, "").expect("the source lexes");
+        resolver::tree_estimate(&tokens, source.len()).expect("the counts fit")
+    }
+
+    /// `prefix`, then the most `{{a}}` that the compile memory budget takes, and the
+    /// same with one more. Each `{{a}}` is one token, one expression byte and five
+    /// source bytes. The estimate of the first passes the budget exactly, and the
+    /// estimate of the second does not.
+    fn sources_around_the_budget(prefix: &str) -> (String, String) {
+        let most = (limits::MAX_COMPILE_MEMORY - tree_of(prefix)) / tree_of("{{a}}");
+        let build = |repeats: usize| format!("{prefix}{}", "{{a}}".repeat(repeats));
+        let (fits, over) = (build(most), build(most + 1));
+        assert!(tree_of(&fits) <= limits::MAX_COMPILE_MEMORY);
+        assert!(tree_of(&over) > limits::MAX_COMPILE_MEMORY);
+        (fits, over)
+    }
+
+    fn assert_compile_memory_refusal<T: std::fmt::Debug>(result: Result<T, MdsError>, what: &str) {
+        let error = result.expect_err(what).serialize();
+        assert_eq!(
+            (error.code.as_str(), error.message.as_str()),
+            ("mds::resource_limit", COMPILE_MEMORY_REFUSAL),
+            "{what}"
+        );
+    }
+
+    #[test]
+    fn an_import_scan_passes_a_source_whose_tree_estimate_fits_the_budget() {
+        let (fits, _) = sources_around_the_budget("@import \"./a.mds\" as a\n");
+        let records = scan_import_records(&fits, ResolveAs::Standalone).expect("the source fits");
+        let paths: Vec<&str> = records.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, ["./a.mds"]);
+        assert_eq!(scan_imports(&fits).expect("the source fits"), ["./a.mds"]);
+    }
+
+    #[test]
+    fn an_import_scan_refuses_a_source_whose_tree_estimate_passes_the_budget() {
+        let (_, interpolations) = sources_around_the_budget("@import \"./a.mds\" as a\n");
+        // Dense syntax: each four bytes `\{{a` are two tokens.
+        let densest = "\\{{a".repeat(1 << 17);
+        for (what, source) in [("interpolations", interpolations), ("densest", densest)] {
+            for resolve_as in [ResolveAs::Standalone, ResolveAs::Base] {
+                assert_compile_memory_refusal(
+                    scan_import_records(&source, resolve_as),
+                    &format!("scan_import_records, {what}, {resolve_as:?}"),
+                );
+            }
+            assert_compile_memory_refusal(scan_imports(&source), &format!("scan_imports, {what}"));
+        }
     }
 }

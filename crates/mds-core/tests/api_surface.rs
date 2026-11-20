@@ -1627,36 +1627,37 @@ fn runtime_value_path_of_64_steps_reaches_its_leaf() {
     );
 }
 
-#[test]
-fn runtime_value_dot_path_past_64_steps_fails_with_a_syntax_error() {
-    // `y` is 64 steps deep, so `y.a` is 65 steps deep.
-    let leaf = Value::String("leaf".into());
-    let error =
-        compile_in_loops_over_runtime_value(31, nest_under_a(1, leaf), "{{y.a}}").unwrap_err();
+/// A runtime value more than 64 levels deep fails the charge of the compiler's copy
+/// of the variables: the byte count stops at 64 levels, so no path into it runs.
+fn assert_deep_value_refused(error: &MdsError) {
     assert_eq!(
-        error_code(&error).as_deref(),
-        Some("mds::syntax"),
+        error_code(error).as_deref(),
+        Some("mds::resource_limit"),
         "{error}"
     );
     assert_eq!(
         error.to_string(),
-        "syntax error: internal error: an evaluated value has an invalid projection"
+        "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
     );
 }
 
 #[test]
-fn runtime_value_loop_variable_past_64_steps_is_undefined() {
+fn runtime_value_dot_path_past_64_steps_fails_the_variable_charge() {
+    // `y` is 64 steps deep, so `y.a` is 65 steps deep.
+    let leaf = Value::String("leaf".into());
+    let error =
+        compile_in_loops_over_runtime_value(31, nest_under_a(1, leaf), "{{y.a}}").unwrap_err();
+    assert_deep_value_refused(&error);
+}
+
+#[test]
+fn runtime_value_loop_variable_past_64_steps_fails_the_variable_charge() {
     // `y` is 63 steps deep and `y.a` is 64, so the loop variable `z` is 65 steps deep.
     let leaf = Value::String("leaf".into());
     let inner = nest_under_a(1, Value::Array(vec![leaf]));
     let error =
         compile_in_loops_over_runtime_value(30, inner, "@for z in y.a:\n{{z}}\n@end").unwrap_err();
-    assert_eq!(
-        error_code(&error).as_deref(),
-        Some("mds::undefined_var"),
-        "{error}"
-    );
-    assert_eq!(error.to_string(), "undefined variable 'z'");
+    assert_deep_value_refused(&error);
 }
 
 #[test]

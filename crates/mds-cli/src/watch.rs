@@ -220,6 +220,13 @@ pub(crate) fn is_content_event(kind: &notify::EventKind) -> bool {
 /// for just-renamed files whose canonical path may differ transiently.
 /// Also tries canonicalizing the event path to handle /tmp → /private/tmp
 /// symlink differences on macOS.
+///
+/// After a case-only rename on a case-insensitive volume (#481), an event names the
+/// file by its new spelling, and the watch set holds the spelling it had at startup.
+/// Each watched path in the event's canonical directory is then resolved again, and
+/// the result is compared with the event's canonical path: canonical with canonical,
+/// never as text or with case folded. This is a trigger only: the watch set keeps the
+/// startup spelling.
 pub(crate) fn event_is_relevant(event: &Event, watched: &HashSet<PathBuf>) -> bool {
     for path in &event.paths {
         if watched.contains(path) {
@@ -228,6 +235,14 @@ pub(crate) fn event_is_relevant(event: &Event, watched: &HashSet<PathBuf>) -> bo
         // Try resolving symlinks in the event path (macOS /tmp → /private/tmp).
         if let Ok(canonical) = path.canonicalize() {
             if watched.contains(&canonical) {
+                return true;
+            }
+            let dir = canonical.parent();
+            if watched
+                .iter()
+                .filter(|w| w.parent() == dir)
+                .any(|w| w.canonicalize().is_ok_and(|now| now == canonical))
+            {
                 return true;
             }
         }
@@ -6674,6 +6689,80 @@ mod tests {
 
         assert!(event_is_relevant(&relevant_event, &watched));
         assert!(!event_is_relevant(&irrelevant_event, &watched));
+    }
+
+    // #481: after a case-only rename on a case-insensitive volume, the event names the
+    // watched file by its new spelling and the watch set holds the spelling it had at
+    // startup. On a case-sensitive volume the two spellings are two files. A probe of
+    // the volume picks the arm, not the OS, and each arm asserts a match and a refusal.
+    #[test]
+    fn event_is_relevant_matches_a_case_only_rename_of_a_watched_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let watched_path = root.join("Main.mds");
+        std::fs::write(&watched_path, "watched").unwrap();
+        let case_insensitive = root.join("MAIN.mds").exists();
+        let other_case = root.join("main.mds");
+        let unrelated = root.join("other.mds");
+        let output = root.join("Main.md");
+        std::fs::write(&unrelated, "unrelated").unwrap();
+        std::fs::write(&output, "output").unwrap();
+        let watched = HashSet::from([watched_path.clone()]);
+        let event = |p: &Path| notify::Event {
+            kind: notify::EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![p.to_path_buf()],
+            attrs: Default::default(),
+        };
+
+        if case_insensitive {
+            std::fs::rename(&watched_path, &other_case).unwrap();
+            let names: Vec<String> = std::fs::read_dir(&root)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                names.iter().any(|n| n == "main.mds") && !names.iter().any(|n| n == "Main.mds"),
+                "arm: case-insensitive volume. The rename must change the stored name, or \
+                 the event below names the old spelling and never reaches the case-only \
+                 path: {names:?}"
+            );
+            assert!(
+                event_is_relevant(&event(&other_case), &watched),
+                "arm: case-insensitive volume. An event for the new spelling must match the \
+                 watched old spelling"
+            );
+        } else {
+            std::fs::write(&other_case, "another file").unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&watched_path).unwrap(),
+                "watched",
+                "arm: case-sensitive volume. Main.mds and main.mds must be two files on this \
+                 volume"
+            );
+            assert!(
+                !event_is_relevant(&event(&other_case), &watched),
+                "arm: case-sensitive volume. An event for another file whose name differs \
+                 only in case must not match"
+            );
+            assert!(
+                event_is_relevant(&event(&watched_path), &watched),
+                "arm: case-sensitive volume. An event for the watched file must match"
+            );
+        }
+        // Both arms: another file and the output beside the watched file never match.
+        let arm = if case_insensitive {
+            "case-insensitive"
+        } else {
+            "case-sensitive"
+        };
+        assert!(
+            !event_is_relevant(&event(&unrelated), &watched),
+            "arm: {arm} volume. An event for an unrelated file must not match"
+        );
+        assert!(
+            !event_is_relevant(&event(&output), &watched),
+            "arm: {arm} volume. An event for the output beside the watched file must not match"
+        );
     }
 
     // T-U4: collect_mds_files recurses and is depth-bounded.

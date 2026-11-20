@@ -5486,6 +5486,11 @@ fn limit_cache_headroom(cache: &mut ModuleCache, headroom: usize) {
     cache.commit_retained(prior);
 }
 
+/// The tree estimate that a compile charges for `source`.
+fn tree_of(source: &str) -> usize {
+    tree_estimate(&tokenize(source, "tree.mds").unwrap(), source.len()).unwrap()
+}
+
 #[test]
 fn cached_module_moves_its_text_tree_and_fragment_to_retained() {
     let key = "part.mds";
@@ -5509,15 +5514,15 @@ fn cached_module_moves_its_text_tree_and_fragment_to_retained() {
     builder.push_segment(0, 0, body.len() as u32);
     assert!(resolved.prompt_map.is_some());
     let origin_bytes = source.len() + 2 * key.len() + 6 * size_of::<usize>();
-    // The entry keeps its parsed tree. The module defines no function, so it does
-    // not keep its scope layer.
+    // The entry keeps its parsed frontmatter tree and its syntax tree estimate. The
+    // module defines no function, so it does not keep its scope layer.
     let tree = parse_frontmatter_yaml_with(raw, Allowance::in_compile(&MemBudget::default()))
         .unwrap()
         .1;
     assert_eq!(resolved.frontmatter_bytes, tree);
     assert_eq!(
         cache.retained,
-        origin_bytes + raw.len() + body.len() + builder.segments_bytes() + tree
+        origin_bytes + raw.len() + body.len() + builder.segments_bytes() + tree + tree_of(&source)
     );
     assert_eq!(
         cache.budget.mem.headroom,
@@ -5531,7 +5536,7 @@ fn cached_modules_count_across_resolve_calls() {
     let files = [("one.mds", "one\n"), ("two.mds", "two\n")];
     let run =
         |cache: &mut ModuleCache, key| cache.resolve_key(key, &Default::default(), &mut vec![]);
-    let cost = 2 * ("one\n".len() + "one.mds".len()) + 6 * size_of::<usize>();
+    let cost = 2 * ("one\n".len() + "one.mds".len()) + 6 * size_of::<usize>() + tree_of("one\n");
     let mut reused = virtual_cache(&files);
     limit_cache_headroom(&mut reused, 2 * cost - 1);
     run(&mut reused, "one.mds").unwrap();
@@ -5566,11 +5571,12 @@ fn fragment_refusal_keeps_prompt_and_uses_existing_warning() {
 
     let mut tight = virtual_cache(&files);
     tight.source_map_mode = true;
-    // Leave enough for the read and all retained text, but not the fragment.
+    // Leave enough for the read, the tree estimate and all retained text, but not
+    // the fragment.
     let text = "body\n".len();
     limit_cache_headroom(
         &mut tight,
-        3 * text + 2 * key.len() + 6 * size_of::<usize>(),
+        3 * text + 2 * key.len() + 6 * size_of::<usize>() + tree_of("body\n"),
     );
     let mut warnings = vec![];
     let part = tight
@@ -5584,6 +5590,10 @@ fn fragment_refusal_keeps_prompt_and_uses_existing_warning() {
     assert_eq!(warnings, ["source map segment cap (1000000 segments) exceeded in imported module 'part.mds'; text included from it is left unmapped in the source map"]);
     assert_eq!(tight.budget.mem.buffers, 0);
 }
+
+/// Each read of `PaddedReads` has this capacity. It is more than the tree estimate
+/// and the output of a small string entry, so a refused read leaves room for one.
+const PADDED_READ: usize = 2048;
 
 struct PaddedReads(VirtualFs);
 
@@ -5602,7 +5612,7 @@ impl FileSystem for PaddedReads {
 
     fn read(&self, key: &str) -> Result<String, MdsError> {
         let source = self.0.read(key)?;
-        let mut padded = String::with_capacity(128);
+        let mut padded = String::with_capacity(PADDED_READ);
         padded.push_str(&source);
         Ok(padded)
     }
@@ -5646,9 +5656,18 @@ fn module_reads_release_to_parent_and_inserts_keep_only_warnings() {
     let [root, a, empty, b] = cache.module_probes.as_slice() else {
         panic!("four modules")
     };
-    for (probe, outer) in [(root, 0), (a, 128), (empty, 256), (b, 128)] {
+    // The intrinsic entry holds its tree estimate as a temporary while its imports
+    // resolve. A cached import keeps its tree, so `empty` sees only the read of `a`.
+    let root_tree = tree_of(files[0].1);
+    let read = PADDED_READ;
+    for (probe, outer) in [
+        (root, 0),
+        (a, read + root_tree),
+        (empty, 2 * read + root_tree),
+        (b, read + root_tree),
+    ] {
         assert_eq!(probe.temporaries_before, outer);
-        assert_eq!(probe.temporaries_open, outer + 128);
+        assert_eq!(probe.temporaries_open, outer + read);
         assert_eq!(probe.temporaries_closed, outer);
     }
     assert_eq!(
@@ -5665,7 +5684,7 @@ fn module_reads_release_to_parent_and_inserts_keep_only_warnings() {
 fn refused_root_read_releases_the_module_mark() {
     let fs = VirtualFs::new(HashMap::from([("main.mds".to_owned(), "body".to_owned())]));
     let mut cache = ModuleCache::with_fs(Box::new(PaddedReads(fs)));
-    limit_cache_headroom(&mut cache, 127);
+    limit_cache_headroom(&mut cache, PADDED_READ - 1);
     let vars = Default::default();
     let mut warnings = vec![];
     let error = cache
@@ -5703,7 +5722,11 @@ fn skeleton_upgrade_adds_to_the_old_retained_charge() {
     assert_eq!(upgraded.prompt_body.as_deref(), Some("body\n"));
     let mut fresh = virtual_cache(&files);
     fresh.resolve_key("base.mds", &vars, &mut warnings).unwrap();
-    assert_eq!(cache.retained, before + fresh.retained);
+    // The skeleton entry counts the tree of the base. The upgrade counts it once,
+    // so it adds the charge of a fresh compile without that tree.
+    let tree = tree_of(files[0].1);
+    assert!(fresh.retained > tree);
+    assert_eq!(cache.retained, before + fresh.retained - tree);
 }
 
 #[test]
@@ -5724,8 +5747,9 @@ fn finalize_refusal_keeps_output_and_releases_map_work() {
         Some(vec![source.to_owned()])
     );
     let (plain, _) = compile(&mut cache, &CompileOptions::default(), &mut vec![]);
-    // Enough to charge the work arrays and body, but not the retained map.
-    limit_cache_headroom(&mut cache, 230);
+    // Enough to charge the tree estimate, the work arrays and body, but not the
+    // retained map.
+    limit_cache_headroom(&mut cache, 230 + tree_of(source));
     let mut warnings = vec![];
     let (tight, dropped) = compile(&mut cache, &opts, &mut warnings);
     assert_eq!(tight, plain);
@@ -5743,7 +5767,8 @@ fn finalize_refusal_keeps_output_and_releases_map_work() {
     let mut builder = MapBuilder::new(ctx.make_origin());
     builder.push_segment(0, 0, source.len() as u32);
     let mem = &mut cache.budget.mem;
-    mem.charge(Part::Temp, Some(3)).unwrap();
+    // In a compile, the entry holds its tree estimate as a temporary at finalize.
+    mem.charge(Part::Temp, Some(3 + tree_of(source))).unwrap();
     let before = *mem;
     let costs = FinalizeCosts {
         content: source.len(),
@@ -5769,8 +5794,10 @@ fn final_output_charges_prefix_and_growth_before_the_reserve() {
         .1;
     for body in cases {
         let growth = raw.len() + 8 + usize::from(!body.trim_end().is_empty());
-        let needed = body.len() + 2 * raw.len() + 9 + growth + 2 * spent;
         let source = format!("---\n{raw}---\n{body}");
+        // The entry holds its tree estimate as a temporary for the whole compile.
+        let tree = tree_of(&source);
+        let needed = body.len() + 2 * raw.len() + 9 + growth + 2 * spent + tree;
         let compile = |headroom| {
             let mut cache = virtual_cache(&[]);
             limit_cache_headroom(&mut cache, headroom);
@@ -5806,7 +5833,7 @@ fn final_output_charges_prefix_and_growth_before_the_reserve() {
             "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
         );
         assert_eq!(
-            compile(body.len() + 2 * raw.len() + 8)
+            compile(body.len() + 2 * raw.len() + 8 + tree)
                 .unwrap_err()
                 .to_string(),
             "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes"
@@ -6135,4 +6162,655 @@ fn the_extends_scope_layer_is_charged_with_the_merge_charge() {
     // The merged mapping and the scope layer each hold the merge charge.
     assert_eq!(charge, base.frontmatter_bytes + child_bytes);
     assert_eq!(cache.budget.mem.mark(), 2 * charge);
+}
+
+/// The tree estimate assumes these type sizes on a 64-bit host. `tests/memory_bound.rs`
+/// counts tokens and expression bytes by the rules that the samples check. A type that
+/// grows, or a lexer that counts in a different way, fails this test, so the estimate
+/// factors are measured again.
+#[test]
+fn tree_estimate_inputs_keep_their_measured_sizes() {
+    use crate::ast::{Arg, Condition, ElseifBranch, Expr};
+    use crate::lexer::Token;
+    let sizes = [
+        ("Node", size_of::<Node>(), 256),
+        ("Token", size_of::<Token>(), 40),
+        ("Expr", size_of::<Expr>(), 72),
+        ("Condition", size_of::<Condition>(), 152),
+        ("Arg", size_of::<Arg>(), 56),
+        ("ElseifBranch", size_of::<ElseifBranch>(), 184),
+    ];
+    for (name, size, _) in sizes {
+        eprintln!("size_of::<{name}>() = {size} B");
+    }
+    if size_of::<usize>() == 8 {
+        for (name, size, measured) in sizes {
+            assert!(
+                size <= measured,
+                "{name} is {size} B; the estimate assumes {measured} B"
+            );
+        }
+    }
+
+    // (source, tokens, expression bytes): directive lines without their newline and
+    // trimmed interpolation text are expression bytes; each other text run is one token.
+    let samples = [
+        ("\\{{a\\{{a", 4, 0),
+        ("@define f():\n\\{{a\\{{a\n@end\n", 6, 16),
+        ("---\na: ''\n---\n{{a}}{{ a }}", 5, 2),
+        ("x\n@if a&&a:\n@end\n", 3, 13),
+        ("{{f(f(a))}}text{{a.a}}", 3, 10),
+        ("a@b\n@c", 2, 2),
+    ];
+    for (source, tokens, expr) in samples {
+        let lexed = tokenize(source, "sample.mds").unwrap();
+        let expr_bytes: usize = lexed
+            .iter()
+            .map(|token| match token {
+                Token::Interpolation(text, _) | Token::Directive(text, _) => text.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!((lexed.len(), expr_bytes), (tokens, expr), "{source:?}");
+        // The compile charges these counts with the factors from limits.rs.
+        let len = source.len();
+        assert_eq!(
+            tree_estimate(&lexed, len),
+            Some(TREE_PER_TOKEN * tokens + TREE_PER_EXPR_BYTE * expr + TREE_PER_TEXT_BYTE * len),
+            "{source:?}"
+        );
+    }
+}
+
+const COMPILE_MEMORY_REFUSAL: &str =
+    "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes";
+
+/// Dense syntax: each four bytes `\{{a` are two tokens. The tree estimate of 2^17
+/// repeats (512 KiB of source) is past the compile memory budget.
+fn dense_past_the_budget() -> String {
+    "\\{{a".repeat(1 << 17)
+}
+
+/// About 1 MiB of prose in lines of 80 bytes: one text token, so the tree estimate
+/// is mostly the text term. A prose source can not pass the budget alone, so the
+/// prose cases first fill the budget to `PROSE_HEADROOM`.
+fn prose_mib() -> String {
+    format!("{}\n", "a".repeat(79)).repeat((1 << 20) / 80)
+}
+
+/// More than the compile of `prose_mib` needs without its tree, and less than its
+/// tree estimate.
+const PROSE_HEADROOM: usize = 12 << 20;
+
+/// The cases that did not fail with the compile memory error, each with its result.
+/// Every case runs before the caller asserts, so a failure names all of them.
+fn missed_memory_refusals(cases: Vec<(String, Result<(), MdsError>)>) -> Vec<String> {
+    cases
+        .into_iter()
+        .filter_map(|(what, result)| match result {
+            Ok(()) => Some(format!("{what}: the compile passed")),
+            Err(error) => {
+                let record = error.serialize();
+                (record.code != "mds::resource_limit" || record.message != COMPILE_MEMORY_REFUSAL)
+                    .then(|| format!("{what}: {}: {}", record.code, record.message))
+            }
+        })
+        .collect()
+}
+
+fn assert_memory_refusal(result: Result<(), MdsError>, what: &str) {
+    let misses = missed_memory_refusals(vec![(what.to_owned(), result)]);
+    assert!(misses.is_empty(), "{misses:?}");
+}
+
+#[test]
+fn a_cached_import_whose_tree_estimate_passes_the_budget_is_refused() {
+    let root = "@import \"./part.mds\" as part\nroot\n";
+    let dense = dense_past_the_budget();
+    let prose = prose_mib();
+    let mut cases = vec![];
+    for (what, part, headroom) in [
+        ("dense import", &dense, MAX_COMPILE_MEMORY),
+        ("prose import", &prose, PROSE_HEADROOM),
+    ] {
+        let mut cache = virtual_cache(&[("main.mds", root), ("part.mds", part)]);
+        limit_cache_headroom(&mut cache, headroom);
+        let result = cache.resolve_key("main.mds", &HashMap::new(), &mut vec![]);
+        assert!(cache.resolving.is_empty(), "{what}");
+        assert_eq!(cache.budget.mem.mark(), 0, "{what}");
+        cases.push((what.to_owned(), result.map(drop)));
+    }
+    let misses = missed_memory_refusals(cases);
+    assert!(misses.is_empty(), "{misses:#?}");
+}
+
+type Entry = fn(&mut ModuleCache, &str) -> Result<(), MdsError>;
+
+/// The resolve functions of each entry kind. The entry is `main.mds`, or the string
+/// `source`; `child.mds` extends `main.mds`.
+const ENTRY_KINDS: [(&str, Entry); 6] = [
+    ("source intrinsic", |cache, source| {
+        cache
+            .resolve_source_intrinsic(source, "", &HashMap::new(), &mut vec![])
+            .map(drop)
+    }),
+    ("source intrinsic opts", |cache, source| {
+        let opts = CompileOptions::default();
+        cache
+            .resolve_source_intrinsic_opts(source, "", &HashMap::new(), &opts, &mut vec![])
+            .map(drop)
+    }),
+    ("resolve_source", |cache, source| {
+        cache
+            .resolve_source(source, "", &HashMap::new(), &mut vec![])
+            .map(drop)
+    }),
+    ("virtual intrinsic", |cache, _| {
+        cache
+            .resolve_virtual_intrinsic("main.mds", &HashMap::new(), &mut vec![])
+            .map(drop)
+    }),
+    ("resolve_key", |cache, _| {
+        cache
+            .resolve_key("main.mds", &HashMap::new(), &mut vec![])
+            .map(drop)
+    }),
+    ("extends base", |cache, _| {
+        cache
+            .resolve_key("child.mds", &HashMap::new(), &mut vec![])
+            .map(drop)
+    }),
+];
+
+const EXTENDS_MAIN: &str = "@extends \"./main.mds\"\n";
+
+#[test]
+fn every_entry_kind_refuses_a_tree_estimate_past_the_budget() {
+    let dense = dense_past_the_budget();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("main.mds");
+    std::fs::write(&path, &dense).unwrap();
+    let modules = || {
+        HashMap::from([
+            ("main.mds".to_owned(), dense.clone()),
+            ("child.mds".to_owned(), EXTENDS_MAIN.to_owned()),
+        ])
+    };
+    let public = [
+        ("compile_str", crate::compile_str(&dense).map(drop)),
+        (
+            "compile_str_with_deps_opts",
+            crate::compile_str_with_deps_opts(&dense, None, None, CompileOptions::default())
+                .map(drop),
+        ),
+        ("file entry", crate::compile(&path, None).map(drop)),
+        (
+            "virtual entry",
+            crate::compile_virtual(modules(), "main.mds", None).map(drop),
+        ),
+        (
+            "virtual extends base",
+            crate::compile_virtual(modules(), "child.mds", None).map(drop),
+        ),
+    ];
+    let mut cases: Vec<_> = public
+        .into_iter()
+        .map(|(what, result)| (what.to_owned(), result))
+        .collect();
+    let prose = prose_mib();
+    for (kind, source, headroom) in [
+        ("dense", &dense, MAX_COMPILE_MEMORY),
+        ("prose", &prose, PROSE_HEADROOM),
+    ] {
+        for (what, entry) in ENTRY_KINDS {
+            let mut cache = virtual_cache(&[("main.mds", source), ("child.mds", EXTENDS_MAIN)]);
+            limit_cache_headroom(&mut cache, headroom);
+            let result = entry(&mut cache, source);
+            assert!(cache.resolving.is_empty(), "{kind} {what}");
+            assert_eq!(cache.budget.mem.mark(), 0, "{kind} {what}");
+            cases.push((format!("{kind} {what}"), result));
+        }
+    }
+    let misses = missed_memory_refusals(cases);
+    assert!(misses.is_empty(), "{misses:#?}");
+}
+
+/// The least headroom with which `entry` compiles `source`.
+fn least_headroom(files: &[(&str, &str)], source: &str, entry: Entry) -> usize {
+    least_passing_headroom(|headroom| {
+        let mut cache = virtual_cache(files);
+        limit_cache_headroom(&mut cache, headroom);
+        entry(&mut cache, source)
+    })
+}
+
+/// The least headroom with which `run` passes. The search keeps a refused low end
+/// and a passing high end, so it ends at an at-cap pair.
+fn least_passing_headroom(run: impl Fn(usize) -> Result<(), MdsError>) -> usize {
+    let (mut refused, mut passed) = (0, MAX_COMPILE_MEMORY);
+    assert!(run(passed).is_ok(), "the full budget compiles");
+    for _ in 0..usize::BITS {
+        if passed - refused <= 1 {
+            break;
+        }
+        let mid = refused + (passed - refused) / 2;
+        match run(mid) {
+            Ok(()) => passed = mid,
+            Err(_) => refused = mid,
+        }
+    }
+    assert_eq!(passed - refused, 1);
+    assert!(run(passed).is_ok());
+    assert_memory_refusal(run(refused), "one byte under the least headroom");
+    passed
+}
+
+#[test]
+fn each_entry_kind_compiles_at_the_cap_that_includes_the_tree_estimate() {
+    let dense = "\\{{a".repeat((1 << 10) + 1);
+    let prose = format!("{}\n", "a".repeat(79)).repeat((1 << 16) / 80 + 1);
+    let cached_import: (&str, Entry) = ("cached import", |cache, _| {
+        cache
+            .resolve_key("root.mds", &HashMap::new(), &mut vec![])
+            .map(drop)
+    });
+    for source in [&dense, &prose] {
+        let files = [
+            ("main.mds", source.as_str()),
+            ("child.mds", EXTENDS_MAIN),
+            ("root.mds", "@import \"./main.mds\" as main\n"),
+        ];
+        let tree = tree_of(source);
+        for (what, entry) in ENTRY_KINDS.into_iter().chain([cached_import]) {
+            let least = least_headroom(&files, source, entry);
+            eprintln!(
+                "{what}: source={} B, tree estimate={tree} B, least headroom={least} B",
+                source.len()
+            );
+            assert!(least > tree, "{what}: {least} B, tree estimate {tree} B");
+        }
+    }
+}
+
+#[test]
+fn tree_estimate_counts_past_the_address_space_fail_closed() {
+    let wrapping = [
+        (usize::MAX / TREE_PER_TOKEN + 1, 0, 0),
+        (0, usize::MAX / TREE_PER_EXPR_BYTE + 1, 0),
+        (0, 0, usize::MAX / TREE_PER_TEXT_BYTE + 1),
+        // Each product fits, and their sum does not.
+        (
+            usize::MAX / TREE_PER_TOKEN,
+            0,
+            usize::MAX / TREE_PER_TEXT_BYTE,
+        ),
+        (
+            usize::MAX / TREE_PER_TOKEN,
+            usize::MAX / TREE_PER_EXPR_BYTE,
+            0,
+        ),
+    ];
+    for (tokens, expr, len) in wrapping {
+        let estimate = tree_bytes(tokens, expr, len);
+        assert_eq!(estimate, None, "({tokens}, {expr}, {len})");
+        let error = MemBudget::default()
+            .charge(Part::Temp, estimate)
+            .unwrap_err();
+        assert_eq!(
+            error.serialize(),
+            MdsError::compile_memory_exceeded().serialize()
+        );
+    }
+    // The largest counts that fit give the exact product.
+    let most = usize::MAX / TREE_PER_TOKEN;
+    assert_eq!(tree_bytes(most, 0, 0), Some(most * TREE_PER_TOKEN));
+    assert_eq!(
+        tree_bytes(1, 1, 1),
+        Some(TREE_PER_TOKEN + TREE_PER_EXPR_BYTE + TREE_PER_TEXT_BYTE)
+    );
+}
+
+#[test]
+fn each_entry_kind_holds_the_tree_estimate_in_its_own_budget_part() {
+    // "main.mds" and the string label "<source>" have the same length, so the two
+    // entries keep the same origin bytes.
+    assert_eq!("main.mds".len(), SOURCE_LABEL.len());
+    let part = "part\n";
+    let root = "@import \"./part.mds\" as part\nroot\n";
+    let files = [("main.mds", root), ("part.mds", part)];
+    let part_kept = kept_bytes(part, "part.mds", part);
+    let root_kept = kept_bytes(root, "main.mds", "root\n");
+    let vars = HashMap::new();
+
+    // The intrinsic entry holds its tree as a temporary while its import resolves.
+    let mut cache = virtual_cache(&files);
+    cache
+        .resolve_source_intrinsic(root, "", &vars, &mut vec![])
+        .unwrap();
+    let [entry, import] = cache.module_probes.as_slice() else {
+        panic!("two modules")
+    };
+    assert_eq!(import.temporaries_before, tree_of(root));
+    assert_eq!(entry.temporaries_closed, 0);
+    assert_eq!(cache.budget.mem.mark(), 0);
+    assert_eq!(cache.retained, part_kept);
+
+    // The string entry keeps its tree in buffers, never in the retained part.
+    let mut cache = virtual_cache(&files);
+    cache.resolve_source(root, "", &vars, &mut vec![]).unwrap();
+    assert_eq!(cache.retained, part_kept);
+    assert_eq!(cache.budget.mem.buffers, root_kept);
+
+    // A key entry and its cached import add their trees to the retained part.
+    let mut cache = virtual_cache(&files);
+    cache.resolve_key("main.mds", &vars, &mut vec![]).unwrap();
+    assert_eq!(cache.retained, part_kept + root_kept);
+    assert_eq!(cache.budget.mem.buffers, 0);
+}
+
+/// The bytes that a cached module of `source` keeps: its source, two copies of its
+/// key, its origin counts, its prompt `body` and its tree estimate.
+fn kept_bytes(source: &str, key: &str, body: &str) -> usize {
+    source.len() + 2 * key.len() + 6 * size_of::<usize>() + body.len() + tree_of(source)
+}
+
+type VarsEntry = fn(&mut ModuleCache, &str, &HashMap<String, Value>) -> Result<(), MdsError>;
+
+/// The nine resolve functions that copy the caller variables. Each compiles
+/// `main.mds`, or the string `source`.
+const VARS_ENTRIES: [(&str, VarsEntry); 9] = [
+    ("resolve_path", |cache, _, vars| {
+        cache.resolve_path("main.mds", vars, &mut vec![]).map(drop)
+    }),
+    ("resolve_path_intrinsic", |cache, _, vars| {
+        cache
+            .resolve_path_intrinsic("main.mds", vars, &mut vec![])
+            .map(drop)
+    }),
+    ("resolve_path_intrinsic_opts", |cache, _, vars| {
+        let opts = CompileOptions::default();
+        cache
+            .resolve_path_intrinsic_opts("main.mds", vars, &opts, &mut vec![])
+            .map(drop)
+    }),
+    ("resolve_key", |cache, _, vars| {
+        cache.resolve_key("main.mds", vars, &mut vec![]).map(drop)
+    }),
+    ("resolve_source", |cache, source, vars| {
+        cache
+            .resolve_source(source, "", vars, &mut vec![])
+            .map(drop)
+    }),
+    ("resolve_virtual_intrinsic", |cache, _, vars| {
+        cache
+            .resolve_virtual_intrinsic("main.mds", vars, &mut vec![])
+            .map(drop)
+    }),
+    ("resolve_virtual_intrinsic_opts", |cache, _, vars| {
+        let opts = CompileOptions::default();
+        cache
+            .resolve_virtual_intrinsic_opts("main.mds", vars, &opts, &mut vec![])
+            .map(drop)
+    }),
+    ("resolve_source_intrinsic", |cache, source, vars| {
+        cache
+            .resolve_source_intrinsic(source, "", vars, &mut vec![])
+            .map(drop)
+    }),
+    ("resolve_source_intrinsic_opts", |cache, source, vars| {
+        let opts = CompileOptions::default();
+        cache
+            .resolve_source_intrinsic_opts(source, "", vars, &opts, &mut vec![])
+            .map(drop)
+    }),
+];
+
+const IMPORT_ROOT: &str = "@import \"./part.mds\" as part\nroot\n";
+const IMPORT_FILES: [(&str, &str); 2] = [("main.mds", IMPORT_ROOT), ("part.mds", "part\n")];
+
+/// Run `entry` on a new cache with `headroom` left. Every run ends with no module
+/// on the stack and no temporary.
+fn run_with_vars(
+    entry: VarsEntry,
+    headroom: usize,
+    vars: &HashMap<String, Value>,
+) -> (ModuleCache, Result<(), MdsError>) {
+    let mut cache = virtual_cache(&IMPORT_FILES);
+    limit_cache_headroom(&mut cache, headroom);
+    let result = entry(&mut cache, IMPORT_ROOT, vars);
+    assert!(cache.resolving.is_empty());
+    assert_eq!(cache.budget.mem.mark(), 0);
+    (cache, result)
+}
+
+/// A 64 KiB text and 100 small variables, so the table, the names and the values
+/// all count.
+fn caller_vars() -> HashMap<String, Value> {
+    let mut vars: HashMap<_, _> = (0..100)
+        .map(|i| (format!("v{i:02}"), Value::Null))
+        .collect();
+    vars.insert("pad".to_owned(), Value::String("x".repeat(1 << 16)));
+    vars
+}
+
+#[test]
+fn each_entry_charges_the_caller_variable_layer_once_at_the_root() {
+    let vars = caller_vars();
+    let layer = runtime_layer(&vars).bytes().unwrap();
+    let names: usize = vars.keys().map(String::len).sum();
+    let per_var = size_of::<(String, crate::scope::Slot)>() + size_of::<Value>();
+    let floor = vars.len() * per_var + names + (1 << 16);
+    assert!(layer >= floor, "layer {layer} B, floor {floor} B");
+    let empty = HashMap::new();
+    let (mut cases, mut misses) = (vec![], vec![]);
+    for (what, entry) in VARS_ENTRIES {
+        // Exactly at the least headroom the compile passes, one byte under it is refused.
+        let least = |vars| least_passing_headroom(|room| run_with_vars(entry, room, vars).1);
+        let added = least(&vars).checked_sub(least(&empty));
+        if added != Some(layer) {
+            misses.push(format!(
+                "{what}: the variables add {added:?} B, not {layer} B"
+            ));
+        }
+        // The layer is the first charge of the compile, in buffers below the root mark.
+        // A layer exactly at the headroom is charged, and one byte more is refused.
+        for (headroom, charged) in [(layer, layer), (layer - 1, 0)] {
+            let (cache, result) = run_with_vars(entry, headroom, &vars);
+            let probes: Vec<_> = cache
+                .module_probes
+                .iter()
+                .map(|probe| (probe.buffers_before, probe.temporaries_before))
+                .collect();
+            if probes != [(charged, 0)] {
+                misses.push(format!("{what} at headroom {headroom}: {probes:?}"));
+            }
+            cases.push((format!("{what} at headroom {headroom}"), result));
+        }
+    }
+    misses.extend(missed_memory_refusals(cases));
+    assert!(misses.is_empty(), "{misses:#?}");
+}
+
+#[test]
+fn empty_caller_variables_charge_no_layer_bytes() {
+    assert_eq!(runtime_layer(&HashMap::new()).bytes(), Some(0));
+    for (what, entry) in VARS_ENTRIES {
+        let (cache, result) = run_with_vars(entry, MAX_COMPILE_MEMORY, &HashMap::new());
+        result.unwrap();
+        assert_eq!(cache.module_probes[0].buffers_before, 0, "{what}");
+    }
+}
+
+#[test]
+fn a_layer_changed_after_its_count_fails_the_root_charge() {
+    assert_eq!(VarLayer::new().bytes(), Some(0));
+    let mut layer = runtime_layer(&HashMap::from([("a".to_owned(), Value::Null)]));
+    assert!(layer.bytes().is_some());
+    // An insert after the collect makes the count unknown, never stale.
+    Arc::get_mut(&mut layer)
+        .unwrap()
+        .insert("b".to_owned(), Arc::new(Value::Null));
+    assert_eq!(layer.bytes(), None);
+    let mut cache = virtual_cache(&[]);
+    let (_, charged) = cache.begin_module("main.mds", &layer, 0);
+    assert_memory_refusal(charged, "a layer with no byte count");
+}
+
+#[test]
+fn a_reused_cache_retains_kept_bytes_and_never_the_caller_layer() {
+    let other = "other\n";
+    let mut cache = virtual_cache(&[IMPORT_FILES[0], IMPORT_FILES[1], ("other.mds", other)]);
+    let vars = caller_vars();
+    let layer = runtime_layer(&vars).bytes().unwrap();
+    let main_kept =
+        kept_bytes("part\n", "part.mds", "part\n") + kept_bytes(IMPORT_ROOT, "main.mds", "root\n");
+    let mut retained = 0;
+    for (key, kept) in [
+        ("main.mds", main_kept),
+        ("other.mds", kept_bytes(other, "other.mds", other)),
+    ] {
+        cache.resolve_key(key, &vars, &mut vec![]).unwrap();
+        retained += kept;
+        assert_eq!(cache.retained, retained, "{key}");
+        assert_eq!(cache.budget.mem.buffers, layer, "{key}");
+        assert_eq!(cache.budget.mem.mark(), 0, "{key}");
+    }
+}
+
+#[test]
+fn a_caller_value_past_the_counted_depth_is_refused_by_the_layer_charge() {
+    let nested =
+        |levels: usize| (0..levels).fold(Value::Null, |value, _| Value::Array(vec![value]));
+    let parsed = |levels: usize| {
+        let json = format!("{}null{}", "[".repeat(levels), "]".repeat(levels));
+        Value::from_json(serde_json::from_str(&json).unwrap())
+    };
+    // The JSON input of the bindings and the CLI admits 64 levels and refuses 65.
+    assert_eq!(parsed(64).unwrap(), nested(64));
+    assert!(parsed(65).is_err());
+    let compile = |levels| {
+        let vars = HashMap::from([("deep".to_owned(), nested(levels))]);
+        crate::compile_str_with("Body\n", None, Some(vars)).map(drop)
+    };
+    compile(64).unwrap();
+    assert_memory_refusal(compile(65), "a value nested 65 levels deep");
+}
+
+/// A compile refuses a value past 64 levels at the variable charge, so this test
+/// puts the value in a scope directly: the path checks past 64 steps still hold.
+#[test]
+fn a_path_past_64_steps_into_a_scope_value_keeps_its_errors() {
+    let nest = |levels: usize, inner| {
+        (0..levels).fold(inner, |value, _| {
+            Value::Object(HashMap::from([("a".to_owned(), value)]))
+        })
+    };
+    // `x` is 31 fields and one index deep. `y` is `fields` more fields and one index.
+    let run = |fields: usize, inner: Value, tail: &str| {
+        let value = nest(
+            31,
+            Value::Array(vec![nest(fields, Value::Array(vec![inner]))]),
+        );
+        let (x, y) = (".a".repeat(31), ".a".repeat(fields));
+        let source = format!("@for x in v{x}:\n@for y in x{y}:\n{tail}\n@end\n@end\n");
+        let tokens = tokenize(&source, "deep.mds").unwrap();
+        let module = parse_with_ctx(&tokens, "deep.mds", &source).unwrap();
+        let mut scope = Scope::new();
+        scope.set_var("v", value);
+        let error = evaluate(&module.body, &mut scope, &mut vec![], "deep.mds", &source);
+        let record = error.unwrap_err().serialize();
+        (record.code, record.message)
+    };
+    let leaf = || Value::String("leaf".into());
+    // `y` is 64 steps deep, so `y.a` is 65 steps deep.
+    assert_eq!(
+        run(31, nest(1, leaf()), "{{y.a}}"),
+        (
+            "mds::syntax".to_owned(),
+            "syntax error: internal error: an evaluated value has an invalid projection".to_owned()
+        )
+    );
+    // `y.a` is 64 steps deep, so the loop variable `z` is 65 steps deep.
+    let inner = nest(1, Value::Array(vec![leaf()]));
+    assert_eq!(
+        run(30, inner, "@for z in y.a:\n{{z}}\n@end"),
+        (
+            "mds::undefined_var".to_owned(),
+            "undefined variable 'z'".to_owned()
+        )
+    );
+}
+
+/// Sources one byte past the `sourcesContent` ceiling: the map drops `sourcesContent`
+/// with the ceiling warning and keeps every source and mapping. Sources at exactly the
+/// ceiling keep `sourcesContent` and do not warn (control).
+///
+/// A compile does not reach this ceiling: the compile memory budget refuses a smaller
+/// set of sources first, because each source byte costs at least 17 bytes of the
+/// budget. The ceiling stays as an extra guard, so this test drives the check itself.
+#[test]
+fn sources_content_one_byte_past_the_ceiling_is_dropped_with_its_warning() {
+    let body = "L1\nL2\n";
+    let opts = CompileOptions::default()
+        .with_source_map(true)
+        .with_include_sources_content(true);
+    let two_sources = || {
+        let mut builder = MapBuilder::from_parts("l1.mds".into(), "l1.mds".into(), "L1\n".into());
+        builder.push_segment(0, 0, 3);
+        builder.switch_to(&Origin {
+            file: Arc::from("l2.mds"),
+            display: Arc::from("l2.mds"),
+            source: Arc::from("L2\n"),
+        });
+        builder.push_segment(3, 0, 3);
+        builder
+    };
+    // Non-vacuity: with no check, each source owns one mapped line and embeds its text.
+    let full = two_sources().finalize_points(body).finish(body, 0, None);
+    assert_eq!(full.sources, ["l1.mds", "l2.mds"]);
+    assert_eq!(
+        full.sources_content,
+        Some(vec!["L1\n".to_string(), "L2\n".to_string()])
+    );
+    assert_eq!(
+        full.mappings.split(';').filter(|l| !l.is_empty()).count(),
+        2
+    );
+    for (total, over) in [
+        (MAX_SOURCES_CONTENT_BYTES + 1, true),
+        (MAX_SOURCES_CONTENT_BYTES, false),
+    ] {
+        let mut warnings = Vec::new();
+        let sm = apply_map_degradation(two_sources(), total, &opts, &mut warnings)
+            .expect("the ceiling never drops the whole map")
+            .finalize_points(body)
+            .finish(body, 0, None);
+        // The literal pins the ceiling at 50 MiB.
+        let expected_warnings = if over {
+            vec![format!(
+                "sourcesContent total size ({total} bytes) exceeds the 52428800 byte \
+                 ceiling; sourcesContent will be omitted from the source map"
+            )]
+        } else {
+            vec![]
+        };
+        assert_eq!(warnings, expected_warnings, "total={total}");
+        let expected_content = if over {
+            None
+        } else {
+            full.sources_content.clone()
+        };
+        assert_eq!(
+            sm.sources_content, expected_content,
+            "total={total}: sourcesContent is kept only up to the ceiling"
+        );
+        assert_eq!(
+            sm.sources, full.sources,
+            "total={total}: every source is kept"
+        );
+        assert_eq!(
+            sm.mappings, full.mappings,
+            "total={total}: every mapping is kept"
+        );
+    }
 }

@@ -7,6 +7,8 @@ use budget::{
     bytes, display_len, format_exact, format_len, render_value, table_bytes, value_bytes,
     MemBudget, Part, NODE, VALUE_ROOT,
 };
+mod held;
+use held::{call_held, evaluate_held};
 
 use crate::arity::check_arity;
 use crate::ast::{
@@ -625,7 +627,7 @@ fn resolve_args(
                 Arg::Call {
                     name,
                     args: inner_args,
-                } => return call_function(name, inner_args, scope, ctx, depth + 1),
+                } => return call_held(name, inner_args, scope, ctx, depth + 1),
                 Arg::MemberAccess { object, fields } => {
                     return resolve_dot_path(object, fields, scope, &mut ctx.budget.mem)
                 }
@@ -807,7 +809,8 @@ fn evaluate_function_body(
     //
     // Conditions for S8 (all must hold):
     //  1. A map is present (source-map mode active, AC-PERF-01).
-    //  2. suppress == 0 — we are not already inside a suppressed body.
+    //  2. suppress == 0 — we are not inside a suppressed body or a held region
+    //     (the `held` module: a condition, an iterable or a call argument).
     //  3. func.origin is Some — the function has provenance metadata (populated
     //     unconditionally since B1 dropped the source_map_mode gate, S7).
     //
@@ -1210,15 +1213,16 @@ fn evaluate_condition(
     anchor: Option<usize>,
 ) -> Result<bool, MdsError> {
     let mark = ctx.budget.mem.mark();
+    // The condition decides the branch; the text of a call in it is not output.
     let result = (|| match condition {
         Condition::Truthy(expr) | Condition::Not(expr) => {
-            let slot = evaluate_expr(expr, scope, ctx)?;
+            let slot = evaluate_held(expr, scope, ctx)?;
             let truthy = slot.get().ok_or_else(invalid_projection)?.is_truthy();
             Ok(truthy != matches!(condition, Condition::Not(_)))
         }
         Condition::Eq(lhs, rhs) | Condition::NotEq(lhs, rhs) => {
-            let lhs = evaluate_expr(lhs, scope, ctx)?;
-            let rhs = evaluate_expr(rhs, scope, ctx)?;
+            let lhs = evaluate_held(lhs, scope, ctx)?;
+            let rhs = evaluate_held(rhs, scope, ctx)?;
             let lhs = lhs.get().ok_or_else(invalid_projection)?;
             let rhs = rhs.get().ok_or_else(invalid_projection)?;
             let eq = values_equal_same_type(lhs, rhs).ok_or_else(|| {
@@ -1326,7 +1330,8 @@ where
 {
     let mark = ctx.budget.mem.mark();
     let result = (|| {
-        let slot = evaluate_expr(&block.iterable, scope, ctx)?;
+        // The iterable gives the items; the text of a call in it is not output.
+        let slot = evaluate_held(&block.iterable, scope, ctx)?;
         let iterable = slot.get().ok_or_else(invalid_projection)?;
 
         if let Some(ref key_var) = block.key_var {
@@ -1502,9 +1507,13 @@ fn evaluate_include(
     // the parent output (set by the Node::Include arm in evaluate_nodes just before
     // calling evaluate_include). The builder caches the fragment's source remap, so
     // an @include inside a @for loop registers the module's sources once (AC-PERF-05).
+    // While the map is held or suppressed, this text is not mapped here, so the
+    // include splices no segment and registers no source; the body is returned as before.
     if let (Some(fragment), Some(map)) = (ns.prompt_map.as_ref(), ctx.map.as_mut()) {
-        let base = map.cursor;
-        map.splice_fragment(fragment, base);
+        if map.suppress == 0 {
+            let base = map.cursor;
+            map.splice_fragment(fragment, base);
+        }
     }
 
     Ok(Some(prompt_body.clone()))

@@ -1451,8 +1451,11 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
     const engines = await loadEngines();
     if (!requireEngines(t, engines, 'U-SM33b')) return;
     await withNestedProject(async (proj) => {
-      // Each module is under the per-file cap; together they are over 10 MiB.
-      const half = 'x'.repeat(6 * 1024 * 1024);
+      // Each module is under the per-file cap; together they are over 10 MiB. Native
+      // admits two imported prose modules of at most about 11.3 MB in total inside its
+      // compile memory budget (about 18.5 budget bytes per source byte), so 2 x 5.2 MiB
+      // (10.9 MB) is about 0.4 MB from each limit.
+      const half = 'x'.repeat(Math.floor(5.2 * 1024 * 1024));
       await writeFile(path.join(proj, 'a.mds'), half);
       await writeFile(path.join(proj, 'b.mds'), half);
       const main = path.join(proj, 'main.mds');
@@ -1466,6 +1469,38 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
         help: null,
         span: null,
       });
+    });
+  });
+
+  test('U-SM33c: a dense module is refused by the import scan, before the compile (#488)', async (t) => {
+    if (!requireEngines(t, { wasm: wasmEngine }, 'U-SM33c')) return;
+    await withNestedProject(async (proj) => {
+      // 2^17 repeats of `\{{a` (512 KiB, under every size cap) are two tokens each, and
+      // their syntax tree estimate is past the compile memory budget. Half as many pass.
+      const dense = path.join(proj, 'dense.mds');
+      const half = path.join(proj, 'half.mds');
+      await writeFile(dense, '\\{{a'.repeat(1 << 17));
+      await writeFile(half, '\\{{a'.repeat(1 << 16));
+      const refusal = {
+        code: 'mds::resource_limit',
+        message: 'resource limit exceeded: compile memory exceeds maximum of 209715200 bytes',
+        help: null,
+        span: null,
+      };
+      const engine = {
+        scanImportRecords: (source, asBase) => wasmEngine.scanImportRecords(source, asBase),
+        preflightModule,
+      };
+
+      // The file walk scans each module with the engine before any compile.
+      assert.deepEqual(errorShape(await rejectionOf(buildModulesMapWith(dense, engine), dense)), refusal);
+      const { modules } = await buildModulesMapWith(half, engine);
+      assert.deepEqual(Object.keys(modules), ['half.mds']);
+
+      // The public API on the WASM backend gives the same refusal.
+      const [refused, passed] = await compileFileOutcomes('wasm', [dense, half]);
+      assert.deepEqual(refused, refusal);
+      assert.equal(typeof passed.output, 'string');
     });
   });
 
@@ -1658,7 +1693,9 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       // Each project crosses the 10 MiB aggregate at its last module, `c`, which native
       // refuses on its own. In `walk-*` the read-ahead budget is spent on `a`, so the
       // walk reads `c` itself; in `race-*` `a` and `c` are read ahead side by side, and
-      // which of them the budget admits depends on which read gets there first.
+      // which of them the budget admits depends on which read gets there first. Each
+      // project holds 10.4 MiB (10.9 MB) of prose: over the 10 MiB guard, and inside
+      // native's compile memory budget, which admits about 11.3 MB of imported prose.
       const rows = [
         // [label, name of c, content of c, native's refusal of c]
         ['invalid UTF-8', 'c.mds', invalidUtf8, 'mds::io'],
@@ -1671,14 +1708,14 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
         const slug = label.replace(/\W+/g, '-');
         const walkDir = path.join(proj, `walk-${slug}`);
         await mkdir(walkDir);
-        await writeFile(path.join(walkDir, 'e.mds'), `@import "./a.mds" as a\nhi\n${text(MiB)}`);
+        await writeFile(path.join(walkDir, 'e.mds'), `@import "./a.mds" as a\nhi\n${text(Math.floor(0.3 * MiB))}`);
         await writeFile(path.join(walkDir, 'a.mds'), `@import "./${name}" as c\nA\n${text(8.5 * MiB)}`);
         await writeFile(path.join(walkDir, name), content(Math.floor(1.6 * MiB)));
         const raceDir = path.join(proj, `race-${slug}`);
         await mkdir(raceDir);
         await writeFile(path.join(raceDir, 'e.mds'), `@import "./a.mds" as a\n@import "./${name}" as c\nhi\n`);
-        await writeFile(path.join(raceDir, 'a.mds'), text(6 * MiB));
-        await writeFile(path.join(raceDir, name), content(6 * MiB));
+        await writeFile(path.join(raceDir, 'a.mds'), text(Math.floor(5.2 * MiB)));
+        await writeFile(path.join(raceDir, name), content(Math.floor(5.2 * MiB)));
         entries.push(path.join(walkDir, 'e.mds'), path.join(raceDir, 'e.mds'));
       }
       const native = await compileFileOutcomes('native', entries);

@@ -32,7 +32,9 @@
 //! `@define` function body has no known `Origin`, `MapBuilder`
 //! increments `suppress` for the body's duration; individual body
 //! nodes are not recorded.  Only the `Interpolation` point for the
-//! call site in the parent output is mapped.
+//! call site in the parent output is mapped.  A call in a condition,
+//! an iterable or a call argument also takes this path, because the
+//! evaluator holds the map there: that text is not output.
 //!
 //! **S6** — `@include` fragment splice carrying foreign source
 //! indices.  `splice_fragment` on `MapBuilder` inserts rebased
@@ -771,6 +773,11 @@ pub(crate) struct SourceIndex(u32);
 /// `Origin` (S8 path) suppression is skipped and the body is recorded
 /// directly with the current source switched to the definition file.
 ///
+/// `suppress > 0` also while the evaluator holds the map for a region whose text
+/// is not output: a condition, an iterable or a call argument. A call there takes
+/// the S3 path, an `@include` there splices nothing, and the release puts back
+/// `cursor` and the segment count.
+///
 /// # Sources
 ///
 /// The source table and the current source are private: sources are registered
@@ -783,7 +790,8 @@ pub(crate) struct MapBuilder {
     pub(crate) segments: Vec<RawSegment>,
     /// Current absolute byte position in the compiled output.
     pub(crate) cursor: u32,
-    /// Suppression depth: >0 means we are inside a function body (S3 path).
+    /// Suppression depth: >0 inside a function body on the S3 path, or inside a
+    /// held region whose text is not output.
     pub(crate) suppress: u32,
     /// The source currently being recorded.
     current_src: SourceIndex,

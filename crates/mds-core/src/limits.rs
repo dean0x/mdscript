@@ -48,17 +48,59 @@ pub(crate) const MAX_OUTPUT_SIZE: usize = 50 * 1024 * 1024;
 
 /// Maximum memory one compile may hold, in bytes (four output buffers: 200 MiB).
 ///
-/// One budget per compile, kept in `evaluator::budget::MemBudget`. It counts output
-/// buffers by capacity, the values that evaluation makes, the read text of each module,
-/// the text, frontmatter trees and scope layers that cached modules keep, kept
-/// source-map segments, warnings, messages and the finalize output. Each part is
-/// charged before its allocation, except at a few named sites that charge right after
-/// one allocation. Exactly the budget passes. The next charge fails with
-/// `mds::resource_limit` (`MdsError::compile_memory_exceeded`). The syntax tree,
-/// tokens, caller variables, the line table, the YAML event buffer and binding output
-/// conversion are outside the budget. The retained part of a reused `ModuleCache`
-/// never resets.
+/// One budget per compile or check, kept in `evaluator::budget::MemBudget`. It counts
+/// output buffers by capacity, the values that evaluation makes, the read text of each
+/// module, the tree estimate of each module (see `TREE_PER_TOKEN`; an import scan
+/// charges it against its own new budget), the compiler's copy of the caller variables, the text, tree estimates, frontmatter trees and scope layers
+/// that cached modules keep, kept source-map segments, warnings, messages and the
+/// finalize output. Each part is charged before its allocation, except at a few named
+/// sites that charge right after one allocation. Exactly the budget passes. The next
+/// charge fails with `mds::resource_limit` (`MdsError::compile_memory_exceeded`).
+///
+/// The compiler's copy of the caller variables is charged once per compile, as buffers,
+/// at the root. The caller's own map is outside the budget. The count stops at 64 levels
+/// of value nesting, so a Rust `Value` nested deeper fails this charge. On a root cache
+/// hit, the copy is made and freed without a charge. On a reused `ModuleCache`, a copy
+/// that a cached function captures lives after its compile, and only that compile counts
+/// it.
+///
+/// Outside the budget: the lexer stage of each source (its `Vec<char>`, its
+/// `byte_offsets` and the tokens it makes), which ends before the tree estimate is
+/// charged. On a 64-bit host it holds 14 B per source byte for ASCII prose, and at most
+/// 56 B per source byte for the densest syntax. Also outside: the caller's own variable
+/// map, the line table, the YAML event buffer and binding output conversion. The
+/// retained part of a reused `ModuleCache` never resets.
 pub(crate) const MAX_COMPILE_MEMORY: usize = 4 * MAX_OUTPUT_SIZE;
+
+/// Syntax tree bytes per token in the tree estimate.
+///
+/// The estimate of a module is `tokens * TREE_PER_TOKEN + expression bytes *
+/// TREE_PER_EXPR_BYTE + source bytes * TREE_PER_TEXT_BYTE`, in checked arithmetic: a
+/// count past the address space fails the charge. Expression bytes are the text of each
+/// directive line and interpolation. The compile memory budget charges the estimate after
+/// the lexer and before the parse of each module: a cached import, an `@extends` base,
+/// the file entry and the string entry. An import scan (`scan_imports`,
+/// `scan_import_records`) charges it in the same place against its own new budget. A
+/// refused tree is never built. A cached module keeps its estimate charged. A skeleton
+/// entry that is upgraded keeps one estimate.
+///
+/// The three factors are measured on a 64-bit host: for each of the 62 shapes in
+/// `tests/memory_bound.rs`, the estimate is at least the compile peak and the bytes
+/// that a cached module keeps. On wasm32 the estimate is high, so a compile refuses
+/// early. For a module compiled alone, the largest sources that pass are about: 484,330 B
+/// of the densest syntax (`\{{a`), 952,385 B of `{{a}}`, 678,735 B of the densest
+/// measured expression shape and 5,229,805 B of prose with one `{{a}}` per 80 B. Plain
+/// prose stops at the 10 MiB file cap first (the budget alone allows 12,336,188 B). A
+/// reused `ModuleCache` fills faster: the sources of all modules that it caches in its
+/// life share about the same ceilings (484,610 B, 956,729 B, 680,939 B, 5,237,969 B and
+/// 12,336,188 B).
+pub(crate) const TREE_PER_TOKEN: usize = 832;
+
+/// Syntax tree bytes per byte of directive and interpolation text in the tree estimate.
+pub(crate) const TREE_PER_EXPR_BYTE: usize = 184;
+
+/// Syntax tree bytes per source byte in the tree estimate.
+pub(crate) const TREE_PER_TEXT_BYTE: usize = 16;
 
 /// Maximum total function calls per compile, across all evaluated modules.
 /// Allows sixteen calls per pass in a million-pass loop budget.
@@ -197,6 +239,10 @@ pub(crate) const MAX_SOURCEMAP_SEGMENTS: usize = 1_000_000;
 ///
 /// Set equal to `MAX_OUTPUT_SIZE` (50 MB): the content set should not dwarf the
 /// compiled output it annotates.
+///
+/// A compile reaches the compile memory budget (`MAX_COMPILE_MEMORY`) first: each
+/// source byte costs at least 17 bytes of that budget, so a compile holds less than
+/// this ceiling of sources. The ceiling stays as an extra guard.
 pub(crate) const MAX_SOURCES_CONTENT_BYTES: usize = MAX_OUTPUT_SIZE;
 
 /// Maximum number of distinct modules besides the entry in a compilation.

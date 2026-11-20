@@ -49,8 +49,8 @@
 //! #412 pins that an `@include` of an extending module is source-mapped: each included
 //! byte maps to the chain file that wrote it, exactly as a direct compile of the chain
 //! maps it; output is unchanged; no map is kept for an empty body; the segment-cap
-//! warning is truthful; the sourcesContent ceiling covers the chain's files; and a
-//! diagnostic in a file first registered by the splice names it root-relative.
+//! warning is truthful; and a diagnostic in a file first registered by the splice
+//! names it root-relative.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -2193,76 +2193,127 @@ fn d1_extends_from_string_no_source_sentinel() {
 
 /// Skeleton lines in the many-regions base. Each `{{v}}\n` line is two spliced
 /// regions (an interpolation node and a text node), all owned by the base.
-const MANY_REGIONS_LINES: usize = 262_144;
+const MANY_REGIONS_LINES: usize = 32_768;
+
+/// Bytes of padding that the many-regions base holds in an unused `@define`. The
+/// padding never renders, but it is part of the base's source. The builder before
+/// #416 copied that whole source once per region, so the padding makes each copy
+/// larger; the shared-source builder reads the source once.
+///
+/// The lines and the padding together fit the compile memory budget with a clear
+/// margin. The syntax tree estimate of the base is about 114 MB (832 bytes per
+/// token, 184 per expression byte, 16 per text byte), about 54 percent of the
+/// 209,715,200-byte budget.
+const MANY_REGIONS_PADDING: usize = 3 * 1024 * 1024;
 
 /// The value each many-regions line renders to — a whole output line nothing else
 /// in the chain can produce.
 const MANY_REGIONS_VALUE: &str = "V416";
 
-/// Absolute smoke bound on one compile of the many-regions chain. Calibrated against
-/// the builder before #416, which copied the base's whole source once per region: that
-/// build runs past five times this bound, while the shared-source builder finishes well
-/// inside a fifth of it (debug profile).
-const MANY_REGIONS_BOUND: Duration = Duration::from_secs(10);
+/// Compiles of each kind (maps off, maps on). The test compares the fastest compile of
+/// each kind, and runs the two kinds in turn, so a short pause in a busy test run does
+/// not change the result.
+const MANY_REGIONS_RUNS: usize = 3;
 
-/// #416: a source-mapped compile of a base with very many top-level skeleton
-/// nodes finishes under an absolute bound; the same chain with maps off is the control.
+/// Most time the fastest source-mapped compile may take, as a multiple of the fastest
+/// compile with maps off. The rule: the limit is about the geometric mean of the
+/// highest ratio measured for the shared-source builder and the lowest ratio measured
+/// for the builder before #416, rounded down, in the debug and release profiles. That
+/// gives the two sides about the same margin.
 ///
-/// The compile runs on its own thread and is awaited with `recv_timeout`, so a
-/// quadratic regression fails at the bound instead of hanging the suite.
+/// Measured on an Apple M-series laptop (fastest of 3, maps on / maps off):
+/// - shared-source builder: 1.27 in debug (390 ms / 308 ms), 1.19 in release
+///   (43 ms / 36 ms);
+/// - builder before #416: 20.21 in debug (6.26 s / 310 ms), 151.85 in release
+///   (5.81 s / 38 ms).
+///
+/// The geometric mean of 1.27 and 20.21 is 5.07, so the limit is 5.
+const MANY_REGIONS_MAX_RATIO: u32 = 5;
+
+/// Hang guard on one compile. A quadratic builder fails the ratio check first; this
+/// bound only stops a compile that does not end from blocking the suite.
+const MANY_REGIONS_BOUND: Duration = Duration::from_secs(120);
+
+/// Compile the many-regions chain once on its own thread, check that every base line
+/// is rendered and that only the base owns a region, and return the compile time.
+///
+/// The compile is awaited with `recv_timeout`, so a compile that does not end fails at
+/// the bound instead of hanging the suite.
+fn compile_many_regions(base: &str, source_map: bool) -> Duration {
+    let modules = extends_chain(base, "@extends \"./base.mds\"\n");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let started = Instant::now();
+        let outcome = mds::compile_virtual_with_deps_opts(
+            modules,
+            "child.mds",
+            None,
+            CompileOptions::default().with_source_map(source_map),
+        )
+        .map(|result| {
+            let lines = output_text(result.output)
+                .lines()
+                .filter(|line| *line == MANY_REGIONS_VALUE)
+                .count();
+            (lines, result.source_map.map(|sm| sm.sources))
+        })
+        .map_err(|err| err.to_string());
+        // The receiver is gone only when the bound already failed the test.
+        let _ = tx.send((outcome, started.elapsed()));
+    });
+    let (outcome, elapsed) = match rx.recv_timeout(MANY_REGIONS_BOUND) {
+        Ok(received) => received,
+        Err(RecvTimeoutError::Timeout) => panic!(
+            "source_map={source_map}: {MANY_REGIONS_LINES} skeleton lines did not \
+             compile within {MANY_REGIONS_BOUND:?}"
+        ),
+        Err(RecvTimeoutError::Disconnected) => {
+            panic!("source_map={source_map}: the compile thread panicked")
+        }
+    };
+    eprintln!("source_map={source_map}: {MANY_REGIONS_LINES} skeleton lines in {elapsed:?}");
+    let (lines, sources) = outcome.unwrap_or_else(|err| panic!("source_map={source_map}: {err}"));
+    // Non-vacuity: every line came from the base through `@extends` — the child's
+    // whole body is the directive, so nothing else can render the value.
+    assert_eq!(
+        lines, MANY_REGIONS_LINES,
+        "source_map={source_map}: every base line must be rendered"
+    );
+    let expected_sources = source_map.then(|| vec!["base.mds".to_string()]);
+    assert_eq!(
+        sources, expected_sources,
+        "source_map={source_map}: only the base owns a region"
+    );
+    elapsed
+}
+
+/// #416: a source-mapped compile of a base with very many top-level skeleton nodes
+/// takes at most `MANY_REGIONS_MAX_RATIO` times as long as the same compile with maps
+/// off, the control. The builder before #416 copied the base's whole source once per
+/// region, so its source-mapped compile grows with the region count times the source
+/// size, and fails this check.
 #[test]
 fn extends_many_regions_source_map_is_not_quadratic() {
     let base = format!(
-        "---\nv: {MANY_REGIONS_VALUE}\n---\n{}",
+        "---\nv: {MANY_REGIONS_VALUE}\n---\n@define unused():\n{}\n@end\n{}",
+        " ".repeat(MANY_REGIONS_PADDING),
         "{{v}}\n".repeat(MANY_REGIONS_LINES)
     );
-    for source_map in [false, true] {
-        let modules = extends_chain(&base, "@extends \"./base.mds\"\n");
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let started = Instant::now();
-            let outcome = mds::compile_virtual_with_deps_opts(
-                modules,
-                "child.mds",
-                None,
-                CompileOptions::default().with_source_map(source_map),
-            )
-            .map(|result| {
-                let lines = output_text(result.output)
-                    .lines()
-                    .filter(|line| *line == MANY_REGIONS_VALUE)
-                    .count();
-                (lines, result.source_map.map(|sm| sm.sources))
-            })
-            .map_err(|err| err.to_string());
-            // The receiver is gone only when the bound already failed the test.
-            let _ = tx.send((outcome, started.elapsed()));
-        });
-        let (outcome, elapsed) = match rx.recv_timeout(MANY_REGIONS_BOUND) {
-            Ok(received) => received,
-            Err(RecvTimeoutError::Timeout) => panic!(
-                "source_map={source_map}: {MANY_REGIONS_LINES} skeleton lines did not \
-                 compile within {MANY_REGIONS_BOUND:?}"
-            ),
-            Err(RecvTimeoutError::Disconnected) => {
-                panic!("source_map={source_map}: the compile thread panicked")
-            }
-        };
-        eprintln!("source_map={source_map}: {MANY_REGIONS_LINES} skeleton lines in {elapsed:?}");
-        let (lines, sources) =
-            outcome.unwrap_or_else(|err| panic!("source_map={source_map}: {err}"));
-        // Non-vacuity: every line came from the base through `@extends` — the child's
-        // whole body is the directive, so nothing else can render the value.
-        assert_eq!(
-            lines, MANY_REGIONS_LINES,
-            "source_map={source_map}: every base line must be rendered"
-        );
-        let expected_sources = source_map.then(|| vec!["base.mds".to_string()]);
-        assert_eq!(
-            sources, expected_sources,
-            "source_map={source_map}: only the base owns a region"
-        );
+    let mut fastest_off = Duration::MAX;
+    let mut fastest_on = Duration::MAX;
+    for _ in 0..MANY_REGIONS_RUNS {
+        fastest_off = fastest_off.min(compile_many_regions(&base, false));
+        fastest_on = fastest_on.min(compile_many_regions(&base, true));
     }
+    eprintln!(
+        "fastest: maps off {fastest_off:?}, maps on {fastest_on:?}, ratio {:.2}",
+        fastest_on.as_secs_f64() / fastest_off.as_secs_f64()
+    );
+    assert!(
+        fastest_on <= fastest_off * MANY_REGIONS_MAX_RATIO,
+        "the fastest source-mapped compile ({fastest_on:?}) took more than \
+         {MANY_REGIONS_MAX_RATIO} times the fastest compile with maps off ({fastest_off:?})"
+    );
 }
 
 // ── #412: an @include of an extending module is source-mapped ─────────────────
@@ -2282,10 +2333,6 @@ const CHAIN_MAIN: &str = "@import \"./c.mds\" as c\nMAIN-HEAD\n@include c\nMAIN-
 /// Mirrors the private `limits::MAX_SOURCEMAP_SEGMENTS`. Pinned by the segment-cap
 /// warning, which prints the real value.
 const MAX_SOURCEMAP_SEGMENTS: usize = 1_000_000;
-
-/// Mirrors the private `limits::MAX_SOURCES_CONTENT_BYTES` (= `MAX_OUTPUT_SIZE`).
-/// Pinned by the ceiling warning, which prints the real value.
-const MAX_SOURCES_CONTENT_BYTES: usize = MAX_OUTPUT_SIZE;
 
 /// The #412 chain and its importer as a module set.
 fn chain_modules() -> HashMap<String, String> {
@@ -2668,95 +2715,6 @@ fn segment_cap_in_an_included_module_leaves_its_text_unmapped() {
     }
 }
 
-/// Levels of the sourcesContent-ceiling chain, and the unrendered padding each level
-/// carries: six levels pass the ceiling, five would not.
-const CEILING_LEVELS: usize = 6;
-const CEILING_PADDING: usize = 9 * 1024 * 1024;
-const _: () = assert!(CEILING_LEVELS * CEILING_PADDING > MAX_SOURCES_CONTENT_BYTES);
-const _: () = assert!((CEILING_LEVELS - 1) * CEILING_PADDING < MAX_SOURCES_CONTENT_BYTES);
-
-/// A `CEILING_LEVELS`-level chain `l1.mds` ← … ← `l6.mds` and an importer that
-/// includes its leaf. Level `k` renders one block (`bk`) and carries `padding` bytes it
-/// never renders: the root in an unused `@define`, each extending level as blank space
-/// between its directives (an extending template may hold only `@block` overrides and
-/// whitespace).
-fn ceiling_chain(padding: usize) -> HashMap<String, String> {
-    let pad = " ".repeat(padding);
-    let blocks: String = (1..=CEILING_LEVELS)
-        .map(|k| format!("@block b{k}:\nL1-B{k}\n@end\n"))
-        .collect();
-    let mut modules = HashMap::from([
-        (
-            "l1.mds".to_string(),
-            format!("@define unused():\n{pad}\n@end\n{blocks}"),
-        ),
-        (
-            "main.mds".to_string(),
-            format!("@import \"./l{CEILING_LEVELS}.mds\" as m\nMAIN\n@include m\n"),
-        ),
-    ]);
-    for k in 2..=CEILING_LEVELS {
-        modules.insert(
-            format!("l{k}.mds"),
-            format!(
-                "@extends \"./l{}.mds\"\n{pad}\n@block b{k}:\nL{k}-B{k}\n@end\n",
-                k - 1
-            ),
-        );
-    }
-    modules
-}
-
-/// #412: the importer's map now carries the included chain's files, so
-/// the sourcesContent ceiling covers them — the first test of that ceiling. A chain
-/// whose files pass it drops `sourcesContent` from the importer's map with the ceiling
-/// warning and keeps every source and mapping; a small copy of the chain keeps
-/// `sourcesContent` (control).
-#[test]
-fn include_of_extending_chain_over_the_sources_content_ceiling_drops_sources_content() {
-    let all_files: std::collections::BTreeSet<String> = (1..=CEILING_LEVELS)
-        .map(|k| format!("l{k}.mds"))
-        .chain(["main.mds".to_string()])
-        .collect();
-    let opts = CompileOptions::default()
-        .with_source_map(true)
-        .with_include_sources_content(true);
-    for (padding, over) in [(CEILING_PADDING, true), (16, false)] {
-        let modules = ceiling_chain(padding);
-        let total: usize = modules.values().map(String::len).sum();
-        let result = mds::compile_virtual_with_deps_opts(modules, "main.mds", None, opts.clone())
-            .unwrap_or_else(|err| panic!("padding={padding}: {err}"));
-        let expected_warnings = if over {
-            vec![format!(
-                "sourcesContent total size ({total} bytes) exceeds the \
-                 {MAX_SOURCES_CONTENT_BYTES} byte ceiling; sourcesContent will be omitted \
-                 from the source map"
-            )]
-        } else {
-            vec![]
-        };
-        assert_eq!(result.warnings, expected_warnings, "padding={padding}");
-        let text = output_text(result.output);
-        let sm = result.source_map.expect("the importer's map is produced");
-        assert_eq!(
-            sm.sources_content.as_ref().map(Vec::len),
-            (!over).then_some(all_files.len()),
-            "padding={padding}: sourcesContent is kept only under the ceiling"
-        );
-        assert_eq!(
-            referenced_sources(&sm),
-            all_files,
-            "padding={padding}: every chain file must own mapped output"
-        );
-        let rendered: Vec<String> = (1..=CEILING_LEVELS).map(|k| format!("L{k}-B{k}")).collect();
-        assert_eq!(
-            text,
-            format!("MAIN\n{}\n", rendered.join("\n")),
-            "padding={padding}: each level renders its block and none of its padding"
-        );
-    }
-}
-
 /// #412 (on disk): a runtime error in an `@extends` region whose file the
 /// importer's map first registered through an `@include` splice names that file by its
 /// root-relative path, never its absolute one, identically with source maps on and off.
@@ -2859,4 +2817,397 @@ fn extends_string_compile_names_the_base_first() {
     assert_eq!(output_text(result.output), "BASE-HEAD\nCHILD\n");
     let sm = result.source_map.expect("source_map must be present");
     assert_eq!(sm.sources, vec!["base.mds", "input.mds"]);
+}
+
+// ── A `@define` call in a condition or an iterable (#486) ─────────────────────
+//
+// A condition or an iterable discards the text of the call it evaluates. Its call
+// must leave no segment and no `sources[]` entry, and must not move the cursor:
+// the map of each template equals the map of the same-length template that reads a
+// plain variable. The tests decode each point, because the release cursor assert
+// compares the cursor with itself and cannot see a shifted body.
+
+/// The define of the #486 templates, in a second file. Its body is the text `a,b`.
+const DEFINE_LIB: &str = "@define yes():\na,b\n@end\n";
+/// The same define, with a body that is an `@include` of `part.mds`.
+const DEFINE_INCLUDE_LIB: &str = "@import \"./part.mds\" as p\n@define yes():\n@include p\n@end\n";
+/// The partial that `DEFINE_INCLUDE_LIB` includes. Its text is `a,b` too.
+const PART: &str = "a,b\n";
+/// The import line of every #486 entry.
+const DEFINE_IMPORT: &str = "@import { yes } from \"./lib.mds\"\n";
+/// The call that the templates put at `SLOT`.
+const DEFINE_CALL: &str = "yes()";
+/// The plain variable of the control templates: same length, same value `a,b`.
+const PLAIN_VAR: &str = "plain";
+
+/// `@if` with the call as the whole condition.
+const IF_CASE: (&str, &str) = (
+    "@if SLOT:\nTHEN {{v}}\n@end\nTAIL {{v}}\n",
+    "THEN V\nTAIL V\n",
+);
+/// `@elseif` with the call as the whole condition.
+const ELSEIF_CASE: (&str, &str) = (
+    "@if off:\nSKIP\n@elseif SLOT:\nTHEN {{v}}\n@end\nTAIL {{v}}\n",
+    "THEN V\nTAIL V\n",
+);
+/// An equality condition with the call on the left side.
+const EQ_CASE: (&str, &str) = (
+    "@if SLOT == \"a,b\":\nTHEN {{v}}\n@end\nTAIL {{v}}\n",
+    "THEN V\nTAIL V\n",
+);
+/// The call as the second operand of `&&`.
+const AND_CASE: (&str, &str) = (
+    "@if on && SLOT:\nTHEN {{v}}\n@end\nTAIL {{v}}\n",
+    "THEN V\nTAIL V\n",
+);
+/// The call as the second operand of `||`, after a false first operand.
+const OR_CASE: (&str, &str) = (
+    "@if off || SLOT:\nTHEN {{v}}\n@end\nTAIL {{v}}\n",
+    "THEN V\nTAIL V\n",
+);
+/// A `@for` over the call result, split on a comma.
+const FOR_CASE: (&str, &str) = (
+    "@for x in split(SLOT, \",\"):\n- {{x}} {{v}}\n@end\nTAIL {{v}}\n",
+    "- a V\n- b V\nTAIL V\n",
+);
+/// Every condition and iterable template.
+const DEFINE_CASES: [(&str, &str); 6] =
+    [IF_CASE, ELSEIF_CASE, EQ_CASE, AND_CASE, OR_CASE, FOR_CASE];
+
+/// The modules of a #486 compile: `entry.mds` is the import line, then `body` with
+/// `SLOT` replaced by `slot`; `lib` is the text of `lib.mds`.
+fn define_modules(lib: &str, body: &str, slot: &str) -> HashMap<String, String> {
+    HashMap::from([
+        ("lib.mds".to_string(), lib.to_string()),
+        ("part.mds".to_string(), PART.to_string()),
+        (
+            "entry.mds".to_string(),
+            format!("{DEFINE_IMPORT}{}", body.replace("SLOT", slot)),
+        ),
+    ])
+}
+
+/// Compile `modules` with the #486 variables, with or without a source map.
+fn compile_define(modules: HashMap<String, String>, source_map: bool) -> CompileResult {
+    let vars = HashMap::from([
+        ("v".to_string(), Value::String("V".to_string())),
+        ("plain".to_string(), Value::String("a,b".to_string())),
+        ("on".to_string(), Value::Boolean(true)),
+        ("off".to_string(), Value::Boolean(false)),
+    ]);
+    let opts = CompileOptions::default()
+        .with_source_map(source_map)
+        .with_include_sources_content(true);
+    mds::compile_virtual_with_deps_opts(modules, "entry.mds", Some(vars), opts)
+        .unwrap_or_else(|err| panic!("the #486 template must compile: {err}"))
+}
+
+/// The output text and the source map of `body` with `slot`.
+fn define_map(lib: &str, body: &str, slot: &str) -> (String, mds::SourceMap) {
+    let modules = define_modules(lib, body, slot);
+    let mut result = compile_define(modules.clone(), true);
+    let sm = result
+        .source_map
+        .take()
+        .expect("source_map must be present");
+    // sourcesContent is one entry per source, and each entry is that module's text.
+    let contents: Vec<String> = sm.sources.iter().map(|s| modules[s].clone()).collect();
+    assert_eq!(
+        sm.sources_content.as_ref(),
+        Some(&contents),
+        "{body:?} with {slot}: sourcesContent must pair with sources"
+    );
+    (output_text(result.output), sm)
+}
+
+/// The map of `case` with the define call equals the map of the plain-variable
+/// template: the same points, the same mappings and the same sources.
+fn assert_define_map_matches_plain(lib: &str, case: (&str, &str)) {
+    let (body, expected) = case;
+    assert_eq!(
+        DEFINE_CALL.len(),
+        PLAIN_VAR.len(),
+        "the control must have the same length"
+    );
+    let (called_text, called) = define_map(lib, body, DEFINE_CALL);
+    let (plain_text, plain) = define_map(lib, body, PLAIN_VAR);
+    assert_eq!(called_text, expected, "{body:?}: output with the call");
+    assert_eq!(
+        plain_text, expected,
+        "{body:?}: output with the plain variable"
+    );
+    // Non-vacuity: the control maps the body and the tail.
+    assert!(
+        mapped_points(&plain).len() >= 4,
+        "{body:?}: the control map must hold the body points; got {:?}",
+        mapped_points(&plain)
+    );
+    assert_eq!(
+        mapped_points(&called),
+        mapped_points(&plain),
+        "{body:?}: every point must keep its plain-template output offset and source"
+    );
+    assert_eq!(called.mappings, plain.mappings, "{body:?}: mappings");
+    assert_eq!(called.sources, plain.sources, "{body:?}: sources");
+    assert_eq!(called.sources, vec!["entry.mds"], "{body:?}: sources");
+}
+
+/// TP-9 (#486): an `@if` that calls an imported define maps as the plain template.
+#[test]
+fn if_condition_define_call_keeps_the_plain_template_map() {
+    assert_define_map_matches_plain(DEFINE_LIB, IF_CASE);
+}
+
+/// TP-10 (#486): an `@elseif` that calls an imported define maps as the plain template.
+#[test]
+fn elseif_condition_define_call_keeps_the_plain_template_map() {
+    assert_define_map_matches_plain(DEFINE_LIB, ELSEIF_CASE);
+}
+
+/// TP-11 (#486): an equality condition with the call on the left side.
+#[test]
+fn equality_condition_define_call_keeps_the_plain_template_map() {
+    assert_define_map_matches_plain(DEFINE_LIB, EQ_CASE);
+}
+
+/// TP-12 (#486): the call as the second operand of `&&`, and of `||` after a false
+/// first operand.
+#[test]
+fn and_or_operand_define_call_keeps_the_plain_template_map() {
+    assert_define_map_matches_plain(DEFINE_LIB, AND_CASE);
+    assert_define_map_matches_plain(DEFINE_LIB, OR_CASE);
+}
+
+/// TP-13 (#486): a `@for` iterable that splits the call result on a comma.
+#[test]
+fn for_iterable_define_call_keeps_the_plain_template_map() {
+    assert_define_map_matches_plain(DEFINE_LIB, FOR_CASE);
+}
+
+/// TP-14 (#486): after a condition call, each body point keeps its own output offset
+/// and maps to the entry file, at the source position of its own text.
+#[test]
+fn condition_define_call_leaves_each_body_point_at_its_output_offset() {
+    let (text, sm) = define_map(DEFINE_LIB, IF_CASE.0, DEFINE_CALL);
+    assert_eq!(text, "THEN V\nTAIL V\n");
+    let entry = |line: usize, col: i64, src_line: i64, src_col: i64| {
+        (line, col, "entry.mds".to_string(), src_line, src_col)
+    };
+    // Entry lines: 0 import, 1 `@if yes():`, 2 `THEN {{v}}`, 3 `@end`, 4 `TAIL {{v}}`.
+    let points = mapped_points(&sm);
+    for expected in [
+        entry(0, 0, 2, 0),
+        entry(0, 5, 2, 5),
+        entry(1, 0, 4, 0),
+        entry(1, 5, 4, 5),
+    ] {
+        assert!(
+            points.contains(&expected),
+            "the point {expected:?} must be in the map; got {points:?}"
+        );
+    }
+    assert!(
+        points.iter().all(|point| point.2 == "entry.mds"),
+        "every point must map to the entry file; got {points:?}"
+    );
+}
+
+/// TP-15 (#486): a define whose body includes a partial, called only in a condition,
+/// leaves no `sources[]` entry and no segment from the partial.
+#[test]
+fn condition_define_call_with_include_registers_no_partial_source() {
+    // Positive control: the same call in a body interpolation does map the partial,
+    // so the vector reaches the include splice.
+    let modules = HashMap::from([
+        ("lib.mds".to_string(), DEFINE_INCLUDE_LIB.to_string()),
+        ("part.mds".to_string(), PART.to_string()),
+        (
+            "entry.mds".to_string(),
+            format!("{DEFINE_IMPORT}A {{{{yes()}}}} B\n"),
+        ),
+    ]);
+    let sm = compile_define(modules, true)
+        .source_map
+        .expect("source_map must be present");
+    assert!(
+        referenced_sources(&sm).contains("part.mds"),
+        "control: a body call must map the included partial; got {:?}",
+        sm.sources
+    );
+
+    assert_define_map_matches_plain(DEFINE_INCLUDE_LIB, IF_CASE);
+    assert_define_map_matches_plain(DEFINE_INCLUDE_LIB, FOR_CASE);
+}
+
+/// TP-16 (#486): the output text of every condition and iterable template is the
+/// same with and without a source map, and messages mode output is unchanged.
+#[test]
+fn condition_define_call_output_is_the_same_with_and_without_a_source_map() {
+    for lib in [DEFINE_LIB, DEFINE_INCLUDE_LIB] {
+        for (body, expected) in DEFINE_CASES {
+            for source_map in [true, false] {
+                let result = compile_define(define_modules(lib, body, DEFINE_CALL), source_map);
+                assert_eq!(
+                    result.source_map.is_some(),
+                    source_map,
+                    "{body:?}: the map must follow the option"
+                );
+                assert_eq!(
+                    output_text(result.output),
+                    expected,
+                    "{body:?}: output with source_map = {source_map}"
+                );
+            }
+        }
+    }
+    let messages = "@message user:\n@if yes():\nTHEN {{v}}\n@end\n\
+                    @for x in split(yes(), \",\"):\n- {{x}}\n@end\n@end\n";
+    for source_map in [true, false] {
+        let result = compile_define(define_modules(DEFINE_LIB, messages, ""), source_map);
+        assert!(
+            result.source_map.is_none(),
+            "messages mode has no source map"
+        );
+        assert_eq!(
+            output_text(result.output),
+            "user: THEN V\n- a\n- b\n",
+            "messages mode output with source_map = {source_map}"
+        );
+    }
+}
+
+/// TP-17 (#486 control): a define call in a body interpolation still maps its body to
+/// the definition file, at the call's output offset.
+#[test]
+fn body_interpolation_define_call_still_maps_its_body_to_the_definition_file() {
+    let modules = define_modules(DEFINE_LIB, "A {{SLOT}} B\n", DEFINE_CALL);
+    let mut result = compile_define(modules, true);
+    let sm = result
+        .source_map
+        .take()
+        .expect("source_map must be present");
+    assert_eq!(output_text(result.output), "A a,b B\n");
+    assert_eq!(sm.sources, vec!["entry.mds", "lib.mds"]);
+    // Entry line 1 is `A {{yes()}} B`; lib line 1 is the body text `a,b`.
+    assert_eq!(
+        mapped_points(&sm),
+        vec![
+            (0, 0, "entry.mds".to_string(), 1, 0),
+            (0, 2, "lib.mds".to_string(), 1, 0),
+            (0, 5, "entry.mds".to_string(), 1, 11),
+        ]
+    );
+}
+
+/// The two defines of the nested-call tests: `f` wraps its argument, `g` is `gee`.
+const NESTED_LIB: &str = "@define f(x):\nF{{x}}\n@end\n@define g():\ngee\n@end\n";
+
+/// TP-19 (#486): a define call in the argument of another define call maps the outer
+/// body at the interpolation offset, with no segment from the inner body.
+#[test]
+fn define_call_in_a_define_argument_maps_the_outer_body_at_the_call_offset() {
+    let modules = HashMap::from([
+        ("lib.mds".to_string(), NESTED_LIB.to_string()),
+        (
+            "entry.mds".to_string(),
+            "@import { f, g } from \"./lib.mds\"\nA {{f(g())}} B\n".to_string(),
+        ),
+    ]);
+    let mut result = compile_define(modules, true);
+    let sm = result
+        .source_map
+        .take()
+        .expect("source_map must be present");
+    assert_eq!(output_text(result.output), "A Fgee B\n");
+    // Lib line 1 is `F{{x}}`, the body of f; lib line 4 is `gee`, the body of g.
+    let points = mapped_points(&sm);
+    assert_eq!(
+        points,
+        vec![
+            (0, 0, "entry.mds".to_string(), 1, 0),
+            (0, 2, "lib.mds".to_string(), 1, 0),
+            (0, 3, "lib.mds".to_string(), 1, 1),
+            (0, 6, "entry.mds".to_string(), 1, 12),
+        ]
+    );
+    assert!(
+        !points.iter().any(|p| p.2 == "lib.mds" && p.3 == 4),
+        "no point may map to the body of the inner call; got {points:?}"
+    );
+}
+
+/// TP-20 (#486): a builtin that wraps a define call maps its result to one call-site
+/// segment in the entry, as for any builtin.
+#[test]
+fn builtin_around_a_define_call_maps_to_one_call_site_segment() {
+    let modules = define_modules(DEFINE_LIB, "A {{upper(SLOT)}} B\n", DEFINE_CALL);
+    let mut result = compile_define(modules, true);
+    let sm = result
+        .source_map
+        .take()
+        .expect("source_map must be present");
+    assert_eq!(output_text(result.output), "A A,B B\n");
+    assert_eq!(sm.sources, vec!["entry.mds"]);
+    // Entry line 1 is `A {{upper(yes())}} B`.
+    assert_eq!(
+        mapped_points(&sm),
+        vec![
+            (0, 0, "entry.mds".to_string(), 1, 0),
+            (0, 2, "entry.mds".to_string(), 1, 2),
+            (0, 5, "entry.mds".to_string(), 1, 18),
+        ]
+    );
+}
+
+/// The lib of TP-21. `f` holds an `@if` whose condition is `CONDITION`; `yes` is the
+/// define of the other #486 templates, so the lib text keeps one shape for both runs.
+const DEFINE_IF_LIB: &str =
+    "@define yes():\na,b\n@end\n@define f():\n@if CONDITION:\nTHEN\n@end\nTAIL\n@end\n";
+
+/// TP-21 (#486): a define call in an `@if` inside the body of a mapped `@define` maps as
+/// the same define with a plain variable in the condition. The entry calls `f` in an
+/// interpolation, so the source is already lib.mds and the segments of the body are
+/// already pushed when the condition is held.
+#[test]
+fn define_call_in_the_condition_of_a_mapped_define_body_keeps_the_plain_template_map() {
+    let entry = "@import { f } from \"./lib.mds\"\nA {{f()}} B\n";
+    let lib = |condition: &str| DEFINE_IF_LIB.replace("CONDITION", condition);
+    let (called_text, called) = define_map(&lib(DEFINE_CALL), entry, "");
+    let (plain_text, plain) = define_map(&lib(PLAIN_VAR), entry, "");
+    assert_eq!(
+        DEFINE_CALL.len(),
+        PLAIN_VAR.len(),
+        "the control must have the same length"
+    );
+    assert_eq!(called_text, "A THEN\nTAIL B\n", "output with the call");
+    assert_eq!(
+        plain_text, "A THEN\nTAIL B\n",
+        "output with the plain variable"
+    );
+    // Lib lines: 1 is the body of `yes`, 5 is `THEN` and 7 is `TAIL`; entry line 2 is
+    // `A {{f()}} B`. The body of `yes` is not output, so no point may map to it.
+    let expected = vec![
+        (0, 0, "entry.mds".to_string(), 2, 0),
+        (0, 2, "lib.mds".to_string(), 5, 0),
+        (1, 0, "lib.mds".to_string(), 7, 0),
+        (1, 4, "entry.mds".to_string(), 2, 9),
+    ];
+    assert_eq!(mapped_points(&plain), expected, "the plain-variable map");
+    assert_eq!(mapped_points(&called), expected, "the map with the call");
+    assert_eq!(called.mappings, plain.mappings, "mappings");
+    assert_eq!(called.sources, plain.sources, "sources");
+    assert_eq!(called.sources, vec!["entry.mds", "lib.mds"], "sources");
+
+    // Control: the same call as an interpolation in the body of `f` does map the body
+    // of `yes`, so the held call above would leave a point if its hold were missing.
+    let output_lib = "@define yes():\na,b\n@end\n@define f():\n{{yes()}}\n@end\n";
+    let (control_text, control) = define_map(output_lib, entry, "");
+    assert_eq!(control_text, "A a,b B\n", "output of the control");
+    assert!(
+        mapped_points(&control)
+            .iter()
+            .any(|point| point.2 == "lib.mds" && point.3 == 1),
+        "control: a body call must map the body of yes; got {:?}",
+        mapped_points(&control)
+    );
 }

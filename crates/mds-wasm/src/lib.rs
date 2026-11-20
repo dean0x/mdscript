@@ -456,18 +456,80 @@ fn virtual_fs(
         })
 }
 
+// The one read of `vars` and `rules` (#483). serde_wasm_bindgen reads a BigInt as a
+// number, and a getter or a Proxy can give a different value at each read. So the
+// snippet reads each value once and builds a new copy, which is all that
+// serde_wasm_bindgen then reads. It refuses what the napi walk refuses, in its
+// order and words: a BigInt, nesting deeper than 1024 levels and more than
+// 1,000,000 values. Any throw in the walk becomes `mds::invalid_options`.
+//
+// - Keys are own enumerable keys (`Object.keys`), set with `defineProperty`, so an
+//   own `__proto__` key stays a key of the copy.
+// - A typed array (an ArrayBuffer view that is iterable) or an ArrayBuffer goes
+//   through as it is, as the napi walk skips it: serde_wasm_bindgen refuses it by
+//   its type and reads no item of it. A DataView is not iterable, so
+//   serde_wasm_bindgen would read its own keys: the walk copies it as an object.
+// - A Map, a Set or another object is copied by its own keys only.
+#[wasm_bindgen(inline_js = r#"
+export function plain_copy(value, field) {
+  let detail = "a value could not be read";
+  const refuse = (text) => {
+    detail = text;
+    throw new Error(text);
+  };
+  const own = (target, key, item) =>
+    Object.defineProperty(target, key, { value: item, enumerable: true, writable: true, configurable: true });
+  try {
+    const root = [value];
+    const pending = [[value, 0, root, 0]];
+    let admitted = 1;
+    while (pending.length > 0) {
+      const [item, depth, target, key] = pending.pop();
+      if (typeof item === "bigint") refuse("typeof BigInt value could not be deserialized");
+      if (typeof item !== "object" || item === null) continue;
+      if ((ArrayBuffer.isView(item) && Symbol.iterator in item) || item instanceof ArrayBuffer) continue;
+      if (depth >= 1024) refuse("value nesting exceeds maximum depth of 1024");
+      const array = Array.isArray(item);
+      const keys = array ? null : Object.keys(item);
+      const length = array ? item.length >>> 0 : keys.length;
+      admitted += length;
+      if (admitted > 1000000) refuse("value has more than 1000000 entries");
+      const copy = array ? [] : {};
+      own(target, key, copy);
+      for (let index = 0; index < length; index += 1) {
+        const name = array ? index : keys[index];
+        const child = item[name];
+        own(copy, name, child);
+        pending.push([child, depth + 1, copy, name]);
+      }
+    }
+    return root[0];
+  } catch {
+    const error = new Error(`invalid ${field}: InvalidArg, ${detail}`);
+    error.code = "mds::invalid_options";
+    throw error;
+  }
+}
+"#)]
+extern "C" {
+    #[wasm_bindgen(catch)]
+    fn plain_copy(value: &JsValue, field: &str) -> Result<JsValue, JsValue>;
+}
+
 /// Extract and validate the `vars` field from the options object.
 ///
-/// Deserializes only the vars sub-value via serde_wasm_bindgen, then
-/// delegates to the shared `parse_json_vars` from mds-core.
+/// Copies only the vars sub-value once through `plain_copy`, deserializes the
+/// copy via serde_wasm_bindgen, then delegates to the shared `parse_json_vars`
+/// from mds-core.
 fn extract_vars(obj: &js_sys::Object) -> Result<Option<HashMap<String, Value>>, JsValue> {
     let val = get_prop_js(obj, "vars");
     if val.is_undefined() || val.is_null() {
         return Ok(None);
     }
-    // Deserialize only the vars sub-value.
+    let field = "options.vars";
+    let val = plain_copy(&val, field)?;
     let vars_json: serde_json::Value =
-        serde_wasm_bindgen::from_value(val).map_err(|e| conversion_error("options.vars", &e))?;
+        serde_wasm_bindgen::from_value(val).map_err(|e| conversion_error(field, &e))?;
     parse_json_vars(vars_json).map(Some).map_err(|e| match e {
         VarsError::InvalidType(msg) => options_error(&msg),
         VarsError::Conversion(mds_err) => mds_error_to_js(mds_err),
@@ -591,9 +653,11 @@ fn extract_rules(obj: &js_sys::Object) -> Result<(mds::LintConfig, Option<String
     if val.is_undefined() || val.is_null() {
         return Ok((mds::LintConfig::default(), None));
     }
-    // Deserialize the rules sub-object via serde_wasm_bindgen.
+    // Copy the rules sub-value once, then deserialize the copy.
+    let field = "options.rules";
+    let val = plain_copy(&val, field)?;
     let rules_json: serde_json::Value =
-        serde_wasm_bindgen::from_value(val).map_err(|e| conversion_error("options.rules", &e))?;
+        serde_wasm_bindgen::from_value(val).map_err(|e| conversion_error(field, &e))?;
     let serde_json::Value::Object(rules_map) = rules_json else {
         return Err(options_error(&format!(
             "options.rules must be a plain object, got {}",

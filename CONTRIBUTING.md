@@ -8,7 +8,7 @@ workflow and the checks that must pass before a change can be merged.
 - **Rust**: stable toolchain; the workspace MSRV is **1.88** (declared in the
   root `Cargo.toml`). The published crates (`mds-core`, `mds-cli`) must compile on
   1.88.
-- **Node.js**: **≥ 22** (see `engines` in the package manifests).
+- **Node.js**: **≥ 22.12** (see `engines` in the package manifests).
 - **wasm-pack** + the `wasm32-unknown-unknown` target, for the WASM build/tests.
 - **@napi-rs/cli** (installed via `npm ci`), for the native addon.
 

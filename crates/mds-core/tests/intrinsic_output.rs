@@ -748,3 +748,92 @@ fn extends_base_with_message_in_block_compiles_to_messages() {
     assert_eq!(msgs[0].role, "user");
     assert_eq!(msgs[0].content, "Base content.");
 }
+
+// ── Nested @for over a loop variable (#489) ───────────────────────────────────
+
+const NESTED_ROWS_FRONTMATTER: &str = "---\nrows:\n  - [1, 2]\n  - [3]\n---\n";
+const NESTED_ROWS_BODY: &str = "@for row in rows:\n@for cell in row:\n{{cell}}\n@end\n@end\n";
+
+/// Assert that `src` passes `check_str`, and that `lint_str` accepts it with
+/// no error-severity finding.
+fn assert_checks_and_lints(src: &str) {
+    mds::check_str(src).expect("check_str must accept the template");
+    let lint = mds::lint_str(src).expect("lint_str must accept the template");
+    let errors: Vec<_> = lint
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == mds::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "lint must give no error: {errors:?}");
+}
+
+#[test]
+fn nested_for_over_outer_loop_variable_compiles() {
+    let src = format!("{NESTED_ROWS_FRONTMATTER}{NESTED_ROWS_BODY}");
+    let md = mds::compile_str(&src)
+        .expect("an inner @for over the outer loop variable must compile")
+        .into_markdown()
+        .expect("markdown");
+    assert_eq!(md, format!("{NESTED_ROWS_FRONTMATTER}1\n2\n3\n"));
+}
+
+#[test]
+fn nested_for_over_outer_loop_variable_checks_and_lints() {
+    assert_checks_and_lints(&format!("{NESTED_ROWS_FRONTMATTER}{NESTED_ROWS_BODY}"));
+}
+
+#[test]
+fn nested_for_inside_define_body_compiles_checks_and_lints() {
+    let src = format!(
+        "{NESTED_ROWS_FRONTMATTER}@define grid(items):\n@for row in items:\n@for cell in row:\n\
+         {{{{cell}}}}\n@end\n@end\n@end\n{{{{grid(rows)}}}}\n"
+    );
+    let md = mds::compile_str(&src)
+        .expect("a nested @for in a @define body must compile")
+        .into_markdown()
+        .expect("markdown");
+    assert_eq!(md, format!("{NESTED_ROWS_FRONTMATTER}1\n2\n3\n"));
+    assert_checks_and_lints(&src);
+}
+
+#[test]
+fn nested_for_over_value_variable_of_key_value_loop_compiles_checks_and_lints() {
+    let frontmatter = "---\ngroups:\n  a: [1, 2]\n  b: [3]\n---\n";
+    let src = format!(
+        "{frontmatter}@for k, v in groups:\n{{{{k}}}}=\n@for x in v:\n{{{{x}}}}\n@end\n@end\n"
+    );
+    let md = mds::compile_str(&src)
+        .expect("an inner @for over the value variable must compile")
+        .into_markdown()
+        .expect("markdown");
+    assert_eq!(md, format!("{frontmatter}a=\n1\n2\nb=\n3\n"));
+    assert_checks_and_lints(&src);
+}
+
+#[test]
+fn nested_for_over_number_item_fails_at_evaluation_without_span() {
+    // The validator cannot know the item type, so the evaluator refuses it.
+    let src = format!("---\nrows:\n  - 1\n---\n{NESTED_ROWS_BODY}");
+    let err = mds::compile_str(&src)
+        .expect_err("an inner @for over a number must fail")
+        .serialize();
+    assert_eq!(err.code, "mds::type_error");
+    assert_eq!(
+        err.message,
+        "type error: expected array for @for loop, got number"
+    );
+    assert_eq!(err.span, None, "the evaluation error has no span");
+}
+
+#[test]
+fn nested_for_over_object_item_fails_at_evaluation_with_key_value_hint() {
+    let src = format!("---\nrows:\n  - a: 1\n---\n{NESTED_ROWS_BODY}");
+    let err = mds::compile_str(&src)
+        .expect_err("a single-variable inner @for over an object must fail")
+        .serialize();
+    assert_eq!(err.code, "mds::syntax");
+    assert_eq!(
+        err.message,
+        "syntax error: to iterate over an object's entries, use `@for key, value in obj:` syntax"
+    );
+}
