@@ -118,7 +118,7 @@ jobs:
       - uses: actions/checkout@v7
       # Pinned to 1.96.0 (released 2026-05-28, >30-day soak per project convention).
       # RATIONALE: unpinned `stable` lets compiler drift silently change the wasm-opt
-      # output size independently of any source change, making the 850 KB guard measure
+      # output size independently of any source change, making the WASM size limit measure
       # a different thing each week.  Previous guard raises were partly caused by this.
       # Scoped to this job only (not repo-wide rust-toolchain.toml) to limit blast radius.
       # WHEN BUMPING: rebuild, re-measure with the new compiler, and update the
@@ -154,6 +154,24 @@ jobs:
       - name: Report WASM binary sizes
         if: always()
         run: |
+          # WHY THIS LIMIT EXISTS (#491). The limit is a tripwire for growth that no
+          # change asked for. It is not a feature budget. It protects the users of
+          # @mdscript/mds-wasm: a browser downloads and compiles each byte of this
+          # binary. No platform limit applies to the binary. The failures that the
+          # limit must catch, with their measured sizes:
+          #   - a lost build setting: one codegen unit for every crate is 54,972 B
+          #     raw (#491); wasm-opt or strip that does not run is larger;
+          #   - toolchain or wasm-bindgen drift with no source change: +7,011 B
+          #     (PR #401), and the 600K -> 650K raise (2026-06);
+          #   - a new dependency path: serde_json's text parser was about 30 KB (#426).
+          # VALUE = the CI-measured size at PR #492 (790,820 B raw) + a 30,000 B
+          # margin (3.8%), rounded up to the next 1,000 B. The margin is larger than
+          # one large feature PR (+11,840 B, PR #294) plus one toolchain bump
+          # (+7,011 B). It is smaller than a lost codegen setting (+54,972 B).
+          # A fix or feature that needs more bytes raises this value in its own PR,
+          # with a ledger line below. Keep release.yml's WASM_SIZE_LIMIT equal
+          # (scripts/__test__/wasm-build-parity.spec.mjs checks it).
+          WASM_SIZE_LIMIT=821000
           for f in crates/mds-wasm/pkg/mds_wasm_bg.wasm crates/mds-wasm/pkg-web/mds_wasm_bg.wasm; do
             if [ ! -f "$f" ]; then
               echo "::error::WASM file missing: $f"
@@ -226,8 +244,16 @@ jobs:
             #   CI-measured post-change: 828,326 bytes raw, 339,102 bytes gzipped
             #   (Binaryen v129, CI run 36448495369). Delta: -9,379 bytes (-1.12%).
             #   Guard NOT raised: 21,674 bytes (2.55%) headroom.
-            if [ "$raw" -gt 850000 ]; then
-              echo "::error::WASM binary exceeds 850,000 byte threshold: ${label} is ${raw} bytes"
+            #   PRs #427-#490 (v0.5.0 waves 2-2.5, 2026-10 to 2026-11) logged no
+            #   entry. CI baseline at 1a15f26: 845,792 bytes raw, 346,529 gzipped
+            #   (CI run 44724390131).
+            #   perf/wasm-one-codegen-unit (2026-11-20, PR #492, #491): one codegen
+            #   unit for every crate in the WASM build. CI-measured post-change:
+            #   790,820 bytes raw, 329,259 bytes gzipped (CI run 44725136672).
+            #   Delta: -54,972 bytes (-6.50%). Guard LOWERED 850,000 -> 821,000
+            #   from its reason (see WASM_SIZE_LIMIT above): 30,180 bytes headroom.
+            if [ "$raw" -gt "$WASM_SIZE_LIMIT" ]; then
+              echo "::error::WASM binary exceeds the ${WASM_SIZE_LIMIT}-byte limit: ${label} is ${raw} bytes"
               exit 1
             fi
           done
