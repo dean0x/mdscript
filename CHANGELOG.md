@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-11-20
+
 ### Added
 
 - `mds::EntryPin`, `mds::NativeFs::with_entry_pin`, `mds::compile_native_fs`, `mds::check_native_fs`, and `mds::lint_native_fs`: native entry APIs with an optional expected key, walked identity, or parent directory.
@@ -2142,7 +2144,8 @@ First public release of the MDS (Markdown Script) compiler.
 
 - 590 Rust tests (integration, unit, and doc-tests across the workspace) plus the JavaScript package suites
 
-[Unreleased]: https://github.com/dean0x/mdscript/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/dean0x/mdscript/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/dean0x/mdscript/compare/v0.4.4...v0.5.0
 [0.4.4]: https://github.com/dean0x/mdscript/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/dean0x/mdscript/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/dean0x/mdscript/compare/v0.4.1...v0.4.2
