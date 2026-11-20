@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-11-20
+
 ### Added
 
 - `mds::ReadLog`, `mds::NativeFs::with_read_log` and `mds::load_vars_file_logged`: record the byte count of each file that a native compile or a `--vars` load reads, a failed one included. A caller can then tell what a read saw without a second look at the file, which a later save can change (#380).
@@ -2153,7 +2155,8 @@ First public release of the MDS (Markdown Script) compiler.
 
 - 590 Rust tests (integration, unit, and doc-tests across the workspace) plus the JavaScript package suites
 
-[Unreleased]: https://github.com/dean0x/mdscript/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/dean0x/mdscript/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/dean0x/mdscript/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/dean0x/mdscript/compare/v0.4.4...v0.5.0
 [0.4.4]: https://github.com/dean0x/mdscript/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/dean0x/mdscript/compare/v0.4.2...v0.4.3
