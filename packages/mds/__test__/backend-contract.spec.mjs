@@ -201,6 +201,57 @@ describe('#483: native and WASM convert vars and rules alike', () => {
         field === 'vars' ? { output: 'ok\n' } : { version: 1 },
       ]);
     });
+
+    // A typed array and an ArrayBuffer go through the WASM copy as they are, so that
+    // serde_wasm_bindgen refuses them by their type. Neither backend reads an item.
+    const byteArrayTail = 'invalid type: byte array, expected any valid JSON value';
+    const byteArrayOnNative = refusal(field, byteArrayTail);
+    const byteArrayOnWasm = {
+      code: 'mds::invalid_options',
+      message: `invalid options.${field}: Error: ${byteArrayTail}`,
+    };
+
+    test(`${field} holding a typed array or an ArrayBuffer is refused as a byte array, each backend in its own words`, () => {
+      for (const make of [() => ({ bad: new Uint8Array(2) }), () => ({ bad: new ArrayBuffer(2) })]) {
+        assert.deepEqual(outcomes(field, make), [byteArrayOnNative, byteArrayOnWasm]);
+      }
+    });
+
+    test(`${field} holding a typed array with its own iterator is refused as a byte array and the iterator never runs`, () => {
+      for (const [backend, expected] of [[native, byteArrayOnNative], [wasm, byteArrayOnWasm]]) {
+        let reads = 0;
+        const view = new Uint8Array(2);
+        Object.defineProperty(view, Symbol.iterator, {
+          value: function* () {
+            reads += 1;
+            yield 1n;
+          },
+        });
+        assert.deepEqual(outcome(backend, field, { bad: view }), expected);
+        assert.equal(reads, 0, 'neither backend may read an item of a typed array');
+      }
+    });
+
+    test(`${field} holding a DataView: native refuses it as a byte array, WASM copies it as an object with no keys`, () => {
+      const [onNative, onWasm] = outcomes(field, () => ({ bad: new DataView(new ArrayBuffer(2)) }));
+      assert.deepEqual(onNative, byteArrayOnNative);
+      // Under `rules`, an object is not a severity string.
+      assert.deepEqual(onWasm, field === 'vars'
+        ? { output: 'ok\n' }
+        : { code: 'mds::invalid_options', message: 'options.rules["bad"] must be a severity string, got object' });
+    });
+
+    test(`${field} holding a BigInt64Array is refused on both backends, so that no BigInt reaches the compiler as a number`, () => {
+      const [onNative, onWasm] = outcomes(field, () => ({ x: new BigInt64Array([1n]) }));
+      // The text after the prefix is the own text of each converter. The native one
+      // is a napi message, so that only its code and prefix are pinned.
+      assert.equal(onNative.code, 'mds::invalid_options');
+      assert.ok(onNative.message.startsWith(`invalid options.${field}: InvalidArg, `), onNative.message);
+      assert.deepEqual(onWasm, {
+        code: 'mds::invalid_options',
+        message: `invalid options.${field}: Error: invalid type: JsValue(BigInt64Array), expected any valid JSON value`,
+      });
+    });
   }
 
   test('clean vars and rules give the same result on both backends', () => {
