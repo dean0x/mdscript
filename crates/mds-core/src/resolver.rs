@@ -237,7 +237,7 @@ fn tree_bytes(tokens: usize, expr: usize, len: usize) -> Option<usize> {
         .checked_add(bytes(len, TREE_PER_TEXT_BYTE)?)
 }
 
-fn tree_estimate(tokens: &[Token], len: usize) -> Option<usize> {
+pub(crate) fn tree_estimate(tokens: &[Token], len: usize) -> Option<usize> {
     let mut expr: usize = 0;
     for token in tokens {
         if let Token::Interpolation(text, _) | Token::Directive(text, _) = token {
@@ -245,6 +245,16 @@ fn tree_estimate(tokens: &[Token], len: usize) -> Option<usize> {
         }
     }
     tree_bytes(tokens.len(), expr, len)
+}
+
+/// Charge the tree estimate of an import scan against a new compile memory budget.
+/// A scan holds one module, so its budget starts empty. It runs between the lexer
+/// and the parser, so a refused tree is never built. A count past the address space
+/// fails the charge.
+pub(crate) fn charge_scan_tree(tokens: &[Token], len: usize) -> Result<(), MdsError> {
+    MemBudget::default()
+        .charge(Part::Temp, tree_estimate(tokens, len))
+        .map(|_| ())
 }
 
 /// Module cache to avoid re-resolving the same file or virtual key.

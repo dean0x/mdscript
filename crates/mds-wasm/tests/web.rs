@@ -798,6 +798,35 @@ fn scan_import_records_returns_error_for_malformed_source() {
     }
 }
 
+/// #488: an import scan counts the syntax tree against the compile memory budget
+/// before it builds the tree, as a compile does. 2^17 repeats of `\{{a` (512 KiB, under
+/// the 10 MiB size cap) are two tokens each, and their estimate is past the budget. The
+/// scan refuses them with native's coded error, not an uncoded trap. Half as many repeats
+/// pass.
+#[wasm_bindgen_test]
+fn import_scans_refuse_a_dense_source_with_a_coded_resource_limit() {
+    let refusal = "resource limit exceeded: compile memory exceeds maximum of 209715200 bytes";
+    let dense = "\\{{a".repeat(1 << 17);
+    let mut errors = vec![mds_wasm::scan_imports(&dense).unwrap_err()];
+    for as_base in [false, true] {
+        errors.push(mds_wasm::scan_import_records(&dense, as_base).unwrap_err());
+    }
+    for err in &errors {
+        assert_eq!(get_str(err, "code"), "mds::resource_limit");
+        assert_eq!(get_str(err, "message"), refusal);
+    }
+
+    let half = "\\{{a".repeat(1 << 16);
+    assert_eq!(
+        js_sys::Array::from(&mds_wasm::scan_imports(&half).unwrap()).length(),
+        0
+    );
+    for as_base in [false, true] {
+        let records = mds_wasm::scan_import_records(&half, as_base).unwrap();
+        assert_eq!(js_sys::Array::from(&records).length(), 0);
+    }
+}
+
 // ── moduleAliases (#414) ─────────────────────────────────────────────────────
 
 /// Options with `modules` and `moduleAliases` built from `(key, value)` pairs, so a

@@ -1472,6 +1472,38 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
     });
   });
 
+  test('U-SM33c: a dense module is refused by the import scan, before the compile (#488)', async (t) => {
+    if (!requireEngines(t, { wasm: wasmEngine }, 'U-SM33c')) return;
+    await withNestedProject(async (proj) => {
+      // 2^17 repeats of `\{{a` (512 KiB, under every size cap) are two tokens each, and
+      // their syntax tree estimate is past the compile memory budget. Half as many pass.
+      const dense = path.join(proj, 'dense.mds');
+      const half = path.join(proj, 'half.mds');
+      await writeFile(dense, '\\{{a'.repeat(1 << 17));
+      await writeFile(half, '\\{{a'.repeat(1 << 16));
+      const refusal = {
+        code: 'mds::resource_limit',
+        message: 'resource limit exceeded: compile memory exceeds maximum of 209715200 bytes',
+        help: null,
+        span: null,
+      };
+      const engine = {
+        scanImportRecords: (source, asBase) => wasmEngine.scanImportRecords(source, asBase),
+        preflightModule,
+      };
+
+      // The file walk scans each module with the engine before any compile.
+      assert.deepEqual(errorShape(await rejectionOf(buildModulesMapWith(dense, engine), dense)), refusal);
+      const { modules } = await buildModulesMapWith(half, engine);
+      assert.deepEqual(Object.keys(modules), ['half.mds']);
+
+      // The public API on the WASM backend gives the same refusal.
+      const [refused, passed] = await compileFileOutcomes('wasm', [dense, half]);
+      assert.deepEqual(refused, refusal);
+      assert.equal(typeof passed.output, 'string');
+    });
+  });
+
   // Writing at the filesystem root needs root, so this runs in a throwaway container
   // (`docker run --rm -v "$PWD":/repo -w /repo/packages/mds node:22 node --test
   // --test-name-pattern U-SM34 __test__/scanner.spec.mjs`).
