@@ -443,6 +443,7 @@ fn rewrite_body(
 ///   error is surfaced verbatim — matching `mds build` / `mds check` — instead
 ///   of silently emitting a still-broken file or a misleading
 ///   `FormatterInvariant` for what is ordinary author error.
+/// - A file-key YAML disagreement is an author error and is returned unchanged.
 /// - Any OTHER compile error (a minority case — typically an undefined runtime
 ///   variable or function; imports still resolve via `base_dir`) means the
 ///   source parsed into a well-formed token stream and only failed later during
@@ -482,6 +483,9 @@ fn assert_equivalent(
             // neutralization (PF-014) plus WIRE-mode filename escaping.
             src: Some(Arc::new(named_source_for_render(file_name, source))),
         }),
+        Err(MdsError::YamlError { message }) if message == lexer::FILE_KEY_FORM => {
+            Err(MdsError::YamlError { message })
+        }
         // Any other compile failure (undefined var/fn, unresolved import, …)
         // means the token stream is well-formed and only later analysis failed,
         // so the rule-aware structural comparison is a meaningful fallback.
