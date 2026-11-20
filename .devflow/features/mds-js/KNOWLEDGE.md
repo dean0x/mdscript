@@ -150,9 +150,10 @@ The differences that remain are named in the CHANGELOG, and `backend-contract.sp
 - **A root BigInt** (`vars: 1n`, `rules: 1n`): each backend keeps its own text. Native checks the type of the option first and gives `options.vars must be a plain object, got unknown`. WASM gives the BigInt text.
 - **One read per value on WASM.** A getter that gives a string first and `1n` later compiles as the string on WASM. Native refuses it with `a value changed while it was read and could not be deserialized`. A getter that gives `1n` on its first read is refused on both. The test pins the native result and the WASM read count of 1.
 - **A read that throws** (a getter or a Proxy trap): WASM gives `mds::invalid_options` with `a value could not be read`. Native passes the exception of the caller through, with no code.
-- **A `Map`** is an empty object on both backends. A `Set` or another object that is not an array is copied by its own keys in the same way, but only the `Map` case has a parity test. A `DataView` is copied as an object.
+- **A `Map`** is an empty object on both backends. A `Set` or another object that is not an array is copied by its own keys in the same way, but only the `Map` case has a parity test.
+- **A `DataView`**: native refuses it as a byte array. WASM copies it as an object with no keys, so `vars` compiles and `rules` gives `options.rules["bad"] must be a severity string, got object`.
 - **An inherited enumerable key** (`Object.create({ bad: 1n })`): native refuses the BigInt. WASM reads own enumerable keys only (`Object.keys`) and does not see it.
-- **Typed arrays and ArrayBuffers** pass through on both backends. Parity for `BigInt64Array` is not claimed.
+- **Typed arrays and ArrayBuffers** (a `BigInt64Array` and a typed array with an own `Symbol.iterator` included): the helper passes them on uncopied, and both backends refuse them with `mds::invalid_options` as a byte array or an invalid type. Only the text after the prefix differs. The iterator runs 0 times on each backend.
 
 The copy sets each key with `Object.defineProperty`, never with `copy[key] =`. So an own `__proto__` key stays a key of the copy, and a plain assignment would set the prototype of the copy instead.
 
