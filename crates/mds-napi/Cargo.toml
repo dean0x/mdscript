@@ -24,7 +24,7 @@ debug-panics = []
 crate-type = ["cdylib"]
 
 [dependencies]
-mds = { package = "mds-core", path = "../mds-core", version = "0.5.1" }
+mds = { package = "mds-core", path = "../mds-core", version = "0.6.0" }
 napi = { workspace = true }
 napi-derive = { workspace = true }
 serde_json = { workspace = true }
