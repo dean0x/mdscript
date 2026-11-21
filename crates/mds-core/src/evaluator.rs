@@ -324,6 +324,8 @@ fn evaluate_nodes(
                              a Text node: every following segment would map to the wrong \
                              output offset"
                             );
+                            // A marked opener maps its kept prefix plus one byte.
+                            // The added LF maps to the first source byte after that prefix.
                             map.push_segment(abs_out, t.offset as u32, t.text.len() as u32);
                         }
                     }

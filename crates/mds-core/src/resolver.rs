@@ -14,7 +14,9 @@ use crate::evaluator::{
     evaluate_messages_seeded, evaluate_seeded, evaluate_with_map_seeded, EvalBudget,
 };
 use crate::fs::{FileSystem, NativeFs, VirtualFs};
-use crate::lexer::{tokenize, Token};
+use crate::lexer::{
+    mask_file_key, probe_file_key, tokenize, Token, FILE_KEY_FORM, INDENTED_DIRECTIVES,
+};
 use crate::limits::{
     MAX_BLOCKS_PER_MODULE, MAX_COMPILE_MEMORY, MAX_DEFINES_PER_MODULE, MAX_FILE_SIZE,
     MAX_MODULE_COUNT, MAX_SOURCES_CONTENT_BYTES, TREE_PER_EXPR_BYTE, TREE_PER_TEXT_BYTE,
@@ -3205,8 +3207,8 @@ fn build_scope_from_frontmatter(
         let serde_yaml_ng::Value::String(key_str) = key else {
             continue;
         };
-        if key_str == "type" && is_md {
-            // Skip the 'type' meta-field for .md files (it's a file-type marker)
+        // SYNC POINT: audit the output, merge and lint reserved keys.
+        if key_str == INDENTED_DIRECTIVES || (key_str == "type" && is_md) {
             continue;
         }
         if key_str == "imports" && is_mds {
@@ -3558,8 +3560,8 @@ fn attach_frontmatter_index(err: MdsError, i: usize) -> MdsError {
     }
 }
 
-/// Parse the frontmatter YAML of a module into a `serde_yaml_ng::Mapping`, once per
-/// module, and return it with the bytes the parse spent.
+/// Parse the frontmatter YAML of a module into a `serde_yaml_ng::Mapping`.
+/// Return it with the bytes that the parse spent.
 ///
 /// The byte allowance is the smaller of the rest of the budget and `MAX_OUTPUT_SIZE`.
 /// The spent bytes stay charged as a temporary; a caller that keeps the tree moves
@@ -3574,10 +3576,44 @@ fn parse_frontmatter_mapping(
     };
     let (yaml, spent) = parse_frontmatter_yaml_with(&fm.raw, Allowance::in_compile(mem))?;
     mem.charge(Part::Temp, Some(spent))?;
-    let serde_yaml_ng::Value::Mapping(map) = yaml else {
-        return Ok((None, spent));
+    let raw = &fm.raw;
+    let expected = probe_file_key(raw).map_err(|_| MdsError::yaml_error(FILE_KEY_FORM))?;
+    let map = match yaml {
+        serde_yaml_ng::Value::Mapping(map) => Some(map),
+        _ => None,
     };
-    Ok((Some(map), spent))
+    let actual = map.as_ref().and_then(|map| map.get(INDENTED_DIRECTIVES));
+    if actual.map(serde_yaml_ng::Value::as_bool) != expected.map(Some) {
+        return Err(MdsError::yaml_error(FILE_KEY_FORM));
+    }
+
+    // A first-line hit cannot be inside another YAML value. For later hits,
+    // verify that an alternate YAML key did not hide a match inside a scalar.
+    if expected.is_some()
+        && !raw
+            .strip_prefix(INDENTED_DIRECTIVES)
+            .is_some_and(|tail| tail.starts_with(':'))
+    {
+        let mark = mem.mark();
+        mem.charge(Part::Temp, Some(raw.len()))?;
+        let verified = (|| -> Result<bool, MdsError> {
+            let masked = mask_file_key(raw).ok_or_else(MdsError::internal)?;
+            let (proof, _) = parse_frontmatter_yaml_with(&masked, Allowance::in_compile(mem))
+                .map_err(|err| match err {
+                    MdsError::YamlError { .. } => MdsError::yaml_error(FILE_KEY_FORM),
+                    other => other,
+                })?;
+            Ok(proof
+                .as_mapping()
+                .and_then(|map| map.get(INDENTED_DIRECTIVES))
+                == Some(&serde_yaml_ng::Value::Null))
+        })();
+        mem.release_to(mark);
+        if !verified? {
+            return Err(MdsError::yaml_error(FILE_KEY_FORM));
+        }
+    }
+    Ok((map, spent))
 }
 
 /// Returns the byte count from `offset` to just before the next `\n` (or

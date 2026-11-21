@@ -7,16 +7,17 @@ any `.mds` file with the CLI:
 mds build examples/ai-agent/system-prompt.mds -o -
 ```
 
-## New in v0.4.0
-
-Four capabilities shipped with v0.4.0 — each has a dedicated example:
+## Quick commands
 
 ```bash
 # Safety-gated formatter — rewrites directive lines only, never body text
 mds fmt --check examples/
 
-# Static analysis — 10 rules, human and JSON output, --fix --diff preview
+# Static analysis — 11 rules, human and JSON output, --fix --diff preview
 mds lint examples/linting/
+
+# Literal conditional lines in an unmarked fence
+mds lint examples/edge-cases/04_escaped_and_code.mds
 
 # Source Map v3 — sidecar .map file (gitignored via examples/**/*.md.map),
 # --inline data-URI, or --embed-sources self-contained variant
@@ -35,6 +36,11 @@ source .venv/bin/activate && python examples/python/demo.py
 mds lint examples/linting/config-demo/loop-shadow.mds
 ```
 
+Set [`indented-directives: true`](../spec.md#indented-directives) in a template's frontmatter to evaluate its indented conditionals, even with four or more spaces.
+The key does not affect unmarked fences.
+Add `+mds` as the last info word of a code fence to evaluate conditional lines inside it.
+Other fence info words that start with `+` and a letter are [reserved](../spec.md#conditionals-inside-a-fence).
+
 ## Templates
 
 | Directory | What it shows |
@@ -46,7 +52,7 @@ mds lint examples/linting/config-demo/loop-shadow.mds
 | [`inheritance/`](inheritance/) | Template inheritance with `@extends`/`@block` — one base agent skeleton specialized into a data analyst and a code reviewer |
 | [`edge-cases/`](edge-cases/) | Numbered walkthrough of language features — loops, conditionals, imports, escaping, re-exports, runtime vars, built-in functions, default args, logical operators, expression directives, frontmatter imports; v0.4.0 adds interior blank-line preservation, typed comparisons, and `@extends` frontmatter merge; `30_set_string_cli.mds` demos `--set` (coerces to number, may raise `mds::type_mismatch`) vs `--set-string` (keeps string bytes byte-for-byte), and both flags on the same key as a hard error; `31_wide_and_nested_fences.mds` shows a 4-backtick fence wrapping a 3-backtick block verbatim; `32_dynamic_message_role.mds` shows `@message {{role}}:` with the role driven by a frontmatter variable |
 | [`stress-test/`](stress-test/) | A large, deeply-composed template tree exercising the resolver and evaluator |
-| [`linting/`](linting/) | Two lint fixtures: `demo.mds` trips four rules (duplicate-import, unused-import, unused-variable, redundant-else); `rules-tour.mds` covers the other five (duplicate-export, unreachable-branch, empty-block, unused-function, legacy-interpolation). Shows `mds lint` human and JSON output, `--fix` tiers (A auto-applies, B standalone-only, C report-only), `--diff` preview, exit-code semantics, and per-rule severity overrides via `mds.json` (`config-demo/`) |
+| [`linting/`](linting/) | `demo.mds` shows four rules. `rules-tour.mds` shows five more. Example 04 under `edge-cases/` shows `literal-directive`. Shows `mds lint` human and JSON output, `--fix` tiers (A auto-applies, B standalone-only, C report-only), `--diff` preview, exit-code semantics, and per-rule severity overrides via `mds.json` (`config-demo/`) |
 | [`source-maps/`](source-maps/) | Source Map v3 generation — sidecar `.map` file, `--inline` data-URI, `--embed-sources` (fills `sourcesContent[]`), combined `--inline --embed-sources`; `config-demo/mds.json` enables `build.source_map = true` project-wide; `--no-source-map` overrides config; messages-mode templates emit a warning and no map; sidecar files are gitignored via `examples/**/*.md.map` |
 | [`formatting/`](formatting/) | Auto-formatter demo (`mds fmt`) — write, `--check`, `--diff`, and stdin filter modes; what fmt normalizes (directive trailing whitespace, line endings, final newline) vs. preserves byte-for-byte (body text, `@message`/`@define` bodies); the safety gate that refuses any rewrite changing compiled output; exit codes. `needs-formatting/` is a deliberately-unformatted fixture: `mds fmt --check examples/formatting/needs-formatting/` exits `1` by design |
 | [`watch/`](watch/) | Live-recompile demo (`mds watch`) — single-file and directory modes, streaming to stdout or a file, partial-edit propagation via the reverse-dependency graph, runtime variable reload with `--vars`, debounce and poll-interval tuning, `--clear` for TTY display |
@@ -83,7 +89,7 @@ mds build examples/ --out-dir dist/
 mds check examples/
 ```
 
-Note: `examples/stress-test/errors/` contains five intentionally-failing fixtures (`bad-arity`, `bad-circular-a/b`, `bad-type`, `bad-undefined`), so `mds build examples/ --out-dir dist/` and `mds check examples/` exit non-zero by design. Likewise, `mds lint examples/` exits 2 by design — it reports `84 clean, 1 with warnings, 8 with errors`. The 8 error-severity files are three deliberate lint demos (`linting/demo.mds`, `linting/rules-tour.mds`, `linting/config-demo/loop-shadow.mds`) and the five `stress-test/errors/` fixtures, which fail analysis (`mds::arity`, `mds::circular_import` ×2, `mds::type_error`, `mds::undefined_var`) rather than tripping lint rules. `mds fmt --check examples/` also exits 1 by design because `examples/formatting/needs-formatting/unformatted.mds` is intentionally left unformatted.
+Note: `examples/stress-test/errors/` contains five intentionally-failing fixtures (`bad-arity`, `bad-circular-a/b`, `bad-type`, `bad-undefined`), so `mds build examples/ --out-dir dist/` and `mds check examples/` exit non-zero by design. Likewise, `mds lint examples/` exits 2 by design. The error-severity files are three deliberate lint demos (`linting/demo.mds`, `linting/rules-tour.mds`, `linting/config-demo/loop-shadow.mds`) and the five `stress-test/errors/` fixtures, which fail analysis (`mds::arity`, `mds::circular_import` ×2, `mds::type_error`, `mds::undefined_var`) rather than tripping lint rules. `mds fmt --check examples/` also exits 1 by design because `examples/formatting/needs-formatting/unformatted.mds` is intentionally left unformatted.
 
 `@message` detection is **static**: a `@message` block anywhere in the template
 (even inside `@if false:`) makes it a messages template. **Mixed content** —

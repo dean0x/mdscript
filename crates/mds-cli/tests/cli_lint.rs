@@ -899,6 +899,107 @@ fn fix_applied_for_block_spanning_empty_define_and_file_changed() {
     );
 }
 
+#[test]
+fn fix_removes_an_empty_in_fence_if_and_preserves_the_other_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("marked.mds");
+    fs::write(
+        &target,
+        "```js +mds\r\n  @if 1 == 1: \t\r\n\t@end\r\n keep\r\n```\r\n",
+    )
+    .unwrap();
+
+    let (json, _) = lint_json(&target, "before fix");
+    let findings = json_diagnostics(&json, "before fix");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0]["rule"], "empty-block");
+
+    let out = lint_path(&target, &["--fix"]);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("Fixed:"), "{stderr}");
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        b"```js +mds\r\n keep\r\n```\r\n"
+    );
+}
+
+#[test]
+fn fix_removes_an_indented_empty_if_and_preserves_the_other_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("indented.mds");
+    let frontmatter = "---\r\nindented-directives: true\r\n---\r\n";
+    fs::write(
+        &target,
+        format!("{frontmatter}  @if 1 == 1: \t\r\n\t@end \t\r\n keep\r\n"),
+    )
+    .unwrap();
+    let (json, _) = lint_json(&target, "before fix");
+    let findings = json_diagnostics(&json, "before fix");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0]["rule"], "empty-block");
+
+    let out = lint_path(&target, &["--fix"]);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("Fixed:"), "{stderr}");
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        format!("{frontmatter} keep\r\n").as_bytes()
+    );
+}
+
+#[test]
+fn the_file_key_suppresses_literal_directive_only_outside_plain_fences() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("indented.mds");
+    let prefix = "---\nindented-directives: true\n---\n  @if 1 == 1:\nkeep\n  @end\n```txt\n";
+    let example = "  @if demo:\nexample\n";
+    fs::write(&target, format!("{prefix}{example}  @end\n```\n")).unwrap();
+    let (json, _) = lint_json(&target, "under the file key");
+    let findings = json_diagnostics(&json, "under the file key");
+    assert_eq!(findings.len(), 2, "{findings:?}");
+    for (finding, offset) in findings
+        .into_iter()
+        .zip([prefix.len(), prefix.len() + example.len()])
+    {
+        assert_eq!(finding["rule"], "literal-directive");
+        assert_eq!(finding["span"]["offset"], offset);
+    }
+}
+
+#[test]
+fn malformed_file_key_reports_a_fixed_message_and_a_safe_source_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("indented.mds");
+    let esc = char::from(0x1b);
+    let bidi = char::from_u32(0x202e).unwrap();
+    let prefix = "---\r\nname: café\r\n";
+    let line = format!("indented-directives: invalid{esc}{bidi}value");
+    let message = "syntax error: expected indented-directives: true or indented-directives: false";
+    fs::write(&path, format!("{prefix}{line}\r\n---\r\n")).unwrap();
+
+    let human = lint_path(&path, &[]);
+    let stderr = String::from_utf8(human.stderr).unwrap();
+    assert_eq!(human.status.code(), Some(2), "{stderr}");
+    assert!(stderr.replace("\n  │ ", " ").contains(message), "{stderr}");
+    let safe_value = format!("invalid?{}value", char::REPLACEMENT_CHARACTER);
+    assert!(stderr.contains(&safe_value), "{stderr:?}");
+    assert!(!stderr.contains([esc, bidi]), "{stderr:?}");
+
+    let json = lint_path(&path, &["--format", "json"]);
+    let wire = String::from_utf8(json.stdout).unwrap();
+    assert_eq!(json.status.code(), Some(2), "{wire}");
+    assert!(!wire.contains([esc, bidi]), "{wire:?}");
+    let document: serde_json::Value = serde_json::from_str(&wire).unwrap();
+    let error = &document["error"];
+    assert_eq!(error["code"], "mds::syntax");
+    assert_eq!(error["message"], message);
+    assert_eq!(error["help"], serde_json::Value::Null);
+    assert_eq!(error["span"]["offset"], prefix.len());
+    assert_eq!(error["span"]["length"], line.len());
+}
+
 // ── L-CLI-RESOURCE: exit code 3 for ResourceLimit (TEST-4) ──────────────────
 //
 // Verifies that a template causing a ResourceLimit in the RESOLVER causes
@@ -3151,6 +3252,46 @@ fn json_diagnostics<'a>(json: &'a serde_json::Value, label: &str) -> Vec<&'a ser
         .collect()
 }
 
+#[test]
+fn literal_directive_reports_a_fixed_message_and_a_safe_source_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("literal.mds");
+    let esc = char::from(0x1b);
+    let bidi = char::from_u32(0x202e).unwrap();
+    let line = format!("  @if tag{esc}{bidi}tail:");
+    let source = format!("{line}\n");
+    fs::write(&path, &source).unwrap();
+    let message = "This conditional line is literal text.";
+
+    let out = lint_path(&path, &[]);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("literal-directive"), "{stderr}");
+    assert!(stderr.contains(message), "{stderr}");
+    let safe_line = format!("@if tag?{}tail:", char::REPLACEMENT_CHARACTER);
+    assert!(stderr.contains(&safe_line), "{stderr:?}");
+    assert!(!stderr.contains([esc, bidi]), "{stderr:?}");
+
+    let (json, wire) = lint_json(&path, "literal directive");
+    assert!(!wire.contains([esc, bidi]), "{wire:?}");
+    let findings = json_diagnostics(&json, "literal directive");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0]["rule"], "literal-directive");
+    assert_eq!(findings[0]["message"], message);
+    assert_eq!(findings[0]["span"]["offset"], 0);
+    assert_eq!(findings[0]["span"]["length"], line.len());
+
+    let build = mds_bin()
+        .arg("build")
+        .arg(&path)
+        .args(["-o", "-"])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "{:?}", build.stderr);
+    assert_eq!(build.stdout, source.as_bytes());
+    assert!(build.stderr.is_empty(), "{:?}", build.stderr);
+}
+
 /// T-9 [AC-C3]: `mds lint --format json` on a source whose diagnostic message embeds a
 /// raw C1 control character (U+0085 NEL) must emit valid JSON with no raw control bytes
 /// anywhere — the embedded character must arrive as its 6-character JSON escape
@@ -4221,14 +4362,14 @@ fn unknown_rule_plural_sorted_warning() {
 #[test]
 fn unknown_rule_cli_exact_golden() {
     // We cannot import mds:: directly from an integration test; hard-code the
-    // current ten names in alphabetical order (the same value KNOWN_LINT_RULES
+    // current eleven names in alphabetical order (the same value KNOWN_LINT_RULES
     // holds, verified by AC-224-7).  If the registry grows this golden must be
     // updated alongside the registry — the test will fail loudly.
     #[rustfmt::skip]
     let recognised = concat!(
         "duplicate-export, duplicate-import, empty-block, legacy-interpolation, ",
-        "redundant-else, shadow-variable, unreachable-branch, unused-function, ",
-        "unused-import, unused-variable"
+        "literal-directive, redundant-else, shadow-variable, unreachable-branch, ",
+        "unused-function, unused-import, unused-variable"
     );
 
     // ── Singular golden ────────────────────────────────────────────────────────
@@ -4319,8 +4460,8 @@ fn unknown_rule_cli_exact_golden_single_file() {
     #[rustfmt::skip]
     let recognised = concat!(
         "duplicate-export, duplicate-import, empty-block, legacy-interpolation, ",
-        "redundant-else, shadow-variable, unreachable-branch, unused-function, ",
-        "unused-import, unused-variable"
+        "literal-directive, redundant-else, shadow-variable, unreachable-branch, ",
+        "unused-function, unused-import, unused-variable"
     );
 
     // ── Singular golden (single-file path) ────────────────────────────────────

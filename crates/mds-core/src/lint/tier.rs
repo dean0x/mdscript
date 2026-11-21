@@ -10,7 +10,8 @@
 //! | A    | duplicate-import, duplicate-export, unreachable-branch,      | Auto-fixable; gated by reverify |
 //! |      | empty-block, legacy-interpolation                            |           |
 //! | B    | unused-import, unused-function                               | Fixable only when structural-standalone |
-//! | C    | unused-variable, redundant-else, shadow-variable             | Never fixed |
+//! | C    | literal-directive, unused-variable, redundant-else,          | Never fixed |
+//! |      | shadow-variable                                             |           |
 //!
 //! This table restates `rule_tier`, which is the authoritative source; `legacy-interpolation`
 //! is the one Tier A rule whose fix is not output-neutral (see `is_output_neutral`).
@@ -46,7 +47,7 @@ pub fn rule_tier(rule: &str) -> FixTier {
         | "empty-block"
         | "legacy-interpolation" => FixTier::A,
         "unused-import" | "unused-function" => FixTier::B,
-        _ => FixTier::C, // unused-variable, redundant-else, shadow-variable, unknown
+        _ => FixTier::C, // literal-directive, unused-variable, redundant-else, shadow-variable, unknown
     }
 }
 
@@ -104,16 +105,14 @@ mod tests {
     /// and the expected-tier table must agree with the registry in BOTH directions.
     ///
     /// AD-224-2 (amended): `ALL_RULE_NAMES` removes string duplication but not
-    /// omission risk — an 11th rule module forgotten here compiles fine. The
-    /// mechanical closure requires:
+    /// omission risk — an unlisted rule module compiles. The test checks:
     /// 1. A separate `EXPECTED` table with explicit (name, tier) pairs.
     /// 2. `assert_eq!(EXPECTED.len(), ALL_RULE_NAMES.len())` — length pin.
     /// 3. Every registry entry appears in `EXPECTED` (registry → table).
     /// 4. Every `EXPECTED` entry appears in the registry (table → registry).
     ///
     /// A rule present in the registry but absent from `EXPECTED`, or vice versa,
-    /// fails this test. The `_ => FixTier::C` catch-all arm is now unreachable
-    /// for valid registered rules.
+    /// fails this test. The catch-all arm covers Tier C and unknown names.
     #[test]
     fn registry_and_tier_table_are_bidirectionally_consistent() {
         use super::super::config::KNOWN_LINT_RULES;
@@ -121,7 +120,7 @@ mod tests {
 
         /// Canonical expected-tier table: (rule_name, expected_FixTier).
         /// Must be updated whenever a rule is added, removed, or re-tiered.
-        /// Pin: len must equal ALL_RULE_NAMES.len() (10 as of this release).
+        /// Pin: len must equal ALL_RULE_NAMES.len() (11 as of this release).
         const EXPECTED: &[(&str, FixTier)] = &[
             // Tier A — auto-fixable with reverify gate
             ("duplicate-export", FixTier::A),
@@ -133,26 +132,27 @@ mod tests {
             ("unused-function", FixTier::B),
             ("unused-import", FixTier::B),
             // Tier C — report-only, never fixed
+            ("literal-directive", FixTier::C),
             ("redundant-else", FixTier::C),
             ("shadow-variable", FixTier::C),
             ("unused-variable", FixTier::C),
         ];
 
-        // Length pin: bump this when a new rule ships.
+        // Length pin: update this when a new rule ships.
         assert_eq!(
             EXPECTED.len(),
-            10,
-            "EXPECTED table length must equal the number of registered rules (10)"
+            11,
+            "EXPECTED table length must equal the number of registered rules (11)"
         );
         assert_eq!(
             ALL_RULE_NAMES.len(),
-            10,
-            "ALL_RULE_NAMES length must equal the number of registered rules (10)"
+            11,
+            "ALL_RULE_NAMES length must equal the number of registered rules (11)"
         );
         assert_eq!(
             KNOWN_LINT_RULES.len(),
-            10,
-            "KNOWN_LINT_RULES length must equal the number of registered rules (10)"
+            11,
+            "KNOWN_LINT_RULES length must equal the number of registered rules (11)"
         );
 
         // Direction 1: every registry entry has a correct entry in EXPECTED.
@@ -198,6 +198,7 @@ mod tests {
             "duplicate-export",
             "unreachable-branch",
             "empty-block",
+            "literal-directive",
             "unused-import",
             "unused-function",
             "unused-variable",
@@ -234,7 +235,7 @@ mod tests {
     /// token that names a registered rule together with the tier of its row
     /// (a continuation row with a blank tier column inherits the tier of the row
     /// above), and asserts the extracted map agrees with `rule_tier` in both
-    /// directions for all 10 rules.
+    /// directions for all 11 rules.
     #[test]
     fn module_doc_tier_table_matches_rule_tier() {
         use super::super::rules::ALL_RULE_NAMES;
@@ -279,13 +280,11 @@ mod tests {
             ("fix.rs", include_str!("fix.rs")),
         ] {
             let extracted = extract_tier_table(source);
-            // Non-vacuity: the parser must actually find all 10 rule names, or the
-            // bidirectional checks below would pass on an empty/partial extraction.
+            // The parser must find every registered rule in each table.
             assert_eq!(
                 extracted.len(),
-                10,
-                "{label}: expected all 10 rule names to be extracted from the module-doc \
-                 Tier table, got {extracted:?}"
+                ALL_RULE_NAMES.len(),
+                "{label}: expected all registered rules in the module-doc tier table, got {extracted:?}"
             );
             // Direction 1: table → rule_tier.
             for &name in ALL_RULE_NAMES {

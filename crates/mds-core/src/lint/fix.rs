@@ -7,7 +7,8 @@
 //! | A    | duplicate-import, duplicate-export, unreachable-branch,    | Auto-fixable (span-removal); gated by reverify |
 //! |      | empty-block, legacy-interpolation                          |           |
 //! | B    | unused-import, unused-function                             | Fixable only when structural-standalone (no imports/extends/partial; reverify applies) |
-//! | C    | unused-variable, redundant-else, shadow-variable           | Report-only; never fixed |
+//! | C    | literal-directive, unused-variable, redundant-else,         | Report-only; never fixed |
+//! |      | shadow-variable                                            |           |
 //!
 //! **Tier B nuance:**
 //! - `unused-function` sets `fix_removals` to a whole-block [`FixLineSpan`] and is

@@ -122,9 +122,8 @@ pub fn format_str_with(source: &str, base_dir: Option<&Path>) -> Result<String, 
 
 /// Format MDS source code with an explicit base directory and file name.
 ///
-/// Identical to [`format_str_with`] but threads `file_name` into lexer errors
-/// and into any [`MdsError::Syntax`] surfaced by the safety gate, so callers
-/// get a diagnostic that names the file rather than showing a blank path.
+/// Like [`format_str_with`], but syntax errors in the input use `file_name`.
+/// A syntax error in an imported file keeps that file's name and source.
 ///
 /// `file_name` is used only for error reporting — it does not affect how
 /// `@import` paths are resolved (that is controlled by `base_dir`).
@@ -168,8 +167,8 @@ fn token_offset(t: &Token) -> usize {
 
 /// Compute the start byte offset of every directive line.
 ///
-/// A `Token::Directive` is only ever lexed at line-start, outside code, so its
-/// own offset IS the directive line's start offset.
+/// Directive tokens can occur inside opted-in fences and can include an indent.
+/// Their offsets still point to the start of the line, before any indent.
 fn directive_line_offsets(tokens: &[Token]) -> BTreeSet<usize> {
     tokens
         .iter()
@@ -443,6 +442,7 @@ fn rewrite_body(
 ///   error is surfaced verbatim — matching `mds build` / `mds check` — instead
 ///   of silently emitting a still-broken file or a misleading
 ///   `FormatterInvariant` for what is ordinary author error.
+/// - A file-key YAML disagreement is an author error and is returned unchanged.
 /// - Any OTHER compile error (a minority case — typically an undefined runtime
 ///   variable or function; imports still resolve via `base_dir`) means the
 ///   source parsed into a well-formed token stream and only failed later during
@@ -473,8 +473,13 @@ fn assert_equivalent(
         // fails at parse time). There is nothing safe to format: surface the
         // real error rather than papering over it with the structural check.
         //
-        // Rebuild `src` so the diagnostic names `file_name` rather than the
-        // blank label used internally by `compile_str_collecting_warnings`.
+        // Keep an imported module's span with its own source. Only the entry
+        // needs the caller's label instead of the in-memory source label.
+        Err(err @ MdsError::Syntax { .. })
+            if err.source_name().is_some() && !err.is_string_source() =>
+        {
+            Err(err)
+        }
         Err(MdsError::Syntax { message, span, .. }) => Err(MdsError::Syntax {
             message,
             span,
@@ -482,6 +487,9 @@ fn assert_equivalent(
             // neutralization (PF-014) plus WIRE-mode filename escaping.
             src: Some(Arc::new(named_source_for_render(file_name, source))),
         }),
+        Err(MdsError::YamlError { message }) if message == lexer::FILE_KEY_FORM => {
+            Err(MdsError::YamlError { message })
+        }
         // Any other compile failure (undefined var/fn, unresolved import, …)
         // means the token stream is well-formed and only later analysis failed,
         // so the rule-aware structural comparison is a meaningful fallback.

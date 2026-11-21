@@ -768,6 +768,28 @@ fn scope_layer_precedence_keeps_imports_reserved_only_for_mds() {
 }
 
 #[test]
+fn indented_directives_never_enters_scope_from_frontmatter() {
+    let frontmatter = crate::ast::Frontmatter {
+        raw: "indented-directives: true\nname: World\n".to_owned(),
+    };
+    let mut mem = MemBudget::default();
+    let (mapping, spent) = parse_frontmatter_mapping(Some(&frontmatter), &mut mem).unwrap();
+    for is_md in [false, true] {
+        let (scope, _) = build_scope_from_frontmatter(
+            Some(&frontmatter),
+            mapping.as_ref(),
+            spent,
+            is_md,
+            &runtime_layer(&HashMap::new()),
+            &mut mem,
+        )
+        .unwrap();
+        assert!(scope.get_slot("name").is_some());
+        assert!(scope.get_slot("indented-directives").is_none());
+    }
+}
+
+#[test]
 fn runtime_layer_is_shared_by_module_scopes() {
     let vars = HashMap::from([("x".into(), Value::String("runtime".into()))]);
     let vars = runtime_layer(&vars);
@@ -1265,6 +1287,99 @@ fn check_virtual(files: &[(&str, &str)], entry: &str) -> Result<(), MdsError> {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
     crate::check_virtual(map, entry, None)
+}
+
+#[test]
+fn extends_lexes_the_base_and_child_with_their_own_file_keys() {
+    let base_body = "  @if 1 == 0:\nbase text\n  @end\n";
+    let child_body = "  @if 1 == 0:\nchild text\n  @end\n";
+    for base_on in [true, false] {
+        let base = format!("---\ntitle: Base\nindented-directives: {base_on}\n---\n{base_body}@block section:\ndefault\n@end\n");
+        let child = format!("---\nindented-directives: {}\n---\n@extends \"./base.mds\"\n@block section:\n{child_body}@end\n", !base_on);
+        let output =
+            compile_virtual(&[("base.mds", &base), ("child.mds", &child)], "child.mds").unwrap();
+        let literal = if base_on { child_body } else { base_body };
+        assert_eq!(output, format!("---\ntitle: Base\n---\n{literal}"));
+    }
+}
+
+const INDENTED_DIRECTIVES_FORM: &str =
+    "expected indented-directives: true or indented-directives: false";
+
+#[test]
+fn indented_directives_yaml_agreement_covers_all_module_kinds() {
+    let entry_routes = [
+        "@import { word } from \"./dep.mds\"\n{{word()}}\n",
+        "@import \"./dep.mds\" as dep\n@include dep\n",
+        "@extends \"./dep.mds\"\n",
+    ];
+    let body = "@define word():\nword\n@end\nbody\n";
+    let compile_error = |files: &[(&str, &str)]| {
+        let err = compile_virtual(files, "entry.mds").unwrap_err();
+        assert_eq!(err.serialize().code, "mds::yaml");
+        assert!(
+            matches!(err, MdsError::YamlError { message } if message == INDENTED_DIRECTIVES_FORM)
+        );
+    };
+    for raw in [
+        "\"indented-directives\": true",
+        "{indented-directives: true}",
+        "? indented-directives\n: true",
+        "# comment\u{2028}indented-directives: true",
+        "{indented-directives: 'true'}",
+    ] {
+        let source = format!("---\n{raw}\n---\n{body}");
+        compile_error(&[("entry.mds", &source)]);
+        for entry in entry_routes {
+            compile_error(&[("entry.mds", entry), ("dep.mds", &source)]);
+        }
+    }
+}
+
+#[test]
+fn indented_directives_yaml_agreement_rejects_a_matching_value_from_another_line() {
+    let src = "---\n\"indented-directives\": true\ntext: \"start\nindented-directives: true\nend\"\n---\nbody\n";
+    let err = compile_virtual(&[("entry.mds", src)], "entry.mds").unwrap_err();
+    assert!(matches!(err, MdsError::YamlError { message } if message == INDENTED_DIRECTIVES_FORM));
+}
+
+#[test]
+fn indented_directives_yaml_agreement_accepts_a_key_after_other_values() {
+    let body = "  @if enabled:\nyes\n  @end\n";
+    for (key, expected) in [("true", "yes\n"), ("false", body)] {
+        let metadata = "title: 'one\ntwo'\nenabled: true\n";
+        let source =
+            format!("---\n{metadata}indented-directives: \t{key} \t # option\n---\n{body}");
+        let output = compile_virtual(&[("entry.mds", &source)], "entry.mds").unwrap();
+        assert_eq!(output, format!("---\n{metadata}---\n{expected}"));
+    }
+}
+
+#[test]
+fn indented_directives_preserves_metadata_after_a_yaml_line_break() {
+    for eol in ['\u{85}', '\u{2028}', '\u{2029}'] {
+        let source = format!(
+            "---\nindented-directives: true # flag{eol}title: Sample\n---\nTitle: {{{{title}}}}\n"
+        );
+        assert_eq!(
+            compile_virtual(&[("entry.mds", &source)], "entry.mds").unwrap(),
+            "---\ntitle: Sample\n---\nTitle: Sample\n"
+        );
+    }
+}
+
+#[test]
+fn indented_directives_yaml_agreement_rejects_a_probe_hit_in_a_scalar() {
+    let src = "---\n\"text\nindented-directives: true\nend\"\n---\nbody\n";
+    let err = compile_virtual(&[("entry.mds", src)], "entry.mds").unwrap_err();
+    assert!(matches!(err, MdsError::YamlError { message } if message == INDENTED_DIRECTIVES_FORM));
+}
+
+#[test]
+fn indented_directives_yaml_agreement_rejects_a_value_changed_by_folding() {
+    let src = "---\nindented-directives: true\n  more\n---\nbody\n";
+    let err = compile_virtual(&[("entry.mds", src)], "entry.mds").unwrap_err();
+    assert!(matches!(err, MdsError::YamlError { message } if message == INDENTED_DIRECTIVES_FORM));
 }
 
 // ── F1: issue worked example (headline test) ──────────────────────────────
@@ -4785,6 +4900,32 @@ fn parse_nodes(source: &str) -> Vec<Node> {
         .body
 }
 
+#[test]
+fn stripped_fence_opener_maps_its_prefix_and_one_source_byte() {
+    let source = "  ```js \t+mds\n  @if 1 == 1:\n  keep\n  @end\n  ```\n";
+    let origin = arc_origin("/p/main.mds", "main.mds", source);
+    let nodes = parse_nodes(source);
+    let (output, map) = ModuleCache::evaluate_regions_with_map(
+        &[(&nodes, &origin)],
+        &mut Scope::new(),
+        &mut vec![],
+        Some(crate::sourcemap::MapBuilder::new(origin.clone())),
+        &mut EvalBudget::default(),
+    )
+    .unwrap();
+
+    assert_eq!(output, "  ```js\n  keep\n  ```\n");
+    let segments: Vec<_> = map
+        .unwrap()
+        .segments
+        .iter()
+        .map(|s| (s.out, s.src, s.src_off, s.len))
+        .collect();
+    assert_eq!(segments, [(0, 0, 0, 8), (8, 0, 28, 7), (15, 0, 42, 6)]);
+    // The opener's synthetic LF takes the place of the space after `js`.
+    assert_eq!(&source[..8], "  ```js ");
+}
+
 /// #416: after region-by-region evaluation every builder entry is the region
 /// origin that registered it, pointer-identical to that module's source — including
 /// when a later region carries another `Origin` value of an already-registered module
@@ -6193,7 +6334,8 @@ fn tree_estimate_inputs_keep_their_measured_sizes() {
     }
 
     // (source, tokens, expression bytes): directive lines without their newline and
-    // trimmed interpolation text are expression bytes; each other text run is one token.
+    // trimmed interpolation text are expression bytes. Fence lines and raw content
+    // runs count as tokens but do not add expression bytes.
     let samples = [
         ("\\{{a\\{{a", 4, 0),
         ("@define f():\n\\{{a\\{{a\n@end\n", 6, 16),
@@ -6201,6 +6343,8 @@ fn tree_estimate_inputs_keep_their_measured_sizes() {
         ("x\n@if a&&a:\n@end\n", 3, 13),
         ("{{f(f(a))}}text{{a.a}}", 3, 10),
         ("a@b\n@c", 2, 2),
+        ("```\n{{a}}\n```\n``` +mds\n @if a:\n@end\n```\n", 7, 11),
+        ("---\nindented-directives: true\n---\n\t@if a:", 4, 7),
     ];
     for (source, tokens, expr) in samples {
         let lexed = tokenize(source, "sample.mds").unwrap();

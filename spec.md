@@ -89,7 +89,7 @@ Hello {{name}}!
 - Escaping: `\{{` produces a literal `{{` in output (no `\}}` escape — a lone `}}` is just two `}` characters)
 - Non-recursive: interpolated values are never re-scanned — the output of `{{x}}` is always plain text, never further interpreted as MDS
 - Escape adjacency: `\` immediately before `{{` is claimed by the `\{{` escape — `\{{x}}` emits literal `{{` followed by the text `x}}`. To get a backslash followed by an interpolated value, write `\ {{x}}` (backslash, space, then `{{x}}`).
-- Inside fenced code blocks (triple backtick or tilde; also indented or blockquoted fences): no interpolation occurs (raw passthrough)
+- Fences pass through as literal text unless they opt in to [conditionals](#conditionals-inside-a-fence).
 - Undefined variable → compilation error (not silent empty string)
 
 **Migration from single-brace syntax:** run `mds lint --fix` (applies the `legacy-interpolation` rule to auto-convert `{x}` → `{{x}}`), then `mds fmt` to normalize formatting.
@@ -225,6 +225,69 @@ Free tier.
 | `"false"` | **truthy** (non-empty string) | requires `x == "false"` |
 
 **`--set-string` truthiness footgun:** `--set-string count=0` sets `count` to the string `"0"`, not the number `0`. The string `"0"` is truthy (`@if count:` is true) even though the number `0` is falsy. Similarly, `--set-string flag=false` sets `flag` to the string `"false"` which is truthy. Compare with string literals explicitly when using `--set-string`: `@if count == "0":`.
+
+#### Conditionals inside a fence
+
+Add `+mds` as the last or only word of a backtick or tilde fence's info string.
+Only the exact ASCII word opts in. Separate info words with spaces or tabs.
+The compiler removes the marker and its adjacent blanks from the opener.
+
+````mds
+```txt +mds
+@if upper("dev") == "DEV":
+Debug mode is on.
+@else:
+Debug mode is off.
+@end
+```
+````
+
+- Use `@if`, `@elseif`, `@else:` and `@end` on their own lines. Spaces and tabs can precede them.
+  Conditions use the same expressions as outside the fence, with function calls permitted.
+- The compiler removes the directive lines and keeps the selected content with its indent.
+  Text in that content stays literal, such as `{{x}}`, `\{{` and other directives such as `@include`.
+  An inner opener with its own marker stays literal. Conditional lines after it still belong to the outer fence.
+- The lexer checks the four keywords without regard to ASCII letter case. An ASCII letter,
+  digit, underscore or hyphen after a keyword makes it part of a longer word, such as `@endnote`.
+  Invalid forms such as `@Else:`, `@end.` and `@if(x):` cause syntax errors.
+  The indent before a conditional cannot contain other whitespace or control characters.
+  A backslash before the `@` makes the line literal. The compiler keeps the backslash in selected content.
+  To show a conditional line as text without a prefix, omit `+mds`.
+- Close each in-fence `@if` before the fence closes.
+  The compiler limits total block depth to 64. Outer blocks and in-fence `@if` blocks count together.
+  At the closer, an open conditional causes a syntax error at the innermost open `@if`.
+  If the fence does not close, the compiler reports the unclosed fence at its opener instead.
+- An in-fence `@elseif`, `@else:` or `@end` cannot continue or close a block outside the fence.
+  It causes a syntax error at its own line if there is no open `@if` in that fence.
+  An outer `@if` can enclose a complete fence.
+- A marked opener cannot have a blockquote prefix or a control character in its info string.
+  An embedded carriage return counts as a control character, but a CRLF line end does not.
+
+**Reserved info words:** On any fence opener, a word that starts with `+` and an ASCII letter
+or a non-ASCII character causes a syntax error. So does a word that contains `+mds` in any ASCII
+letter case, or a `+` word just before `mds` in any ASCII letter case. The only exception is
+the exact final marker. Words such as `+5`, `+=` and `++` stay valid.
+
+#### Indented directives
+
+Set `indented-directives: true` in a file's own YAML frontmatter to enable indented directives outside fences.
+Only `@if`, `@elseif`, `@else:` and `@end` can use this opt-in. Use ASCII spaces or tabs for the indent.
+Four or more spaces also count. If the key is absent or `false`, indented conditional lines are text, not directives.
+
+The key does not affect `>`-prefixed lines or unmarked fences. Other indented `@` lines are not directives.
+Markdown list structure does not affect these directives. Outside fences, an indented `@end` closes the innermost open MDS block of any kind.
+An indented conditional in an invalid form, such as `@else` without its colon, causes a syntax error under this opt-in.
+
+Write the key once, at the start of a frontmatter line, with an unquoted lowercase Boolean.
+Put at least one space or tab after the colon. Spaces and tabs can follow the value.
+If you add a comment, put a space or tab before it.
+A quoted value, a blank before the colon or a repeated key line causes `mds::syntax` at that line.
+If the key in parsed YAML does not match the source line and Boolean value, the compiler reports `mds::yaml`.
+`mds check`, `mds lint` and `mds fmt` also report this YAML error.
+
+The key does not pass through `@extends`, `@import` or `@include`. This also applies to imported `@define` bodies.
+This top-level key is reserved. It does not enter variable scope or appear in standalone or merged output frontmatter.
+The `unused-variable` rule does not report it.
 
 ---
 
@@ -790,7 +853,7 @@ The blank lines between sections come from the base skeleton (the blank line bet
 
 - Frontmatter from all ancestors is deep-merged in order: base < intermediate < child < runtime vars
 - Nested mappings are merged key-by-key; arrays replace wholesale; scalars: child wins
-- Reserved keys (`imports`, `type`, `extends`) are excluded from the merged scope
+- The merged scope excludes reserved top-level keys (`imports`, `type`, `extends`, `indented-directives`).
 - Per-file `imports:` entries in frontmatter are each resolved against their own file's location
 - The **deep-merged** frontmatter (base < child, reserved keys excluded) is emitted in the compiled output — not just the child's raw frontmatter. Both base-only and child-only keys appear; child wins on collisions
 
@@ -800,7 +863,7 @@ The blank lines between sections come from the base skeleton (the blank line bet
 
 | Template type | Emitted frontmatter |
 |---------------|---------------------|
-| **Standalone** | Raw-verbatim: the original source YAML between `---` fences, byte-for-byte (comments and quoting preserved) |
+| **Standalone** | Raw source YAML with reserved keys removed (comments and quoting preserved on retained lines) |
 | **`@extends` child** | Canonically re-serialized: serde-yaml output of the deep-merged mapping (comments and original quoting are normalized away; YAML structure is canonical) |
 
 This asymmetry is intentional: standalone templates can round-trip YAML comments and non-canonical quoting, while `@extends` templates must emit a merged structure that has no single "source" YAML string. Runtime `--set`/`--set-string` variables do not alter the emitted frontmatter in either case — they affect only the compiled body.
@@ -938,7 +1001,7 @@ charged, and the entry holds its estimate until it resolves. A module that a com
 resolves first as an `@extends` base and then as an import keeps one estimate. The
 estimate counts the tokens during the parse, the syntax tree, and the copy of a
 `@define` or `@block` body that the compiler keeps. Its factors are measured on a
-64-bit host: for each of the 62 source shapes that `crates/mds-core/tests/memory_bound.rs`
+64-bit host: for each of the 65 source shapes that `crates/mds-core/tests/memory_bound.rs`
 measures, the estimate is at least the peak heap of a compile and at least the bytes
 that a cached module keeps. On wasm32 the estimate is higher than the memory that it
 counts, so a compile there is refused earlier.
@@ -955,7 +1018,7 @@ in its life share about the same ceiling.
 |---|---|---|
 | The densest syntax, `\{{a` repeated | 484,330 bytes | 484,610 bytes |
 | `{{a}}` repeated | 952,385 bytes | 956,729 bytes |
-| The densest measured expression shape | 678,735 bytes | 680,939 bytes |
+| The densest measured expression shape (alternating fence content and directives) | 616,935 bytes | 618,527 bytes |
 | Prose with one `{{a}}` in each 80 bytes | 5,229,805 bytes | 5,237,969 bytes |
 | Prose | 10,485,760 bytes: the 10 MiB file cap applies first, and the budget alone admits 12,336,188 | 12,336,188 bytes |
 
@@ -1096,7 +1159,7 @@ and I/O failures are described below the table.
 | `mds::expected_markdown` | Rust API only: `CompileResult::into_markdown()` on a messages result | `mds-core` API | n/a | Rust |
 | `mds::expected_messages` | Rust API only: `CompileResult::into_messages()` on a markdown result | `mds-core` API | n/a | Rust |
 | `mds::formatter_invariant` | The formatter's rewrite failed the compile-equivalence gate — a formatter defect; nothing is written | formatter | 1 / n/a | CLI (`fmt`), Rust |
-| `mds::internal` | A failed memory-counter check at the end of a compile (§5 "Compile memory budget"), with the message `internal compiler error`, no help and no span; a panic caught at a binding boundary, or a result that could not be serialised; the raw payload is attached as `detail` only under the off-by-default `debug-panics` feature (`SECURITY.md`). On the CLI, also the error `mds lint --format json` records for an input whose analysis panicked, with the fixed message `internal compiler error` and nothing of the panic (§5 "Panics on the CLI") | resolver (the counter check); napi, WASM, Python; `mds lint` | 101 / 101 | all |
+| `mds::internal` | A lexer step that does not advance or a failed memory-counter check at the end of a compile (§5 "Compile memory budget"). Both give `internal compiler error` with no help and no span. Also: a panic caught at a binding boundary, or a result that could not be serialised; the raw payload is attached as `detail` only under the off-by-default `debug-panics` feature (`SECURITY.md`). On the CLI, also the error `mds lint --format json` records for an input whose analysis panicked, with the fixed message `internal compiler error` and nothing of the panic (§5 "Panics on the CLI") | lexer (the progress check); resolver (the counter check); napi, WASM, Python; `mds lint` | 101 / 101 | all |
 | `mds::invalid_options` | Malformed or type-incorrect options: unknown keys, wrong types, `basePath` on file methods or on the WASM backend, source-map options on `check`, an empty `basePath`, a WASM `moduleAliases` entry that is not a normalized module key or names no module (`options.moduleAliases["<alias>"]: <reason>`) | napi, WASM, Python, `@mdscript/mds` | n/a | napi, WASM, Python, `@mdscript/mds` |
 | `mds::filename_collision` | `options.modules` already contains the entry `filename` | WASM (surfaced through `@mdscript/mds`) | n/a | WASM, `@mdscript/mds` |
 | `mds::invalid_backend_result` | The selected backend returned a result of an unexpected shape | `@mdscript/mds` | n/a | `@mdscript/mds` |
@@ -1916,6 +1979,8 @@ Rules default to the severities shown below — **not all rules default to `warn
 | `unreachable-branch` | **error** | yes (A)³ | A | A branch condition (`@if`/`@elseif`) is always-true (with later branches) or always-false, making some code dead. |
 | `duplicate-import` | **error** | yes (A) | A | The same file is imported more than once in a single file (modulo alias). |
 | `duplicate-export` | **error** | yes (A) | A | The same export name is defined more than once in a single file. |
+| `legacy-interpolation` | warn | yes (A) | A | A legacy `{x}` interpolation can use `{{x}}` instead. |
+| `literal-directive` | warn | no | C | A conditional line stays literal: an indented line outside a fence without `indented-directives: true`, or a line in an unmarked fence with `@if …:` before `@end`. The rule skips fences with `mds` as the first info word. |
 
 ¹ **`unused-import` is report-only in practice**: `fixable` is always `false` for this rule. A file that triggers `unused-import` contains at least one `@import` directive, making it non-*structural-standalone* (see below); Tier B fixes require a structural-standalone file. The rule is still useful — the warning clears as a side effect of applying other fixes (e.g. removing a duplicate import that was also the unused one). To silence it, set `"unused-import": "off"` in `mds.json`.
 
@@ -2102,6 +2167,8 @@ These are intentionally deferred to keep the language simple and the compiler fo
 ```
 file            := frontmatter? extends? (directive | text)*
 frontmatter     := "---\n" yaml_content "---\n"
+indented_key    := "indented-directives:" [ \t]+ ("true" | "false") ([ \t]+ "#" <rest of line>)? [ \t]*
+                   (* optional top-level line in yaml_content; see §4.3 *)
 extends         := "@extends" quoted_path
 directive       := import | export | define | include | if_block | for_block | message_block | block
 
@@ -2139,6 +2206,7 @@ text          := (raw_text | interpolation | escaped_open)*
 raw_text      := <any run containing no "{{" and no "\{{"; single "{"/"}" is ordinary text>
 interpolation := "{{" ws (qualified_call | member_access | function_call | identifier) ws "}}"
 escaped_open  := "\{{"        (* emits literal "{{" *)
+fence_marker  := "+mds"       (* exact last or only word of a fence info string; see §4.3 *)
 qualified_call  := identifier "." identifier "(" arguments? ")"
 member_access   := identifier ("." identifier)+
 function_call   := identifier "(" arguments? ")"

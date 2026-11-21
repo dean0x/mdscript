@@ -67,7 +67,10 @@ Unlike general-purpose template engines, MDS is Markdown-native: no delimiters t
 ## Features
 
 - **Variables**: YAML frontmatter or runtime `--set KEY=VALUE` flags
-- **Conditionals**: `@if`/`@elseif`/`@else`/`@end` with negation and equality comparisons
+- **Conditionals**: `@if`/`@elseif`/`@else:`/`@end` with negation and equality comparisons.
+  Add `+mds` as the last info word of a code fence to evaluate conditional lines inside it.
+  Other fence info words that start with `+` and a letter are [reserved](spec.md#conditionals-inside-a-fence).
+  Set [`indented-directives: true`](spec.md#indented-directives) in a file's frontmatter to evaluate indented conditionals outside fences.
 - **Loops**: `@for item in list:` iteration over arrays and objects
 - **Functions**: `@define` reusable blocks with parameters
 - **Imports/Exports**: modular prompt libraries with alias, merge, and selective imports
@@ -82,7 +85,7 @@ mds build [FILE|DIR] [OPTIONS]  Compile an MDS template or directory to Markdown
 mds watch [FILE|DIR] [OPTIONS]  Watch and auto-recompile on save
 mds check [FILE|DIR] [OPTIONS]  Validate without rendering
 mds fmt [FILE|DIR] [OPTIONS]    Reformat MDS file(s) in place (opinionated, safety-gated)
-mds lint [FILE|DIR] [OPTIONS]   Static-analysis lint (10 rules; --fix, --format json)
+mds lint [FILE|DIR] [OPTIONS]   Static-analysis lint (11 rules; --fix, --format json)
 mds init [FILENAME]             Create a starter MDS file
 
 Global options:
@@ -334,7 +337,7 @@ any formatting behavior yet; frontmatter key sorting is deferred to a future ver
 
 ### Static analysis with `mds lint`
 
-A 10-rule static analyzer that catches common template authoring issues:
+Check templates for common errors and style problems with 11 rules:
 
 ```bash
 mds lint template.mds           # lint a single file
@@ -370,6 +373,7 @@ Rules (configure via `mds.json` `lint.rules`; severities differ per rule):
 | `shadow-variable` | off/info | Inner-scope variable shadows an outer-scope variable (must be enabled via `mds.json`) |
 | `empty-block` | warn | `@if`/`@elseif`/`@else`/`@for`/`@define`/`@message` body is empty or whitespace-only (auto-fixable) |
 | `legacy-interpolation` | warn | Single-brace `{x}` syntax from MDS v0.x; migrates to `{{x}}` automatically (auto-fixable) |
+| `literal-directive` | warn | Conditional lines that stay literal: indented lines without the file opt-in, or lines in an unmarked fence with `@if …:` before `@end` (report-only). The `mds` label suppresses the fence warning. |
 | `redundant-else` | warn | `@else` body is structurally identical to the `@if`/`@elseif` then-body |
 | `unreachable-branch` | **error** | Branch condition is always-true or always-false (auto-fixable) |
 | `duplicate-import` | **error** | Same file imported more than once (auto-fixable) |

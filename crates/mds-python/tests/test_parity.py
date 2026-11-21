@@ -17,7 +17,12 @@ from typing import Any
 import pytest
 
 import markdown_script as m
-from conftest import cli_build
+from conftest import REPO_ROOT, cli_build
+
+FENCE_FIXTURES = REPO_ROOT / "packages" / "mds" / "__test__" / "fixtures"
+FENCE_INPUT = FENCE_FIXTURES / "fence_optin.mds"
+FENCE_SOURCE = FENCE_INPUT.read_bytes().decode("utf-8")
+FENCE_EXPECTED = (FENCE_FIXTURES / "fence_optin.expected.md").read_text(encoding="utf-8")
 
 # (id, source, vars, expected canonical dict) — import-free so `dependencies == []`.
 GOLDENS: list[tuple[str, str, dict[str, object], dict[str, object]]] = [
@@ -49,6 +54,12 @@ GOLDENS: list[tuple[str, str, dict[str, object], dict[str, object]]] = [
             "warnings": [],
             "dependencies": [],
         },
+    ),
+    (
+        "fence_optin",
+        FENCE_SOURCE,
+        {},
+        {"kind": "markdown", "output": FENCE_EXPECTED, "warnings": [], "dependencies": []},
     ),
     (
         "messages",
@@ -99,6 +110,16 @@ def test_par2_live_cli_markdown_byte_parity(
         py = m.compile(src, vars=vars).to_dict()
         assert py["kind"] == "markdown"
         assert py["output"] == cli_out, f"payload mismatch for {src!r}"
+
+
+def test_par2_live_cli_fence_optin_byte_parity(mds_cli: pathlib.Path) -> None:
+    cli = subprocess.run(
+        [str(mds_cli), "build", str(FENCE_INPUT), "-o", "-"],
+        capture_output=True,
+        check=True,
+    )
+    assert cli.stdout == FENCE_EXPECTED.encode("utf-8")
+    assert m.compile(FENCE_SOURCE).output == cli.stdout.decode("utf-8")
 
 
 def test_par2_live_cli_messages_byte_parity(
@@ -315,10 +336,8 @@ def test_par4_lint_virtual_matches_golden(
 # emits them as JSON null. This diverged report.to_dict() from result.to_dict()["files"][i]
 # for any diagnostic with a null help or span.
 #
-# None of the current 10 lint rules produce null help or span in production, so the
-# divergence was invisible to the existing LINT_GOLDENS. This test constructs a
-# LintResult directly from a canonical dict (via LintResult.__new__) to exercise the
-# null-help / null-span path explicitly, providing a non-circular differential check.
+# The LINT_GOLDENS had no null help or span, so they missed this difference.
+# This test constructs a LintResult from a canonical dict to check both null fields.
 
 
 def test_par6_file_report_to_dict_parity_null_help_span() -> None:

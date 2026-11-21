@@ -43,6 +43,7 @@ pub(crate) mod arity;
 pub(crate) mod ast;
 pub(crate) mod builtins;
 pub(crate) mod error;
+pub(crate) mod escape_class;
 pub(crate) mod evaluator;
 pub(crate) mod formatter;
 pub(crate) mod fs;
@@ -882,12 +883,12 @@ pub fn check_str_collecting_warnings(
 /// never emitted as output FM. Contrast with `RESERVED_MERGE_KEYS` in `resolver/frontmatter.rs`
 /// which includes `extends` (the merge gate sees it as a directive to consume, not a value key).
 ///
-/// SYNC POINT: when this constant changes, also audit `RESERVED_MERGE_KEYS` in
-/// `resolver/frontmatter.rs` — the two constants serve different purposes and are intentionally
-/// not identical.
-const RESERVED_OUTPUT_KEYS: &[&str] = &["type", "imports"];
+/// SYNC POINT: also audit `RESERVED_MERGE_KEYS` in `resolver/frontmatter.rs`,
+/// `build_scope_from_frontmatter` in `resolver.rs`, and `RESERVED` in `lint/facts.rs`.
+/// Each site reserves keys for its own purpose.
+const RESERVED_OUTPUT_KEYS: &[&str] = &["type", "imports", lexer::INDENTED_DIRECTIVES];
 
-/// Remove reserved keys (`type: mds` and `imports:` blocks) from raw frontmatter content.
+/// Remove reserved keys from raw frontmatter content.
 ///
 /// Returns `Some(remaining)` if any non-whitespace content survives after filtering,
 /// or `None` if the frontmatter would be empty (nothing worth emitting).
@@ -896,17 +897,33 @@ const RESERVED_OUTPUT_KEYS: &[&str] = &["type", "imports"];
 /// - Top-level `type: mds` lines (all three YAML quoting styles; `type` with any other value
 ///   is not a reserved directive and is left in place).
 /// - Top-level `imports:` key and its continuation lines (indented child lines).
+/// - Top-level `indented-directives:` line.
 fn strip_reserved_keys(raw: &str) -> Option<String> {
     // Verify this function's bespoke stripping logic covers the keys listed in
     // RESERVED_OUTPUT_KEYS. Zero cost in release; surfaces drift in debug/test builds.
     debug_assert!(
-        RESERVED_OUTPUT_KEYS.contains(&"type") && RESERVED_OUTPUT_KEYS.contains(&"imports"),
-        "RESERVED_OUTPUT_KEYS must include 'type' and 'imports' — update strip_reserved_keys if it changes"
+        RESERVED_OUTPUT_KEYS.contains(&"type")
+            && RESERVED_OUTPUT_KEYS.contains(&"imports")
+            && RESERVED_OUTPUT_KEYS.contains(&lexer::INDENTED_DIRECTIVES),
+        "RESERVED_OUTPUT_KEYS must match the keys handled by strip_reserved_keys"
     );
     let mut filtered = String::with_capacity(raw.len());
     let mut in_imports_block = false;
 
     for line in raw.lines() {
+        let line = if line
+            .strip_prefix(lexer::INDENTED_DIRECTIVES)
+            .is_some_and(|tail| tail.starts_with(':'))
+        {
+            in_imports_block = false;
+            // YAML can end the key's comment before the next LF. Keep the next field.
+            let Some((_, rest)) = line.split_once(['\u{85}', '\u{2028}', '\u{2029}']) else {
+                continue;
+            };
+            rest
+        } else {
+            line
+        };
         // Blank lines are not YAML keys — preserve them outside an imports block
         // and skip them (without resetting state) inside one.
         if line.is_empty() {
@@ -2365,6 +2382,20 @@ mod tests {
             result,
             Some("config:\n  type: \"mds\"\n  theme: dark\n".to_string()),
             "indented quoted type:mds should be preserved, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn indented_directives_is_a_reserved_output_key() {
+        assert!(RESERVED_OUTPUT_KEYS.contains(&"indented-directives"));
+    }
+
+    #[test]
+    fn indented_directives_is_stripped_only_at_top_level() {
+        let raw = "indented-directives: false # off\nconfig:\n  indented-directives: custom\n";
+        assert_eq!(
+            strip_reserved_keys(raw).as_deref(),
+            Some("config:\n  indented-directives: custom\n"),
         );
     }
 

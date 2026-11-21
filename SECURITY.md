@@ -292,7 +292,7 @@ parse, so it never builds a tree that does not fit. An import scan (`scan_import
 estimate against its own new budget, so a scan of a very large or dense module stops
 with `mds::resource_limit`. A cached module keeps its estimate
 charged. A module resolved first as an `@extends` base and then as an import keeps one
-estimate. The factors are measured on a 64-bit host: for each of the 62 shapes in
+estimate. The factors are measured on a 64-bit host: for each of the 65 shapes in
 `crates/mds-core/tests/memory_bound.rs`, the estimate is at least the compile peak and
 the bytes that a cached module keeps. On wasm32 the estimate is high, so a compile is
 refused earlier. The table gives about the largest source of each shape for a module
@@ -302,7 +302,7 @@ compiled alone, with no runtime variables:
 |---|---|---|
 | The densest syntax, `\{{a` repeated | 484,330 bytes | 484,610 bytes |
 | `{{a}}` repeated | 952,385 bytes | 956,729 bytes |
-| The densest measured expression shape | 678,735 bytes | 680,939 bytes |
+| The densest measured expression shape (alternating fence content and directives) | 616,935 bytes | 618,527 bytes |
 | Prose with one `{{a}}` in each 80 bytes | 5,229,805 bytes | 5,237,969 bytes |
 | Prose | 10,485,760 bytes (the 10 MiB file cap applies first; the budget alone admits 12,336,188) | 12,336,188 bytes |
 

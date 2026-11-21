@@ -253,7 +253,7 @@ pub(super) fn collect_facts(
 
 /// Collect frontmatter variable keys from the raw YAML string.
 ///
-/// Reserved keys (imports, type, extends, prompt) are excluded.
+/// Reserved keys are excluded.
 /// Approximate source offsets are computed via substring search in `source`.
 fn collect_frontmatter_vars(
     fm: &crate::ast::Frontmatter,
@@ -261,7 +261,15 @@ fn collect_frontmatter_vars(
     ctx: &mut AnalysisContext,
 ) -> Result<(), MdsError> {
     // Reserved keys per Appendix A (unused-variable skip-set).
-    const RESERVED: &[&str] = &["imports", "type", "extends", "prompt"];
+    // SYNC POINT: audit `strip_reserved_keys` and `RESERVED_OUTPUT_KEYS` in lib.rs,
+    // `RESERVED_MERGE_KEYS` in resolver/frontmatter.rs, and `build_scope_from_frontmatter`.
+    const RESERVED: &[&str] = &[
+        "imports",
+        "type",
+        "extends",
+        "prompt",
+        crate::lexer::INDENTED_DIRECTIVES,
+    ];
 
     // Route through the bounded choke point (#162). A resource limit (size cap / node
     // budget) propagates so the lint pass fails closed on an amplification attack; a plain
@@ -969,6 +977,17 @@ mod tests {
                 "should exclude reserved key '{reserved}'"
             );
         }
+    }
+
+    #[test]
+    fn indented_directives_is_not_a_frontmatter_variable_fact() {
+        let ctx = facts("---\nindented-directives: true\nname: World\n---\nHello!\n");
+        let names: Vec<_> = ctx
+            .frontmatter_vars
+            .iter()
+            .map(|var| var.name.as_str())
+            .collect();
+        assert_eq!(names, ["name"]);
     }
 
     /// Regression: a non-ASCII frontmatter key that ALSO appears inside an earlier

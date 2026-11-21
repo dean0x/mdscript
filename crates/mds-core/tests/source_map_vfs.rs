@@ -2392,6 +2392,25 @@ fn mapped_points(sm: &mds::SourceMap) -> Vec<MappedPoint> {
     points
 }
 
+#[test]
+fn opted_in_fence_map_skips_directive_lines_and_unselected_content() {
+    let source = "Intro\n```js \t+mds\n @if 1 == 1:\nkeep\n\t@else:\ndrop\n @end\n```\nAfter\n";
+    let modules = HashMap::from([("main.mds".into(), source.into())]);
+    let result = vfs_with_map(modules, "main.mds");
+    let map = result.source_map.as_ref().unwrap();
+    assert_eq!(map.sources_content, Some(vec![source.into()]));
+    let expected = [0, 1, 3, 7, 8]
+        .into_iter()
+        .enumerate()
+        .map(|(generated, original)| (generated, 0, "main.mds".into(), original, 0))
+        .collect::<Vec<_>>();
+    assert_eq!(mapped_points(map), expected);
+    assert_eq!(
+        result.into_markdown().unwrap(),
+        "Intro\n```js\nkeep\n```\nAfter\n"
+    );
+}
+
 /// The names of the sources `sm`'s mappings reference.
 fn referenced_sources(sm: &mds::SourceMap) -> std::collections::BTreeSet<String> {
     referenced_src_indices(&sm.mappings)

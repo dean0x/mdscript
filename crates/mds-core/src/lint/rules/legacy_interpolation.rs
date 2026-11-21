@@ -3,9 +3,9 @@
 //!
 //! ## Detection strategy
 //!
-//! TOKEN-based, not AST-based. Fenced code blocks become `Node::Text` in the AST
-//! so AST scanning would false-positive on code examples. Instead, we scan
-//! `Token::Text` tokens, which structurally skip fences/directives/frontmatter.
+//! The parser turns literal fence content into `Node::Text`.
+//! Scan tokens instead. Literal content in opted-in and unmarked fences
+//! stays `Token::CodeContent`, which this rule skips.
 //!
 //! ## What we detect
 //!
@@ -390,9 +390,18 @@ mod tests {
 
     #[test]
     fn no_flag_inside_code_fence() {
-        let src = "```\n{name}\n```\n";
-        let diags = check_src(src);
-        assert!(diags.is_empty(), "inside code fence must not be flagged");
+        for info in ["", "+mds"] {
+            let src = format!("{{outside}}\n```{info}\n@if show:\n{{inside}}\n@end\n```\n");
+            let findings = check_src(&src);
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].span.as_ref().unwrap().offset, 0);
+        }
+    }
+
+    #[test]
+    fn does_not_flag_single_braces_in_opted_in_fence() {
+        let diags = check_src("```+mds\n@if show:\n{x}\n@end\n```\n");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
     #[test]

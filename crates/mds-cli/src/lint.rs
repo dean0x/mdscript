@@ -2080,7 +2080,7 @@ mod tests {
     use std::rc::Rc;
 
     /// ISS-13: CLI-level genuine partial overlaps are structurally impossible with
-    /// the current 10 rules.  Every pair of real-rule fix spans is either disjoint
+    /// the current 11 rules.  Every pair of real-rule fix spans is either disjoint
     /// (different AST blocks) or in a containment relationship (same block, different
     /// rules) — the latter is resolved by `dedup_contained_or_identical` before the
     /// overlap detector is reached.  No MDS fixture can drive `overlap_rejected=true`

@@ -84,15 +84,15 @@ pub(crate) const MAX_COMPILE_MEMORY: usize = 4 * MAX_OUTPUT_SIZE;
 /// refused tree is never built. A cached module keeps its estimate charged. A skeleton
 /// entry that is upgraded keeps one estimate.
 ///
-/// The three factors are measured on a 64-bit host: for each of the 62 shapes in
+/// The three factors are measured on a 64-bit host: for each of the 65 shapes in
 /// `tests/memory_bound.rs`, the estimate is at least the compile peak and the bytes
 /// that a cached module keeps. On wasm32 the estimate is high, so a compile refuses
 /// early. For a module compiled alone, the largest sources that pass are about: 484,330 B
-/// of the densest syntax (`\{{a`), 952,385 B of `{{a}}`, 678,735 B of the densest
+/// of the densest syntax (`\{{a`), 952,385 B of `{{a}}`, 616,935 B of the densest
 /// measured expression shape and 5,229,805 B of prose with one `{{a}}` per 80 B. Plain
 /// prose stops at the 10 MiB file cap first (the budget alone allows 12,336,188 B). A
 /// reused `ModuleCache` fills faster: the sources of all modules that it caches in its
-/// life share about the same ceilings (484,610 B, 956,729 B, 680,939 B, 5,237,969 B and
+/// life share about the same ceilings (484,610 B, 956,729 B, 618,527 B, 5,237,969 B and
 /// 12,336,188 B).
 pub(crate) const TREE_PER_TOKEN: usize = 832;
 

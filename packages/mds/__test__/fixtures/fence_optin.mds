@@ -1,0 +1,14 @@
+---
+indented-directives: true
+---
+```text +mds
+  @if 1 == 2:
+fence other arm
+  @else:
+fence selected arm
+  @end
+```
+
+  @if 2 == 2:
+indented selected arm
+  @end

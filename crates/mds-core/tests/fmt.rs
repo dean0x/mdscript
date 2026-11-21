@@ -420,6 +420,166 @@ fn gate_fallback_undefined_var_source_still_formats() {
 }
 
 #[test]
+fn fmt_keeps_the_fence_marker_and_round_trips_the_selected_arm() {
+    let source =
+        "```js +mds\r\n  @if 1 == 1: \t\r\nkeep\r\n  @else:\r\ndrop\r\n  @end \t\r\n```\r\n";
+    let formatted = format_str(source).unwrap();
+    assert_eq!(
+        formatted,
+        "```js +mds\n  @if 1 == 1:\nkeep\n  @else:\ndrop\n  @end\n```\n"
+    );
+    assert_eq!(format_str(&formatted).unwrap(), formatted);
+    let expected = Some("```js\nkeep\n```\n".to_owned());
+    assert_eq!(compiled_markdown(source), expected);
+    assert_eq!(compiled_markdown(&formatted), expected);
+}
+
+#[test]
+fn fmt_falls_back_to_structure_for_an_undefined_fence_condition() {
+    let source = "```js +mds\r\n\t@if runtime_flag: \t\r\nkeep\r\n\t@end\r\n```\r\n\r\n";
+    let err = mds::compile_str(source).unwrap_err().serialize();
+    assert_eq!(err.code, "mds::undefined_var");
+    assert!(err.message.contains("runtime_flag"), "{err:?}");
+    assert_eq!(err.span.unwrap().offset, "```js +mds\r\n".len());
+    let formatted = format_str(source).unwrap();
+    assert_eq!(
+        formatted,
+        "```js +mds\n\t@if runtime_flag:\nkeep\n\t@end\n```\n"
+    );
+    assert_eq!(format_str(&formatted).unwrap(), formatted);
+
+    let vars = std::collections::HashMap::from([("runtime_flag".into(), mds::Value::from(true))]);
+    let output = mds::compile_str_with(&formatted, None, Some(vars))
+        .unwrap()
+        .into_markdown()
+        .unwrap();
+    assert_eq!(output, "```js\nkeep\n```\n");
+}
+
+#[test]
+fn empty_block_fix_inside_an_opted_in_fence_passes_reverify() {
+    use mds::fix::{apply_fixes_incremental, plan_fixes, FixOutcome};
+
+    let source = "```js +mds\r\n  @if 1 == 1: \t\r\n\t@end\r\n keep\r\n```\r\n";
+    let lint = mds::lint_str(source).unwrap();
+    let outcome = apply_fixes_incremental(source, plan_fixes(&lint, source), &lint, |candidate| {
+        mds::compile_str(candidate)?;
+        mds::lint_str(candidate)
+    });
+    let FixOutcome::Fixed {
+        source: fixed,
+        residual,
+    } = outcome
+    else {
+        panic!("expected a full fix: {outcome:?}");
+    };
+    assert_eq!(fixed, "```js +mds\r\n keep\r\n```\r\n");
+    assert!(residual.diagnostics.is_empty(), "{residual:?}");
+    let expected = Some("```js\n keep\n```\n".into());
+    assert_eq!(compiled_markdown(source), expected);
+    assert_eq!(compiled_markdown(&fixed), expected);
+}
+
+#[test]
+fn fmt_preserves_the_file_key_and_round_trips_indented_directives() {
+    let source = "---\r\nindented-directives: true\r\n---\r\n    @if 1 == 1: \t\r\n  keep  \r\n\t@end \t\r\nAfter\r\n";
+    let formatted = format_str(source).unwrap();
+    assert_eq!(
+        formatted,
+        "---\nindented-directives: true\n---\n    @if 1 == 1:\n  keep  \n\t@end\nAfter\n"
+    );
+    assert_eq!(format_str(&formatted).unwrap(), formatted);
+    let expected = Some("  keep  \nAfter\n".to_owned());
+    assert_eq!(compiled_markdown(source), expected);
+    assert_eq!(compiled_markdown(&formatted), expected);
+}
+
+#[test]
+fn shared_fence_opt_in_fixture_has_the_same_directives_across_rust_surfaces() {
+    use mds::{check_str, compile_str, lint_str, scan_import_records, ResolveAs};
+
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../packages/mds/__test__/fixtures");
+    let read_fixture = |name| {
+        let path = fixtures.join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+            .replace("\r\n", "\n")
+    };
+    let source = read_fixture("fence_optin.mds");
+    let expected = read_fixture("fence_optin.expected.md");
+    assert_eq!(
+        compile_str(&source).unwrap().into_markdown().unwrap(),
+        expected
+    );
+    check_str(&source).unwrap();
+    assert!(lint_str(&source)
+        .unwrap()
+        .diagnostics
+        .iter()
+        .any(|finding| finding.rule == "unreachable-branch"));
+    assert_eq!(format_str(&source).unwrap(), source);
+    let padded = source.replace(":\n", ": \t\n");
+    assert_eq!(format_str(&padded).unwrap(), source);
+    assert!(scan_import_records(&source, ResolveAs::Standalone)
+        .unwrap()
+        .is_empty());
+
+    // Break each conditional separately. A surface that treats it as text will accept it.
+    for condition in ["@if 1 == 2:", "@if 2 == 2:"] {
+        let broken = source.replacen(condition, "@if ):", 1);
+        let expected = compile_str(&broken).unwrap_err().serialize();
+        assert_eq!(expected.code, "mds::syntax");
+        assert!(expected.span.is_some());
+        for error in [
+            check_str(&broken).unwrap_err(),
+            lint_str(&broken).unwrap_err(),
+            format_str(&broken).unwrap_err(),
+            scan_import_records(&broken, ResolveAs::Standalone).unwrap_err(),
+        ] {
+            let diagnostic = error.serialize();
+            assert_eq!(diagnostic.code, expected.code);
+            assert_eq!(diagnostic.span, expected.span);
+        }
+    }
+}
+
+#[test]
+fn check_lint_and_fmt_report_file_key_yaml_disagreement() {
+    let valid = "---\nindented-directives: true\n---\n  @if 1 == 1:\nkeep\n  @end\n";
+    mds::check_str(valid).unwrap();
+    assert!(mds::lint_str(valid).unwrap().diagnostics.is_empty());
+    assert_eq!(format_str(valid).unwrap(), valid);
+
+    let source = valid.replace("indented-directives:", "\"indented-directives\":");
+    for error in [
+        mds::check_str(&source).unwrap_err(),
+        mds::lint_str(&source).unwrap_err(),
+        format_str(&source).unwrap_err(),
+    ] {
+        let diagnostic = error.serialize();
+        assert_eq!(diagnostic.code, "mds::yaml");
+        assert!(matches!(error, MdsError::YamlError { message }
+            if message == "expected indented-directives: true or indented-directives: false"));
+        assert!(diagnostic.span.is_none());
+    }
+}
+
+#[test]
+fn format_str_named_keeps_the_imported_fence_error_location() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = "@import \"./lib.mds\" as lib\n@include lib\n";
+    let prefix = "First\nSecond\n```+mds\n";
+    std::fs::write(dir.path().join("lib.mds"), format!("{prefix}  @end\n```\n")).unwrap();
+    let error = format_str_named(entry, Some(dir.path()), "entry.mds").unwrap_err();
+    assert_eq!(error.source_name(), Some("lib.mds"));
+    let diagnostic = error.serialize();
+    assert_eq!(diagnostic.code, "mds::syntax");
+    let span = diagnostic.span.unwrap();
+    assert_eq!((span.offset, span.line), (prefix.len(), Some(4)));
+}
+
+#[test]
 fn gate_full_check_runs_when_base_dir_resolves_imports() {
     let dir = tempfile::tempdir().unwrap();
     let lib_path = dir.path().join("lib.mds");

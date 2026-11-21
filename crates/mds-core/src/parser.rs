@@ -313,6 +313,7 @@ impl Parser<'_> {
                     self.pos += 1;
                 }
                 Token::CodeFence(fence, offset) => {
+                    // A marked opener keeps a source prefix. Add one LF to each fence line.
                     nodes.push(Node::Text(TextNode {
                         text: format!("{fence}\n"),
                         offset: *offset,

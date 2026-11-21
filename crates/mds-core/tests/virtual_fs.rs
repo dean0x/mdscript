@@ -1362,6 +1362,483 @@ fn issue_149_indented_fence_inside_list_item_with_braces() {
     );
 }
 
+fn entry_markdown(source: &str) -> String {
+    compile_vfs(
+        HashMap::from([("main.mds".into(), source.into())]),
+        "main.mds",
+    )
+    .unwrap()
+}
+
+fn assert_syntax(err: &MdsError, message: &str, offset: usize) -> SerializedSpan {
+    let diagnostic = err.serialize();
+    assert_eq!(diagnostic.code, "mds::syntax", "{err}");
+    assert_eq!(diagnostic.message, format!("syntax error: {message}"));
+    let span = diagnostic.span.expect("expected a source span");
+    assert_eq!(span.offset, offset);
+    span
+}
+
+#[test]
+fn example_04_keeps_its_literal_fence_byte_for_byte() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/edge-cases/04_escaped_and_code.mds");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    let expected = "```\n@if condition:\nThis is literal text inside a code fence.\n@end\n{this_is_also_literal}\n```\n";
+    assert!(source.replace("\r\n", "\n").contains(expected));
+    assert!(entry_markdown(&source).contains(expected));
+}
+
+#[test]
+fn bare_opted_in_fence_selects_each_arm_and_strips_the_marker() {
+    let source =
+        "```+mds\n@if choice == 1:\none\n@elseif choice == 2:\ntwo\n@else:\nother\n@end\n```\n";
+    for (choice, arm) in [(1, "one"), (2, "two"), (3, "other")] {
+        let vars = HashMap::from([("choice".into(), Value::Number(f64::from(choice)))]);
+        let output = mds::compile_str_with(source, None, Some(vars))
+            .unwrap()
+            .into_markdown()
+            .unwrap();
+        assert_eq!(output, format!("```\n{arm}\n```\n"));
+    }
+}
+
+#[test]
+fn opted_in_fence_preserves_its_label_and_kept_indentation_with_lf_or_crlf() {
+    for (opener, prefix, closer) in [
+        ("  ```js \t+mds  ", "  ```js", "  ``` \t"),
+        ("  ~~~ \t+mds", "  ~~~", "  ~~~~ \t"),
+    ] {
+        let source = format!(
+            "- Item\n\n{opener}\n  first\n  second\n \t@if 1 == 1:\n    \tkeep\n\t@end\n{closer}\n\nAfter\n"
+        );
+        let expected =
+            format!("- Item\n\n{prefix}\n  first\n  second\n    \tkeep\n{closer}\n\nAfter\n");
+        assert_eq!(entry_markdown(&source), expected);
+        assert_eq!(entry_markdown(&source.replace('\n', "\r\n")), expected);
+    }
+}
+
+#[test]
+fn imported_define_evaluates_an_opted_in_fence_on_each_call() {
+    let modules = HashMap::from([
+        (
+            "main.mds".into(),
+            "@import \"./helper.mds\" as h\n{{h.pick(true)}}\n{{h.pick(false)}}\n".into(),
+        ),
+        (
+            "helper.mds".into(),
+            "@define pick(show):\n```txt +mds\n@if show:\nyes\n@else:\nno\n@end\n```\n@end\n"
+                .into(),
+        ),
+    ]);
+    assert_eq!(
+        compile_vfs(modules, "main.mds").unwrap(),
+        "```txt\nyes\n```\n```txt\nno\n```\n"
+    );
+}
+
+#[test]
+fn lint_counts_a_frontmatter_variable_used_only_in_a_fence_condition() {
+    let source = "---\nshow: true\nspare: true\n---\n```+mds\n@if show:\nkeep\n@end\n```\n";
+    let lint = mds::lint_str(source).unwrap();
+    let unused: Vec<_> = lint
+        .diagnostics
+        .iter()
+        .filter(|d| d.rule == "unused-variable")
+        .collect();
+    assert_eq!(unused.len(), 1, "{unused:?}");
+    assert!(unused[0].message.contains("'spare'"), "{unused:?}");
+}
+
+#[test]
+fn braces_and_non_keywords_stay_literal_inside_an_opted_in_fence() {
+    let literal = "{{missing}} \\{{missing}}\n@for example\n@define example\n@endnote\n@ifdef\n@Endpoint\n@end_2\n@if3\n@else-help\n";
+    let source = format!("```+mds\n@if 1 == 1:\n{literal}@end\n```\n");
+    assert_eq!(entry_markdown(&source), format!("```\n{literal}```\n"));
+
+    let err = mds::compile_str("{{missing}}\n").unwrap_err().serialize();
+    assert_eq!(err.code, "mds::undefined_var");
+    assert!(err.message.contains("missing"), "{err:?}");
+    assert_eq!(err.span.unwrap().offset, 0);
+}
+
+#[test]
+fn backslash_prefixed_conditionals_stay_literal_in_an_opted_in_fence() {
+    let literal = "  \\@if missing:\n\\@elseif missing:\n\\@else:\n\\@end\n";
+    let source = format!("```+mds\n@if 1 == 1:\n{literal}@end\n```\n");
+    assert_eq!(entry_markdown(&source), format!("```\n{literal}```\n"));
+}
+
+#[test]
+fn interpolation_does_not_re_scan_a_value_with_a_marked_fence() {
+    let value = "```+mds\n@if 1 == 0:\nliteral\n@end\n```\n";
+    let vars = HashMap::from([("body".into(), Value::String(value.into()))]);
+    let output = mds::compile_str_with("{{body}}", None, Some(vars))
+        .unwrap()
+        .into_markdown()
+        .unwrap();
+    assert_eq!(output, value);
+    assert_eq!(entry_markdown(value), "```\n```\n");
+}
+
+#[test]
+fn only_the_outer_fence_loses_its_marker() {
+    let source = "````+mds\n```+mds\n@if 1 == 1:\nkeep\n@else:\ndrop\n@end\n```\n````\n";
+    assert_eq!(entry_markdown(source), "````\n```+mds\nkeep\n```\n````\n");
+}
+
+#[test]
+fn a_closer_refuses_the_innermost_open_if_even_in_an_arm() {
+    let start = "Before\n```+mds\n@if 1 == 1:\n  @if 1 == 0:\nkeep\n";
+    let balanced = format!("{start}  @end\n@end\n```\n");
+    assert_eq!(entry_markdown(&balanced), "Before\n```\n```\n");
+
+    for suffix in ["```\n", "```\n@end\n@end\n"] {
+        let err = mds::compile_str(&format!("{start}{suffix}")).unwrap_err();
+        assert_syntax(
+            &err,
+            "conditional directive must end before the code fence closes",
+            start.find("  @if").unwrap(),
+        );
+    }
+    let err = mds::compile_str(start).unwrap_err();
+    assert_syntax(&err, "unclosed code fence", start.find("```").unwrap());
+}
+
+#[test]
+fn in_fence_controls_cannot_continue_or_close_any_enclosing_block() {
+    let fence = "```\nkeep\n```\n";
+    for (outer, tail, expected) in [
+        ("@if 1 == 1:\n", "@end\n", fence.to_owned()),
+        ("@if 1 == 0:\n@else:\n", "@end\n", fence.to_owned()),
+        (
+            "---\nitems: [a]\n---\n@for item in items:\n",
+            "@end\n",
+            format!("---\nitems: [a]\n---\n{fence}"),
+        ),
+        ("@define show():\n", "@end\n{{show()}}\n", fence.to_owned()),
+        ("@message user:\n", "@end\n", fence.trim_end().to_owned()),
+        ("@block body:\n", "@end\n", fence.to_owned()),
+    ] {
+        let balanced = format!("{outer}```+mds\n  @if 1 == 1:\nkeep\n  @end\n```\n{tail}");
+        let result = mds::compile_str(&balanced).unwrap();
+        if outer.starts_with("@message") {
+            let messages = result.into_messages().unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].role, "user");
+            assert_eq!(messages[0].content, expected);
+        } else {
+            assert_eq!(result.into_markdown().unwrap(), expected);
+        }
+
+        let start = format!("{outer}```+mds\n");
+        for control in ["  @end", "\t@else:", " @elseif 1 == 1:"] {
+            let source = format!("{start}{control}\n```\n{tail}");
+            let err = mds::compile_str(&source).unwrap_err();
+            assert_syntax(
+                &err,
+                "conditional directive needs an open if in this code fence",
+                start.len(),
+            );
+        }
+    }
+}
+
+#[test]
+fn a_balanced_outer_if_can_wrap_an_unmarked_or_opted_in_fence() {
+    let unmarked = "```mds\n@if 1 == 0:\nkeep\n@end\n```\n";
+    let marked = "```mds +mds\n@if upper(\"yes\") == \"NO\":\ndrop\n@else:\nkeep\n@end\n```\n";
+    for (fence, expected) in [(unmarked, unmarked), (marked, "```mds\nkeep\n```\n")] {
+        let source = format!("@if 1 == 1:\n{fence}@end\n");
+        assert_eq!(entry_markdown(&source), expected);
+    }
+}
+
+fn fence_with_outer_ifs(outer_depth: usize) -> String {
+    let fence = "```txt +mds\n@if 1 == 1:\nkeep\n@else:\ndrop\n@end\n```\n";
+    format!(
+        "{}{fence}{}",
+        "@if 1 == 1:\n".repeat(outer_depth),
+        "@end\n".repeat(outer_depth)
+    )
+}
+
+#[test]
+fn opted_in_fence_compiles_at_total_block_depth_64() {
+    assert_eq!(
+        entry_markdown(&fence_with_outer_ifs(63)),
+        "```txt\nkeep\n```\n"
+    );
+}
+
+#[test]
+fn opted_in_fence_rejects_total_block_depth_65() {
+    let error = mds::compile_str(&fence_with_outer_ifs(64))
+        .unwrap_err()
+        .serialize();
+    assert_eq!(error.code, "mds::syntax");
+    assert!(
+        error
+            .message
+            .contains("nesting depth exceeds maximum of 64"),
+        "got: {}",
+        error.message
+    );
+}
+
+#[test]
+fn stray_control_names_the_imported_partial_and_its_line() {
+    let entry = "@import \"./helper.mds\" as h\n@include h\n";
+    let partial = "Partial\n\n```+mds\n  @end\n```\n";
+    let modules = |helper: &str| {
+        HashMap::from([
+            ("main.mds".into(), entry.into()),
+            ("helper.mds".into(), helper.into()),
+        ])
+    };
+    let balanced = partial.replace("  @end", "  @if 1 == 1:\nkeep\n  @end");
+    assert_eq!(
+        compile_vfs(modules(&balanced), "main.mds").unwrap(),
+        "Partial\n\n```\nkeep\n```\n"
+    );
+
+    let err = compile_vfs_err(modules(partial), "main.mds");
+    let span = assert_syntax(
+        &err,
+        "conditional directive needs an open if in this code fence",
+        partial.find("  @end").unwrap(),
+    );
+    assert_eq!(span.line, Some(4));
+    let MdsError::Syntax {
+        src: Some(source), ..
+    } = err
+    else {
+        panic!("expected a named source: {err:?}");
+    };
+    assert_eq!(source.name(), "helper.mds");
+}
+
+#[test]
+fn conditional_near_misses_fail_at_their_own_line() {
+    let contexts = [("```+mds\n", "```\n"), (INDENTED_ON, "")];
+    let start = "  @if 1 == 1:\nkeep\n";
+    for (prefix, close) in contexts {
+        let valid =
+            format!("{prefix}{start}  @elseif 1 == 0:\ndrop\n  @else:\ndrop\n  @end\n{close}");
+        assert_eq!(entry_markdown(&valid), format!("{close}keep\n{close}"));
+    }
+
+    const VALID_DIRECTIVES: &str = "Valid directives: @if, @elseif, @else:, @end, @for, @define, @import, @export, @include, @message, @block, @extends";
+    let unknown = |word| format!("unknown directive: {word}. {VALID_DIRECTIVES}");
+    for (line, tail, message) in [
+        ("@else", "@end\n", "found '@else' without colon — use '@else:' (with trailing colon)".into()),
+        ("@elseif:", "@end\n", "found '@elseif:' without a condition — use '@elseif <condition>:' (condition required)".into()),
+        ("@elseif", "@end\n", "@elseif must appear inside an @if block".into()),
+        ("@if x", "@end\n@end\n", "@if directive must end with ':'".into()),
+        ("@end extra", "", unknown("@end extra")),
+        ("@end of the day", "", unknown("@end of the day")),
+        ("@Else:", "@end\n", unknown("@Else:")),
+        ("@END", "", unknown("@END")),
+        ("@end.", "", unknown("@end.")),
+        ("@if(x):", "@end\n@end\n", unknown("@if(x):")),
+    ] {
+        for (prefix, close) in contexts {
+            let source = format!("{prefix}{start}  {line}\n{tail}{close}");
+            let err = mds::compile_str(&source).unwrap_err();
+            assert_syntax(&err, &message, prefix.len() + start.len());
+        }
+    }
+}
+
+#[test]
+fn invalid_indent_is_refused_after_two_content_lines() {
+    let start = "```+mds\nfirst\nsecond\n";
+    let source = |indent| format!("{start}{indent} @if 1 == 1:\nkeep\n{indent} @end\n```\n");
+    assert_eq!(
+        entry_markdown(&source(' ')),
+        "```\nfirst\nsecond\nkeep\n```\n"
+    );
+    for codepoint in [0x00a0, 0x3000, 0xfeff, 0x1b, 0x202e, 0x0d] {
+        let err = mds::compile_str(&source(char::from_u32(codepoint).unwrap())).unwrap_err();
+        assert_syntax(
+            &err,
+            "invalid indent for a conditional directive",
+            start.len(),
+        );
+    }
+}
+
+#[test]
+fn malformed_or_unsupported_openers_fail_at_the_opener_line() {
+    let source = |opener: &str| format!("Intro\n{opener}\n@if 1 == 1:\nkeep\n@end\n```\n");
+    assert_eq!(
+        entry_markdown(&source("```js +mds")),
+        "Intro\n```js\nkeep\n```\n"
+    );
+    for opener in [
+        "```+extra",
+        "```js +mds title",
+        "```+mds +mds",
+        "```+MDS",
+        "```js+mds",
+        "```+ MdS",
+    ] {
+        let err = mds::compile_str(&source(opener)).unwrap_err();
+        assert_syntax(&err, "invalid code fence info word", "Intro\n".len());
+    }
+    let err = mds::compile_str(&source("> ```+mds")).unwrap_err();
+    assert_syntax(
+        &err,
+        "conditional code fence cannot have a blockquote prefix",
+        "Intro\n".len(),
+    );
+    for codepoint in [0x1b, 0x7f, 0x85, 0x202e, 0x2028, 0xfeff] {
+        let opener = format!("```js{} +mds", char::from_u32(codepoint).unwrap());
+        let err = mds::compile_str(&source(&opener)).unwrap_err();
+        assert_syntax(
+            &err,
+            "conditional code fence info contains a control character",
+            "Intro\n".len(),
+        );
+    }
+    let nbsp = char::from_u32(0x00a0).unwrap();
+    for opener in [format!("```js{nbsp}+mds"), format!("```+{nbsp}mds")] {
+        let err = mds::compile_str(&source(&opener)).unwrap_err();
+        assert_syntax(&err, "invalid code fence info word", "Intro\n".len());
+    }
+}
+
+#[test]
+fn legal_plus_words_and_a_bidi_look_alike_keep_the_fence_literal() {
+    let bidi = char::from_u32(0x202e).unwrap();
+    let pop = char::from_u32(0x202c).unwrap();
+    let look_alike = format!("{bidi}sdm+{pop}");
+    for info in [
+        "+",
+        "+5",
+        "+=",
+        "++",
+        "+\"",
+        "title=\"a + b\"",
+        "title=\"+5\"",
+        &look_alike,
+    ] {
+        let source = format!("```js {info}\n@if 1 == 0:\nliteral\n@end\n```\n");
+        assert_eq!(entry_markdown(&source), source);
+    }
+}
+
+#[test]
+fn compile_variable_reaches_if_in_imported_define() {
+    let modules = HashMap::from([
+        (
+            "main.mds".into(),
+            "@import \"./helper.mds\" as h\n{{h.pick()}}\n".into(),
+        ),
+        (
+            "helper.mds".into(),
+            "@define pick():\n@if choice == \"yes\":\nthen\n@else:\nelse\n@end\n@end\n".into(),
+        ),
+    ]);
+    // The unmarked form records the behavior on main.
+    for (choice, expected) in [("yes", "then\n"), ("no", "else\n")] {
+        let vars = HashMap::from([("choice".into(), Value::String(choice.into()))]);
+        let output = mds::compile_virtual(modules.clone(), "main.mds", Some(vars))
+            .unwrap()
+            .into_markdown()
+            .unwrap();
+        assert_eq!(output, expected);
+    }
+}
+
+const INDENTED_ON: &str = "---\nindented-directives: true\n---\n";
+
+#[test]
+fn the_file_key_selects_indented_arms_but_leaves_quotes_and_plain_fences_literal() {
+    let conditional = "    @if 1 == 0:\ndrop\n\t@elseif 1 == 1:\n  keep\n  @else:\ndrop\n \t@end\n";
+    let literal = "> @if 1 == 0:\nquoted\n> @end\n```txt\n  @if 1 == 0:\nfenced\n  @end\n```\n";
+    for (prefix, expected) in [
+        (INDENTED_ON, "  keep\n"),
+        ("---\nindented-directives: false\n---\n", conditional),
+        ("", conditional),
+    ] {
+        assert_eq!(
+            entry_markdown(&format!("{prefix}{conditional}{literal}")),
+            format!("{expected}{literal}")
+        );
+    }
+}
+
+#[test]
+fn indented_ends_follow_mds_blocks_across_list_items() {
+    let source = format!("{INDENTED_ON}- First\n  @if 1 == 1:\n- Second\n@for word in words:\n  {{{{word}}}}\n  @end\n  @end\nAfter\n");
+    let vars = HashMap::from([(
+        "words".into(),
+        Value::Array(vec![Value::String("keep".into())]),
+    )]);
+    let output = mds::compile_str_with(&source, None, Some(vars))
+        .unwrap()
+        .into_markdown()
+        .unwrap();
+    assert_eq!(output, "- First\n- Second\n  keep\nAfter\n");
+}
+
+#[test]
+fn indented_keywords_after_interpolation_evaluate_without_re_scanning_the_value() {
+    let value = "  @if 1 == 0:\nliteral\n  @end";
+    let vars = HashMap::from([("body".into(), Value::String(value.into()))]);
+    let source = format!("{INDENTED_ON}{{{{body}}}}\n  @if 1 == 1:\nkeep\n  @end\n");
+    let output = mds::compile_str_with(&source, None, Some(vars))
+        .unwrap()
+        .into_markdown()
+        .unwrap();
+    assert_eq!(output, format!("{value}\nkeep\n"));
+}
+
+#[test]
+fn non_ascii_indent_errors_after_plain_lines_only_with_the_file_key() {
+    let lead = "first\nsecond\n";
+    assert_eq!(
+        entry_markdown(&format!("{INDENTED_ON}{lead}  @if 1 == 0:\ndrop\n  @end\n")),
+        lead
+    );
+    for codepoint in [0x00a0, 0x3000, 0xfeff] {
+        let indent = char::from_u32(codepoint).unwrap();
+        let literal = format!("{lead}{indent}@if 1 == 0:\nkeep\n{indent}@end\n");
+        assert_eq!(entry_markdown(&literal), literal);
+        let err = mds::compile_str(&format!("{INDENTED_ON}{literal}")).unwrap_err();
+        assert_syntax(
+            &err,
+            "invalid indent for a conditional directive",
+            INDENTED_ON.len() + lead.len(),
+        );
+    }
+}
+
+#[test]
+fn includes_and_imported_defines_use_their_own_file_key() {
+    for helper_on in [true, false] {
+        let entry = format!(
+            "---\nindented-directives: {}\n---\n@import \"./helper.mds\" as h\n  @if 1 == 0:\nentry\n  @end\n@include h\n{{{{h.pick()}}}}\n",
+            !helper_on
+        );
+        let helper = format!("---\nindented-directives: {helper_on}\n---\n@define pick():\nstart\n  @if 1 == 0:\ndefine\n  @end\n@end\n  @if 1 == 0:\ninclude\n  @end\n");
+        let output = compile_vfs(
+            HashMap::from([("main.mds".into(), entry), ("helper.mds".into(), helper)]),
+            "main.mds",
+        )
+        .unwrap();
+        let expected = if helper_on {
+            "  @if 1 == 0:\nentry\n  @end\nstart\n"
+        } else {
+            "  @if 1 == 0:\ninclude\n  @end\nstart\n  @if 1 == 0:\ndefine\n  @end\n"
+        };
+        assert_eq!(output, expected, "helper key: {helper_on}");
+    }
+}
+
 // ── D2: type_mismatch_at — span threaded from @if/@elseif directive ──────────────
 //
 // These tests verify that a cross-type comparison (e.g. string == number) in an

@@ -127,36 +127,71 @@ fn tree_factors() -> (usize, usize, usize) {
 /// `tree_estimate_inputs_keep_their_measured_sizes` in `resolver_tests.rs` checks the
 /// lexer against these counts; `compile_peak_heap_stays_within_each_bound` checks
 /// `token_stats` against them and checks that `resolver_tests.rs` holds the same list.
-const LEXER_SAMPLES: [(&str, usize, usize); 6] = [
+const LEXER_SAMPLES: [(&str, usize, usize); 8] = [
     ("\\{{a\\{{a", 4, 0),
     ("@define f():\n\\{{a\\{{a\n@end\n", 6, 16),
     ("---\na: ''\n---\n{{a}}{{ a }}", 5, 2),
     ("x\n@if a&&a:\n@end\n", 3, 13),
     ("{{f(f(a))}}text{{a.a}}", 3, 10),
     ("a@b\n@c", 2, 2),
+    ("```\n{{a}}\n```\n``` +mds\n @if a:\n@end\n```\n", 7, 11),
+    ("---\nindented-directives: true\n---\n\t@if a:", 4, 7),
 ];
 
-/// The lexer's token count and expression bytes for the shapes of this test (ASCII
-/// or wide prose, no code fence). A frontmatter block is three tokens. A line that
-/// starts with `@` is one token, and its text without the newline is expression bytes.
-/// `\{{` is one token. `{{x}}` is one token, and its trimmed inner text is expression
-/// bytes. Each other run of text is one token. `compile_peak_heap_stays_within_each_bound`
-/// compares these rules with the lexer's counts for `LEXER_SAMPLES`.
+/// Count tokens and expression bytes for the test shapes, not arbitrary MDS.
+/// Frontmatter is three tokens. Outside a fence, a line that starts with `@` is
+/// one directive, `\{{` is one escape, and `{{x}}` is one interpolation.
+/// The backtick fence shapes have one token per delimiter line. Their contents are
+/// raw text, except for `@if` and `@end` lines in marked fences. The file key makes
+/// the same indented lines directives outside fences.
+/// Each text run is one token. Full directive lines and trimmed interpolation
+/// contents add expression bytes. `LEXER_SAMPLES` checks these counts.
 fn token_stats(source: &str) -> (usize, usize) {
     let mut rest = source;
     let mut tokens = 0;
+    let mut indented = false;
     if let Some(body) = source.strip_prefix("---\n") {
         let close = body.find("\n---\n").expect("closed frontmatter") + 1;
+        indented = body[..close]
+            .lines()
+            .any(|line| line == "indented-directives: true");
         rest = &body[close + "---\n".len()..];
         tokens = 3;
     }
     let (mut expr, mut in_text, mut i) = (0, false, 0);
+    let mut fence = None;
     while i < rest.len() {
         let tail = &rest[i..];
-        if (i == 0 || rest.as_bytes()[i - 1] == b'\n') && tail.starts_with('@') {
-            let line = tail.find('\n').unwrap_or(tail.len());
-            (tokens, expr, in_text, i) = (tokens + 1, expr + line, false, i + line + 1);
-        } else if tail.starts_with("\\{{") {
+        if i == 0 || rest.as_bytes()[i - 1] == b'\n' {
+            let line = tail.split('\n').next().unwrap_or(tail);
+            let next = i + line.len() + usize::from(line.len() < tail.len());
+            if let Some(info) = line.strip_prefix("```") {
+                fence = match fence {
+                    None => Some(info.ends_with(" +mds")),
+                    Some(_) => None,
+                };
+                (tokens, in_text, i) = (tokens + 1, false, next);
+                continue;
+            }
+            let conditional = || {
+                let trimmed = line.trim_start_matches([' ', '\t']);
+                trimmed.starts_with("@if ") || trimmed == "@end"
+            };
+            let directive = match fence {
+                None => line.starts_with('@') || indented && conditional(),
+                Some(marked) => marked && conditional(),
+            };
+            if directive {
+                (tokens, expr, in_text, i) = (tokens + 1, expr + line.len(), false, next);
+                continue;
+            }
+            if fence.is_some() {
+                tokens += usize::from(!in_text);
+                (in_text, i) = (true, next);
+                continue;
+            }
+        }
+        if tail.starts_with("\\{{") {
             (tokens, in_text, i) = (tokens + 1, false, i + 3);
         } else if let Some(inner) = tail.strip_prefix("{{") {
             let close = inner.find("}}").expect("closed interpolation");
@@ -874,9 +909,26 @@ fn imports_measured(part: &str, count: usize) -> (Result<CompileResult, MdsError
     peak_growth(|| mds::compile_virtual(modules, "main.mds", None))
 }
 
-/// The densest syntax: each four bytes `\{{a` make two nodes. The node and token counts
-/// sit just past a power of two, where a growing vector holds almost twice its length.
+/// The lexer finishes before the parser rejects the first directive.
+fn assert_lexer_peak(label: &str, source: &str) {
+    let (result, peak) = peak_growth(|| mds::scan_imports(source));
+    let error = result.expect_err("unknown directive").serialize();
+    assert_eq!(error.code, "mds::syntax");
+    assert!(error.message.contains("unknown directive: @x"), "{error:?}");
+    eprintln!(
+        "lexer heap (B): {label}: source={}, peak={peak}",
+        source.len()
+    );
+    assert!(
+        peak <= LEXER_PEAK_PER_BYTE * source.len(),
+        "{label}: lexer peak {peak} B for {} B of source",
+        source.len()
+    );
+}
+
 fn assert_syntax_tree_peaks() {
+    // Each four bytes in the densest text shape make two nodes. The token and node
+    // counts are just above a power of two, so a vector can hold almost twice its length.
     let dense = "\\{{a".repeat((1 << 14) + 1);
     let function = format!("@define f():\n{dense}\n@end\n");
     let block = format!("@block b:\n{dense}\n@end\n");
@@ -923,16 +975,7 @@ fn assert_syntax_tree_peaks() {
         );
     }
 
-    // The parser refuses the first directive, so the lexer finishes and no tree is built.
-    let lexed = format!("@x\n{dense}");
-    let (result, lexer_peak) = peak_growth(|| mds::scan_imports(&lexed));
-    eprintln!("lexer heap (B): source={}, peak={lexer_peak}", lexed.len());
-    let error = result.expect_err("unknown directive").serialize();
-    assert_eq!(error.code, "mds::syntax");
-    assert!(
-        lexer_peak <= LEXER_PEAK_PER_BYTE * lexed.len(),
-        "lexer: {lexer_peak} B"
-    );
+    assert_lexer_peak("dense text", &format!("@x\n{dense}"));
 
     // Each further import adds one cached module, which keeps its tree.
     let peaks = [1, 2, 3].map(|count| {
@@ -1062,6 +1105,13 @@ fn assert_syntax_tree_peaks() {
             prose_unit.repeat((1 << 13) + 1),
         ),
     ];
+    let fence_shapes = [
+        ("dense fence conditionals", "@if a:\n@end\n"),
+        (
+            "alternating fence content and directives",
+            "@if a:\nx\n@end\nx\n",
+        ),
+    ];
     // (label, expression shape, source)
     let mut shapes = vec![
         ("prose text".to_owned(), false, text.clone()),
@@ -1093,6 +1143,20 @@ fn assert_syntax_tree_peaks() {
         shapes.push((format!("{label}, in @block"), true, in_block));
     }
 
+    for (label, unit) in fence_shapes {
+        let fence = format!("``` +mds\n{}```\n", unit.repeat(quarter));
+        assert_lexer_peak(label, &format!("@x\n{fence}"));
+        shapes.push((label.to_owned(), true, format!("{falsy}{fence}")));
+    }
+
+    let indented_prefix = "---\na: ''\nindented-directives: true\n---\n";
+    let indent = " ".repeat(64);
+    let pairs = format!("{indent}@if a:\n{indent}@end\n").repeat((1 << 11) + 1);
+    let label = "dense indented conditionals";
+    assert_lexer_peak(label, &format!("{indented_prefix}@x\n{pairs}"));
+    shapes.push((label.to_owned(), true, format!("{indented_prefix}{pairs}")));
+    assert_eq!(shapes.len(), 65);
+
     // One compile charges the estimate and the read text (one byte per source byte)
     // together before the parse; the source file cap also applies. A reused cache keeps
     // the estimate and the prompt text of each cached module for its whole life. The
@@ -1102,7 +1166,7 @@ fn assert_syntax_tree_peaks() {
         let scaled = |per_unit: usize| (budget as u128 * len as u128 / per_unit as u128) as usize;
         (scaled(est + len).min(10 * MIB), scaled(est + output))
     };
-    let mut lowest = (usize::MAX, String::new());
+    let mut lowest = (usize::MAX, String::new(), usize::MAX);
     let mut least_margin = (usize::MAX, String::new());
     for (label, expression, source) in shapes {
         let (tokens, expr) = token_stats(&source);
@@ -1130,7 +1194,8 @@ fn assert_syntax_tree_peaks() {
         assert!(est >= need, "{label}: estimate {est} B, measure {need} B");
         least_margin = least_margin.min((est - need, label.clone()));
         if expression {
-            lowest = lowest.min((ceilings(est, source.len(), output).0, label));
+            let (one, life) = ceilings(est, source.len(), output);
+            lowest = lowest.min((one, label, life));
         }
     }
     eprintln!(
@@ -1150,8 +1215,8 @@ fn assert_syntax_tree_peaks() {
         eprintln!("ceiling: {label}: one compile={one}, reused cache life={life}");
     }
     eprintln!(
-        "ceiling: lowest expression shape: {} at {} B (one compile)",
-        lowest.1, lowest.0
+        "ceiling: lowest expression shape: {}: one compile={}, reused cache life={}",
+        lowest.1, lowest.0, lowest.2
     );
 }
 

@@ -187,6 +187,9 @@ use std::fmt;
 use std::fmt::Write as _;
 
 use crate::error::SerializedSpan;
+use crate::escape_class::{
+    is_control_char, is_three_byte_format_hazard, is_two_byte_format_hazard,
+};
 use crate::limits::MAX_DIAGNOSTICS;
 
 // ── Severity ──────────────────────────────────────────────────────────────────
@@ -1249,18 +1252,6 @@ fn escapes_in(ch: char, mode: EscapeMode) -> bool {
     is_control_char(ch) || (mode == EscapeMode::Wire && ch == '\n')
 }
 
-/// Returns `true` for codepoints escaped in **both** modes.
-///
-/// Also the predicate driving [`neutralize_source_for_render`], so the render path
-/// and the escape path can never diverge on which characters are hostile (PF-004).
-#[inline]
-fn is_control_char(ch: char) -> bool {
-    (ch < '\u{0020}' && ch != '\n' && ch != '\t')
-        || ch == '\u{007F}'
-        || ('\u{0080}'..='\u{009F}').contains(&ch)
-        || is_format_hazard_char(ch)
-}
-
 // ── #265: forbidden path characters ─────────────────────────────────────────
 
 /// Returns `true` when `ch` must be refused in a **path** accepted from
@@ -1320,63 +1311,6 @@ pub fn escape_path_for_message(path: &str) -> Cow<'_, str> {
         }
     }
     Cow::Owned(out)
-}
-
-/// Returns `true` for the non-C0/C1 codepoints that are still display-hazardous.
-///
-/// The class is split by **UTF-8 byte width**, not by hazard category, because
-/// [`neutralize_source_for_render`] must substitute a replacement of identical byte
-/// length and therefore needs a different replacement per width. Splitting the
-/// predicate is what keeps that invariant checkable by reading the code rather than
-/// by trusting a comment: a member added to the wrong helper is a byte-width bug the
-/// `assert_eq!` in `neutralize_source_for_render` catches immediately — in release
-/// builds too (#220).
-///
-/// See [`is_two_byte_format_hazard`] and [`is_three_byte_format_hazard`] for the
-/// per-width membership and the rationale for each codepoint.
-#[inline]
-fn is_format_hazard_char(ch: char) -> bool {
-    is_two_byte_format_hazard(ch) || is_three_byte_format_hazard(ch)
-}
-
-/// Display-hazardous codepoints that occupy **2 bytes** in UTF-8 (U+0080–U+07FF).
-///
-/// - **U+061C** — ARABIC LETTER MARK. One of the twelve codepoints with the Unicode
-///   `Bidi_Control=Yes` property, and the only one outside the U+200E–U+2069 range.
-///   It reorders how the rest of a line renders exactly like its U+200E/U+200F
-///   siblings (Trojan Source, CVE-2021-42574), so omitting it would leave a hole in
-///   the bidi class that the other eleven members close.
-///
-/// Members here are neutralized to U+00A0 NBSP (also 2 bytes), the same replacement
-/// the C1 range uses — **not** U+FFFD, which is 3 bytes and would break the
-/// byte-length invariant.
-#[inline]
-fn is_two_byte_format_hazard(ch: char) -> bool {
-    ch == '\u{061C}'
-}
-
-/// Display-hazardous codepoints that occupy **3 bytes** in UTF-8 (U+0800–U+FFFF).
-///
-/// - **U+200E/U+200F, U+202A–U+202E, U+2066–U+2069** — the remaining eleven Unicode
-///   bidirectional controls (marks, embeddings, overrides, isolates). They reorder how
-///   the rest of a line renders, which is the Trojan Source attack (CVE-2021-42574): a
-///   diagnostic or filename can be made to display as something entirely different from
-///   its bytes.
-/// - **U+2028/U+2029** — LINE SEPARATOR / PARAGRAPH SEPARATOR. Both terminate a
-///   JavaScript string literal, so an unescaped one can break out of generated JS.
-/// - **U+FEFF** — BOM / ZERO WIDTH NO-BREAK SPACE. Invisible in every renderer, so it
-///   can hide or split content the reader believes is contiguous.
-///
-/// Members here are neutralized to U+FFFD (also 3 bytes).
-#[inline]
-fn is_three_byte_format_hazard(ch: char) -> bool {
-    matches!(ch,
-        '\u{200E}' | '\u{200F}'
-        | '\u{2028}' | '\u{2029}'
-        | '\u{202A}'..='\u{202E}'
-        | '\u{2066}'..='\u{2069}'
-        | '\u{FEFF}'
-    )
 }
 
 /// Replace control characters in source text with byte-length-preserving substitutes so
