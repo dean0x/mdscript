@@ -102,7 +102,9 @@ From JavaScript, `compile`/`compileFile` return a **discriminated union**
 branched on `kind`:
 
 ```js
-import { compile, compileFile } from '@mdscript/mds';
+import { init, compile, compileFile } from '@mdscript/mds';
+
+await init();
 
 // Markdown template
 const r1 = compile(markdownSource);

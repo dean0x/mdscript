@@ -11,9 +11,10 @@ npm install @mdscript/mds
 ## Node.js usage
 
 Node.js selects the native addon. If the addon is not available, it uses WASM.
-Call `await init()` once before any other function. Before `init()`, every
-compile, check, lint and `getBackend()` call throws an error. `init()` is
-idempotent and safe to call multiple times.
+Call `await init()` once before you call a compile, check, lint or backend
+function. If you call one of these functions before `init()` finishes, it
+throws an error. You can call `init()` more than one time. Calls after the
+first do nothing.
 
 ```ts
 import { init, compile, check, compileFile, checkFile, getBackend, isMdsError } from '@mdscript/mds';
@@ -103,7 +104,7 @@ try {
 | `lintFile(path, options?)` | Static analysis on a file |
 | `lintVirtual(modules, entry, options?)` | Static analysis on an in-memory module map |
 | `getBackend()` | Returns the active backend: `'native'` or `'wasm'` |
-| `init(options?)` | Load the backend. Call and await it before any other function (Node.js and browser) |
+| `init(options?)` | Load the backend. Await it before you call a compile, check, lint or backend function (Node.js and browser) |
 | `isMdsError(err)` | Type guard for MDS compiler errors (requires `code` starting with `"mds::"`) |
 
 ### Options
