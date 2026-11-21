@@ -8,13 +8,18 @@ JavaScript/TypeScript bindings for the [MDS](../../README.md) compiler.
 npm install @mdscript/mds
 ```
 
-## Node.js usage (zero-config)
+## Node.js usage
 
-Node.js auto-selects the native addon and falls back to WASM if unavailable.
-No initialization required.
+Node.js selects the native addon. If the addon is not available, it uses WASM.
+Call `await init()` once before you call a compile, check, lint or backend
+function. If you call one of these functions before `init()` finishes, it
+throws an error. You can call `init()` more than one time. Calls after the
+first do nothing.
 
 ```ts
-import { compile, check, compileFile, checkFile, getBackend, isMdsError } from '@mdscript/mds';
+import { init, compile, check, compileFile, checkFile, getBackend, isMdsError } from '@mdscript/mds';
+
+await init();
 
 // Compile MDS source to Markdown
 const result = compile('Hello {{name}}', { vars: { name: 'world' } });
@@ -99,7 +104,7 @@ try {
 | `lintFile(path, options?)` | Static analysis on a file |
 | `lintVirtual(modules, entry, options?)` | Static analysis on an in-memory module map |
 | `getBackend()` | Returns the active backend: `'native'` or `'wasm'` |
-| `init(options?)` | Initialize the WASM backend (browser/explicit WASM only) |
+| `init(options?)` | Load the backend. Await it before you call a compile, check, lint or backend function (Node.js and browser) |
 | `isMdsError(err)` | Type guard for MDS compiler errors (requires `code` starting with `"mds::"`) |
 
 ### Options
