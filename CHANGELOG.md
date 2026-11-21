@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The `@mdscript/mds` README now says that the Node.js entry needs `await init()` before other calls. It said that Node.js needs no initialization.
+
 ## [0.6.0] — 2026-11-21
 
 ### Added
