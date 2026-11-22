@@ -4,6 +4,7 @@ use super::frontmatter::deep_merge_yaml;
 use super::*;
 use crate::evaluator::evaluate;
 use crate::limits::{MAX_FRONTMATTER_IMPORTS, MAX_FRONTMATTER_MERGE_DEPTH};
+use std::path::PathBuf;
 
 // Helper to build a YAML Value from inline YAML text
 fn yaml(s: &str) -> serde_yaml_ng::Value {
@@ -1081,7 +1082,7 @@ mod prompt_source_scan {
     }
 
     // Ignore comments and literals before the scan considers names or test attributes.
-    fn source_tokens(mut rest: &str) -> Vec<&str> {
+    pub(super) fn source_tokens(mut rest: &str) -> Vec<&str> {
         let mut tokens = Vec::new();
         for _ in 0..rest.len() {
             rest = rest.trim_start();
@@ -5999,6 +6000,96 @@ fn final_output_charges_prefix_and_growth_before_the_reserve() {
     }
 }
 
+fn resolver_production_sources() -> Vec<(PathBuf, String)> {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut paths = vec![PathBuf::from("resolver.rs")];
+    for entry in std::fs::read_dir(src.join("resolver")).unwrap() {
+        let entry = entry.unwrap();
+        let kind = entry.file_type().unwrap();
+        assert!(
+            !kind.is_dir() && !kind.is_symlink(),
+            "unexpected resolver entry: {entry:?}"
+        );
+        let name = entry.file_name();
+        let path = std::path::Path::new(&name);
+        if kind.is_file()
+            && path.extension().is_some_and(|ext| ext == "rs")
+            && !name.to_string_lossy().ends_with("_tests.rs")
+        {
+            paths.push(std::path::Path::new("resolver").join(path));
+        }
+    }
+    assert!(
+        paths.len() >= 3,
+        "expected resolver.rs and at least two children: {paths:?}"
+    );
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(src.join(&path))
+                .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
+            (path, text)
+        })
+        .collect()
+}
+
+fn blank_inline_resolver_tests(source: &str) -> Option<String> {
+    let marker = ["#", "[", "cfg", "(", "test", ")", "]", "mod", "tests", "{"];
+    let tokens = prompt_source_scan::source_tokens(source);
+    let start = tokens
+        .windows(marker.len())
+        .position(|window| window == marker)?;
+    let mut depth = 1;
+    let close = tokens[start + marker.len()..]
+        .iter()
+        .find(|&&token| {
+            match token {
+                "{" => depth += 1,
+                "}" => depth -= 1,
+                _ => (),
+            }
+            depth == 0
+        })
+        .expect("inline test module must close");
+    // Every token is a slice of source, so its pointer gives a byte offset.
+    let from = tokens[start].as_ptr() as usize - source.as_ptr() as usize;
+    let to = close.as_ptr() as usize - source.as_ptr() as usize + 1;
+    let mut bytes = source.as_bytes().to_vec();
+    for byte in &mut bytes[from..to] {
+        if !matches!(*byte, b'\r' | b'\n') {
+            *byte = b' ';
+        }
+    }
+    Some(String::from_utf8(bytes).expect("only the test module changed to spaces"))
+}
+
+const RESOLVER_FRONTMATTER: &str = "resolver/frontmatter.rs";
+
+fn resolver_source_text(sources: &[(PathBuf, String)], include_frontmatter: bool) -> String {
+    let mut joined = String::new();
+    for (path, source) in sources {
+        if include_frontmatter || path != std::path::Path::new(RESOLVER_FRONTMATTER) {
+            joined.push_str(
+                blank_inline_resolver_tests(source)
+                    .as_deref()
+                    .unwrap_or(source),
+            );
+            joined.push('\n');
+        }
+    }
+    joined
+}
+
+fn plant_in_resolver_child(sources: &mut [(PathBuf, String)], plant: &str) {
+    let (_, child) = sources
+        .iter_mut()
+        .find(|(path, _)| path == std::path::Path::new("resolver/inheritance.rs"))
+        .expect("resolver source walk must reach inheritance.rs");
+    child.push('\n');
+    child.push_str(plant);
+}
+
 #[test]
 fn only_commit_retained_updates_cache_headroom() {
     fn writes(source: &str, field: &str) -> usize {
@@ -6040,29 +6131,50 @@ fn only_commit_retained_updates_cache_headroom() {
             && !evaluator.contains(".resolve_")
     }
 
-    let resolver = include_str!("resolver.rs");
+    let mut sources = resolver_production_sources();
+    let resolver = resolver_source_text(&sources, true);
     let evaluator = concat!(
         include_str!("evaluator.rs"),
         include_str!("evaluator/budget.rs")
     );
-    assert!(valid(resolver, evaluator));
+    assert!(valid(&resolver, evaluator));
     assert!(!valid(
         &format!("{resolver}\nself.retained = 0;"),
         evaluator
     ));
     assert!(!valid(&format!("{resolver}\nmem.headroom = 0;"), evaluator));
     assert!(!valid(
-        resolver,
+        &resolver,
         &format!("{evaluator}\nmem.headroom -= 1;")
     ));
     assert!(!valid(
-        resolver,
+        &resolver,
         &format!("{evaluator}\nuse crate::resolver::ModuleCache;")
     ));
     assert!(!valid(
-        resolver,
+        &resolver,
         &format!("{evaluator}\ncache.resolve_by_key(key);")
     ));
+
+    let mut with_tests = sources.clone();
+    plant_in_resolver_child(&mut sources, "self.retained = 0;");
+    assert!(
+        !valid(&resolver_source_text(&sources, true), evaluator),
+        "must count the retained write in a child"
+    );
+    plant_in_resolver_child(
+        &mut with_tests,
+        r#"#[cfg(test)]
+mod tests {
+    fn fixture() { let brace = "}"; /* } */ self.retained = 0; }
+}"#,
+    );
+    assert!(valid(&resolver_source_text(&with_tests, true), evaluator));
+    plant_in_resolver_child(&mut with_tests, "self.retained = 0;");
+    assert!(
+        !valid(&resolver_source_text(&with_tests, true), evaluator),
+        "must count the retained write after the inline test module"
+    );
 }
 
 pub(super) const TEMPORARIES_SEED_KEY: &str = "root-with-live-temporaries.mds";
@@ -6179,8 +6291,9 @@ fn resolution_funnel_has_one_pop_and_five_finish_calls() {
             })
     }
 
-    let source = include_str!("resolver.rs");
-    assert!(valid(source));
+    let sources = resolver_production_sources();
+    let source = resolver_source_text(&sources, true);
+    assert!(valid(&source));
     assert!(!valid(&format!("{source}\nself.resolving . pop ();")));
     assert!(!valid(&format!("{source}\nself.finish_root()?;")));
     let with_assert = source.replacen(
@@ -6189,6 +6302,14 @@ fn resolution_funnel_has_one_pop_and_five_finish_calls() {
         1,
     );
     assert!(!valid(&with_assert));
+    for plant in ["self.resolving . pop ();", "self.finish_root()?;"] {
+        let mut planted = sources.clone();
+        plant_in_resolver_child(&mut planted, plant);
+        assert!(
+            !valid(&resolver_source_text(&planted, true)),
+            "must reject `{plant}` in a child"
+        );
+    }
 }
 
 /// Parse `yaml` as a compile parse does. Returns the mapping and its spent bytes.
@@ -6282,18 +6403,28 @@ fn every_frontmatter_merge_goes_through_the_charged_helper() {
             .split_once("fn merge_frontmatter(")
             .and_then(|(_, rest)| rest.split_once("\n    }"));
         // Outside its tests, frontmatter.rs holds the definition and its recursion.
-        let production = frontmatter.split_once("\n#[cfg(test)]\nmod tests {");
+        let production = blank_inline_resolver_tests(frontmatter);
         calls(resolver) == 1
             && helper.is_some_and(|(body, _)| calls(body) == 1)
-            && production.is_some_and(|(code, _)| calls(code) == 2)
+            && production.is_some_and(|code| calls(&code) == 2)
     }
 
-    let resolver = include_str!("resolver.rs");
-    let frontmatter = include_str!("resolver/frontmatter.rs");
-    assert!(valid(resolver, frontmatter));
+    let mut sources = resolver_production_sources();
+    let resolver = resolver_source_text(&sources, false);
+    let (_, frontmatter) = sources
+        .iter()
+        .find(|(path, _)| path == std::path::Path::new(RESOLVER_FRONTMATTER))
+        .expect("resolver source walk must reach frontmatter.rs");
+    assert!(valid(&resolver, frontmatter));
     let planted = "let merged = deep_merge_yaml(&base, &child, 0)?;";
     assert!(!valid(&format!("{resolver}\n{planted}"), frontmatter));
-    assert!(!valid(resolver, &format!("{planted}\n{frontmatter}")));
+    assert!(!valid(&resolver, &format!("{planted}\n{frontmatter}")));
+    let frontmatter = frontmatter.clone();
+    plant_in_resolver_child(&mut sources, planted);
+    assert!(
+        !valid(&resolver_source_text(&sources, false), &frontmatter),
+        "must count the direct merge call in a child"
+    );
 }
 
 #[test]

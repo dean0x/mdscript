@@ -63,6 +63,7 @@ const ARCH_INDEPENDENT: &[&str] = &[
     "resolver/frontmatter.rs",
     "resolver/inheritance.rs",
     BUDGET_SOURCE,
+    "evaluator/held.rs",
 ];
 
 /// The four cfg key names that the listed files must not contain. `cfg(unix)`,
@@ -254,6 +255,60 @@ fn budget_rules_apply_to_each_source_file() {
         std::fs::read_to_string(src_dir.join(name)).expect("source must be readable")
     })
     .unwrap_or_else(|error| panic!("{error}"));
+}
+
+#[test]
+fn arch_independent_lists_every_resolver_and_evaluator_child() {
+    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut walked = Vec::new();
+    for folder in ["resolver", "evaluator"] {
+        let before = walked.len();
+        for entry in std::fs::read_dir(src_dir.join(folder)).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            assert!(
+                !kind.is_dir() && !kind.is_symlink(),
+                "unexpected source entry: {entry:?}"
+            );
+            let path = entry.path();
+            let name = rel(&src_dir, &path);
+            if kind.is_file()
+                && path.extension().is_some_and(|ext| ext == "rs")
+                && !name.ends_with("_tests.rs")
+            {
+                walked.push(name);
+            }
+        }
+        assert!(walked.len() > before, "no production files in {folder}/");
+    }
+    assert!(
+        walked.len() >= 4,
+        "expected at least four children: {walked:?}"
+    );
+    let missing = unlisted(&walked, ARCH_INDEPENDENT);
+    assert!(
+        missing.is_empty(),
+        "add these files to ARCH_INDEPENDENT: {missing:?}"
+    );
+}
+
+fn unlisted<'a>(walked: &'a [String], listed: &[&str]) -> Vec<&'a str> {
+    let mut missing: Vec<_> = walked
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !listed.contains(name))
+        .collect();
+    missing.sort_unstable();
+    missing
+}
+
+#[test]
+fn arch_independent_completeness_flags_an_unlisted_child() {
+    let walked = [
+        "resolver/inheritance.rs".to_owned(),
+        "resolver/planted.rs".to_owned(),
+    ];
+    assert_eq!(unlisted(&walked, ARCH_INDEPENDENT), ["resolver/planted.rs"]);
 }
 
 #[test]
