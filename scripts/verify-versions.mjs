@@ -1,5 +1,19 @@
 #!/usr/bin/env node
 // Check release manifest and lockfile versions against the Cargo workspace.
+// One release uses one version. This gate checks these rules:
+//   1. Each publishable package.json uses the workspace version.
+//   2. Published dependency sets use no `file:` specifiers.
+//   3. Each internal `@mdscript/*` dependency uses a caret range on that
+//      version (for example, ^0.1.0).
+//   4. Each crate's path+version dependency on mds-core uses the workspace
+//      version.
+//   5. The Python distribution name is `markdown-script`, not `mdscript`.
+//      pyproject.toml declares the version as dynamic so maturin reads it from
+//      the Cargo workspace.
+//   6. Cargo.lock has one source-less entry at that version for each workspace
+//      crate. The publishable workspace entries in package-lock.json use that
+//      version and the same caret ranges for internal dependencies.
+//
 // Run locally and in CI. Exit 0 means consistent; exit 1 means drift or bad input.
 'use strict';
 

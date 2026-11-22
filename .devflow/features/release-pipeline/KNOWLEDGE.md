@@ -554,10 +554,10 @@ belongs in a built CI job (here, `ci.yml`'s `js` job), never in `test:gates`.
   debug namespace to enable, and the wrapper-cache presence check (wrappers found under
   `~/.cache/cargo-zigbuild/0.23.0/wrappers/` by the post-build step) is the run-proof that
   cargo-zigbuild 0.23.0 actually executed in the job.
-- **`NPM_TOKEN` has a roughly 60-day lifetime and must be rotated by hand**: the npm
-  publish token backing `secrets.NPM_TOKEN` was rotated 2026-09-24. Run the
-  branch dry run to check it before the tag push. `Credential probe` skips
-  `npm whoami` on PR runs.
+- **`NPM_TOKEN` has a lifetime of about 60 days**. The 2026-09-24 rotation put
+  the next due date near 2026-11-20. Run the branch dry run before the tag push.
+  `Credential probe` skips `npm whoami` on PR runs. If npm uses OIDC trusted
+  publishing, this manual rotation is not necessary.
 - **Dependabot may retarget a superseded PR instead of closing it**: when a newer
   Dependabot PR supersedes an older one for the same dependency, Dependabot can rebase
   the OLD PR onto the new target rather than closing it, leaving its title and branch

@@ -92,13 +92,8 @@ npm run build -w @mdscript/mds-wasm
 ```
 
 Requires [`wasm-pack`](https://rustwasm.github.io/wasm-pack/) and the
-`wasm32-unknown-unknown` Rust target. The build writes to `dist/node` and
+`wasm32-unknown-unknown` Rust target. Output is written to `dist/node` and
 `dist/web`.
-
-The build checks the versions of `wasm-pack` and `wasm-opt` on `PATH` against
-[the CI pins](../../.github/actions/setup-wasm/action.yml). A difference gives
-one warning and does not stop the build. If `wasm-opt` is absent from `PATH`,
-`wasm-pack` uses its bundled `wasm-opt`, not the CI version.
 
 ## License
 

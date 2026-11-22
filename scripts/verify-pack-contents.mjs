@@ -32,9 +32,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
-// The 8 publishable workspaces (mirrors PKG_PATHS in scripts/verify-versions.mjs,
-// expressed as npm workspace identifiers rather than package.json paths since
-// each entry here is passed straight to `npm pack --dry-run -w <ws>`).
+// These 8 npm workspace identifiers match the paths in PKG_PATHS in
+// scripts/release-manifest.mjs. Each is an argument to `npm pack --dry-run -w <ws>`.
 export const WORKSPACES = [
   '@mdscript/mds',
   '@mdscript/mds-wasm',

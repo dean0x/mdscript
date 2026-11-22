@@ -75,8 +75,14 @@ jobs:
             exit 1
           fi
           # This check does not verify publish rights for the @mdscript scope.
-          if ! npm whoami --registry https://registry.npmjs.org >/dev/null 2>&1; then
-            echo "::error::npm whoami failed. Verify NPM_TOKEN before release."
+          WHO_LOG=$(mktemp)
+          trap 'rm -f "$WHO_LOG"' EXIT
+          if ! npm whoami --registry https://registry.npmjs.org >"$WHO_LOG" 2>&1; then
+            WHO=$(<"$WHO_LOG")
+            WHO=${WHO//"$NODE_AUTH_TOKEN"/[redacted]}
+            WHO=${WHO//"$CARGO_REG_TOKEN"/[redacted]}
+            printf '::error::npm whoami failed. Verify NPM_TOKEN before release. %s\n' \
+              "$(printf '%s' "$WHO" | jq -Rs @json)"
             exit 1
           fi
           echo "npm whoami and crates.io input checks passed."
@@ -88,11 +94,18 @@ jobs:
           RESP=$(curl -fsS "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=pypi" \
             -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}")
           TOK=$(jq -er '.value' <<< "$RESP")
-          CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+          MINT_LOG=$(mktemp)
+          trap 'rm -f "$MINT_LOG"' EXIT
+          CODE=$(curl -sS -o "$MINT_LOG" -w '%{http_code}' \
             -X POST https://pypi.org/_/oidc/mint-token \
             -d "{\"token\":\"${TOK}\"}")
           [ "$CODE" = "200" ] || {
             echo "::error::PyPI mint failed (HTTP $CODE). Verify the trusted publisher before release."
+            if MESSAGE=$(jq -er 'objects | .message | strings' "$MINT_LOG" 2>/dev/null); then
+              MESSAGE=${MESSAGE//"$TOK"/[redacted]}
+              MESSAGE=${MESSAGE//"$ACTIONS_ID_TOKEN_REQUEST_TOKEN"/[redacted]}
+              printf '::error::PyPI response: %s\n' "$(printf '%s' "$MESSAGE" | jq -Rs @json)"
+            fi
             exit 1
           }
           echo "PyPI trusted publisher OK"

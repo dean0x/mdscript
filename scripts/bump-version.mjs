@@ -1,6 +1,11 @@
 #!/usr/bin/env node
-// Bump release manifests and workspace lock entries, then stamp the changelog.
+// Set a new version in the workspace Cargo.toml and its path+version
+// dependencies on mds-core. Update publishable npm versions and internal
+// dependency ranges. Update only the workspace entries in both lockfiles.
+// Stamp CHANGELOG.md. Run locally before you tag a release.
+//
 // Usage: node scripts/bump-version.mjs <version>
+//   Example: node scripts/bump-version.mjs 0.2.0
 'use strict';
 
 import { writeFileSync } from 'node:fs';
@@ -64,7 +69,9 @@ function stampChangelog(text, version, date) {
     /^(## \[Unreleased\]\s*)$/m,
     `$1\n## [${version}] — ${date}\n`,
   ).replace(
-    // Use the base URL from the existing link. Keep all prior release links.
+    // Point [Unreleased] at the new tag. Add the new release compare link
+    // directly below it. Use the repository URL from the existing link so
+    // the script does not hardcode it. Leave all earlier release links intact.
     /^(\[Unreleased\]: (https:\/\/[^\s/]+\/[^\s/]+\/[^\s/]+)\/compare\/)v([\d.]+)(\.\.\.HEAD)$/m,
     (_, _prefix, baseUrl, prevVersion) =>
       `[Unreleased]: ${baseUrl}/compare/v${version}...HEAD\n[${version}]: ${baseUrl}/compare/v${prevVersion}...v${version}`,
