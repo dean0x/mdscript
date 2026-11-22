@@ -59,6 +59,13 @@
 //! File I/O and atomic writes are the CLI's responsibility. `fix.rs` operates
 //! entirely on in-memory byte slices. The caller owns the file read and write.
 //!
+//! ## Edit order
+//!
+//! The planner sorts its edits by byte range and does not depend on diagnostic
+//! order except for identical ranges. For those ranges, it keeps the first edit
+//! in input order. The input order for lint results comes from `sort_diagnostics`
+//! in `diagnostic.rs`. That single stable sort uses file, then byte offset.
+//!
 //! ## Containment deduplication (AC-F-26)
 //!
 //! Before overlap detection, `dedup_contained_or_identical` removes any edit
@@ -1287,6 +1294,27 @@ mod tests {
             1,
             "exactly one edit must survive dedup; edits: {:?}",
             plan.edits
+        );
+    }
+
+    #[test]
+    fn identical_fix_ranges_keep_first_replacement_in_input_order() {
+        let diag = |text: &str| LintDiagnostic {
+            fix_removals: None,
+            fix_edits: Some(vec![crate::lint::diagnostic::TextEdit {
+                start: 0,
+                end: 3,
+                new_text: text.to_string(),
+            }]),
+            ..make_diag("legacy-interpolation", 0, 3)
+        };
+        let result = make_result(vec![diag("zebra"), diag("ant")]);
+
+        let plan = plan_fixes(&result, "old");
+
+        assert_eq!(
+            plan.edits,
+            [ByteEdit::replacement(0, 3, "legacy-interpolation", "zebra")]
         );
     }
 
