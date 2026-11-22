@@ -4,5 +4,6 @@
     "noEmit": true,
     "rootDir": "__test__/types"
   },
-  "include": ["__test__/types/**/*.ts"]
+  "include": ["__test__/types/**/*.ts"],
+  "exclude": ["__test__/types/eopt-off.ts"]
 }

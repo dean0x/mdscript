@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.types.json",
+  "compilerOptions": {
+    "exactOptionalPropertyTypes": false
+  },
+  "include": ["__test__/types/**/*.ts"],
+  "exclude": ["__test__/types/eopt-on.ts"]
+}
