@@ -53,6 +53,6 @@
     "@mdscript/mds": "file:../mds",
     "@rspack/core": "2.1.10",
     "@types/node": "^26.2.0",
-    "typescript": "^6.0.3"
+    "typescript": "^7.0.2"
   }
 }
