@@ -54,16 +54,10 @@ These are **not** automated and must be done before the first release:
    lands (ADR-012 amendment). Only the first `pypa/gh-action-pypi-publish` run
    on a real tag push secures the name.
 
-   **PyPI OIDC probe:** The `version-gate` job also probes the PyPI trusted
-   publisher by performing the OIDC mint-token exchange (`pypi.org/_/oidc/mint-token`)
-   before any irreversible publish. A missing, expired, or mismatched trusted-publisher
-   record causes version-gate to fail, aborting the release before any crates.io or
-   npm publish runs. The minted token expires unused — the probe is free and safe.
-   This step is NOT tag-guarded so it runs in the `workflow_dispatch` dry run too,
-   exercising the PyPI trust chain before the real tag push (PF-039). It is
-   run on `pull_request` events too — the version-gate step fails closed on
-   fork and Dependabot PRs (they receive no `id-token: write` and no
-   repository secrets), and no PR run can reach a publish in any case.
+   **PyPI OIDC probe:** `Credential probe` checks the PyPI trusted publisher
+   before any publish. It calls `pypi.org/_/oidc/mint-token` on tag push and
+   manual dispatch. A missing, expired, or mismatched record stops the release.
+   The probe does not use the token it receives. A PR run skips this step.
 
 6. **Configure TestPyPI trusted publisher** (optional, needed for `testpypi: true`
    dispatch runs) at [test.pypi.org/manage/account/publishing](https://test.pypi.org/manage/account/publishing/):
@@ -161,8 +155,8 @@ gh workflow run release.yml          # workflow_dispatch — builds the 7-target
                                      # step. Publishes NOTHING.
 ```
 
-The dry-run workflow runs `version-gate` in full, which includes the
-**credential probe** (security-08). What each registry check proves:
+The dry-run workflow runs **Credential probe** before `Version gate`.
+What each registry check proves:
 
 - **npm** (`npm whoami`): proves the token is accepted by the npm registry
   (authentication). Does NOT prove publish rights to the `@mdscript` scope —
@@ -192,13 +186,10 @@ The dry-run workflow runs `version-gate` in full, which includes the
   completed it; see PF-023). A durable fix — Trusted Publishing for crates.io —
   is tracked in #368; #345 is closed as won't-fix-as-filed with this finding.
 
-All three checks **run on every event, including `pull_request`**. On fork and
-Dependabot PRs — which receive no repository secrets and no `id-token: write` —
-they fail closed with an actionable error: maintainers must supersede with a
-first-party branch PR or dispatch `gh workflow run release.yml --ref <branch>`.
-On release-surface PRs a fail-closed `Version gate` **blocks the merge** because
-D-PR7 requires it (by design, not advisory) — supersede with a first-party branch
-PR or dispatch by hand.
+The registry checks run on tag push and manual dispatch. On PR runs,
+`Credential probe` reports a notice and passes. `Version gate` rejects fork and
+Dependabot PRs that touch the release surface. Replace such a PR with a maintainer
+PR. A PR outside the release surface does not require release checks.
 
 Even though release-surface PRs now trigger `release.yml` automatically, a
 manual `gh workflow run release.yml --ref <branch>` is still required in four
@@ -212,10 +203,9 @@ cases (the six release-surface paths are `.github/workflows/release.yml`,
 2. **Changes outside the release surface** — dependency sweeps,
    `crates/mds-core/**`, `Cargo.toml`, and `package.json` are not in the six
    paths above and do not trigger a `pull_request` run on `release.yml`.
-3. **Dependabot and fork PRs** — no repository secrets and no `id-token: write`;
-   `Version gate` fails closed with the "No Actions secrets on this run" error.
-   Do not merge on those checks; supersede with a maintainer-authored PR or
-   dispatch by hand.
+3. **Dependabot and fork PRs on the release surface** — `Version gate` reports
+   "Release checks require a maintainer PR." Open a maintainer PR to replace it.
+   Dispatch a dry run on the maintainer branch.
 4. **TestPyPI handshake** — `gh workflow run release.yml --ref <branch> -f testpypi=true`
    (once per version; `skip-existing: true` makes repeats no-ops).
 
@@ -257,9 +247,8 @@ control (PF-013 — a gate never observed rejecting anything is not evidence):
 
 The rehearsal proves everything listed above; it cannot prove the upload handshake
 and trusted-publisher exchange at publish time — the action has no dry-run mode.
-The credential half is covered by `version-gate`'s OIDC probe (which runs on
-every event including PRs); the upload half is closed by the opt-in TestPyPI leg
-(`-f testpypi=true`), which exercises the full exchange once per version.
+`Credential probe` checks the exchange on tag push and manual dispatch. The
+opt-in TestPyPI leg (`-f testpypi=true`) tests the full upload once per version.
 
 `publish-crates` needs this job, so a broken pin aborts the release before the
 irreversible crates.io write. It is intentionally unguarded, so it runs on
@@ -352,9 +341,9 @@ The release is driven by pushing a `vX.Y.Z` tag. This is how all versions have s
 
 ### What happens after tagging
 
-The `release.yml` workflow runs, in order:
-   1. **version-gate** — synchronized-version check, credential probe, PyPI OIDC
-      probe, source-hygiene gate, and CI-history gate (fails fast).
+The `credential-probe` job checks the registry inputs first. After it passes,
+`release.yml` runs these jobs:
+   1. **version-gate** — checks versions, source hygiene, and CI history.
    2. **build-napi** (parallel with build-python) — cross-compiles the addon for
       all 7 targets.
    3. **build-python** (parallel with build-napi) — builds `cp311-abi3` wheels
@@ -401,7 +390,8 @@ the failed job tells you what has already happened: nothing publishes before
 
 | Failed job | Already irreversible | Recovery |
 |---|---|---|
-| `Version gate` — version mismatch, CI-history gate on a still-running CI run, credential or OIDC probe, source hygiene | Nothing | Fix the cause. CI still running or just finished: wait for it, then `gh run rerun <run-id> --failed`. Wrong commit tagged (version mismatch, hygiene): delete the tag (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`), land the fix via PR, wait for its CI, re-tag. |
+| `Credential probe` — a registry check failed | Nothing | Correct the registry setup. Run `gh run rerun <run-id> --failed`. |
+| `Version gate` — version mismatch, CI-history gate on a still-running CI run, source hygiene | Nothing | Fix the cause. CI still running or just finished: wait for it, then `gh run rerun <run-id> --failed`. Wrong commit tagged (version mismatch, hygiene): delete the tag (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`), land the fix via PR, wait for its CI, re-tag. |
 | `build-napi`, `build-python`, `Stage + verify platform packages`, `Alpine load test (linux-arm64-musl)`, `Rehearse PyPI publish (no upload)` | Nothing | Transient (runner, Docker Hub pull, registry outage): `gh run rerun <run-id> --failed` — re-runs the failed jobs and their dependents; upstream artifacts are reused. Genuine defect: land the fix, bump to the next patch version, tag that. Do not move a tag that a defect was found on. |
 | `Publish to crates.io` at `Publish mds-core` — the v0.4.0 case: HTTP 403 from a revoked token, run 33569514359 | Nothing | Fix the secret or cause, then `gh run rerun <run-id> --failed`. |
 | `Publish to crates.io` after `mds-core` is live — index poll timeout, `Publish mds-cli` failure | `mds-core@X.Y.Z` on crates.io (cannot be deleted; `cargo yank` only hides it from new resolutions) | Transient: `gh run rerun <run-id> --failed` — the `mds-core` step treats "already uploaded" as success and proceeds to `mds-cli`. Defect in `mds-cli`: the version is consumed for the whole workspace (one coordinated version); land the fix, bump to the next patch, optionally `cargo yank --version X.Y.Z mds-core`, and say so in the GitHub Release body. |

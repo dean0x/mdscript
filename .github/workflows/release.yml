@@ -48,77 +48,85 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
+  credential-probe:
+    name: Credential probe
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v7
+        if: github.event_name != 'pull_request'
+        with: { node-version: 22, registry-url: "https://registry.npmjs.org" }
+      - name: Verify npm and crates.io registry inputs
+        if: github.event_name != 'pull_request'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          CARGO_REG_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::Set NPM_TOKEN before release."
+            exit 1
+          fi
+          # crates.io has no read-only check for this input. See #345.
+          if [ -z "$CARGO_REG_TOKEN" ]; then
+            echo "::error::Set CARGO_REGISTRY_TOKEN before release."
+            exit 1
+          fi
+          # This check does not verify publish rights for the @mdscript scope.
+          if ! npm whoami --registry https://registry.npmjs.org >/dev/null 2>&1; then
+            echo "::error::npm whoami failed. Verify NPM_TOKEN before release."
+            exit 1
+          fi
+          echo "npm whoami and crates.io input checks passed."
+      - name: Verify PyPI trusted publisher
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          RESP=$(curl -fsS "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=pypi" \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}")
+          TOK=$(jq -er '.value' <<< "$RESP")
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -X POST https://pypi.org/_/oidc/mint-token \
+            -d "{\"token\":\"${TOK}\"}")
+          [ "$CODE" = "200" ] || {
+            echo "::error::PyPI mint failed (HTTP $CODE). Verify the trusted publisher before release."
+            exit 1
+          }
+          echo "PyPI trusted publisher OK"
+      - name: Skip registry probes on pull requests
+        if: github.event_name == 'pull_request'
+        run: echo "::notice::Registry probes run on tag push and manual dispatch."
+
+  # ---------------------------------------------------------------------------
   # D1 — version-consistency gate. Cheap; fails fast before any build/publish.
   # ---------------------------------------------------------------------------
   version-gate:
     name: Version gate
+    needs: [credential-probe]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       checks: read   # commit check/status reads
       actions: read  # CI workflow runs + their jobs, for the CI-history step
-      id-token: write # OIDC for PyPI trusted publisher probe (F5, security-08)
     steps:
+      - name: Require a maintainer PR for release checks
+        if: github.event_name == 'pull_request'
+        env:
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+        shell: bash
+        run: |
+          if [ "$GITHUB_ACTOR" = "dependabot[bot]" ] || [ "$IS_FORK" = "true" ]; then
+            echo "::error::Release checks require a maintainer PR. Open a maintainer PR with the same changes."
+            exit 1
+          fi
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.ref }}
       - uses: actions/setup-node@v7
-        with: { node-version: 22, registry-url: "https://registry.npmjs.org" }
-      - name: "Verify publish credentials before irreversible steps (security-08)"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          CARGO_REG_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
-        run: |
-          # Fail closed on fork and Dependabot pull_request events: these receive
-          # no repository secrets and no id-token: write (read-only GITHUB_TOKEN),
-          # so the credential probes cannot succeed there. A maintainer-authored PR
-          # or a manual `gh workflow run release.yml --ref <branch>` is the remedy.
-          if [ -z "$NODE_AUTH_TOKEN" ] && [ "${GITHUB_EVENT_NAME}" = "pull_request" ] \
-             && { [ "${GITHUB_ACTOR}" = "dependabot[bot]" ] || [ "${IS_FORK}" = "true" ]; }; then
-            echo "::error::No Actions secrets on this run: pull_request runs from Dependabot or a fork are treated as fork PRs (read-only token, no Actions secrets, no id-token: write), so the release credentials cannot be verified here. Do NOT merge on these checks. Supersede with a maintainer-authored PR, or run: gh workflow run release.yml --ref ${GITHUB_HEAD_REF}"
-            exit 1
-          fi
-          # Guard: npm token must be non-empty. A missing or revoked secret interpolates
-          # to an empty string in GitHub Actions — not an error — so this must be checked
-          # explicitly before cargo publish runs and makes crates.io publish irreversible.
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "::error::NPM_TOKEN is empty or unset — npm publish would fail AFTER cargo publish (irreversible). Set the NPM_TOKEN repo secret. (security-08)"
-            exit 1
-          fi
-          # Guard: cargo token non-empty. That is the strongest check crates.io allows for an
-          # API token (no read-only endpoint accepts a scoped token; #345, RELEASING.md "credential probe").
-          if [ -z "$CARGO_REG_TOKEN" ]; then
-            echo "::error::CARGO_REGISTRY_TOKEN is empty or unset — cargo publish would fail. Set the CARGO_REGISTRY_TOKEN repo secret. (security-08)"
-            exit 1
-          fi
-          # Verify npm authentication: whoami proves the token is accepted by the registry.
-          # NOTE: this verifies authentication only, NOT publish rights to @mdscript scope.
-          # A read-only or wrongly-scoped token passes this check but fails at publish time.
-          WHO=$(npm whoami --registry https://registry.npmjs.org 2>&1) || {
-            echo "::error::npm whoami failed — NPM_TOKEN may be revoked or expired: ${WHO}"
-            exit 1
-          }
-          echo "npm credentials verified: token resolves to npm user '${WHO}'"
-      # PyPI OIDC trusted-publisher probe (F5, security-08). The mint-token
-      # exchange is free and idempotent — the minted token is simply unused here.
-      # NOT tag-guarded: this step must run in the workflow_dispatch dry run
-      # (PF-039) so a misconfigured or expired trusted publisher is caught BEFORE
-      # any irreversible crates.io publish. version-gate has id-token: write above.
-      - name: "Verify PyPI trusted publisher before irreversible steps (security-08)"
-        shell: bash
-        run: |
-          set -euo pipefail
-          RESP=$(curl -sS "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=pypi" \
-            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}")
-          TOK=$(echo "$RESP" | jq -r '.value')
-          CODE=$(curl -sS -o /tmp/mint.json -w '%{http_code}' \
-            -X POST https://pypi.org/_/oidc/mint-token \
-            -d "{\"token\":\"${TOK}\"}")
-          [ "$CODE" = "200" ] || {
-            echo "::error::PyPI OIDC mint failed (HTTP $CODE) — trusted publisher missing, expired, or mismatched. Fix BEFORE tagging; crates.io is irreversible."
-            jq -r '.message // .' /tmp/mint.json; exit 1; }
-          echo "PyPI trusted publisher OK"
+        with: { node-version: 22 }
       # The pypa/gh-action-pypi-publish pin is validated in rehearse-publish-python
       # (pin shape, GHCR manifest, docker pull, twine check — each with a positive
       # control). publish-crates needs that job, so a bad pin still aborts the

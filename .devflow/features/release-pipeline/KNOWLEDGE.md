@@ -47,10 +47,10 @@ Three entry points, one workflow:
 (avoids PF-017's cancelled-run-as-green shape mid-sequence and prevents a partial-publish
 state between `cargo publish` and `npm publish`).
 
-## Component Architecture — Eleven Jobs and Their DAG
+## Component Architecture — Twelve Jobs and Their DAG
 
 ```
-version-gate
+credential-probe → version-gate
   ├─→ build-napi (7 legs)  ─→ stage-and-verify-napi ─→ load-test-musl-arm64 ─┐
   └─→ build-python (8 legs) ─→ rehearse-publish-python ──────────────────────┤
                                 └─→ publish-testpypi     │ (dispatch+input only)
@@ -67,7 +67,8 @@ Job details:
 
 | Job id | Display name | Guarded by | Needs |
 |---|---|---|---|
-| `version-gate` | Version gate | nothing (always runs) | — |
+| `credential-probe` | Credential probe | no job guard; PR notice only | — |
+| `version-gate` | Version gate | no job guard | credential-probe |
 | `build-napi` | Build napi (...) | nothing | version-gate |
 | `stage-and-verify-napi` | Stage + verify platform packages | nothing | build-napi |
 | `load-test-musl-arm64` | Alpine load test (linux-arm64-musl) | unguarded, not-cancelled + `needs.stage-and-verify-napi.result == 'success'` | stage-and-verify-napi |
@@ -178,16 +179,20 @@ subject from the current branch at execution time; avoids PF-017).
 
 ## Integration Patterns — Gate Details
 
-### version-gate (always runs)
+### credential-probe
 
-Every step in `version-gate` runs on every event **except** the CI-history gate, which is
-step-skipped on `pull_request` with `if: github.event_name != 'pull_request'`. Reason: on
-`pull_request` `github.sha` is the merge commit whose own `ci.yml` run is concurrent, and
-the gate correctly fails closed on an in-progress run. A notice step fires instead so the
-job still reaches `success`.
+On tag push and manual dispatch, this job runs `npm whoami`, checks the crates.io
+input, and checks the PyPI trusted publisher. On a PR run, only its notice step
+runs. The job does not check out the repository.
+
+### version-gate
+
+This job runs after `credential-probe` passes. The CI-history step skips PR runs
+because `github.sha` is the merge commit, not the branch head. A notice step runs
+instead.
 
 Steps (in order):
-1. Verify publish credentials (npm `whoami` + cargo token non-empty + PyPI OIDC mint-token exchange).
+1. Reject fork and Dependabot PRs on the release surface.
 2. Assert synchronized versions, no `file:` refs.
 3. Assert no hazardous codepoints in tracked source.
 4. Run `npm run test:gates` — all six spec files, 240 tests (grew from four spec files / 212 tests after `verify-pack-contents.spec.mjs` was added in PR #402), including pin-shape specs (S16), the publish-pin floor v1.14.3 (S23), per-leg cache key spec (S20), Alpine load test job spec (S21), the cargo-zigbuild musl-leg spec (S22), and the hermetic pack-contents helper tests (see the pack-contents gate subsection below).
@@ -196,10 +201,10 @@ Steps (in order):
 Because `npm run test:gates` runs inside `version-gate`, a malformed pin (e.g. a commit SHA
 instead of a `vX.Y.Z` tag) causes `Version gate` to fail before the rehearsal job ever runs.
 
-**Fork / Dependabot PRs**: The "Verify publish credentials" step explicitly exits 1 with a
-`::error::` when `NODE_AUTH_TOKEN` is empty on a `pull_request` event from Dependabot or a
-fork (`IS_FORK=true`). Do not merge on these checks; supersede with a maintainer PR or a
-manual `gh workflow run`.
+**Fork and Dependabot PRs**: On a release-surface PR, `Version gate` exits 1 if
+`GITHUB_ACTOR` is `dependabot[bot]` or `IS_FORK` is `true`. The step does not use
+registry inputs. Replace the PR with a maintainer PR. Changes outside the release
+surface do not start this workflow on a PR.
 
 ### rehearse-publish-python — Four Gates with Positive Controls (PF-013)
 
@@ -477,9 +482,8 @@ belongs in a built CI job (here, `ci.yml`'s `js` job), never in `test:gates`.
   any banner comment above a job (e.g. the `# ====` separator above `publish-crates`)
   belongs to the PRECEDING job's section, not to `publish-crates`. Assert guards via
   `extractJobIf`, never `section.includes()`.
-- **Dependabot / fork PRs fail credential probe and should not be merged on**: the step exits
-  1 with `IS_FORK` "No Actions secrets on this run." The remedy is a maintainer PR or a
-  manual dispatch.
+- **Release-surface Dependabot and fork PRs fail `Version gate`**: replace them
+  with a maintainer PR. `Credential probe` reports a notice on all PR runs.
 - **TestPyPI pending publisher expires ~30 days after creation** if no upload lands. A missing
   or expired record causes `Trusted publishing exchange failure: invalid-publisher` in
   `publish-testpypi`.
@@ -497,7 +501,7 @@ belongs in a built CI job (here, `ci.yml`'s `js` job), never in `test:gates`.
 - **crates.io token — no read-only probe**: `GET /api/v1/me` is `AuthCheck::only_cookie()`
   and returns HTTP 403 for any API token. The only token-accepting read route
   (`GET /api/v1/me/tokens/{id}`) rejects scoped tokens with HTTP 403. The non-empty guard
-  in `version-gate` is therefore the strongest check available. A revoked token is first
+  in `credential-probe` is therefore the strongest check available. A revoked token is first
   detected at `cargo publish` (fail-before-write, after the build matrix is paid for); see
   PF-023 and the v0.4.0 precedent (`gh run rerun --failed`). Durable fix tracked in #368.
 - **`napi-staged` artifact carries root-level `*.node` files** in addition to `npm/**`: the
@@ -527,13 +531,9 @@ belongs in a built CI job (here, `ci.yml`'s `js` job), never in `test:gates`.
   `~/.cache/cargo-zigbuild/0.23.0/wrappers/` by the post-build step) is the run-proof that
   cargo-zigbuild 0.23.0 actually executed in the job.
 - **`NPM_TOKEN` has a roughly 60-day lifetime and must be rotated by hand**: the npm
-  publish token backing `secrets.NPM_TOKEN` (checked by `version-gate`'s `npm whoami`
-  credential probe and consumed by `publish-npm`) was rotated 2026-09-24 (next rotation
-  due roughly 2026-11-20). Because the credential probe runs on `pull_request` events
-  too, not just tag push, an expired token is caught on a release-surface PR run before
-  any tag is pushed — this is how the 2026-09-24 rotation need was caught on PR #399,
-  well before a release. Moving npm publishing to OIDC trusted publishing would remove
-  the rotation burden entirely.
+  publish token backing `secrets.NPM_TOKEN` was rotated 2026-09-24. Run the
+  branch dry run to check it before the tag push. `Credential probe` skips
+  `npm whoami` on PR runs.
 - **Dependabot may retarget a superseded PR instead of closing it**: when a newer
   Dependabot PR supersedes an older one for the same dependency, Dependabot can rebase
   the OLD PR onto the new target rather than closing it, leaving its title and branch
