@@ -155,7 +155,7 @@ export interface CompileOptions extends CheckOptions {
 }
 
 /**
- * Options for file-based compile operations.
+ * Options for `compileFile()` (Node.js entry only).
  *
  * `CompileFileOptions` deliberately does NOT extend `CompileOptions`. After
  * `CompileOptions` gained `basePath`, inheriting it here would silently add a
@@ -183,14 +183,7 @@ export interface CompileFileOptions {
 }
 
 /**
- * @deprecated Renamed to {@link CompileFileOptions} for consistency with
- * {@link CheckFileOptions} and {@link LintFileOptions}. This alias is preserved
- * for backward compatibility and will be removed in a future major version.
- */
-export type FileOptions = CompileFileOptions;
-
-/**
- * Options for file-based check-only operations.
+ * Options for `checkFile()` (Node.js entry only).
  *
  * `basePath` is not accepted on file operations: the base directory is derived
  * from the file path. The `basePath?: never` declaration rejects assignment from

@@ -1132,7 +1132,7 @@ describe('options-validation', () => {
     // (see the cast comment at node.ts:114-117). That is correct only while every
     // checkFile key is also a compileFile key.
     //
-    // If CheckFileOptions ever gains a key that FileOptions lacks, assertKnownKeys
+    // If CheckFileOptions gains a key that CompileFileOptions lacks, assertKnownKeys
     // would ACCEPT it on checkFile while the WASM path silently DROPPED it —
     // reintroducing the exact #180 bug class (validated-then-discarded) on one backend
     // only. The native path is unaffected, so a native-only test suite would not catch
@@ -1143,7 +1143,7 @@ describe('options-validation', () => {
       missing,
       [],
       `METHOD_KEYS.checkFile keys absent from METHOD_KEYS.compileFile: [${missing.join(', ')}]. ` +
-        'Either add them to FileOptions, or give checkFile its own forwarding path in ' +
+        'Either add them to CompileFileOptions, or give checkFile its own forwarding path in ' +
         'node.ts prepareFileArgs/fileOpts — otherwise the WASM backend drops them silently.',
     );
 

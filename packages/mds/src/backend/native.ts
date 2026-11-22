@@ -3,9 +3,9 @@ import type {
   CheckFileOptions,
   CheckOptions,
   CheckResult,
+  CompileFileOptions,
   CompileOptions,
   CompileResult,
-  FileOptions,
   LintFileOptions,
   LintOptions,
   LintResult,
@@ -91,7 +91,7 @@ export function createNativeBackend(addon: NapiAddon): MdsNodeBackend {
       return result as CheckResult;
     },
 
-    async compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
+    async compileFile(path: string, options?: CompileFileOptions): Promise<CompileResult> {
       // Defense in depth (PF-004): the public compileFile wrapper already rejects
       // basePath, but guard here so a future internal caller obtaining a backend via
       // createNativeBackend(addon) and bypassing the public wrapper cannot get the

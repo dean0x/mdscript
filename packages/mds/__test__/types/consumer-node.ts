@@ -17,9 +17,7 @@
 import type {
   CheckFileOptions,
   CheckOptions,
-  CompileFileOptions,
   CompileOptions,
-  FileOptions,
   LintDiagnostic,
   LintFileOptions,
   LintFileReport,
@@ -31,6 +29,9 @@ import type {
   RuleSeverity,
   SourceMapV3,
 } from '../../dist/node.js';
+import type { CompileFileOptions } from '../../dist/node.js';
+// @ts-expect-error — the Node.js entry must not export FileOptions.
+import type { FileOptions } from '../../dist/node.js';
 
 // ── Positive cases: basePath accepted on string-surface types ─────────────────
 
@@ -56,10 +57,6 @@ const _compileFileOpts: CompileFileOptions = { vars: {}, sourceMap: true, source
 // @ts-expect-error — basePath is intentionally absent from CompileFileOptions (D-TS-03)
 const _compileFileBasePath: CompileFileOptions = { basePath: '/some/dir' };
 
-// D-TS-02: FileOptions (deprecated alias for CompileFileOptions) must NOT have basePath.
-// @ts-expect-error — basePath is intentionally absent from FileOptions (D-TS-02)
-const _fileOpts: FileOptions = { basePath: '/some/dir' };
-
 // CheckFileOptions must NOT have basePath.
 // @ts-expect-error — basePath is intentionally absent from CheckFileOptions
 const _checkFileOpts: CheckFileOptions = { basePath: '/some/dir' };
@@ -76,8 +73,8 @@ const _lintFileOpts: LintFileOptions = { basePath: '/some/dir' };
 // causes TypeScript to report: "Type 'string | undefined' is not assignable to
 // type 'undefined'" when a variable carrying basePath is used.
 declare const _compileSrcVar: CompileOptions;
-// @ts-expect-error — CompileOptions (basePath?: string) is not assignable to FileOptions (basePath?: never)
-const _fileFromCompileVar: FileOptions = _compileSrcVar;
+// @ts-expect-error — CompileOptions (basePath?: string) is not assignable to CompileFileOptions (basePath?: never)
+const _fileFromCompileVar: CompileFileOptions = _compileSrcVar;
 declare const _checkSrcVar: CheckOptions;
 // @ts-expect-error — CheckOptions (basePath?: string) is not assignable to CheckFileOptions (basePath?: never)
 const _checkFileFromVar: CheckFileOptions = _checkSrcVar;
@@ -163,7 +160,7 @@ const _ruleName: LintRuleName = 'unused-variable';
 // Prevent unused-variable TS errors for the above declarations.
 void _compileOpts; void _checkOpts; void _lintOpts;
 void _compileFileOpts; void _compileFileBasePath;
-void _fileOpts; void _checkFileOpts; void _lintFileOpts;
+void _checkFileOpts; void _lintFileOpts;
 void _fileFromCompileVar; void _checkFileFromVar; void _lintFileFromVar;
 void _inferredWithBasePath; void _compileFileFromInferred;
 void _validRule; void _fwdCompat; void _badSeverity;
