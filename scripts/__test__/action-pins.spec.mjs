@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const PIN = /^([^\s@]+)@([0-9a-f]{40}) {2}# (\S+)$/;
+const FIRST_PARTY_PIN = /^[^\s@]+@v\d+(?:\.\d+){0,2}(?:[ \t]+#.*)?$/;
 const PYPI = 'pypa/gh-action-pypi-publish';
 const RUST = 'dtolnay/rust-toolchain';
 const EMPTY_EXPR = /\$\{\{\s*\}\}/;
@@ -87,10 +88,16 @@ export function checkActionPins(sources) {
       const use = /^( *)(- +)?uses:[ \t]*(.*)$/.exec(line);
       if (!use) continue;
       const value = use[3];
-      if (/^(?:actions\/|\.\/)/i.test(value)) continue;
-      thirdPartyCount += 1;
+      if (value.startsWith('./')) continue;
       const at = `${file}:${i + 1}`;
       const action = value.split('@', 1)[0].toLowerCase();
+      if (action.startsWith('actions/')) {
+        if (!FIRST_PARTY_PIN.test(value)) {
+          problems.push(`${at}: expected a first-party action version tag (vN, vN.N, or vN.N.N)`);
+        }
+        continue;
+      }
+      thirdPartyCount += 1;
       if (action === PYPI) {
         // This action needs the release tag to select the image.
         if (!/^v\d+\.\d+\.\d+$/.test(value.slice(PYPI.length + 1))) {
@@ -125,7 +132,7 @@ export function checkActionPins(sources) {
       }
     }
   }
-  return { thirdPartyCount, problems };
+  return { thirdPartyCount, problems, toolchainChannels: [...shaByChannel.keys()] };
 }
 
 const SHA = 'a'.repeat(40);
@@ -135,6 +142,7 @@ const toolchain = (sha, channel, raw = channel) =>
 const inspect = (text) => checkActionPins([['fixture.yml', text]]);
 
 for (const [name, text, expected] of [
+  ['rejects a branch ref for a first-party action', '  - uses: actions/checkout@main', 'expected a first-party action version tag (vN, vN.N, or vN.N.N)'],
   ['rejects a mutable third-party ref', '  - uses: Swatinem/rust-cache@v2', 'expected action@<40-digit SHA>  # <ref>'],
   ['requires two spaces before the ref comment', `  - uses: Swatinem/rust-cache@${SHA} # v2`, 'expected action@<40-digit SHA>  # <ref>'],
   ['rejects a SHA for the PyPI action', `  - uses: ${PYPI}@${SHA}  # v1.14.3`, 'expected PyPI vX.Y.Z tag'],
@@ -150,6 +158,12 @@ for (const [name, text, expected] of [
   });
 }
 
+for (const tag of ['v4', 'v4.2', 'v4.2.2']) {
+  test(`accepts the first-party action tag ${tag}`, () => {
+    assert.deepEqual(inspect(`  - uses: actions/checkout@${tag}`).problems, []);
+  });
+}
+
 test('accepts valid pins and ignores commented-out action uses', () => {
   const text = [
     `    # - uses: Swatinem/rust-cache@v2`,
@@ -162,11 +176,13 @@ test('accepts valid pins and ignores commented-out action uses', () => {
     `      uses: ${RUST}@${OTHER_SHA}  # 1.88`,
     toolchain(SHA, 'stable'),
   ].join('\n');
-  assert.deepEqual(inspect(text), { thirdPartyCount: 3, problems: [] });
+  assert.deepEqual(inspect(text), { thirdPartyCount: 3, problems: [], toolchainChannels: ['1.88', 'stable'] });
 });
 
 test('workflows and composite actions satisfy the pin policy', () => {
-  const { thirdPartyCount, problems } = checkActionPins(actionSources());
+  const { thirdPartyCount, problems, toolchainChannels } = checkActionPins(actionSources());
   assert.ok(thirdPartyCount > 0, 'expected at least one third-party action use');
   assert.deepEqual(problems, [], problems.join('\n'));
+  const missingChannels = ['stable', '1.88', '1.96.0'].filter((channel) => !toolchainChannels.includes(channel));
+  assert.deepEqual(missingChannels, [], `missing Rust toolchain channels: ${missingChannels.join(', ')}`);
 });
