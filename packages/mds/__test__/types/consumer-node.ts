@@ -69,26 +69,21 @@ const _lintFileOpts: LintFileOptions = { basePath: '/some/dir' };
 // Object-literal excess-property checks only fire on fresh literals. The cases
 // below use typed variables — the realistic consumer shape — to prove that the
 // structural type matrix also rejects passing a string-surface options object
-// directly to a file-surface API. `basePath?: never` on the file-surface types
-// causes TypeScript to report: "Type 'string | undefined' is not assignable to
-// type 'undefined'" when a variable carrying basePath is used.
+// directly to a file-surface API. With exactOptionalPropertyTypes, TS2375
+// reports: "Type 'string | undefined' is not assignable to type 'never'."
 declare const _compileSrcVar: CompileOptions;
-// @ts-expect-error — CompileOptions (basePath?: string) is not assignable to CompileFileOptions (basePath?: never)
+// @ts-expect-error — CompileOptions (basePath?: string | undefined) is not assignable to CompileFileOptions (basePath?: never)
 const _fileFromCompileVar: CompileFileOptions = _compileSrcVar;
 declare const _checkSrcVar: CheckOptions;
-// @ts-expect-error — CheckOptions (basePath?: string) is not assignable to CheckFileOptions (basePath?: never)
+// @ts-expect-error — CheckOptions (basePath?: string | undefined) is not assignable to CheckFileOptions (basePath?: never)
 const _checkFileFromVar: CheckFileOptions = _checkSrcVar;
 declare const _lintSrcVar: LintOptions;
-// @ts-expect-error — LintOptions (basePath?: string) is not assignable to LintFileOptions (basePath?: never)
+// @ts-expect-error — LintOptions (basePath?: string | undefined) is not assignable to LintFileOptions (basePath?: never)
 const _lintFileFromVar: LintFileOptions = _lintSrcVar;
 
 // ── Inferred-object case (AC-P3-20 / testing-05) ─────────────────────────────
-// The PR description claimed that inferred-object variables (type inferred from
-// the literal, e.g. `{ basePath: string }`) are NOT rejected by file-surface
-// types. The compiler disagrees: TS2322 fires — `string` is not assignable to
-// `undefined` (the effective type of `basePath?: never`). The fixture encodes
-// the ACTUAL compiler behaviour and prevents the PR-description claim from
-// becoming silently true in a future TypeScript release.
+// With exactOptionalPropertyTypes, the inferred basePath also fails assignment.
+// TS2322 reports: "Type 'string' is not assignable to type 'never'."
 const _inferredWithBasePath = { basePath: '/some/dir' };
 // @ts-expect-error — { basePath: string } is rejected by CompileFileOptions (basePath?: never)
 const _compileFileFromInferred: CompileFileOptions = _inferredWithBasePath;

@@ -14,7 +14,7 @@
  */
 export interface MdsApi {
   /** Compile a file at the given absolute path and return the compiled output. */
-  compileFile(path: string, options?: { vars?: Record<string, unknown> }): Promise<CompileResult>;
+  compileFile(path: string, options?: { vars?: Record<string, unknown> | undefined }): Promise<CompileResult>;
   /** Initialize the compiler backend. Must be awaited before calling compileFile. */
   init(): Promise<void>;
 }
@@ -83,7 +83,7 @@ export interface TransformResult {
 /** Options accepted by bundler plugin factories (Vite, Rollup, Webpack, etc.). */
 export interface MdsPluginOptions {
   /** Runtime variables made available for interpolation in .mds templates. */
-  vars?: Record<string, unknown>;
+  vars?: Record<string, unknown> | undefined;
 }
 
 /**

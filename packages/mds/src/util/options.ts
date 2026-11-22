@@ -269,6 +269,9 @@ export function assertKnownKeys(options: object, method: MethodName): void {
 
 // ── Option forwarding ──────────────────────────────────────────────────────────
 
+// The `!= null` filter omits keys whose value is undefined.
+type DefinedOptional<T> = { [K in keyof T]?: Exclude<T[K], undefined> };
+
 /**
  * Forward `options` to the backend, keeping only the keys listed in
  * {@link METHOD_KEYS} for `method`.
@@ -281,12 +284,9 @@ export function assertKnownKeys(options: object, method: MethodName): void {
  * error — the root shape of PF-004 / #180.
  *
  * The generic `M` parameter links `options` to `method` via {@link OptionsFor},
- * so the compiler rejects mismatches (e.g. passing `CompileOptions` to a
- * `'checkFile'` call). Call sites receive `Partial<OptionsFor[M]> | undefined`
- * and are assignable to the backend's parameter type without unchecked casts.
- * The internal accumulation into `Record<string, unknown>` loses per-key types
- * at the accumulation site; the single controlled cast to `Partial<OptionsFor[M]>`
- * at the return keeps every external call site cast-free.
+ * so the compiler rejects mismatches (e.g. passing `CompileOptions` to a `'checkFile'` call).
+ * The return type matches the backend's optional properties. The cast restores
+ * the property types that `Record<string, unknown>` does not track.
  *
  * Returns `undefined` when `options` is nullish or every accepted key is absent,
  * preserving the backend no-options fast path (avoids allocating empty objects
@@ -298,7 +298,7 @@ export function assertKnownKeys(options: object, method: MethodName): void {
 export function forwardOpts<M extends MethodName>(
   options: OptionsFor[M] | null | undefined,
   method: M,
-): Partial<OptionsFor[M]> | undefined {
+): DefinedOptional<OptionsFor[M]> | undefined {
   if (options == null) return undefined;
   const keys = METHOD_KEYS[method];
   const src = options as Record<string, unknown>;
@@ -307,13 +307,9 @@ export function forwardOpts<M extends MethodName>(
   for (const k of keys) {
     const v = src[k];
     if (v != null) {
-      // The accumulation into Record<string,unknown> loses per-key types
-      // internally; the single controlled cast to Partial<OptionsFor[M]> at the
-      // return keeps callers cast-free — tsc verifies the forwarded shape against
-      // each backend parameter type at the call site.
       out[k] = v;
       any = true;
     }
   }
-  return any ? (out as Partial<OptionsFor[M]>) : undefined;
+  return any ? (out as DefinedOptional<OptionsFor[M]>) : undefined;
 }
