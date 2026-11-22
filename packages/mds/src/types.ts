@@ -112,7 +112,7 @@ export interface CheckResult {
  */
 export interface CheckOptions {
   /** Runtime variables made available for interpolation in the template. */
-  vars?: Record<string, unknown>;
+  vars?: Record<string, unknown> | undefined;
   /**
    * Base directory for resolving `@import` directives in the source string.
    * Defaults to the process cwd when omitted.
@@ -121,12 +121,14 @@ export interface CheckOptions {
    * which succeeds silently but resolves against the wrong directory if the
    * source string was not loaded from cwd. Provide an explicit path when the
    * source contains `@import` or `@extends`.
+   * An explicit `undefined` has the same effect as an omitted key: imports resolve
+   * against the process cwd, subject to the same import path checks.
    *
    * **WASM backend:** rejected at runtime with `mds::invalid_options` -- the WASM
    * backend has no filesystem access. Set `MDS_BACKEND=native` to force the native
    * backend.
    */
-  basePath?: string;
+  basePath?: string | undefined;
 }
 
 /**
@@ -141,7 +143,7 @@ export interface CompileOptions extends CheckOptions {
    * `result.sourceMap`. Ignored for `@message`-mode templates (no renderable
    * output means no mappable positions). Defaults to `false`.
    */
-  sourceMap?: boolean;
+  sourceMap?: boolean | undefined;
   /**
    * When `true`, embeds the original source text in `sourceMap.sourcesContent`.
    * Requires `sourceMap: true`; passing `sourcesContent: true` without
@@ -151,11 +153,11 @@ export interface CompileOptions extends CheckOptions {
    * including any hardcoded values. Only use in trusted environments.
    * Defaults to `false`.
    */
-  sourcesContent?: boolean;
+  sourcesContent?: boolean | undefined;
 }
 
 /**
- * Options for file-based compile operations.
+ * Options for `compileFile()` (Node.js entry only).
  *
  * `CompileFileOptions` deliberately does NOT extend `CompileOptions`. After
  * `CompileOptions` gained `basePath`, inheriting it here would silently add a
@@ -165,45 +167,39 @@ export interface CompileOptions extends CheckOptions {
  */
 export interface CompileFileOptions {
   /** Runtime variables made available for interpolation in the template. */
-  vars?: Record<string, unknown>;
+  vars?: Record<string, unknown> | undefined;
   /** When `true`, appends a Source Map v3 document to the result. */
-  sourceMap?: boolean;
+  sourceMap?: boolean | undefined;
   /**
    * When `true`, embeds the original source text in `sourceMap.sourcesContent`.
    * Requires `sourceMap: true`.
    *
    * **Privacy warning**: embeds the full template source. Only use in trusted environments.
    */
-  sourcesContent?: boolean;
+  sourcesContent?: boolean | undefined;
   /**
    * Not accepted on file operations: the base directory is derived from the file
-   * path. Passing a non-null value throws `mds::invalid_options`.
+   * path. The wrapper treats `undefined` as absent.
+   * For other values, including `null`, it throws `mds::invalid_options`.
    */
   basePath?: never;
 }
 
 /**
- * @deprecated Renamed to {@link CompileFileOptions} for consistency with
- * {@link CheckFileOptions} and {@link LintFileOptions}. This alias is preserved
- * for backward compatibility and will be removed in a future major version.
- */
-export type FileOptions = CompileFileOptions;
-
-/**
- * Options for file-based check-only operations.
+ * Options for `checkFile()` (Node.js entry only).
  *
  * `basePath` is not accepted on file operations: the base directory is derived
- * from the file path. The `basePath?: never` declaration rejects assignment from
- * any variable whose inferred type carries `basePath` (e.g. a `CheckOptions`
- * value), producing a compile-time error rather than a runtime surprise.
+ * from the file path. The `basePath?: never` declaration rejects a `CheckOptions`
+ * variable because its `basePath` can hold a string.
  * Only `vars` is forwarded to the backend.
  */
 export interface CheckFileOptions {
   /** Runtime variables made available for interpolation in the template. */
-  vars?: Record<string, unknown>;
+  vars?: Record<string, unknown> | undefined;
   /**
    * Not accepted on file operations: the base directory is derived from the file
-   * path. Passing a non-null value throws `mds::invalid_options`.
+   * path. The wrapper treats `undefined` as absent.
+   * For other values, including `null`, it throws `mds::invalid_options`.
    */
   basePath?: never;
 }
@@ -342,7 +338,7 @@ export interface LintResult {
 /** Options for source-string lint operations. */
 export interface LintOptions {
   /** Runtime variables injected into the check gate (not the lint rules). */
-  vars?: Record<string, unknown>;
+  vars?: Record<string, unknown> | undefined;
   /**
    * Per-rule severity overrides, e.g. `{ 'shadow-variable': 'warn' }`.
    *
@@ -351,7 +347,7 @@ export interface LintOptions {
    * unknown rule is not enforced by the engine. `Record<string, …>` is
    * accepted for forward compatibility with future rule names.
    */
-  rules?: Record<string, RuleSeverity>;
+  rules?: Record<string, RuleSeverity> | undefined;
   /**
    * Base directory for resolving `@import` directives in the source string.
    * Defaults to the process cwd when omitted.
@@ -360,6 +356,8 @@ export interface LintOptions {
    * which succeeds silently but resolves against the wrong directory if the
    * source string was not loaded from cwd. Provide an explicit path when the
    * source contains `@import` or `@extends`.
+   * An explicit `undefined` has the same effect as an omitted key: imports resolve
+   * against the process cwd, subject to the same import path checks.
    *
    * The WASM backend **rejects** a non-null `basePath` with
    * `mds::invalid_options` rather than silently ignoring it. This surfaces the
@@ -367,13 +365,13 @@ export interface LintOptions {
    * Set `MDS_BACKEND=native` to force the native backend, or use
    * {@link MdsBaseBackend.lintVirtual} with pre-resolved modules.
    */
-  basePath?: string;
+  basePath?: string | undefined;
 }
 
 /** Options for file-based and virtual lint operations. */
 export interface LintFileOptions {
   /** Runtime variables injected into the check gate (not the lint rules). */
-  vars?: Record<string, unknown>;
+  vars?: Record<string, unknown> | undefined;
   /**
    * Per-rule severity overrides, e.g. `{ 'shadow-variable': 'warn' }`.
    *
@@ -382,11 +380,12 @@ export interface LintFileOptions {
    * unknown rule is not enforced by the engine. `Record<string, …>` is
    * accepted for forward compatibility with future rule names.
    */
-  rules?: Record<string, RuleSeverity>;
+  rules?: Record<string, RuleSeverity> | undefined;
   /**
    * Not accepted: `lintFile` derives the base directory from the file path;
    * `lintVirtual` resolves imports against the caller-supplied module map.
-   * Passing a non-null value throws `mds::invalid_options`.
+   * The wrapper treats `undefined` as absent.
+   * For other values, including `null`, it throws `mds::invalid_options`.
    */
   basePath?: never;
 }
@@ -424,7 +423,7 @@ export interface InitOptions {
    * - `Response` — pre-fetched `fetch()` response
    * - `BufferSource` — pre-loaded bytes (e.g. from a bundler asset)
    */
-  wasmUrl?: string | URL | Response | BufferSource;
+  wasmUrl?: string | URL | Response | BufferSource | undefined;
 }
 
 /**

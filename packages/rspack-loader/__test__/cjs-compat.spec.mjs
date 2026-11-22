@@ -26,7 +26,13 @@ const hasCjsBuild = existsSync(cjsPath);
 // Fixture — exists in this package's own __test__/fixtures/ directory.
 const SIMPLE_MDS = resolve(__dirname, 'fixtures/simple.mds');
 
-describe('rspack-loader CJS build', { skip: !hasCjsBuild && 'dist-cjs/ not built — run build first' }, () => {
+describe('rspack-loader CJS build', { skip: !hasCjsBuild && !process.env.CI && 'dist-cjs/ not built — run build first' }, () => {
+  if (!hasCjsBuild) {
+    test('has a CJS build', () => {
+      assert.ok(hasCjsBuild, 'dist-cjs/ missing in CI — build step did not run');
+    });
+    return;
+  }
   const cjsBuild = require(cjsPath);
   const { default: mdsLoader, _resetForTesting, _setTransformerForTesting } = cjsBuild;
 

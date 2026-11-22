@@ -38,8 +38,11 @@
     "dist/"
   ],
   "scripts": {
+    "clean:dist": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
+    "prebuild": "npm run clean:dist",
     "build": "tsc -p tsconfig.json",
-    "test": "tsc -p tsconfig.types.json && node --test __test__/*.spec.mjs",
+    "pretest": "npm run build",
+    "test": "tsc -p tsconfig.types.json && tsc -p tsconfig.types.eopt-off.json && node --test __test__/*.spec.mjs",
     "test:native": "node --test __test__/native-backend.spec.mjs",
     "test:perf": "node --test __test__/perf.spec.mjs"
   },
@@ -51,6 +54,6 @@
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
-    "typescript": "^6.0.3"
+    "typescript": "^7.0.2"
   }
 }

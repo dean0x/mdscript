@@ -114,13 +114,17 @@ try {
 Each cell names the accepted option type. `basePath` is a string-surface option only;
 file-path methods derive the base directory from the file argument.
 
-|           | String source                | File path          |
-|-----------|------------------------------|--------------------|
-| `compile` | `CompileOptions`             | `FileOptions`      |
-| `check`   | `CheckOptions`               | `CheckFileOptions` |
-| `lint`    | `LintOptions`                | `LintFileOptions`  |
+|           | String source    | File path            |
+|-----------|------------------|----------------------|
+| `compile` | `CompileOptions` | `CompileFileOptions` |
+| `check`   | `CheckOptions`   | `CheckFileOptions`   |
+| `lint`    | `LintOptions`    | `LintFileOptions`    |
 
 #### Option types
+
+Optional input fields accept explicit `undefined`. If your TypeScript config
+sets `exactOptionalPropertyTypes`, omit `basePath` from file and virtual options.
+At runtime, these methods treat `basePath: undefined` as absent.
 
 ```ts
 // CheckOptions — accepted by check() (string source)
@@ -132,35 +136,37 @@ file-path methods derive the base directory from the file argument.
 // {basePath: undefined} is treated as absent on both backends.
 // {basePath: ''} (empty string) is rejected — omit the key rather than passing an empty string.
 interface CheckOptions {
-  vars?: Record<string, unknown>;
-  basePath?: string;
+  vars?: Record<string, unknown> | undefined;
+  basePath?: string | undefined;
 }
 
 // CompileOptions — accepted by compile() (string source)
 // Extends CheckOptions: inherits vars and basePath.
 // basePath behaves the same as for CheckOptions (see above).
 interface CompileOptions extends CheckOptions {
-  sourceMap?: boolean;      // generate Source Map v3; result gains a `sourceMap` field
-  sourcesContent?: boolean; // embed source text in map (requires sourceMap: true)
-                            // ⚠ Privacy: embeds the full template source
+  // Generate Source Map v3 and add `sourceMap` to the result.
+  sourceMap?: boolean | undefined;
+  // Privacy: This option puts the full template source in the map.
+  // Requires sourceMap: true.
+  sourcesContent?: boolean | undefined;
 }
 
-// FileOptions — accepted by compileFile()
+// CompileFileOptions — accepted by compileFile()
 // basePath is NOT accepted: the base directory is derived from the file path.
-// basePath?: never blocks assigning a CompileOptions variable to this type (TS2322).
-interface FileOptions {
-  vars?: Record<string, unknown>;
-  sourceMap?: boolean;
-  sourcesContent?: boolean;
+// basePath?: never blocks assigning a CompileOptions variable to this type.
+interface CompileFileOptions {
+  vars?: Record<string, unknown> | undefined;
+  sourceMap?: boolean | undefined;
+  sourcesContent?: boolean | undefined;
   basePath?: never; // not accepted; present to produce a compile-time error when a string-surface variable is passed
 }
 
 // CheckFileOptions — accepted by checkFile()
 // basePath is NOT accepted (base directory from file path).
-// basePath?: never blocks assigning a CheckOptions variable to this type (TS2322).
+// basePath?: never blocks assigning a CheckOptions variable to this type.
 // Source-map options are NOT accepted; passing them throws mds::invalid_options.
 interface CheckFileOptions {
-  vars?: Record<string, unknown>;
+  vars?: Record<string, unknown> | undefined;
   basePath?: never; // not accepted; present to produce a compile-time error when a string-surface variable is passed
 }
 
@@ -173,24 +179,24 @@ interface CheckFileOptions {
 // Set MDS_BACKEND=native to use the native backend, or use lintVirtual with
 // pre-resolved modules.
 interface LintOptions {
-  vars?: Record<string, unknown>;
-  rules?: Record<string, 'off' | 'info' | 'warn' | 'error'>;
-  basePath?: string;
+  vars?: Record<string, unknown> | undefined;
+  rules?: Record<string, 'off' | 'info' | 'warn' | 'error'> | undefined;
+  basePath?: string | undefined;
 }
 
 // LintFileOptions — accepted by lintFile() and lintVirtual()
 // basePath is NOT accepted: lintFile derives the base directory from the file path;
 // lintVirtual resolves imports against the caller-supplied module map, not the filesystem.
-// basePath?: never blocks assigning a LintOptions variable to this type (TS2322).
+// basePath?: never blocks assigning a LintOptions variable to this type.
 interface LintFileOptions {
-  vars?: Record<string, unknown>;
-  rules?: Record<string, 'off' | 'info' | 'warn' | 'error'>;
+  vars?: Record<string, unknown> | undefined;
+  rules?: Record<string, 'off' | 'info' | 'warn' | 'error'> | undefined;
   basePath?: never; // not accepted; present to produce a compile-time error when a string-surface variable is passed
 }
 
 // InitOptions
 interface InitOptions {
-  wasmUrl?: string | URL | Response | BufferSource;
+  wasmUrl?: string | URL | Response | BufferSource | undefined;
 }
 ```
 

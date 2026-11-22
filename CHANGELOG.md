@@ -7,9 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Optional input fields in `@mdscript/mds` and optional `vars` fields in `@mdscript/bundler-utils` accept explicit `undefined` with `exactOptionalPropertyTypes` (#312).
+  File and virtual options still require callers to omit `basePath` in this mode.
+  **Type-only compatibility note:** With `exactOptionalPropertyTypes` on, TypeScript can reject assignments of these options to types that disallow explicit `undefined`, with no runtime effect.
+
+### Removed
+
+- **BREAKING:** Remove `FileOptions` from `@mdscript/mds` (#222). TypeScript reports `TS2305` for imports of this alias.
+  Replace `FileOptions` with `CompileFileOptions` in imports and type references.
+
 ### Fixed
 
 - The `@mdscript/mds` README and the JavaScript example in `examples/README.md` now call `await init()` before the Node.js entry compiles. The README said that Node.js needs no initialization.
+
+### Internal
+
+- Enable `exactOptionalPropertyTypes` in the base TypeScript config. Check the `@mdscript/mds` type fixtures with this flag on and off (#312).
+- The lockfile gives each of the six workspaces its own TypeScript 7.0.2 copy. The root copy stays at 6.0.3 because `@napi-rs/cli` requires `^6.0.3` (#364).
+- Use `bundler` module resolution for the CommonJS builds of `bundler-utils`, `webpack-loader` and `rspack-loader`. Their CommonJS output does not change (#364).
+- The `@mdscript/mds` build clears `dist/` first. `npm test` in that package runs this build before the type fixtures and specs (#312).
+- Both `@mdscript/mds` entry points use the shared export list in `public-types.ts`. `export-surface.spec.mjs` checks the export names (#312).
+- The `cjs-compat` specs fail in CI if the CommonJS build is absent (#364).
+- Remove the TypeScript major version ignore entry from Dependabot (#364).
 
 ## [0.6.0] — 2026-11-21
 

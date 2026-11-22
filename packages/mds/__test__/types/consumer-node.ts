@@ -10,16 +10,14 @@
  * AC-P3-21: all option types a consumer needs are exported from dist/node.d.ts
  * (the entry the `exports` map resolves for Node.js consumers).
  *
- * Note: this file is compiled by tsconfig.types.json (noEmit: true) and is NOT
- * in the main build (tsconfig.json excludes __test__). It runs as part of
- * `npm test` via the test script preamble.
+ * `npm test` checks this file with tsconfig.types.json and tsconfig.types.eopt-off.json.
+ * The code below each `@ts-expect-error` must cause a type error in both modes.
+ * Both configs set `noEmit: true`. The main build excludes `__test__`.
  */
 import type {
   CheckFileOptions,
   CheckOptions,
-  CompileFileOptions,
   CompileOptions,
-  FileOptions,
   LintDiagnostic,
   LintFileOptions,
   LintFileReport,
@@ -31,6 +29,9 @@ import type {
   RuleSeverity,
   SourceMapV3,
 } from '../../dist/node.js';
+import type { CompileFileOptions } from '../../dist/node.js';
+// @ts-expect-error — the Node.js entry must not export FileOptions.
+import type { FileOptions } from '../../dist/node.js';
 
 // ── Positive cases: basePath accepted on string-surface types ─────────────────
 
@@ -56,10 +57,6 @@ const _compileFileOpts: CompileFileOptions = { vars: {}, sourceMap: true, source
 // @ts-expect-error — basePath is intentionally absent from CompileFileOptions (D-TS-03)
 const _compileFileBasePath: CompileFileOptions = { basePath: '/some/dir' };
 
-// D-TS-02: FileOptions (deprecated alias for CompileFileOptions) must NOT have basePath.
-// @ts-expect-error — basePath is intentionally absent from FileOptions (D-TS-02)
-const _fileOpts: FileOptions = { basePath: '/some/dir' };
-
 // CheckFileOptions must NOT have basePath.
 // @ts-expect-error — basePath is intentionally absent from CheckFileOptions
 const _checkFileOpts: CheckFileOptions = { basePath: '/some/dir' };
@@ -72,26 +69,21 @@ const _lintFileOpts: LintFileOptions = { basePath: '/some/dir' };
 // Object-literal excess-property checks only fire on fresh literals. The cases
 // below use typed variables — the realistic consumer shape — to prove that the
 // structural type matrix also rejects passing a string-surface options object
-// directly to a file-surface API. `basePath?: never` on the file-surface types
-// causes TypeScript to report: "Type 'string | undefined' is not assignable to
-// type 'undefined'" when a variable carrying basePath is used.
+// directly to a file-surface API. With exactOptionalPropertyTypes, TS2375
+// reports: "Type 'string | undefined' is not assignable to type 'never'."
 declare const _compileSrcVar: CompileOptions;
-// @ts-expect-error — CompileOptions (basePath?: string) is not assignable to FileOptions (basePath?: never)
-const _fileFromCompileVar: FileOptions = _compileSrcVar;
+// @ts-expect-error — CompileOptions (basePath?: string | undefined) is not assignable to CompileFileOptions (basePath?: never)
+const _fileFromCompileVar: CompileFileOptions = _compileSrcVar;
 declare const _checkSrcVar: CheckOptions;
-// @ts-expect-error — CheckOptions (basePath?: string) is not assignable to CheckFileOptions (basePath?: never)
+// @ts-expect-error — CheckOptions (basePath?: string | undefined) is not assignable to CheckFileOptions (basePath?: never)
 const _checkFileFromVar: CheckFileOptions = _checkSrcVar;
 declare const _lintSrcVar: LintOptions;
-// @ts-expect-error — LintOptions (basePath?: string) is not assignable to LintFileOptions (basePath?: never)
+// @ts-expect-error — LintOptions (basePath?: string | undefined) is not assignable to LintFileOptions (basePath?: never)
 const _lintFileFromVar: LintFileOptions = _lintSrcVar;
 
 // ── Inferred-object case (AC-P3-20 / testing-05) ─────────────────────────────
-// The PR description claimed that inferred-object variables (type inferred from
-// the literal, e.g. `{ basePath: string }`) are NOT rejected by file-surface
-// types. The compiler disagrees: TS2322 fires — `string` is not assignable to
-// `undefined` (the effective type of `basePath?: never`). The fixture encodes
-// the ACTUAL compiler behaviour and prevents the PR-description claim from
-// becoming silently true in a future TypeScript release.
+// With exactOptionalPropertyTypes, the inferred basePath also fails assignment.
+// TS2322 reports: "Type 'string' is not assignable to type 'never'."
 const _inferredWithBasePath = { basePath: '/some/dir' };
 // @ts-expect-error — { basePath: string } is rejected by CompileFileOptions (basePath?: never)
 const _compileFileFromInferred: CompileFileOptions = _inferredWithBasePath;
@@ -163,7 +155,7 @@ const _ruleName: LintRuleName = 'unused-variable';
 // Prevent unused-variable TS errors for the above declarations.
 void _compileOpts; void _checkOpts; void _lintOpts;
 void _compileFileOpts; void _compileFileBasePath;
-void _fileOpts; void _checkFileOpts; void _lintFileOpts;
+void _checkFileOpts; void _lintFileOpts;
 void _fileFromCompileVar; void _checkFileFromVar; void _lintFileFromVar;
 void _inferredWithBasePath; void _compileFileFromInferred;
 void _validRule; void _fwdCompat; void _badSeverity;
