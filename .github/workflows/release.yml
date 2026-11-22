@@ -745,6 +745,11 @@ jobs:
       # build and its artifacts would poison the shared Swatinem/rust-cache key
       # (host target/release/build/ artifacts built on Ubuntu 22.04 have a
       # higher glibc requirement than the manylinux 2.17 container runtime).
+      # In v1.51.0, the PyO3/maturin-action purge checks debugBuildDir, not
+      # releaseBuildDir. It misses proc-macro files in target/release/deps
+      # (PyO3/maturin-action#476). Keep the host install guard and per-leg keys.
+      # This workaround does not change the wheel build. Simplify it only after
+      # an upstream fix ships and a release rehearsal with that fix passes.
       # Use the current stable compiler for host wheel builds.
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca  # stable
         if: ${{ !matrix.sdist && runner.os != 'Linux' }}
