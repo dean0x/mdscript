@@ -1238,10 +1238,12 @@ jobs:
           echo "tag=$TAG crate=$CRATE_VER"
           test "$TAG" = "$CRATE_VER" || { echo "::error::tag v$TAG != crate version $CRATE_VER"; exit 1; }
       - name: Publish mds-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           # Idempotency: a re-run where the version is already published should pass.
           # Any other failure (bad token, outage, genuine version conflict) must fail loudly.
-          if OUTPUT=$(cargo publish -p mds-core --token "${{ secrets.CARGO_REGISTRY_TOKEN }}" 2>&1); then
+          if OUTPUT=$(cargo publish -p mds-core 2>&1); then
             echo "$OUTPUT"
           elif echo "$OUTPUT" | grep -qE "already (uploaded|exists|published)"; then
             echo "::notice::mds-core already published — idempotent re-run, skipping"
@@ -1275,9 +1277,11 @@ jobs:
           echo "::error::mds-core@${VERSION} not visible in crates.io after $((MAX * 15)) s"
           exit 1
       - name: Publish mds-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           # Same idempotency guard as mds-core above.
-          if OUTPUT=$(cargo publish -p mds-cli --token "${{ secrets.CARGO_REGISTRY_TOKEN }}" 2>&1); then
+          if OUTPUT=$(cargo publish -p mds-cli 2>&1); then
             echo "$OUTPUT"
           elif echo "$OUTPUT" | grep -qE "already (uploaded|exists|published)"; then
             echo "::notice::mds-cli already published — idempotent re-run, skipping"
@@ -1304,7 +1308,6 @@ jobs:
     env:
       NPM_CONFIG_PROVENANCE: "true"
       NPM_CONFIG_ACCESS: "public"
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1313,7 +1316,6 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          registry-url: "https://registry.npmjs.org"
       # Use the CI compiler for the published WASM so the size check applies to the release.
       # Before a bump here, update the CI pin and measure the WASM size again.
       # This SHA ignores the input. The input keeps the version after a move to a stable SHA.
@@ -1364,8 +1366,14 @@ jobs:
               exit 1
             fi
           done
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
       - name: Publish platform packages (napi prepublish)
         working-directory: crates/mds-napi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           # Idempotency: a re-run finds already-published platform packages and
           # returns E403. Tolerate E403-only failures; any other error fails loudly.
@@ -1385,6 +1393,8 @@ jobs:
             echo "$OUTPUT"
           fi
       - name: Publish npm packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           # Idempotency: publish_if_absent checks npm view before publishing so
           # a re-run skips already-published versions without swallowing genuine

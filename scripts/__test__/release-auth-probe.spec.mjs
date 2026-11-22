@@ -2021,6 +2021,98 @@ function stepMatching(steps, regex) {
   return steps.find(s => regex.test(s.body)) ?? null;
 }
 
+const secretRef = /\bsecrets\s*(?:\.|\[)/;
+
+function stepEnv(step) {
+  return /^        env:\n((?: {10}[^\n]*\n?)+)/m.exec(step)?.[1] ?? '';
+}
+
+function namedStep(steps, name) {
+  return steps.find(step => step.body.startsWith(`      - name: ${name}\n`));
+}
+
+function assertPublishEnv(section, names, binding) {
+  const steps = jobSteps(section);
+  for (const name of names) {
+    const step = namedStep(steps, name);
+    assert.ok(step && stepEnv(step.body).split('\n').includes(`          ${binding}`),
+      `${name} must bind its registry value in step env`);
+  }
+  const references = stripCommentLines(section).split('\n').filter(line => secretRef.test(line));
+  assert.deepEqual(references, names.map(() => `          ${binding}`),
+    'only publish step env may reference registry values');
+}
+
+function assertCargoPublishEnv(section) {
+  assertPublishEnv(section, ['Publish mds-core', 'Publish mds-cli'],
+    'CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}');
+  assert.doesNotMatch(stripCommentLines(section), /\bcargo publish[^\n]*\s--token\b/,
+    'cargo publish must not use a token flag');
+}
+
+const platformPublish = 'Publish platform packages (napi prepublish)';
+const npmPublish = 'Publish npm packages';
+
+function assertNpmPublishEnv(section) {
+  assertPublishEnv(section, [platformPublish, npmPublish],
+    'NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}');
+}
+
+function assertNpmRegistryOrder(section) {
+  const steps = jobSteps(section);
+  const setupNode = steps.filter(step => /^      - uses: actions\/setup-node@/m.test(step.body));
+  const registrySteps = steps.filter(step => /\bregistry-url:/.test(step.body));
+  assert.ok(setupNode.length === 2 && registrySteps.length === 1 &&
+    registrySteps[0] === setupNode[1] &&
+    /registry-url: "https:\/\/registry\.npmjs\.org"/.test(setupNode[1].body) &&
+    !/\bcache:/.test(setupNode[1].body),
+    'only the second setup-node step must set the npm registry, without cache');
+  const install = stepMatching(steps, /^      - run: npm ci$/m);
+  const build = namedStep(steps, 'Build WASM + TS packages');
+  const platform = namedStep(steps, platformPublish);
+  const npm = namedStep(steps, npmPublish);
+  assert.ok(install && build && platform && npm && setupNode[0].index < install.index &&
+    install.index < build.index && build.index < setupNode[1].index &&
+    setupNode[1].index + 1 === platform.index && platform.index + 1 === npm.index,
+    'npm install and build must run before registry setup directly precedes the publish steps');
+}
+
+test('S24: only the two Cargo publish steps bind registry values', () => {
+  const section = extractJobSection(yml, 'publish-crates');
+  assertCargoPublishEnv(section);
+  const withFlag = section.replace('cargo publish -p mds-core ',
+    'cargo publish -p mds-core --token "${{ secrets.CARGO_REGISTRY_TOKEN }}" ');
+  assert.throws(() => assertCargoPublishEnv(withFlag), /only publish step env/);
+  const withEnvFlag = withFlag.replace('${{ secrets.CARGO_REGISTRY_TOKEN }}"', '$CARGO_REGISTRY_TOKEN"');
+  assert.throws(() => assertCargoPublishEnv(withEnvFlag), /must not use a token flag/);
+  const withInput = section.replace('        with:\n',
+    '        with:\n          extra: ${{ secrets.CARGO_REGISTRY_TOKEN }}\n');
+  assert.throws(() => assertCargoPublishEnv(withInput), /only publish step env/);
+  const withoutBinding = section.replace('          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}\n', '');
+  assert.throws(() => assertCargoPublishEnv(withoutBinding), /Publish mds-core must bind/);
+});
+
+test('S25: only the two npm publish steps bind registry values', () => {
+  const section = extractJobSection(yml, 'publish-npm');
+  assertNpmPublishEnv(section);
+  const withJobEnv = section.replace('    env:\n',
+    '    env:\n      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n');
+  assert.throws(() => assertNpmPublishEnv(withJobEnv), /only publish step env/);
+  const withoutBinding = section.replace('          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n', '');
+  assert.throws(() => assertNpmPublishEnv(withoutBinding), /Publish platform packages .* must bind/);
+});
+
+test('S26: npm registry setup runs after the build and directly before publish', () => {
+  const section = extractJobSection(yml, 'publish-npm');
+  assertNpmRegistryOrder(section);
+  const earlyRegistry = section.replace('          cache: npm\n',
+    '          cache: npm\n          registry-url: "https://registry.npmjs.org"\n');
+  assert.throws(() => assertNpmRegistryOrder(earlyRegistry), /only the second setup-node/);
+  const separated = section.replace(`      - name: ${platformPublish}`,
+    `      - run: npm ci\n      - name: ${platformPublish}`);
+  assert.throws(() => assertNpmRegistryOrder(separated), /directly precedes/);
+});
+
 /**
  * Split the comment-stripped build-napi section into matrix settings entries.
  * Each entry starts at a 10-space bullet line (the list items under `settings:`).
