@@ -197,7 +197,7 @@ Checks in order:
 1. Reject fork and Dependabot PRs on the release surface.
 2. Check release manifests and workspace member versions in both lockfiles.
 3. Check tracked source for hazardous codepoints.
-4. Run `npm run test:gates` (10 spec files, 298 tests on 2026-11-22).
+4. Run `npm run test:gates` (10 spec files, 326 tests on 2026-11-23).
 5. On tag push or manual dispatch, require a successful `CI` run for the selected SHA.
 
 The `source-hygiene` job in `ci.yml` also runs `verify-versions.mjs` on each PR.
@@ -209,7 +209,10 @@ Because `npm run test:gates` runs inside `version-gate`, a malformed pin (e.g. a
 instead of a `vX.Y.Z` tag) causes `Version gate` to fail before the rehearsal job ever runs.
 
 **Fork and Dependabot PRs**: On a release-surface PR, `Version gate` exits 1 if
-`GITHUB_ACTOR` is `dependabot[bot]` or `IS_FORK` is `true`. The step does not use
+`GITHUB_ACTOR` or `PR_AUTHOR` (`pull_request.user.login`) is `dependabot[bot]`,
+if `IS_FORK` is `true`, or if `HEAD_REPOSITORY` (`head.repo.full_name`) is not
+`GITHUB_REPOSITORY`. An empty head repository therefore fails closed. Spec S31 has
+one mutation control for each condition. The step does not use
 registry inputs. Replace the PR with a maintainer PR. Changes outside the release
 surface do not start this workflow on a PR.
 

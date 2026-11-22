@@ -194,8 +194,10 @@ The registry checks run on tag push and manual dispatch. On PR runs,
 `Credential probe` reports a notice and passes. The npm and crates.io publish
 steps receive only the registry inputs that they use.
 
-`Version gate` rejects fork and Dependabot PRs that touch the release surface.
-Replace such a PR with a maintainer PR. A PR outside the release surface does not
+`Version gate` rejects a PR that touches the release surface when the actor or
+the PR author is `dependabot[bot]`, when the head repository is a fork, or when
+the head repository is missing or is not this repository. A maintainer push to a
+Dependabot PR is also rejected. Replace such a PR with a maintainer PR. A PR outside the release surface does not
 require release checks.
 
 Even though release-surface PRs now trigger `release.yml` automatically, a
