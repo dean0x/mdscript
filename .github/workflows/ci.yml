@@ -498,6 +498,8 @@ jobs:
           node-version: 22
       - name: Scan tracked source for hazardous codepoints
         run: node scripts/verify-no-control-bytes.mjs
+      - name: Check release manifest and lockfile versions
+        run: node scripts/verify-versions.mjs
       - name: Run positive-control and class-completeness suite
         run: npm run test:gates
 
