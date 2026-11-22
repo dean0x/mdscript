@@ -305,8 +305,10 @@ jobs:
           ref: ${{ github.ref }}
       - uses: actions/setup-node@v7
         with: { node-version: 22, cache: npm }
-      - uses: dtolnay/rust-toolchain@stable
+      # Use the current stable compiler for each native addon target.
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca  # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.settings.target }}
       # Install the pinned cargo-zigbuild BEFORE rust-cache (#339): napi's -x path only checks that
       # `cargo help zigbuild` succeeds and otherwise runs an unpinned `cargo install cargo-zigbuild`
@@ -331,7 +333,7 @@ jobs:
       # host is already encoded (runner.os/arch + rustc host hash), so only the
       # target is added. Intentional; must survive rust-cache version bumps --
       # spec S20 in scripts/__test__/release-auth-probe.spec.mjs pins it.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           key: ${{ matrix.settings.target }}
       - name: Install zig
@@ -735,16 +737,18 @@ jobs:
       # build and its artifacts would poison the shared Swatinem/rust-cache key
       # (host target/release/build/ artifacts built on Ubuntu 22.04 have a
       # higher glibc requirement than the manylinux 2.17 container runtime).
-      - uses: dtolnay/rust-toolchain@stable
+      # Use the current stable compiler for host wheel builds.
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca  # stable
         if: ${{ !matrix.sdist && runner.os != 'Linux' }}
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
       # Per-leg cache key: target + manylinux flavour so a containerised Linux
       # leg (glibc 2.17 manylinux / musl) never restores host-built build scripts
       # or proc-macro .so files written by another leg; legs without manylinux
       # render a trailing dash (harmless, validated warm in #347). Intentional;
       # spec S20 in scripts/__test__/release-auth-probe.spec.mjs pins it.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         if: ${{ !matrix.sdist }}
         with:
           key: ${{ matrix.target }}-${{ matrix.manylinux }}
@@ -1218,9 +1222,12 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.ref }}
-      - uses: dtolnay/rust-toolchain@stable
+      # Use current stable Cargo to publish the crates.
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca  # stable
+        with:
+          toolchain: stable
       # Single-leg job: the automatic job-id key is already unique; no per-leg key (#352).
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
       - name: Verify tag matches workspace version
         run: |
           TAG="${{ github.ref_name }}"
@@ -1307,16 +1314,13 @@ jobs:
           node-version: 22
           cache: npm
           registry-url: "https://registry.npmjs.org"
-      # performance-01 / PF-021: pin to the same 1.96.0 SHA that ci.yml's wasm
-      # job uses so the compiler that MEASURES size and the compiler that BUILDS
-      # the published artifact are identical. Unpinned @stable lets toolchain
-      # drift silently push the binary past the WASM size limit between releases.
-      # WHEN BUMPING: update ci.yml's wasm job pin first, re-measure, then
-      # update here to keep both in sync.
+      # Use the CI compiler for the published WASM so the size check applies to the release.
+      # Before a bump here, update the CI pin and measure the WASM size again.
+      # This SHA ignores the input. The input keeps the version after a move to a stable SHA.
       - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e  # 1.96.0
-        with: { targets: wasm32-unknown-unknown }
+        with: { toolchain: 1.96.0, targets: wasm32-unknown-unknown }
       # Single-leg job: the automatic job-id key is already unique; no per-leg key (#352).
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
       - uses: ./.github/actions/setup-wasm
       - run: npm ci
       - name: Restore staged napi tree (.node + npm/ platform dirs)
