@@ -13,29 +13,7 @@ import type {
 import { initWasmBrowser, createWasmBackend } from './backend/wasm.js';
 import { assertKnownKeys, getBasePathError } from './util/options.js';
 
-export { isMdsError, LINT_RULE_NAMES } from './types.js';
-export type {
-  BackendType,
-  CheckOptions,
-  CheckResult,
-  CompileOptions,
-  CompileResult,
-  InitOptions,
-  LintDiagnostic,
-  LintFileOptions,
-  LintFileReport,
-  LintOptions,
-  LintResult,
-  LintRuleName,
-  LintSpan,
-  MarkdownResult,
-  MdsError,
-  MdsErrorSpan,
-  Message,
-  MessagesResult,
-  RuleSeverity,
-  SourceMapV3,
-} from './types.js';
+export * from './public-types.js';
 
 let resolvedBackend: MdsBaseBackend | undefined;
 // Cached while the init attempt is in-flight so concurrent init() calls share

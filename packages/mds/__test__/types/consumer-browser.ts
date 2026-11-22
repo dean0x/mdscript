@@ -13,10 +13,8 @@
  * runtime-only, not type-level. Callers who need import resolution must use
  * the Node.js entry with MDS_BACKEND=native.
  *
- * `FileOptions` and `CheckFileOptions` carry no `@ts-expect-error` guard here
- * because neither type is exported from the browser entry — there is nothing
- * to verify absence on. The only file-surface negative case in this fixture
- * is `LintFileOptions`, the one file-surface type the browser entry does export.
+ * The browser entry exports `LintFileOptions` for virtual lint operations.
+ * It does not export `CompileFileOptions`, `CheckFileOptions`, or `MdsBaseBackend`.
  */
 import type {
   CheckOptions,
@@ -31,6 +29,13 @@ import type {
   RuleSeverity,
   SourceMapV3,
 } from '../../dist/browser.js';
+
+// @ts-expect-error -- CompileFileOptions is only available in Node.js.
+import type { CompileFileOptions } from '../../dist/browser.js';
+// @ts-expect-error -- CheckFileOptions is only available in Node.js.
+import type { CheckFileOptions } from '../../dist/browser.js';
+// @ts-expect-error -- MdsBaseBackend is internal.
+import type { MdsBaseBackend } from '../../dist/browser.js';
 
 // ── Positive: basePath accepted on string-surface types (shared with Node) ────
 // D-TS-01 / ADR-011: CompileOptions, CheckOptions, and LintOptions carry
