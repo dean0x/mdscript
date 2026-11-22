@@ -5,12 +5,14 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { LOCK_MEMBERS } from '../release-manifest.mjs';
 
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const read = (path) => readFileSync(join(ROOT, path), 'utf8');
 const serialize = (data) => `${JSON.stringify(data, null, 2)}\n`;
 const canonical = () => /^\[workspace\.package\]\r?\nversion = "([^"]+)"/m.exec(read('Cargo.toml'))[1];
 const NEXT = '101.102.103';
+const PRERELEASE = `${NEXT}-rc.1`;
 const CORE = '[[package]]\nname = "mds-core"';
 const REGISTRY_CORE = `\n${CORE}\nversion = "9.9.9"\nsource = "registry+https://example.invalid/index"\n`;
 const CORE_BLOCK = /\[\[package\]\]\r?\nname = "mds-core"\r?\n[\s\S]*?(?=^\[\[package\]\]|(?![\s\S]))/m;
@@ -77,6 +79,36 @@ for (const [name, edit, problem] of [
 const NAPI_DIR = 'crates/mds-napi';
 const MDS_DIR = 'packages/mds';
 const MDS_DEP = '@mdscript/mds-napi';
+const PYPROJECT = 'crates/mds-python/pyproject.toml';
+for (const [name, path, edit, problem] of [
+  ['package version drift', `${MDS_DIR}/package.json`, (text) => {
+    const pkg = JSON.parse(text);
+    return serialize({ ...pkg, version: NEXT });
+  }, /packages\/mds\/package\.json: version "101\.102\.103" != workspace version/],
+  ['an internal file specifier', `${MDS_DIR}/package.json`, (text) => {
+    const pkg = JSON.parse(text);
+    return serialize({
+      ...pkg, optionalDependencies: { ...pkg.optionalDependencies, [MDS_DEP]: `file:../../${NAPI_DIR}` },
+    });
+  }, /packages\/mds\/package\.json: optionalDependencies\["@mdscript\/mds-napi"\] uses a file: specifier/],
+  ['mds-core dependency version drift', 'crates/mds-cli/Cargo.toml', (text) =>
+    text.replace(/^(.*package = "mds-core".*version = ")[^"]+/m, (_, prefix) => `${prefix}${NEXT}`),
+  /crates\/mds-cli\/Cargo\.toml: mds-core dep version "101\.102\.103" != workspace version/],
+  ['a different Python project name', PYPROJECT, (text) => text.replace('name = "markdown-script"', 'name = "mdscript"'),
+    /crates\/mds-python\/pyproject\.toml: project name is not "markdown-script"/],
+  ['a Python dynamic list without version', PYPROJECT, (text) => text.replace('dynamic = ["version"]', 'dynamic = []'),
+    /crates\/mds-python\/pyproject\.toml: "version" must be in dynamic\[\]/],
+]) {
+  test(`version gate rejects ${name}`, (t) => {
+    const repo = fixture(t);
+    const original = repo.read(path);
+    const planted = edit(original);
+    assert.notEqual(planted, original);
+    repo.write(path, planted);
+    assertRejected(repo.run('scripts/verify-versions.mjs'), problem);
+  });
+}
+
 for (const [name, edit, problem] of [
   ['stale workspace version', (lock) => { lock.packages[NAPI_DIR].version = '9.9.9'; }, /package-lock\.json:.*crates\/mds-napi.*9\.9\.9/],
   ['absent workspace', (lock) => { delete lock.packages[NAPI_DIR]; }, /package-lock\.json:.*crates\/mds-napi.*missing/],
@@ -137,7 +169,27 @@ test('bump updates only workspace lock fields and keeps CRLF', (t) => {
   assert.equal(verified.status, 0, verified.stderr);
 });
 
-for (const [name, path, edit, problem] of [
+test('bump stamps the changelog before and after a prerelease', (t) => {
+  const repo = fixture(t);
+  const previous = canonical();
+  for (const [version, from] of [[PRERELEASE, previous], [NEXT, PRERELEASE]]) {
+    const result = repo.run('scripts/bump-version.mjs', version);
+    assert.equal(result.status, 0, result.stderr);
+    const changelog = repo.read('CHANGELOG.md');
+    const [unreleased, release] = changelog.split(/\r?\n/).filter((line) => /^\[.*\]:/.test(line));
+    assert.ok(unreleased.startsWith('[Unreleased]: '));
+    assert.ok(unreleased.endsWith(`/compare/v${version}...HEAD`));
+    assert.ok(release.startsWith(`[${version}]: `));
+    assert.ok(release.endsWith(`/compare/v${from}...v${version}`));
+    assert.ok(changelog.includes(`\n## [${version}] — `));
+  }
+});
+
+for (const [name, path, edit, problem, version = NEXT] of [
+  ['missing Unreleased heading', 'CHANGELOG.md', (text) => text.replace(/^## \[Unreleased\]\r?\n/m, ''),
+    /CHANGELOG\.md: missing ## \[Unreleased\] heading/],
+  ['missing Unreleased compare link', 'CHANGELOG.md', (text) => text.replace(/^\[Unreleased\]:[^\r\n]*\r?\n/m, ''),
+    /CHANGELOG\.md: missing or invalid \[Unreleased\]: compare link/, PRERELEASE],
   ['missing Cargo member', 'Cargo.lock', (text) => text.replace(CORE_BLOCK, ''), /Cargo\.lock:.*mds-core.*missing/],
   ['duplicate Cargo member', 'Cargo.lock', (text) => text + REGISTRY_CORE, /Cargo\.lock:.*mds-core.*duplicate/],
   ['missing npm workspace', 'package-lock.json', (text) => {
@@ -155,11 +207,24 @@ for (const [name, path, edit, problem] of [
     assert.notEqual(planted, original);
     repo.write(path, planted);
     const before = repo.files.map(repo.read);
-    const result = repo.run('scripts/bump-version.mjs', NEXT);
+    const result = repo.run('scripts/bump-version.mjs', version);
     assertRejected(result, problem);
     assert.deepEqual(repo.files.map(repo.read), before);
   });
 }
+
+test('lock member names match the Cargo workspace member names', () => {
+  const workspace = read('Cargo.toml').split(/^\[/m).find((section) => section.startsWith('workspace]'));
+  const members = /^[ \t]*members\s*=\s*\[([^\]]*)\]/m.exec(workspace ?? '');
+  assert.ok(members, 'Cargo.toml: expected [workspace] members');
+  const names = [...members[1].matchAll(/"([^"]+)"/g)].map(([, dir]) => {
+    const pkg = read(`${dir}/Cargo.toml`).split(/^\[/m).find((section) => section.startsWith('package]'));
+    const name = /^[ \t]*name\s*=\s*"([^"]+)"/m.exec(pkg ?? '');
+    assert.ok(name, `${dir}/Cargo.toml: expected [package] name`);
+    return name[1];
+  });
+  assert.deepEqual(LOCK_MEMBERS.toSorted(), names.toSorted());
+});
 
 test('import exposes pure lock checks and rewrites without CLI effects', (t) => {
   const repo = fixture(t);
@@ -172,7 +237,6 @@ import * as manifest from './scripts/release-manifest.mjs';
 const { LOCK_MEMBERS, PKG_DIRS, PKG_PATHS, CRATE_CARGO_PATHS } = manifest;
 assert.equal(PKG_PATHS.length, 8);
 assert.equal(CRATE_CARGO_PATHS.length, 4);
-assert.equal(LOCK_MEMBERS.length, 5);
 assert.equal(PKG_DIRS.length, 8);
 const cargo = readFileSync('Cargo.lock', 'utf8');
 const npm = readFileSync('package-lock.json', 'utf8');

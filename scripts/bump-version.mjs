@@ -20,6 +20,11 @@ import {
 const serialize = (json, eol) => `${JSON.stringify(json, null, 2).replaceAll('\n', eol)}${eol}`;
 const lineEnd = (text) => text.includes('\r\n') ? '\r\n' : '\n';
 const setVersion = (version) => (_, prefix, _previous, suffix) => `${prefix}${version}${suffix}`;
+const RELEASE_VERSION = String.raw`\d+\.\d+\.\d+(?:-[\w.]+)?`;
+const VERSION_ARG = new RegExp(`^${RELEASE_VERSION}$`);
+const UNRELEASED_LINK = new RegExp(
+  String.raw`^\[Unreleased\]: (https://[^\s/]+/[^\s/]+/[^\s/]+)/compare/v(${RELEASE_VERSION})\.\.\.HEAD$`, 'm',
+);
 
 export function rewriteCargoLock(text, version, members) {
   const { lines, blocks } = scanCargoLock(text, members);
@@ -65,17 +70,15 @@ export function rewritePackageLock(text, version, dirs) {
 }
 
 function stampChangelog(text, version, date) {
-  return text.replace(
-    /^(## \[Unreleased\]\s*)$/m,
-    `$1\n## [${version}] — ${date}\n`,
-  ).replace(
-    // Point [Unreleased] at the new tag. Add the new release compare link
-    // directly below it. Use the repository URL from the existing link so
-    // the script does not hardcode it. Leave all earlier release links intact.
-    /^(\[Unreleased\]: (https:\/\/[^\s/]+\/[^\s/]+\/[^\s/]+)\/compare\/)v([\d.]+)(\.\.\.HEAD)$/m,
-    (_, _prefix, baseUrl, prevVersion) =>
-      `[Unreleased]: ${baseUrl}/compare/v${version}...HEAD\n[${version}]: ${baseUrl}/compare/v${prevVersion}...v${version}`,
+  const withHeading = text.replace(/^(## \[Unreleased\]\s*)$/m, `$1\n## [${version}] — ${date}\n`);
+  if (withHeading === text) return { ok: false, problem: 'CHANGELOG.md: missing ## [Unreleased] heading' };
+
+  // Use the existing repository URL and keep earlier release links intact.
+  const stamped = withHeading.replace(UNRELEASED_LINK, (_, baseUrl, prevVersion) =>
+    `[Unreleased]: ${baseUrl}/compare/v${version}...HEAD\n[${version}]: ${baseUrl}/compare/v${prevVersion}...v${version}`,
   );
+  if (stamped === withHeading) return { ok: false, problem: 'CHANGELOG.md: missing or invalid [Unreleased]: compare link' };
+  return { ok: true, text: stamped };
 }
 
 function prepareBump(files, version, date) {
@@ -98,7 +101,9 @@ function prepareBump(files, version, date) {
   const npmLock = rewritePackageLock(files.get('package-lock.json'), version, PKG_DIRS);
   if (npmLock.ok) updated.set('package-lock.json', npmLock.text);
   else problems.push(npmLock.problem);
-  updated.set('CHANGELOG.md', stampChangelog(files.get('CHANGELOG.md'), version, date));
+  const changelog = stampChangelog(files.get('CHANGELOG.md'), version, date);
+  if (changelog.ok) updated.set('CHANGELOG.md', changelog.text);
+  else problems.push(changelog.problem);
 
   if (problems.length > 0) return { updated, problems };
   return { updated, problems: checkVersions(updated).problems };
@@ -106,7 +111,7 @@ function prepareBump(files, version, date) {
 
 function main() {
   const version = process.argv[2];
-  if (!version || !/^\d+\.\d+\.\d+(-[\w.]+)?$/.test(version)) {
+  if (!VERSION_ARG.test(version ?? '')) {
     console.error('Usage: bump-version.mjs <semver>  (e.g. 0.2.0)');
     process.exitCode = 1;
     return;
