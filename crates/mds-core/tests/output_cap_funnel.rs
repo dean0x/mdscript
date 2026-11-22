@@ -60,7 +60,9 @@ const ARCH_INDEPENDENT: &[&str] = &[
     "scope.rs",
     "value.rs",
     "limits.rs",
+    "resolver/charges.rs",
     "resolver/frontmatter.rs",
+    "resolver/import_paths.rs",
     "resolver/inheritance.rs",
     BUDGET_SOURCE,
     "evaluator/held.rs",
@@ -282,8 +284,8 @@ fn arch_independent_lists_every_resolver_and_evaluator_child() {
         assert!(walked.len() > before, "no production files in {folder}/");
     }
     assert!(
-        walked.len() >= 4,
-        "expected at least four children: {walked:?}"
+        walked.len() >= 6,
+        "expected at least six children: {walked:?}"
     );
     let missing = unlisted(&walked, ARCH_INDEPENDENT);
     assert!(

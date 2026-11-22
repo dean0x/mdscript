@@ -30,7 +30,7 @@ only; please upgrade to the newest release before reporting.
 MDS treats template sources, imported modules, and runtime variables as untrusted
 input. The compiler enforces several defense-in-depth controls:
 
-### Filesystem boundary (`crates/mds-core/src/fs.rs`, `resolver.rs`)
+### Filesystem boundary (`crates/mds-core/src/fs.rs`, `resolver.rs`, `resolver/import_paths.rs`)
 
 - **Path-traversal prevention**: import paths are rejected if they resolve outside
   the project root (`..` traversal, or a symlinked parent directory leading out),
@@ -271,7 +271,7 @@ place each check runs, and the tests that pin them — in `spec.md` §4.6
 | Frontmatter byte allowance | 50 MiB (52,428,800 bytes) per frontmatter parse, or the rest of the compile budget when that is smaller. Each YAML node spends 192 bytes plus its string or key bytes before it is built, so an alias of a long scalar spends the scalar again at each use. The one exception is the bytes of a `!tag`: the parser spends them after it copies the tag. Above it, `resource limit exceeded: frontmatter YAML expands beyond maximum of 52428800 bytes`, or the compile memory message when the rest of the budget set the allowance. | `resolver/frontmatter.rs` (`NODE_YAML`, `Allowance`) |
 | Max warnings | 1,000 | `evaluator.rs` (`MAX_WARNINGS`) |
 | Max import depth | 64 | `resolver.rs` (`MAX_IMPORT_DEPTH`) |
-| Max module count | 256 distinct modules besides the entry; see [spec §4.1](spec.md#41-variables-yaml-frontmatter) for the count rule and virtual-map bound | `limits.rs` (`MAX_MODULE_COUNT`), `resolver.rs` |
+| Max module count | 256 distinct modules besides the entry; see [spec §4.1](spec.md#41-variables-yaml-frontmatter) for the count rule and virtual-map bound | `limits.rs` (`MAX_MODULE_COUNT`), `resolver/charges.rs` |
 | Max path segments | 256 per entry or import path | `fs.rs` (`MAX_PATH_SEGMENTS`) |
 | Max block nesting depth | 64 | `limits.rs` (`MAX_NESTING_DEPTH`) |
 | Max `@define` declarations per module | 256 | `limits.rs` (`MAX_DEFINES_PER_MODULE`) |
