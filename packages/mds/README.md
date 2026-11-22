@@ -153,7 +153,7 @@ interface CompileOptions extends CheckOptions {
 
 // CompileFileOptions — accepted by compileFile()
 // basePath is NOT accepted: the base directory is derived from the file path.
-// basePath?: never blocks assigning a CompileOptions variable to this type (TS2322).
+// basePath?: never blocks assigning a CompileOptions variable to this type.
 interface CompileFileOptions {
   vars?: Record<string, unknown> | undefined;
   sourceMap?: boolean | undefined;
@@ -163,7 +163,7 @@ interface CompileFileOptions {
 
 // CheckFileOptions — accepted by checkFile()
 // basePath is NOT accepted (base directory from file path).
-// basePath?: never blocks assigning a CheckOptions variable to this type (TS2322).
+// basePath?: never blocks assigning a CheckOptions variable to this type.
 // Source-map options are NOT accepted; passing them throws mds::invalid_options.
 interface CheckFileOptions {
   vars?: Record<string, unknown> | undefined;
@@ -187,7 +187,7 @@ interface LintOptions {
 // LintFileOptions — accepted by lintFile() and lintVirtual()
 // basePath is NOT accepted: lintFile derives the base directory from the file path;
 // lintVirtual resolves imports against the caller-supplied module map, not the filesystem.
-// basePath?: never blocks assigning a LintOptions variable to this type (TS2322).
+// basePath?: never blocks assigning a LintOptions variable to this type.
 interface LintFileOptions {
   vars?: Record<string, unknown> | undefined;
   rules?: Record<string, 'off' | 'info' | 'warn' | 'error'> | undefined;

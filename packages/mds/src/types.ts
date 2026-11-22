@@ -177,7 +177,8 @@ export interface CompileFileOptions {
   sourcesContent?: boolean | undefined;
   /**
    * Not accepted on file operations: the base directory is derived from the file
-   * path. Passing a non-null value throws `mds::invalid_options`.
+   * path. The wrapper treats `undefined` as absent.
+   * For other values, including `null`, it throws `mds::invalid_options`.
    */
   basePath?: never;
 }
@@ -186,9 +187,8 @@ export interface CompileFileOptions {
  * Options for `checkFile()` (Node.js entry only).
  *
  * `basePath` is not accepted on file operations: the base directory is derived
- * from the file path. The `basePath?: never` declaration rejects assignment from
- * any variable whose inferred type carries `basePath` (e.g. a `CheckOptions`
- * value), producing a compile-time error rather than a runtime surprise.
+ * from the file path. The `basePath?: never` declaration rejects a `CheckOptions`
+ * variable because its `basePath` can hold a string.
  * Only `vars` is forwarded to the backend.
  */
 export interface CheckFileOptions {
@@ -196,7 +196,8 @@ export interface CheckFileOptions {
   vars?: Record<string, unknown> | undefined;
   /**
    * Not accepted on file operations: the base directory is derived from the file
-   * path. Passing a non-null value throws `mds::invalid_options`.
+   * path. The wrapper treats `undefined` as absent.
+   * For other values, including `null`, it throws `mds::invalid_options`.
    */
   basePath?: never;
 }
@@ -379,7 +380,8 @@ export interface LintFileOptions {
   /**
    * Not accepted: `lintFile` derives the base directory from the file path;
    * `lintVirtual` resolves imports against the caller-supplied module map.
-   * Passing a non-null value throws `mds::invalid_options`.
+   * The wrapper treats `undefined` as absent.
+   * For other values, including `null`, it throws `mds::invalid_options`.
    */
   basePath?: never;
 }

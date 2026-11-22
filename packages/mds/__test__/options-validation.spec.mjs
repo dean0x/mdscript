@@ -823,80 +823,31 @@ describe('options-validation', () => {
 
   // ── {basePath: undefined} cross-backend parity (AC-P3-08 / U-OV-29) ────────
 
-  test('U-OV-29: {basePath: undefined} has consistent throw/no-throw on both backends for compile/check/compileFile/checkFile (AC-P3-08)', async () => {
-    requireNativeAddon(); // hard-fail without addon
-
-    // Semantic: basePath: undefined is treated as absent ("value is intent") on the
-    // wrapper side. The WASM guard checks != null so undefined passes through.
-    // On native, `forwardOpts` (driven by METHOD_KEYS) drops undefined values with a
-    // `!= null` guard before the backend receives the object, so napi's
-    // has_named_property("basePath") gate never sees the key. Both backends must agree.
-    //
-    // AC-P3-08 requires all FOUR methods: the file surfaces are the interesting half,
-    // because napi keys off property PRESENCE — if forwardOpts ever included
-    // `basePath: undefined` verbatim, native would throw while WASM would not.
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-bp-undef-'));
-    const file = path.join(tmp, 'ok.mds');
-    fs.writeFileSync(file, 'Hello\n', 'utf8');
-
-    const methods = [
-      { name: 'compile',     call: 'compile(SRC, OPTS)',        fn: (opts) => compile('Hello\n', opts) },
-      { name: 'check',       call: 'check(SRC, OPTS)',          fn: (opts) => check('Hello\n', opts) },
-      { name: 'compileFile', call: 'await compileFile(F, OPTS)', fn: (opts) => compileFile(file, opts) },
-      { name: 'checkFile',   call: 'await checkFile(F, OPTS)',   fn: (opts) => checkFile(file, opts) },
-    ];
-
-    try {
-      for (const { name, call, fn } of methods) {
-        let nativeThrew = false;
-        try { await fn({ basePath: undefined }); } catch { nativeThrew = true; }
-
-        // WASM path via subprocess. init() must be awaited before any method.
-        // The subprocess emits getBackend() to stdout so the parent can verify the
-        // WASM backend was actually selected — MDS_BACKEND=wasm is advisory and
-        // node.ts only console.warns on unrecognised values, so a drift in the
-        // env-var name or accepted values would silently fall back to native.
-        // Capturing and asserting the backend string here guards against that.
-        const { execFileSync } = await import('node:child_process');
-        let wasmThrew = false;
-        let wasmBackendStr = '';
-        const script = [
-          `import { init, getBackend, ${name} } from './dist/node.js';`,
-          `const SRC = 'Hello\\n';`,
-          `const F = ${JSON.stringify(file)};`,
-          `const OPTS = { basePath: undefined };`,
-          `await init();`,
-          `process.stdout.write(getBackend());`,
-          `try { ${call}; process.exit(0); } catch { process.exit(1); }`,
-        ].join('\n');
-        try {
-          wasmBackendStr = execFileSync(process.execPath, ['--input-type=module'], {
-            input: script,
-            cwd: PKG_DIR,
-            env: { ...process.env, MDS_BACKEND: 'wasm' },
-            timeout: 15000,
-            encoding: 'utf8',
-          });
-        } catch (e) {
-          wasmThrew = true;
-          // stdout is populated even when exit code is non-zero (the method threw)
-          wasmBackendStr = typeof e.stdout === 'string' ? e.stdout : '';
-        }
-
-        assert.strictEqual(
-          wasmBackendStr,
-          'wasm',
-          `${name}: WASM subprocess must use the wasm backend (getBackend() returned ` +
-            `${JSON.stringify(wasmBackendStr)}) — MDS_BACKEND=wasm may be unrecognised`,
-        );
-        assert.strictEqual(
-          nativeThrew,
-          wasmThrew,
-          `${name}: native (threw=${nativeThrew}) and WASM (threw=${wasmThrew}) must agree on {basePath: undefined}`,
-        );
-      }
-    } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+  test('U-OV-29: all seven methods accept {basePath: undefined} on native and WASM', async () => {
+    const { execFileSync } = await import('node:child_process');
+    const script = `
+      import * as mds from './dist/node.js';
+      await mds.init();
+      const opts = { basePath: undefined };
+      const file = './__test__/fixtures/simple.mds';
+      mds.compile('Hello', opts);
+      mds.check('Hello', opts);
+      mds.lint('Hello', opts);
+      await mds.compileFile(file, opts);
+      await mds.checkFile(file, opts);
+      await mds.lintFile(file, opts);
+      mds.lintVirtual({ 'a.mds': 'Hello' }, 'a.mds', opts);
+      process.stdout.write(mds.getBackend());
+    `;
+    for (const backend of ['native', 'wasm']) {
+      const actual = execFileSync(process.execPath, ['--input-type=module'], {
+        input: script,
+        cwd: PKG_DIR,
+        env: { ...process.env, MDS_BACKEND: backend },
+        timeout: 15000,
+        encoding: 'utf8',
+      });
+      assert.equal(actual, backend);
     }
   });
 
@@ -1082,6 +1033,8 @@ describe('options-validation', () => {
       'forwardOpts({}, compile) must be undefined — {} would defeat the WASM fast path');
     assert.strictEqual(forwardOpts(null, 'compile'), undefined,
       'forwardOpts(null, compile) must be undefined');
+    assert.strictEqual(forwardOpts({ vars: undefined }, 'compile'), undefined);
+    assert.deepStrictEqual(forwardOpts({ vars: undefined, sourceMap: false }, 'compile'), { sourceMap: false });
 
     // Part 2: object-identity assertion through a WASM spy. compileOpts() inside
     // the WASM backend must return the SAME DEFAULT_COMPILE_OPTS reference for both

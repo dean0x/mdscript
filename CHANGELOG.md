@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Optional input fields in `@mdscript/mds` and optional `vars` fields in `@mdscript/bundler-utils` accept explicit `undefined` (#312).
+- Optional input fields in `@mdscript/mds` and optional `vars` fields in `@mdscript/bundler-utils` accept explicit `undefined` with `exactOptionalPropertyTypes` (#312).
+  File and virtual options still require callers to omit `basePath` in this mode.
 
 ### Removed
 

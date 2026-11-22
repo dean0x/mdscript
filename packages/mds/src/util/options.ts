@@ -194,7 +194,7 @@ const BASEPATH_REJECTORS: ReadonlyMap<MethodName, () => Error & { code: string }
 
 /**
  * Return the purpose-built `basePath` error for `method` if `options.basePath`
- * is non-null and `method` is in {@link BASEPATH_REJECTORS}, or `undefined`
+ * is not `undefined` and `method` is in {@link BASEPATH_REJECTORS}, or `undefined`
  * otherwise.
  *
  * Callers throw the returned error synchronously — the same channel as
