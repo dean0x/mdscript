@@ -3,7 +3,7 @@ use crate::ast::{
     render_signature, required_param_count, Arg, BlockNode, Condition, Expr, ForBlock, IfBlock,
     MessageBlock, Node,
 };
-use crate::error::MdsError;
+use crate::error::{MdsError, SourceLoc};
 use crate::scope::Scope;
 use crate::value::Value;
 
@@ -284,10 +284,12 @@ fn validate_call_arity(
                 required,
                 total,
                 arg_count,
-                file,
-                source,
-                offset,
-                len,
+                SourceLoc {
+                    file,
+                    source,
+                    offset,
+                    len,
+                },
                 Some(render_signature(name, &func.params)),
             ));
         }
@@ -299,10 +301,12 @@ fn validate_call_arity(
                 meta.min_args,
                 meta.max_args,
                 arg_count,
-                file,
-                source,
-                offset,
-                len,
+                SourceLoc {
+                    file,
+                    source,
+                    offset,
+                    len,
+                },
                 None, // built-in signatures live in docs, not the error message
             ));
         }
@@ -360,10 +364,12 @@ fn validate_expr(
                     required,
                     total,
                     args.len(),
-                    file,
-                    source,
-                    offset,
-                    len,
+                    SourceLoc {
+                        file,
+                        source,
+                        offset,
+                        len,
+                    },
                     Some(render_signature(&qualified, &func.params)),
                 ));
             }
