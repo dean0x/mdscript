@@ -5,7 +5,7 @@ description: "Use when modifying release.yml, adding CI jobs, updating TIER_B_EX
 category: architecture
 directories: [.github/workflows, .github/actions, scripts, scripts/__test__]
 created: 2026-09-07
-updated: 2026-09-25
+updated: 2026-11-22
 ---
 
 # Release Pipeline Gates
@@ -15,9 +15,10 @@ updated: 2026-09-25
 The release pipeline is a single coordinated tag-push that ships every language surface
 simultaneously: two Rust crates (crates.io), nine npm packages, and one Python wheel
 matrix (PyPI). All live in `.github/workflows/release.yml`. The same workflow has two
-rehearsal entry points — a `pull_request` trigger for release-surface PRs and a
-`workflow_dispatch` for branch dry-runs — so that the tag-guarded publish path is exercised
-before it runs for real.
+rehearsal entry points: `pull_request` for release-surface PRs and
+`workflow_dispatch` for branch dry runs. The dry run checks the registries and
+builds the release artifacts. The publish steps first run on a release tag,
+except for the opt-in TestPyPI job.
 
 `scripts/verify-pr-checks.mjs` is the mandatory pre-merge gate for EVERY PR; it asserts
 that every required context is `completed+success` and emits the exact `gh pr merge`
@@ -47,10 +48,10 @@ Three entry points, one workflow:
 (avoids PF-017's cancelled-run-as-green shape mid-sequence and prevents a partial-publish
 state between `cargo publish` and `npm publish`).
 
-## Component Architecture — Eleven Jobs and Their DAG
+## Component Architecture — Twelve Jobs and Their DAG
 
 ```
-version-gate
+credential-probe → version-gate
   ├─→ build-napi (7 legs)  ─→ stage-and-verify-napi ─→ load-test-musl-arm64 ─┐
   └─→ build-python (8 legs) ─→ rehearse-publish-python ──────────────────────┤
                                 └─→ publish-testpypi     │ (dispatch+input only)
@@ -67,7 +68,8 @@ Job details:
 
 | Job id | Display name | Guarded by | Needs |
 |---|---|---|---|
-| `version-gate` | Version gate | nothing (always runs) | — |
+| `credential-probe` | Credential probe | no job guard; PR notice only | — |
+| `version-gate` | Version gate | no job guard | credential-probe |
 | `build-napi` | Build napi (...) | nothing | version-gate |
 | `stage-and-verify-napi` | Stage + verify platform packages | nothing | build-napi |
 | `load-test-musl-arm64` | Alpine load test (linux-arm64-musl) | unguarded, not-cancelled + `needs.stage-and-verify-napi.result == 'success'` | stage-and-verify-napi |
@@ -178,28 +180,41 @@ subject from the current branch at execution time; avoids PF-017).
 
 ## Integration Patterns — Gate Details
 
-### version-gate (always runs)
+### credential-probe
 
-Every step in `version-gate` runs on every event **except** the CI-history gate, which is
-step-skipped on `pull_request` with `if: github.event_name != 'pull_request'`. Reason: on
-`pull_request` `github.sha` is the merge commit whose own `ci.yml` run is concurrent, and
-the gate correctly fails closed on an in-progress run. A notice step fires instead so the
-job still reaches `success`.
+On tag push and manual dispatch, this job runs `npm whoami`, checks the crates.io
+input, and checks the PyPI trusted publisher. On a PR run, only its notice step
+runs. The npm and crates.io publish steps receive only the registry inputs that
+they use.
 
-Steps (in order):
-1. Verify publish credentials (npm `whoami` + cargo token non-empty + PyPI OIDC mint-token exchange).
-2. Assert synchronized versions, no `file:` refs.
-3. Assert no hazardous codepoints in tracked source.
-4. Run `npm run test:gates` — all six spec files, 240 tests (grew from four spec files / 212 tests after `verify-pack-contents.spec.mjs` was added in PR #402), including pin-shape specs (S16), the publish-pin floor v1.14.3 (S23), per-leg cache key spec (S20), Alpine load test job spec (S21), the cargo-zigbuild musl-leg spec (S22), and the hermetic pack-contents helper tests (see the pack-contents gate subsection below).
-5. Assert tagged SHA has green CI history (step-skipped on `pull_request`).
+### version-gate
+
+This job runs after `credential-probe` passes. The CI-history step skips PR runs
+because `github.sha` is the merge commit, not the branch head. A notice step runs
+instead.
+
+Checks in order:
+1. Reject fork and Dependabot PRs on the release surface.
+2. Check release manifests and workspace member versions in both lockfiles.
+3. Check tracked source for hazardous codepoints.
+4. Run `npm run test:gates` (10 spec files, 326 tests on 2026-11-23).
+5. On tag push or manual dispatch, require a successful `CI` run for the selected SHA.
+
+The `source-hygiene` job in `ci.yml` also runs `verify-versions.mjs` on each PR.
+`scripts/release-manifest.mjs` lists the workspace members that the check covers.
+The check does not examine transitive versions. `bump-version.mjs` updates both
+lockfiles without a package manager run.
 
 Because `npm run test:gates` runs inside `version-gate`, a malformed pin (e.g. a commit SHA
 instead of a `vX.Y.Z` tag) causes `Version gate` to fail before the rehearsal job ever runs.
 
-**Fork / Dependabot PRs**: The "Verify publish credentials" step explicitly exits 1 with a
-`::error::` when `NODE_AUTH_TOKEN` is empty on a `pull_request` event from Dependabot or a
-fork (`IS_FORK=true`). Do not merge on these checks; supersede with a maintainer PR or a
-manual `gh workflow run`.
+**Fork and Dependabot PRs**: On a release-surface PR, `Version gate` exits 1 if
+`GITHUB_ACTOR` or `PR_AUTHOR` (`pull_request.user.login`) is `dependabot[bot]`,
+if `IS_FORK` is `true`, or if `HEAD_REPOSITORY` (`head.repo.full_name`) is not
+`GITHUB_REPOSITORY`. An empty head repository therefore fails closed. Spec S31 has
+one mutation control for each condition. The step does not use
+registry inputs. Replace the PR with a maintainer PR. Changes outside the release
+surface do not start this workflow on a PR.
 
 ### rehearse-publish-python — Four Gates with Positive Controls (PF-013)
 
@@ -245,10 +260,24 @@ days unused.
 
 ### publish-crates — Irreversibility and Ordering (PF-023)
 
-`cargo publish -p mds-core` is idempotent (treats `already (uploaded|exists|published)` as
-success). `npm publish` calls in `publish-npm` have NO such guard — a partial npm failure is
-unrecoverable by re-run. This makes `publish-crates` the single irreversible point of no
-return; all correctness gates run before it.
+The first successful crates.io publish is the first permanent registry change.
+`Publish mds-core` accepts a version that already exists. The crates.io index
+poll has a bound of 20 attempts. In `publish-npm`, `napi prepublish` tolerates
+E403 for platform packages, and `publish_if_absent` skips versions that npm can
+already find. After a partial release, rerun the failed jobs on the same tag.
+
+### build-python — wheel cache setup (#351)
+
+Linux wheel containers supply Rust. `build-python` installs Rust on the host
+for macOS and Windows wheels only. Each wheel cache key includes the target and
+container flavor. The source distribution does not use the cache.
+
+In `maturin-action` v1.51.0, the purge checks `debugBuildDir` instead of
+`releaseBuildDir`. It misses proc-macro files in `target/release/deps`
+([upstream issue](https://github.com/PyO3/maturin-action/issues/476)). Keep the
+host install guard and per-leg keys. Revisit them only after an upstream fix
+ships and a release rehearsal with that fix passes. Confirm the cache hit in a
+second run in the same cache scope.
 
 ### build-napi — musl legs with cargo-zigbuild (#339)
 
@@ -477,9 +506,11 @@ belongs in a built CI job (here, `ci.yml`'s `js` job), never in `test:gates`.
   any banner comment above a job (e.g. the `# ====` separator above `publish-crates`)
   belongs to the PRECEDING job's section, not to `publish-crates`. Assert guards via
   `extractJobIf`, never `section.includes()`.
-- **Dependabot / fork PRs fail credential probe and should not be merged on**: the step exits
-  1 with `IS_FORK` "No Actions secrets on this run." The remedy is a maintainer PR or a
-  manual dispatch.
+- **Release-surface Dependabot and fork PRs fail `Version gate`**. Each new
+  `rust-cache` release or move of the Rust toolchain action's stable branch can
+  open such a PR. Replace it with a maintainer PR. Verify the upstream revision
+  and update all sites that use that pin. `Credential probe` reports a notice on
+  PR runs. Run the branch dry run after CI passes to check the registries.
 - **TestPyPI pending publisher expires ~30 days after creation** if no upload lands. A missing
   or expired record causes `Trusted publishing exchange failure: invalid-publisher` in
   `publish-testpypi`.
@@ -497,7 +528,7 @@ belongs in a built CI job (here, `ci.yml`'s `js` job), never in `test:gates`.
 - **crates.io token — no read-only probe**: `GET /api/v1/me` is `AuthCheck::only_cookie()`
   and returns HTTP 403 for any API token. The only token-accepting read route
   (`GET /api/v1/me/tokens/{id}`) rejects scoped tokens with HTTP 403. The non-empty guard
-  in `version-gate` is therefore the strongest check available. A revoked token is first
+  in `credential-probe` is therefore the strongest check available. A revoked token is first
   detected at `cargo publish` (fail-before-write, after the build matrix is paid for); see
   PF-023 and the v0.4.0 precedent (`gh run rerun --failed`). Durable fix tracked in #368.
 - **`napi-staged` artifact carries root-level `*.node` files** in addition to `npm/**`: the
@@ -526,14 +557,10 @@ belongs in a built CI job (here, `ci.yml`'s `js` job), never in `test:gates`.
   debug namespace to enable, and the wrapper-cache presence check (wrappers found under
   `~/.cache/cargo-zigbuild/0.23.0/wrappers/` by the post-build step) is the run-proof that
   cargo-zigbuild 0.23.0 actually executed in the job.
-- **`NPM_TOKEN` has a roughly 60-day lifetime and must be rotated by hand**: the npm
-  publish token backing `secrets.NPM_TOKEN` (checked by `version-gate`'s `npm whoami`
-  credential probe and consumed by `publish-npm`) was rotated 2026-09-24 (next rotation
-  due roughly 2026-11-20). Because the credential probe runs on `pull_request` events
-  too, not just tag push, an expired token is caught on a release-surface PR run before
-  any tag is pushed — this is how the 2026-09-24 rotation need was caught on PR #399,
-  well before a release. Moving npm publishing to OIDC trusted publishing would remove
-  the rotation burden entirely.
+- **`NPM_TOKEN` has a lifetime of about 60 days**. The 2026-09-24 rotation put
+  the next due date near 2026-11-20. Run the branch dry run before the tag push.
+  `Credential probe` skips `npm whoami` on PR runs. If npm uses OIDC trusted
+  publishing, this manual rotation is not necessary.
 - **Dependabot may retarget a superseded PR instead of closing it**: when a newer
   Dependabot PR supersedes an older one for the same dependency, Dependabot can rebase
   the OLD PR onto the new target rather than closing it, leaving its title and branch
@@ -544,8 +571,12 @@ belongs in a built CI job (here, `ci.yml`'s `js` job), never in `test:gates`.
 
 ## Key Files
 
-- `.github/workflows/release.yml` — the complete 11-job release workflow (1430+ lines).
-- `.github/workflows/ci.yml` — the build/test workflow whose contexts populate Tier A.
+- `.github/workflows/release.yml` — the twelve-job release workflow.
+- `.github/workflows/ci.yml` — the build and test workflow. Its contexts populate Tier A.
+- `scripts/release-manifest.mjs` — the workspace members that the version scripts check.
+- `scripts/verify-versions.mjs` — the version check for release manifests and both lockfiles.
+- `scripts/bump-version.mjs` — the version update for release manifests and both lockfiles.
+- `scripts/__test__/action-pins.spec.mjs` — the action pin and Rust toolchain input checks.
 - `scripts/verify-pr-checks.mjs` — mandatory pre-merge verifier; exports `EXPECTED_CONTEXTS`,
   `TIER_B_EXPECTED_SKIPPED`, `RELEASE_SURFACE`, `RELEASE_SURFACE_CONTEXTS`.
 - `scripts/musl-load-probe.cjs` — Alpine container smoke-test for musl napi addons; accepts

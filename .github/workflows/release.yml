@@ -48,77 +48,105 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
+  credential-probe:
+    name: Credential probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v7
+        if: github.event_name != 'pull_request'
+        with: { node-version: 22, registry-url: "https://registry.npmjs.org" }
+      - name: Verify npm and crates.io registry inputs
+        if: github.event_name != 'pull_request'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          CARGO_REG_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::Set NPM_TOKEN before release."
+            exit 1
+          fi
+          # crates.io has no read-only check for this input. See #345.
+          if [ -z "$CARGO_REG_TOKEN" ]; then
+            echo "::error::Set CARGO_REGISTRY_TOKEN before release."
+            exit 1
+          fi
+          # This check does not verify publish rights for the @mdscript scope.
+          WHO_LOG=$(mktemp)
+          trap 'rm -f "$WHO_LOG"' EXIT
+          if ! npm whoami --registry https://registry.npmjs.org >"$WHO_LOG" 2>&1; then
+            WHO=$(<"$WHO_LOG")
+            WHO=${WHO//"$NODE_AUTH_TOKEN"/[redacted]}
+            WHO=${WHO//"$CARGO_REG_TOKEN"/[redacted]}
+            printf '::error::npm whoami failed. Verify NPM_TOKEN before release. %s\n' \
+              "$(printf '%s' "$WHO" | jq -Rs @json)"
+            exit 1
+          fi
+          echo "npm whoami and crates.io input checks passed."
+      - name: Verify PyPI trusted publisher
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          RESP=$(curl -fsS --connect-timeout 10 --max-time 30 \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=pypi" \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}")
+          TOK=$(jq -er '.value' <<< "$RESP")
+          MINT_LOG=$(mktemp)
+          trap 'rm -f "$MINT_LOG"' EXIT
+          CODE=$(curl -sS --connect-timeout 10 --max-time 30 -o "$MINT_LOG" -w '%{http_code}' \
+            -X POST https://pypi.org/_/oidc/mint-token \
+            -d "{\"token\":\"${TOK}\"}")
+          [ "$CODE" = "200" ] || {
+            echo "::error::PyPI mint failed (HTTP $CODE). Verify the trusted publisher before release."
+            if MESSAGE=$(jq -er 'objects | .message | strings' "$MINT_LOG" 2>/dev/null); then
+              MESSAGE=${MESSAGE//"$TOK"/[redacted]}
+              MESSAGE=${MESSAGE//"$ACTIONS_ID_TOKEN_REQUEST_TOKEN"/[redacted]}
+              printf '::error::PyPI response: %s\n' "$(printf '%s' "$MESSAGE" | jq -Rs @json)"
+            fi
+            exit 1
+          }
+          echo "PyPI trusted publisher OK"
+      - name: Skip registry probes on pull requests
+        if: github.event_name == 'pull_request'
+        run: echo "::notice::Registry probes run on tag push and manual dispatch."
+
+  # ---------------------------------------------------------------------------
   # D1 — version-consistency gate. Cheap; fails fast before any build/publish.
   # ---------------------------------------------------------------------------
   version-gate:
     name: Version gate
+    needs: [credential-probe]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       checks: read   # commit check/status reads
       actions: read  # CI workflow runs + their jobs, for the CI-history step
-      id-token: write # OIDC for PyPI trusted publisher probe (F5, security-08)
     steps:
+      - name: Require a maintainer PR for release checks
+        if: github.event_name == 'pull_request'
+        env:
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        shell: bash
+        run: |
+          if [ "$GITHUB_ACTOR" = "dependabot[bot]" ] ||
+             [ "$PR_AUTHOR" = "dependabot[bot]" ] ||
+             [ "$IS_FORK" = "true" ] ||
+             [ "$HEAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]; then
+            echo "::error::Release checks require a maintainer PR. Open a maintainer PR with the same changes."
+            exit 1
+          fi
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.ref }}
       - uses: actions/setup-node@v7
-        with: { node-version: 22, registry-url: "https://registry.npmjs.org" }
-      - name: "Verify publish credentials before irreversible steps (security-08)"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          CARGO_REG_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
-        run: |
-          # Fail closed on fork and Dependabot pull_request events: these receive
-          # no repository secrets and no id-token: write (read-only GITHUB_TOKEN),
-          # so the credential probes cannot succeed there. A maintainer-authored PR
-          # or a manual `gh workflow run release.yml --ref <branch>` is the remedy.
-          if [ -z "$NODE_AUTH_TOKEN" ] && [ "${GITHUB_EVENT_NAME}" = "pull_request" ] \
-             && { [ "${GITHUB_ACTOR}" = "dependabot[bot]" ] || [ "${IS_FORK}" = "true" ]; }; then
-            echo "::error::No Actions secrets on this run: pull_request runs from Dependabot or a fork are treated as fork PRs (read-only token, no Actions secrets, no id-token: write), so the release credentials cannot be verified here. Do NOT merge on these checks. Supersede with a maintainer-authored PR, or run: gh workflow run release.yml --ref ${GITHUB_HEAD_REF}"
-            exit 1
-          fi
-          # Guard: npm token must be non-empty. A missing or revoked secret interpolates
-          # to an empty string in GitHub Actions — not an error — so this must be checked
-          # explicitly before cargo publish runs and makes crates.io publish irreversible.
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "::error::NPM_TOKEN is empty or unset — npm publish would fail AFTER cargo publish (irreversible). Set the NPM_TOKEN repo secret. (security-08)"
-            exit 1
-          fi
-          # Guard: cargo token non-empty. That is the strongest check crates.io allows for an
-          # API token (no read-only endpoint accepts a scoped token; #345, RELEASING.md "credential probe").
-          if [ -z "$CARGO_REG_TOKEN" ]; then
-            echo "::error::CARGO_REGISTRY_TOKEN is empty or unset — cargo publish would fail. Set the CARGO_REGISTRY_TOKEN repo secret. (security-08)"
-            exit 1
-          fi
-          # Verify npm authentication: whoami proves the token is accepted by the registry.
-          # NOTE: this verifies authentication only, NOT publish rights to @mdscript scope.
-          # A read-only or wrongly-scoped token passes this check but fails at publish time.
-          WHO=$(npm whoami --registry https://registry.npmjs.org 2>&1) || {
-            echo "::error::npm whoami failed — NPM_TOKEN may be revoked or expired: ${WHO}"
-            exit 1
-          }
-          echo "npm credentials verified: token resolves to npm user '${WHO}'"
-      # PyPI OIDC trusted-publisher probe (F5, security-08). The mint-token
-      # exchange is free and idempotent — the minted token is simply unused here.
-      # NOT tag-guarded: this step must run in the workflow_dispatch dry run
-      # (PF-039) so a misconfigured or expired trusted publisher is caught BEFORE
-      # any irreversible crates.io publish. version-gate has id-token: write above.
-      - name: "Verify PyPI trusted publisher before irreversible steps (security-08)"
-        shell: bash
-        run: |
-          set -euo pipefail
-          RESP=$(curl -sS "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=pypi" \
-            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}")
-          TOK=$(echo "$RESP" | jq -r '.value')
-          CODE=$(curl -sS -o /tmp/mint.json -w '%{http_code}' \
-            -X POST https://pypi.org/_/oidc/mint-token \
-            -d "{\"token\":\"${TOK}\"}")
-          [ "$CODE" = "200" ] || {
-            echo "::error::PyPI OIDC mint failed (HTTP $CODE) — trusted publisher missing, expired, or mismatched. Fix BEFORE tagging; crates.io is irreversible."
-            jq -r '.message // .' /tmp/mint.json; exit 1; }
-          echo "PyPI trusted publisher OK"
+        with: { node-version: 22 }
       # The pypa/gh-action-pypi-publish pin is validated in rehearse-publish-python
       # (pin shape, GHCR manifest, docker pull, twine check — each with a positive
       # control). publish-crates needs that job, so a bad pin still aborts the
@@ -305,8 +333,10 @@ jobs:
           ref: ${{ github.ref }}
       - uses: actions/setup-node@v7
         with: { node-version: 22, cache: npm }
-      - uses: dtolnay/rust-toolchain@stable
+      # Use the current stable compiler for each native addon target.
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca  # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.settings.target }}
       # Install the pinned cargo-zigbuild BEFORE rust-cache (#339): napi's -x path only checks that
       # `cargo help zigbuild` succeeds and otherwise runs an unpinned `cargo install cargo-zigbuild`
@@ -331,7 +361,7 @@ jobs:
       # host is already encoded (runner.os/arch + rustc host hash), so only the
       # target is added. Intentional; must survive rust-cache version bumps --
       # spec S20 in scripts/__test__/release-auth-probe.spec.mjs pins it.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           key: ${{ matrix.settings.target }}
       - name: Install zig
@@ -735,16 +765,23 @@ jobs:
       # build and its artifacts would poison the shared Swatinem/rust-cache key
       # (host target/release/build/ artifacts built on Ubuntu 22.04 have a
       # higher glibc requirement than the manylinux 2.17 container runtime).
-      - uses: dtolnay/rust-toolchain@stable
+      # In v1.51.0, the PyO3/maturin-action purge checks debugBuildDir, not
+      # releaseBuildDir. It misses proc-macro files in target/release/deps
+      # (PyO3/maturin-action#476). Keep the host install guard and per-leg keys.
+      # Spec S20 in scripts/__test__/release-auth-probe.spec.mjs checks those keys.
+      # This workaround does not change the wheel build. Simplify it only after
+      # an upstream fix ships and a release rehearsal with that fix passes.
+      # Use the current stable compiler for host wheel builds.
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca  # stable
         if: ${{ !matrix.sdist && runner.os != 'Linux' }}
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
       # Per-leg cache key: target + manylinux flavour so a containerised Linux
       # leg (glibc 2.17 manylinux / musl) never restores host-built build scripts
       # or proc-macro .so files written by another leg; legs without manylinux
-      # render a trailing dash (harmless, validated warm in #347). Intentional;
-      # spec S20 in scripts/__test__/release-auth-probe.spec.mjs pins it.
-      - uses: Swatinem/rust-cache@v2
+      # render a trailing dash (harmless, validated warm in #347).
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         if: ${{ !matrix.sdist }}
         with:
           key: ${{ matrix.target }}-${{ matrix.manylinux }}
@@ -1218,12 +1255,15 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.ref }}
-      - uses: dtolnay/rust-toolchain@stable
+      # Use current stable Cargo to publish the crates.
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca  # stable
+        with:
+          toolchain: stable
       # Single-leg job: the automatic job-id key is already unique; no per-leg key (#352).
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
       - name: Verify tag matches workspace version
         run: |
-          TAG="${{ github.ref_name }}"
+          TAG="$GITHUB_REF_NAME"
           TAG="${TAG#v}"
           CRATE_VER="$(cargo metadata --no-deps --format-version 1 \
             | grep -o '"name":"mds-core","version":"[^"]*"' \
@@ -1231,10 +1271,12 @@ jobs:
           echo "tag=$TAG crate=$CRATE_VER"
           test "$TAG" = "$CRATE_VER" || { echo "::error::tag v$TAG != crate version $CRATE_VER"; exit 1; }
       - name: Publish mds-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           # Idempotency: a re-run where the version is already published should pass.
           # Any other failure (bad token, outage, genuine version conflict) must fail loudly.
-          if OUTPUT=$(cargo publish -p mds-core --token "${{ secrets.CARGO_REGISTRY_TOKEN }}" 2>&1); then
+          if OUTPUT=$(cargo publish -p mds-core 2>&1); then
             echo "$OUTPUT"
           elif echo "$OUTPUT" | grep -qE "already (uploaded|exists|published)"; then
             echo "::notice::mds-core already published — idempotent re-run, skipping"
@@ -1268,9 +1310,11 @@ jobs:
           echo "::error::mds-core@${VERSION} not visible in crates.io after $((MAX * 15)) s"
           exit 1
       - name: Publish mds-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           # Same idempotency guard as mds-core above.
-          if OUTPUT=$(cargo publish -p mds-cli --token "${{ secrets.CARGO_REGISTRY_TOKEN }}" 2>&1); then
+          if OUTPUT=$(cargo publish -p mds-cli 2>&1); then
             echo "$OUTPUT"
           elif echo "$OUTPUT" | grep -qE "already (uploaded|exists|published)"; then
             echo "::notice::mds-cli already published — idempotent re-run, skipping"
@@ -1297,7 +1341,6 @@ jobs:
     env:
       NPM_CONFIG_PROVENANCE: "true"
       NPM_CONFIG_ACCESS: "public"
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1306,17 +1349,13 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          registry-url: "https://registry.npmjs.org"
-      # performance-01 / PF-021: pin to the same 1.96.0 SHA that ci.yml's wasm
-      # job uses so the compiler that MEASURES size and the compiler that BUILDS
-      # the published artifact are identical. Unpinned @stable lets toolchain
-      # drift silently push the binary past the WASM size limit between releases.
-      # WHEN BUMPING: update ci.yml's wasm job pin first, re-measure, then
-      # update here to keep both in sync.
+      # Use the CI compiler for the published WASM so the size check applies to the release.
+      # Before a bump here, update the CI pin and measure the WASM size again.
+      # This SHA ignores the input. The input keeps the version after a move to a stable SHA.
       - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e  # 1.96.0
-        with: { targets: wasm32-unknown-unknown }
+        with: { toolchain: 1.96.0, targets: wasm32-unknown-unknown }
       # Single-leg job: the automatic job-id key is already unique; no per-leg key (#352).
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
       - uses: ./.github/actions/setup-wasm
       - run: npm ci
       - name: Restore staged napi tree (.node + npm/ platform dirs)
@@ -1343,7 +1382,8 @@ jobs:
       # BEFORE any irreversible npm publish so a bloated binary aborts before
       # anything reaches the registry. The limit and its reason live in ci.yml's
       # wasm job ("WHY THIS LIMIT EXISTS"); this value must stay equal to it
-      # (scripts/__test__/wasm-build-parity.spec.mjs checks it).
+      # (scripts/__test__/wasm-build-parity.spec.mjs checks it). See the #128
+      # catch-up entry in that job's size ledger for the current CI baseline.
       - name: "Assert WASM binary size limit (PF-021)"
         run: |
           WASM_SIZE_LIMIT=821000
@@ -1360,8 +1400,14 @@ jobs:
               exit 1
             fi
           done
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
       - name: Publish platform packages (napi prepublish)
         working-directory: crates/mds-napi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           # Idempotency: a re-run finds already-published platform packages and
           # returns E403. Tolerate E403-only failures; any other error fails loudly.
@@ -1381,11 +1427,13 @@ jobs:
             echo "$OUTPUT"
           fi
       - name: Publish npm packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           # Idempotency: publish_if_absent checks npm view before publishing so
           # a re-run skips already-published versions without swallowing genuine
           # failures. Never use continue-on-error — it masks partial state. PF-023.
-          VER="${{ github.ref_name }}"
+          VER="$GITHUB_REF_NAME"
           VER="${VER#v}"
           publish_if_absent() {
             local pkg="$1"

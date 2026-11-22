@@ -15,3 +15,8 @@ runs:
     - name: Verify wasm-opt
       shell: bash
       run: wasm-opt --version
+    # publish-npm uses this action after the crates.io publish.
+    # The CI-history gate requires this check to pass in CI on the tagged commit first.
+    - name: Check WASM tool pins
+      shell: bash
+      run: node "$GITHUB_WORKSPACE/scripts/check-wasm-tools.mjs" --strict

@@ -1890,20 +1890,19 @@ describe('D-PR7: release-surface presence check', () => {
       'a partial changed-files list must exit 2');
   });
 
-  test('D-PR7h: live path requires the release runs when the files endpoint reports a surface file', () => {
-    // End-to-end through main(): the files endpoint (not a hand-built
-    // changedFiles array) drives the presence check. Without the release
-    // check-runs this PR must FAIL — proving fetchChangedFiles is wired into
-    // evaluateChecks and that D-PR7a-f are not testing a disconnected function.
-    const runner = stubRunner([
-      ['/files', [{ filename: 'crates/mds-napi/src/lib.rs' }]],
-      ['/pulls/', { ...PR_OK, changed_files: 1 }],
+  test('D-PR7h: a Dependabot PR with no release runs passes only off the release surface', () => {
+    const pr = { ...PR_OK, changed_files: 1, user: { login: 'dependabot[bot]' } };
+    const verifyWithoutRelease = filename => main(['1'], stubRunner([
+      ['/files', [{ filename }]],
+      ['/pulls/', pr],
       ['/protection', PROTECTION_OK],
       ['/check-runs', CHECKS_OK_WITH_HYGIENE],
       ['/status', { statuses: [], total_count: 0 }],
       ['/actions/runs', RUNS_NONE],
-    ]);
-    assert.equal(main(['1'], runner, OK_GH_VERSION), 1,
+    ]), OK_GH_VERSION);
+
+    assert.equal(verifyWithoutRelease('Cargo.toml'), 0, 'a change outside the release surface must pass');
+    assert.equal(verifyWithoutRelease('crates/mds-napi/src/lib.rs'), 1,
       'a release-surface file with no release check-runs must exit 1');
   });
 

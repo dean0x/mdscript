@@ -30,7 +30,7 @@ All packages ship as a single coordinated release at the same version, driven by
 `release.yml`. **Release via tag-push:**
 
 ```bash
-node scripts/bump-version.mjs X.Y.Z   # bump all manifests + stamp CHANGELOG
+node scripts/bump-version.mjs X.Y.Z   # bump all manifests + both lockfiles, stamp CHANGELOG
 # land the bump on main via PR (CI-gated), then:
 git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z
 ```
@@ -56,7 +56,7 @@ See @RELEASING.md for the full runbook.
 - `debug-panics` Cargo feature must never ship enabled (all three binding crates) — it attaches raw panic payloads (may contain filesystem paths) to errors
 - `debug-panics` Cargo feature (`mds-cli`) must never ship enabled — it prints a panic's message and location after the fixed internal-compiler-error text, which a panic otherwise shows alone, with an escaped backtrace only when RUST_BACKTRACE is set (#389). It is non-default, but `mds-cli` publishes to crates.io, so `cargo install mds-cli --features debug-panics` would ship it to a user; `crates/mds-cli/tests/panic_hook.rs` fails if any feature turns it on. Its code compiles only with the feature, so check it with `cargo clippy -p mds-cli --all-targets --features debug-panics -- -D warnings`
 - `startup-race-probe` Cargo feature (`mds-cli`) must never ship enabled — it injects a 200 ms sleep into `mds watch` startup as the positive control for the arm-before-publish ordering (#317). It is non-default, but `mds-cli` publishes to crates.io, so `cargo install mds-cli --features startup-race-probe` would ship the delay to a user. It is exercised only by the `Watch startup race (probe)` CI job
-- Local WASM builds do NOT require system Binaryen — wasm-pack auto-downloads wasm-opt (v117) into its cache on first use. Install Binaryen v129+ (`brew install binaryen` / `apt install binaryen`) only for offline builds, to override a stale wasm-opt on PATH, or to reproduce CI's exact release optimizer (the setup-wasm action pins v129)
+- Local WASM builds do NOT require system Binaryen — wasm-pack auto-downloads wasm-opt (v117) into its cache on first use. `scripts/check-wasm-tools.mjs` compares the `wasm-pack` and `wasm-opt` on PATH with the exact pins in `.github/actions/setup-wasm/action.yml` (wasm-pack v0.14.0, Binaryen 129). On a mismatch or an absent tool, the local build scripts warn and continue, and CI (`--strict`) stops. To reproduce CI's exact release optimizer, put exactly those versions on PATH; a package manager (`brew` / `apt`) can install another Binaryen version, and then the check warns
 - `crates/mds-python` (PyO3): test with **pytest, not `cargo test`** — 0 Rust tests by design (`[lib] test = false`). `abi3-py311` is always-on and `extension-module` is the default feature, so `cargo build/clippy/test --workspace` compile the cdylib without linking libpython; pyo3's abi3 forward-compat tolerates an older `python3` on PATH (repo default is 3.9)
 - `crates/mds-python/build.rs` emits a cdylib-scoped `-undefined dynamic_lookup` so bare `cargo build` links the extension on macOS (Linux allows undefined cdylib symbols; maturin passes the flag itself when it builds the wheel)
 - Local Python dev: `maturin develop` needs an active **virtualenv** + `python3` on PATH; CI has no venv so it uses `pip install ./crates/mds-python` (the maturin PEP 517 backend). Wheels are `cp311-abi3` (one per platform)

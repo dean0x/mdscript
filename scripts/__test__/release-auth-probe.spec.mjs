@@ -1,5 +1,5 @@
 /**
- * Tests for the npm auth probe in version-gate (security-08).
+ * Tests for the release workflow and its registry checks.
  *
  * Parses .github/workflows/release.yml with structural text analysis — no
  * external YAML parser; none is present in package.json. Indentation-aware
@@ -8,8 +8,8 @@
  * (applies ADR-009, avoids PF-013)
  *
  * Ordering invariant:
- *   version-gate (probe) → build-napi → stage-and-verify-napi → publish-crates
- * A revoked or absent NPM_TOKEN must fail in version-gate — before any
+ *   credential-probe → version-gate → build-napi → stage-and-verify-napi → publish-crates
+ * A revoked or absent NPM_TOKEN must fail in credential-probe — before any
  * cargo publish makes a crates.io release irreversible.
  *
  * What npm whoami proves and does NOT prove:
@@ -20,6 +20,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -130,126 +131,94 @@ function transitivelyNeeds(graph, start, target) {
   return false;
 }
 
+function cargoPublishJobIds(source) {
+  return findAllJobIds(source).filter(id => {
+    const section = stripCommentLines(extractJobSection(source, id));
+    return /^(?: {10,}| {6}- run: | {8}run: )(?:if (?:! )?)?(?:OUTPUT=\$\()?(?:timeout [0-9]+ )?cargo publish\b/m.test(section);
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('security-08: npm auth probe in version-gate', () => {
+describe('registry checks in credential-probe', () => {
 
   // -------------------------------------------------------------------------
-  // S1: The setup-node step in version-gate must set registry-url so that
-  // actions/setup-node writes `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`
-  // into .npmrc. Without this line, `npm whoami` cannot read the token even
-  // when NODE_AUTH_TOKEN is set in the step environment.
+  // S1: setup-node sets the registry before npm whoami.
   // -------------------------------------------------------------------------
-  test('version-gate setup-node sets registry-url (ensures .npmrc auth line is written)', () => {
-    const section = extractJobSection(yml, 'version-gate');
-    assert.ok(section, 'version-gate job section must exist in release.yml');
-    assert.ok(
-      section.includes('registry-url') && section.includes('registry.npmjs.org'),
-      'version-gate setup-node must declare registry-url: "https://registry.npmjs.org"; ' +
-      'without this, setup-node does not write the auth token line into .npmrc and ' +
-      'npm whoami cannot authenticate. ' +
-      `Found section:\n${section}`,
-    );
+  test('S1: credential-probe sets the npm registry before npm whoami', () => {
+    const section = extractJobSection(yml, 'credential-probe');
+    assert.ok(section, 'credential-probe must exist');
+    const registryBeforeWhoami = source => {
+      const steps = jobSteps(source);
+      const setup = stepMatching(steps, /^      - uses: actions\/setup-node@/m);
+      const probe = stepMatching(steps, /^          if ! npm whoami --registry /m);
+      return setup && probe && setup.index < probe.index &&
+        /registry-url: "https:\/\/registry\.npmjs\.org"/.test(setup.body);
+    };
+    assert.ok(registryBeforeWhoami(section), 'setup-node must set the registry before npm whoami');
+    const noRegistry = section.replace('registry-url:', 'unused:');
+    assert.ok(!registryBeforeWhoami(noRegistry));
+  });
+
+  test('S2: npm whoami has its registry value in step env', () => {
+    const section = extractJobSection(yml, 'credential-probe');
+    assert.ok(section, 'credential-probe must exist');
+    const hasNpmProbe = source => jobSteps(source).some(({ body }) =>
+      /^          if ! npm whoami --registry /m.test(body) &&
+      stepEnv(body).includes('NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}'));
+    assert.ok(hasNpmProbe(section), 'npm whoami must have a step env binding');
+    const withInput = section.replace('        env:\n', '        with:\n');
+    assert.ok(!hasNpmProbe(withInput));
   });
 
   // -------------------------------------------------------------------------
-  // S2: version-gate must contain a step that binds NPM_TOKEN through env:
-  // and calls npm whoami to verify the token is accepted by the registry.
+  // S3: Check for a crates.io value before the build matrix starts.
   // -------------------------------------------------------------------------
-  test('version-gate contains credential probe step referencing secrets.NPM_TOKEN via env', () => {
-    const section = extractJobSection(yml, 'version-gate');
-    assert.ok(section, 'version-gate job section must exist');
-    // Probe must bind through env: (standard script-injection guard — the secret
-    // value must not be substituted into the shell source).
-    assert.ok(
-      section.includes('secrets.NPM_TOKEN'),
-      'version-gate must contain a step whose env: references secrets.NPM_TOKEN; ' +
-      `got section:\n${section}`,
-    );
-    // npm whoami is the observable check: it contacts the registry and returns the
-    // authenticated username, proving the token is valid at workflow time.
-    assert.ok(
-      section.includes('npm whoami'),
-      'version-gate credential probe must call npm whoami to verify token validity; ' +
-      `got section:\n${section}`,
-    );
+  test('S3: credential-probe checks for a non-empty Cargo registry value', () => {
+    const section = extractJobSection(yml, 'credential-probe');
+    assert.ok(section, 'credential-probe must exist');
+    const hasCargoProbe = source => jobSteps(source).some(({ body }) =>
+      hasEmptyGuard(body) && stepEnv(body).includes('CARGO_REG_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}'));
+    assert.ok(hasCargoProbe(section), 'the Cargo probe must bind and check the registry value');
+    const commentedGuard = section.replace('if [ -z "$CARGO_REG_TOKEN" ]; then',
+      '# if [ -z "$CARGO_REG_TOKEN" ]; then');
+    assert.ok(!hasCargoProbe(commentedGuard));
+    const withInput = section.replace('        env:\n', '        with:\n');
+    assert.ok(!hasCargoProbe(withInput));
   });
 
-  // -------------------------------------------------------------------------
-  // S3: version-gate must also guard CARGO_REGISTRY_TOKEN — catching a missing
-  // cargo token before the 7-target cross-compile matrix starts, not after.
-  // -------------------------------------------------------------------------
-  test('version-gate guards CARGO_REGISTRY_TOKEN for non-empty (security-08)', () => {
-    const section = extractJobSection(yml, 'version-gate');
-    assert.ok(section, 'version-gate job section must exist');
-    assert.ok(
-      section.includes('secrets.CARGO_REGISTRY_TOKEN'),
-      'version-gate must guard CARGO_REGISTRY_TOKEN via env: in the probe step; ' +
-      `got section:\n${section}`,
-    );
-    // S3 extension: the -z guard must be in executable code, not inside a comment.
-    // Positive control (avoids PF-013): a section that binds the secret but places
-    // the guard line only inside a comment must return false.
-    const guardLineInComment = [
-      '        env:',
-      '          CARGO_REG_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}',
-      '        run: |',
-      '          # if [ -z "$CARGO_REG_TOKEN" ]; then',
-      '          echo "do something else"',
-    ].join('\n');
-    assert.ok(
-      !hasEmptyGuard(guardLineInComment),
-      'positive control: hasEmptyGuard must return false when the guard line is only inside a comment',
-    );
-    assert.ok(
-      hasEmptyGuard(section),
-      'version-gate must contain an executable `if [ -z "$CARGO_REG_TOKEN" ]; then` guard ' +
-      '(#345, RELEASING.md "credential probe") — the strongest check crates.io allows for an ' +
-      'API token; a missing token is first detected at cargo publish (fail-before-write) but ' +
-      'this guard catches it before the expensive 7-target cross-compile matrix runs; ' +
-      `got section:\n${section}`,
-    );
-  });
-
-  // -------------------------------------------------------------------------
-  // S4: Every job with cargo publish must transitively need version-gate.
-  //
-  // This is the core ordering invariant: cargo publish (irreversible) must not
-  // start unless the credential probe has already passed in version-gate.
-  // Checked via BFS over the needs graph so future job reorderings are caught.
-  //
-  // Non-vacuity guard (ADR-009): assert at least one cargo-publish job exists
-  // so the loop cannot trivially pass by returning no jobs to check.
-  // -------------------------------------------------------------------------
-  test('every cargo-publish job transitively needs version-gate (ordering invariant)', () => {
-    const graph = buildNeedsGraph(yml);
-    const allJobIds = [...graph.keys()];
-
-    // Find all jobs whose step text contains the `cargo publish` command.
-    const cargoPublishJobs = allJobIds.filter(id => {
-      const section = extractJobSection(yml, id);
-      return section !== null && section.includes('cargo publish');
-    });
-
-    // Non-vacuity: if no cargo-publish job exists, the loop passes vacuously.
-    // A release workflow without cargo publish is indeterminate — not a pass (ADR-009).
-    assert.ok(
-      cargoPublishJobs.length > 0,
-      'release.yml must contain at least one job with `cargo publish` (ADR-009 non-vacuity guard); ' +
-      `found jobs: ${allJobIds.join(', ')}`,
-    );
-
-    for (const job of cargoPublishJobs) {
-      assert.ok(
-        transitivelyNeeds(graph, job, 'version-gate'),
-        `Job "${job}" contains cargo publish but does not transitively need "version-gate". ` +
-        `The credential probe in version-gate would be bypassed, meaning a revoked NPM_TOKEN ` +
-        `would not be caught until after crates.io publish (irreversible). ` +
-        `Direct needs of "${job}": [${(graph.get(job) ?? []).join(', ')}]`,
-      );
+  test('S4: every Cargo publish job needs both gates', async t => {
+    const checkOrdering = source => {
+      const graph = buildNeedsGraph(source);
+      const publishers = cargoPublishJobIds(source);
+      assert.ok(publishers.includes('publish-crates'), 'publish-crates must run cargo publish');
+      assert.ok(!publishers.includes('credential-probe'), 'credential-probe must not run cargo publish');
+      for (const job of publishers) {
+        for (const gate of ['version-gate', 'credential-probe']) {
+          assert.ok(transitivelyNeeds(graph, job, gate), `${job} must transitively need ${gate}`);
+        }
+      }
+    };
+    for (const [label, run] of [
+      ['direct command', '      - run: cargo publish -p fixture\n'],
+      ['negated condition', '      - run: |\n          if ! cargo publish -p fixture; then exit 1; fi\n'],
+      ['timeout wrapper', '      - run: timeout 600 cargo publish -p fixture\n'],
+    ]) {
+      await t.test(`rejects an unguarded publisher with a ${label}`, () => {
+        const fixture = `${yml}\n  unguarded-publisher:\n    steps:\n${run}`;
+        assert.throws(() => checkOrdering(fixture), /unguarded-publisher must transitively need version-gate/);
+      });
     }
+    checkOrdering(yml);
+    const onlyVersion = yml.replace('    needs: [credential-probe]\n', '');
+    assert.throws(() => checkOrdering(onlyVersion), /publish-crates must transitively need credential-probe/);
+    const probe = extractJobSection(yml, 'credential-probe');
+    const mention = probe.replace('    steps:\n', '    steps:\n      - run: echo "cargo publish -p fixture"\n');
+    checkOrdering(yml.replace(probe, mention));
+    const command = probe.replace('    steps:\n', '    steps:\n      - run: cargo publish -p fixture\n');
+    assert.throws(() => checkOrdering(yml.replace(probe, command)), /credential-probe must not run cargo publish/);
   });
 
 });
@@ -394,21 +363,19 @@ describe('B1: release-surface PR gate and rehearsal jobs', () => {
 
   // -------------------------------------------------------------------------
   // S7: rehearse-publish-python must transitively need version-gate.
-  // This ensures the credential probe runs before the OIDC exchange contacts
-  // the registry, preserving the security-08 ordering invariant.
+  // Run the rehearsal only after both gates pass.
   // -------------------------------------------------------------------------
-  test('S7: rehearse-publish-python transitively needs version-gate (ordering invariant)', () => {
-    const graph = buildNeedsGraph(yml);
-    assert.ok(
-      graph.has('rehearse-publish-python'),
-      'rehearse-publish-python must be in the jobs graph (see S5)',
-    );
-    assert.ok(
-      transitivelyNeeds(graph, 'rehearse-publish-python', 'version-gate'),
-      'rehearse-publish-python must transitively need version-gate so the credential ' +
-      'probe runs before the OIDC exchange; ' +
-      `direct needs: [${(graph.get('rehearse-publish-python') ?? []).join(', ')}]`,
-    );
+  test('S7: rehearse-publish-python transitively needs both gates', () => {
+    const checkOrdering = source => {
+      const graph = buildNeedsGraph(source);
+      for (const gate of ['version-gate', 'credential-probe']) {
+        assert.ok(transitivelyNeeds(graph, 'rehearse-publish-python', gate),
+          `rehearse-publish-python must transitively need ${gate}`);
+      }
+    };
+    const onlyVersion = yml.replace('    needs: [credential-probe]\n', '');
+    assert.throws(() => checkOrdering(onlyVersion), /must transitively need credential-probe/);
+    checkOrdering(yml);
   });
 
   // -------------------------------------------------------------------------
@@ -443,33 +410,33 @@ describe('B1: release-surface PR gate and rehearsal jobs', () => {
   // (ADR-013 amendment 2026-09-06). The fix is a step-level if: so the job
   // runs (and succeeds) but the CI-history step is skipped on non-tag events.
   // -------------------------------------------------------------------------
-  test('S9: CI-history step in version-gate uses step-level if: (not job-level)', () => {
+  test('S9: only the CI-history step, not the job, has the non-PR guard', () => {
     const section = extractJobSection(yml, 'version-gate');
-    assert.ok(section !== null, 'version-gate must exist');
-
-    // Confirm the CI-history step still exists (non-vacuity).
-    assert.ok(
-      section.includes('Assert tagged SHA has green CI history'),
-      'version-gate must still contain the CI-history step (non-vacuity guard)',
-    );
-
-    // Step-level if: is at 8-space indent (step field); job-level at 4-space.
-    // We accept step-level if: anywhere in the section (the step is the only
-    // consumer of a conditional skip in version-gate).
-    const hasStepLevelIf = section.split('\n').some(l => /^        if:/.test(l));
-    assert.ok(
-      hasStepLevelIf,
-      'version-gate must use a step-level if: (8-space indent) on the CI-history step ' +
-      'so that PRs can skip that step without marking version-gate itself skipped — a ' +
-      'skipped version-gate would fail the Tier-B verifier (ADR-013 amendment 2026-09-06); ' +
-      `got section (first 800 chars):\n${section.slice(0, 800)}`,
-    );
+    const checkGuard = source => {
+      assert.equal(extractJobIf(source), null, 'version-gate must have no job if');
+      const step = stepMatching(jobSteps(source), /^      - name: "Assert tagged SHA has green CI history/m);
+      assert.ok(step && stepIf(step.body) === nonPrGuard, 'CI history must keep its step guard');
+    };
+    checkGuard(section);
+    const jobGuard = section.replace('    steps:\n', `    if: ${nonPrGuard}\n    steps:\n`);
+    assert.throws(() => checkGuard(jobGuard), /must have no job if/);
+    const unguardedStep = section.replace(`        if: ${nonPrGuard}\n`, '');
+    assert.throws(() => checkGuard(unguardedStep), /CI history must keep its step guard/);
   });
 
   // -------------------------------------------------------------------------
   // S10: The on: block must include a pull_request trigger with at least one
   // path from RELEASE_SURFACE (ensuring release-surface PRs exercise the gate).
   // -------------------------------------------------------------------------
+  test('S10a: Release only matches changes on the release surface for a Dependabot PR', () => {
+    const paths = extractPullRequestPaths(yml);
+    assert.ok(paths?.length, 'Release must have a PR paths filter');
+    const matches = file => paths.some(pattern => pattern.endsWith('/**')
+      ? file.startsWith(pattern.slice(0, -2))
+      : file === pattern);
+    assert.equal(matches('Cargo.toml'), false, 'a change to Cargo.toml alone must not start Release');
+    assert.equal(matches('crates/mds-napi/src/lib.rs'), true, 'an on-surface change must start Release');
+  });
   test('S10: on.pull_request.paths equals RELEASE_SURFACE exactly (as a set)', () => {
     const onBlock = extractOnBlock(yml);
     assert.ok(onBlock !== null, 'release.yml must have an on: block');
@@ -923,22 +890,7 @@ describe('B1: release-surface PR gate and rehearsal jobs', () => {
       'non-vacuity: rehearse-publish-python must be a graph node; PF-013',
     );
 
-    const allIds = findAllJobIds(yml);
-    const cargoPublishJobs = allIds.filter(id => {
-      // Use stripCommentLines and then look for lines where "cargo publish" is
-      // the actual command being run (not in echo strings or error messages).
-      // A line that is the command starts with leading whitespace then "cargo ",
-      // as opposed to being inside an echo/error string.
-      const section = stripCommentLines(extractJobSection(yml, id) ?? '');
-      return section.split('\n').some(line => {
-        const trimmed = line.trimStart();
-        return trimmed.startsWith('cargo publish') ||
-               // inside if/OUTPUT=$(...) patterns
-               trimmed.includes('cargo publish -p ') ||
-               // bare cargo publish invocation
-               /^\s*cargo publish\b/.test(line);
-      });
-    });
+    const cargoPublishJobs = cargoPublishJobIds(yml);
     assert.ok(
       cargoPublishJobs.length > 0,
       'non-vacuity (PF-013): at least one job must contain "cargo publish"; found none',
@@ -2019,6 +1971,301 @@ function jobSteps(section) {
  */
 function stepMatching(steps, regex) {
   return steps.find(s => regex.test(s.body)) ?? null;
+}
+
+const secretRef = /\bsecrets\s*(?:\.|\[)/;
+
+function stepEnv(step) {
+  return /^        env:\n((?: {10}[^\n]*\n?)+)/m.exec(step)?.[1] ?? '';
+}
+
+function namedStep(steps, name) {
+  return steps.find(step => step.body.startsWith(`      - name: ${name}\n`));
+}
+
+function assertPublishEnv(section, names, binding) {
+  const steps = jobSteps(section);
+  for (const name of names) {
+    const step = namedStep(steps, name);
+    assert.ok(step && stepEnv(step.body).split('\n').includes(`          ${binding}`),
+      `${name} must bind its registry value in step env`);
+  }
+  const references = stripCommentLines(section).split('\n').filter(line => secretRef.test(line));
+  assert.deepEqual(references, names.map(() => `          ${binding}`),
+    'only publish step env may reference registry values');
+}
+
+function assertCargoPublishEnv(section) {
+  assertPublishEnv(section, ['Publish mds-core', 'Publish mds-cli'],
+    'CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}');
+  assert.doesNotMatch(stripCommentLines(section), /\bcargo publish[^\n]*\s--token\b/,
+    'cargo publish must not use a token flag');
+}
+
+const platformPublish = 'Publish platform packages (napi prepublish)';
+const npmPublish = 'Publish npm packages';
+
+function assertNpmPublishEnv(section) {
+  assertPublishEnv(section, [platformPublish, npmPublish],
+    'NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}');
+}
+
+function assertNpmRegistryOrder(section) {
+  const steps = jobSteps(section);
+  const setupNode = steps.filter(step => /^      - uses: actions\/setup-node@/m.test(step.body));
+  const registrySteps = steps.filter(step => /\bregistry-url:/.test(step.body));
+  assert.ok(setupNode.length === 2 && registrySteps.length === 1 &&
+    registrySteps[0] === setupNode[1] &&
+    /registry-url: "https:\/\/registry\.npmjs\.org"/.test(setupNode[1].body) &&
+    !/\bcache:/.test(setupNode[1].body),
+    'only the second setup-node step must set the npm registry, without cache');
+  const install = stepMatching(steps, /^      - run: npm ci$/m);
+  const build = namedStep(steps, 'Build WASM + TS packages');
+  const platform = namedStep(steps, platformPublish);
+  const npm = namedStep(steps, npmPublish);
+  assert.ok(install && build && platform && npm && setupNode[0].index < install.index &&
+    install.index < build.index && build.index < setupNode[1].index &&
+    setupNode[1].index + 1 === platform.index && platform.index + 1 === npm.index,
+    'npm install and build must run before registry setup directly precedes the publish steps');
+}
+
+test('S24: only the two Cargo publish steps bind registry values', () => {
+  const section = extractJobSection(yml, 'publish-crates');
+  assertCargoPublishEnv(section);
+  const withFlag = section.replace('cargo publish -p mds-core ',
+    'cargo publish -p mds-core --token "${{ secrets.CARGO_REGISTRY_TOKEN }}" ');
+  assert.throws(() => assertCargoPublishEnv(withFlag), /only publish step env/);
+  const withEnvFlag = withFlag.replace('${{ secrets.CARGO_REGISTRY_TOKEN }}"', '$CARGO_REGISTRY_TOKEN"');
+  assert.throws(() => assertCargoPublishEnv(withEnvFlag), /must not use a token flag/);
+  const withInput = section.replace('        with:\n',
+    '        with:\n          extra: ${{ secrets.CARGO_REGISTRY_TOKEN }}\n');
+  assert.throws(() => assertCargoPublishEnv(withInput), /only publish step env/);
+  const withoutBinding = section.replace('          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}\n', '');
+  assert.throws(() => assertCargoPublishEnv(withoutBinding), /Publish mds-core must bind/);
+});
+
+test('S25: only the two npm publish steps bind registry values', () => {
+  const section = extractJobSection(yml, 'publish-npm');
+  assertNpmPublishEnv(section);
+  const withJobEnv = section.replace('    env:\n',
+    '    env:\n      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n');
+  assert.throws(() => assertNpmPublishEnv(withJobEnv), /only publish step env/);
+  const withoutBinding = section.replace('          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n', '');
+  assert.throws(() => assertNpmPublishEnv(withoutBinding), /Publish platform packages .* must bind/);
+});
+
+test('S26: npm registry setup runs after the build and directly before publish', () => {
+  const section = extractJobSection(yml, 'publish-npm');
+  assertNpmRegistryOrder(section);
+  const earlyRegistry = section.replace('          cache: npm\n',
+    '          cache: npm\n          registry-url: "https://registry.npmjs.org"\n');
+  assert.throws(() => assertNpmRegistryOrder(earlyRegistry), /only the second setup-node/);
+  const separated = section.replace(`      - name: ${platformPublish}`,
+    `      - run: npm ci\n      - name: ${platformPublish}`);
+  assert.throws(() => assertNpmRegistryOrder(separated), /directly precedes/);
+});
+
+const nonPrGuard = "github.event_name != 'pull_request'";
+const prGuard = "github.event_name == 'pull_request'";
+
+function stepIf(step) {
+  return /^(?: {8}| {6}- )if: (.+)$/m.exec(step)?.[1];
+}
+
+function yamlOutsideRunBlocks(section) {
+  return stripCommentLines(section).replace(
+    /^ {6}(?:  |- )run: [|>][-+]?\n(?:[ ]{10}[^\n]*\n?|\n)*/gm, '');
+}
+
+function assertVersionInputs(section) {
+  const yaml = yamlOutsideRunBlocks(section);
+  assert.doesNotMatch(yaml, /^ {6}id-token:|^ {4}permissions:\s*\{[^}]*\bid-token\s*:/m,
+    'version-gate must not declare id-token permissions');
+  assert.doesNotMatch(stripCommentLines(section), secretRef, 'version-gate must not reference secrets');
+}
+
+function jobsWithOidcWrite(source) {
+  const hasWrite = section => /^(?: {2,6}id-token:\s*write\b| {0,4}permissions:\s*\{[^}]*\bid-token\s*:\s*write\b)/m
+    .test(yamlOutsideRunBlocks(section));
+  const jobs = findAllJobIds(source).filter(id => hasWrite(extractJobSection(source, id)));
+  return hasWrite(source.split(/^jobs:$/m)[0]) ? ['workflow', ...jobs] : jobs;
+}
+
+test('S27: version-gate has no id-token permission or secret reference', () => {
+  const section = extractJobSection(yml, 'version-gate');
+  const withBlockGrant = section.replace('    permissions:\n', '    permissions:\n      id-token: write\n');
+  assert.throws(() => assertVersionInputs(withBlockGrant), /must not declare id-token/);
+  const withSecret = section.replace('    steps:\n', '    env:\n      FIXTURE: ${{ secrets.PROBE }}\n    steps:\n');
+  assert.throws(() => assertVersionInputs(withSecret), /must not reference secrets/);
+  assertVersionInputs(section);
+});
+
+test('S28: only the registry probe and the three expected publish jobs have OIDC write', () => {
+  const allowed = ['credential-probe', 'publish-npm', 'publish-python', 'publish-testpypi'];
+  const checkGrants = source => assert.deepEqual(jobsWithOidcWrite(source).sort(), allowed);
+  checkGrants(yml);
+  const section = extractJobSection(yml, 'version-gate');
+  const withInlineGrant = section.replace(/^    permissions:\n(?: {6}[^\n]*\n)+/m,
+    '    permissions: { contents: read, id-token: write }\n');
+  assert.throws(() => assertVersionInputs(withInlineGrant), /must not declare id-token/);
+  assert.throws(() => checkGrants(yml.replace(section, withInlineGrant)), /version-gate/);
+  const withBlockGrant = section.replace('    permissions:\n', '    permissions:\n      id-token: write\n');
+  assert.throws(() => checkGrants(yml.replace(section, withBlockGrant)), /version-gate/);
+  const withWorkflowGrant = yml.replace(/^permissions:\n/m, 'permissions:\n  id-token: write\n');
+  assert.throws(() => checkGrants(withWorkflowGrant), /workflow/);
+  const withEcho = section.replace('    steps:\n', '    steps:\n      - run: |\n          echo "id-token: write"\n');
+  assertVersionInputs(withEcho);
+  checkGrants(yml.replace(section, withEcho));
+});
+
+function assertProbeGuards(section) {
+  assert.match(section ?? '', /^    name: Credential probe$/m, 'Credential probe job must exist');
+  assert.equal(extractJobIf(section), null, 'Credential probe must have no job if');
+  assert.match(yamlOutsideRunBlocks(section), /^    permissions:\n      id-token: write\n    steps:$/m,
+    'Credential probe must grant only id-token write');
+  assert.doesNotMatch(section.split(/^    steps:$/m)[0], secretRef, 'Credential probe must bind registry values only in steps');
+  assert.doesNotMatch(stripCommentLines(section), /\buses:\s*actions\/checkout@/, 'Credential probe must not check out code');
+  const steps = jobSteps(section);
+  const notices = steps.filter(({ body }) => stepIf(body) === prGuard);
+  assert.ok(notices.length === 1 && /^        run: echo "::notice::[^"\n]+"\s*$/m.test(notices[0].body) &&
+    !secretRef.test(notices[0].body), 'PR runs must execute only a notice');
+  for (const step of steps) {
+    if (step !== notices[0]) assert.equal(stepIf(step.body), nonPrGuard, 'each probe step must skip on PRs');
+  }
+  const mint = stepMatching(steps, /https:\/\/pypi\.org\/_\/oidc\/mint-token/);
+  assert.ok(mint && /\[ "\$CODE" = "200" \]/.test(mint.body), 'PyPI probe must require HTTP 200');
+}
+
+test('S29: Credential probe reports on PRs without checkout or registry calls', () => {
+  const section = extractJobSection(yml, 'credential-probe');
+  assertProbeGuards(section);
+  const unguarded = section.replace('    steps:\n', '    steps:\n      - run: curl https://pypi.org/_/oidc/mint-token\n');
+  assert.throws(() => assertProbeGuards(unguarded), /each probe step must skip on PRs/);
+  const skipped = section.replace('    steps:\n', `    if: ${nonPrGuard}\n    steps:\n`);
+  assert.throws(() => assertProbeGuards(skipped), /must have no job if/);
+  const extraGrant = section.replace('      id-token: write\n', '      id-token: write\n      contents: read\n');
+  assert.throws(() => assertProbeGuards(extraGrant), /must grant only id-token write/);
+  const jobEnv = section.replace('    permissions:\n', '    env:\n      FIXTURE: ${{ secrets.PROBE }}\n    permissions:\n');
+  assert.throws(() => assertProbeGuards(jobEnv), /must bind registry values only in steps/);
+  const checkout = section.replace('    steps:\n', `    steps:\n      - uses: actions/checkout@v7\n        if: ${nonPrGuard}\n`);
+  assert.throws(() => assertProbeGuards(checkout), /must not check out code/);
+  assert.throws(() => assertProbeGuards(section.replace(prGuard, nonPrGuard)), /must execute only a notice/);
+  assert.throws(() => assertProbeGuards(section.replace('"$CODE" = "200"', '"$CODE" = "404"')), /must require HTTP 200/);
+});
+
+test('S30: every release job runs after Credential probe', () => {
+  const checkGraph = source => {
+    const graph = buildNeedsGraph(source);
+    assert.ok(graph.has('credential-probe'), 'Credential probe must be in the jobs graph');
+    for (const id of graph.keys()) {
+      if (id === 'credential-probe') continue;
+      assert.ok(transitivelyNeeds(graph, id, 'credential-probe'), `${id} must need credential-probe`);
+    }
+  };
+  checkGraph(yml);
+  const withoutEdge = yml.replace('    needs: [credential-probe]\n', '');
+  assert.throws(() => checkGraph(withoutEdge), /version-gate must need credential-probe/);
+  const isolatedJob = `${yml}\n  isolated-job:\n    runs-on: ubuntu-latest\n`;
+  assert.throws(() => checkGraph(isolatedJob), /isolated-job must need credential-probe/);
+});
+
+function stepRun(body) {
+  return /^ {8}run: \|\n((?: {10}[^\n]*\n?)+)/m.exec(body)?.[1] ?? '';
+}
+
+describe('S31: Version gate requires a maintainer PR with a head in this repository', () => {
+  const section = extractJobSection(yml, 'version-gate');
+  const step = namedStep(jobSteps(section), 'Require a maintainer PR for release checks');
+  const env = {
+    GITHUB_ACTOR: 'maintainer',
+    PR_AUTHOR: 'maintainer',
+    IS_FORK: 'false',
+    HEAD_REPOSITORY: 'example/repo',
+    GITHUB_REPOSITORY: 'example/repo',
+  };
+
+  function assertMaintainerResult(run, overrides, expected) {
+    assert.ok(run, 'the PR rule must have a shell script');
+    assert.doesNotMatch(run, /\$\{\{/, 'the PR rule must read inputs from env');
+    const result = spawnSync('bash', ['--noprofile', '--norc', '-c', run], {
+      env: { ...env, ...overrides }, encoding: 'utf8', timeout: 5000,
+    });
+    assert.ifError(result.error);
+    assert.equal(result.status, expected, `the PR rule must exit ${expected}: ${result.stderr}`);
+    if (expected === 1) assert.match(result.stdout, /^::error::Release checks require a maintainer PR\./);
+  }
+
+  test('reads PR inputs from step env and runs only in the PR step', () => {
+    assert.equal(extractJobIf(section), null, 'Version gate must have no job if');
+    assert.equal(stepIf(step.body), prGuard, 'Version gate must check release-surface PRs');
+    assert.deepEqual(stepEnv(step.body).trim().split('\n').map(line => line.trim()).sort(), [
+      'HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}',
+      'IS_FORK: ${{ github.event.pull_request.head.repo.fork }}',
+      'PR_AUTHOR: ${{ github.event.pull_request.user.login }}',
+    ]);
+  });
+
+  test('accepts a valid same-repository PR', () => {
+    assertMaintainerResult(stepRun(step.body), {}, 0);
+  });
+
+  for (const [label, overrides, condition] of [
+    ['a Dependabot actor', { GITHUB_ACTOR: 'dependabot[bot]' }, '[ "$GITHUB_ACTOR" = "dependabot[bot]" ]'],
+    ['a maintainer actor with a Dependabot author', { PR_AUTHOR: 'dependabot[bot]' }, '[ "$PR_AUTHOR" = "dependabot[bot]" ]'],
+    ['a fork', { IS_FORK: 'true' }, '[ "$IS_FORK" = "true" ]'],
+    ['a different head repository', { HEAD_REPOSITORY: 'example/other' }, '[ "$HEAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]'],
+    ['a missing head repository', { HEAD_REPOSITORY: '', IS_FORK: '' }, null],
+  ]) {
+    test(`rejects ${label}`, () => {
+      const run = stepRun(step.body);
+      assertMaintainerResult(run, overrides, 1);
+      if (condition === null) return;
+      const mutated = run.replace(condition, 'false');
+      assert.notEqual(mutated, run, 'the mutation must remove one condition');
+      assert.throws(() => assertMaintainerResult(mutated, overrides, 1), /the PR rule must exit 1/);
+    });
+  }
+});
+
+describe('S32: Credential probe has time limits', () => {
+  const section = extractJobSection(yml, 'credential-probe');
+
+  test('the job has a ten-minute limit', () => {
+    const check = source => assert.match(source, /^ {4}timeout-minutes: 10$/m, 'Credential probe must have a ten-minute limit');
+    check(section);
+    assert.throws(() => check(section.replace('    timeout-minutes: 10\n', '')), /ten-minute limit/);
+  });
+
+  for (const [name, result] of [['OIDC request', 'RESP'], ['mint POST', 'CODE']]) {
+    test(`${name} has connection and total time limits`, () => {
+      const step = namedStep(jobSteps(section), 'Verify PyPI trusted publisher');
+      const command = stepRun(step.body).replaceAll('\\\n', '').split('\n')
+        .find(line => line.trimStart().startsWith(`${result}=$(curl `)) ?? '';
+      const limits = ['--connect-timeout 10', '--max-time 30'];
+      const check = call => {
+        for (const limit of limits) {
+          assert.ok(call.includes(` ${limit} `), `${name} must set ${limit}`);
+        }
+      };
+      check(command);
+      for (const limit of limits) {
+        assert.throws(() => check(command.replace(` ${limit} `, ' ')), { message: `${name} must set ${limit}` });
+      }
+      if (result === 'CODE') assert.doesNotMatch(command, /\s--retry(?:[\s=]|$)/);
+    });
+  }
+});
+
+for (const [job, name, variable] of [
+  ['publish-crates', 'Verify tag matches workspace version', 'TAG'],
+  ['publish-npm', npmPublish, 'VER'],
+]) {
+  test(`S33: ${job} reads the tag name from env`, () => {
+    const step = namedStep(jobSteps(extractJobSection(yml, job)), name);
+    const run = stepRun(step.body);
+    assert.ok(run.split('\n').some(line => line.trim() === `${variable}="$GITHUB_REF_NAME"`));
+    assert.doesNotMatch(run, /\$\{\{\s*github\.ref_name\s*\}\}/);
+  });
 }
 
 /**

@@ -9,7 +9,10 @@ workflow and the checks that must pass before a change can be merged.
   root `Cargo.toml`). The published crates (`mds-core`, `mds-cli`) must compile on
   1.88.
 - **Node.js**: **≥ 22.12** (see `engines` in the package manifests).
-- **wasm-pack** + the `wasm32-unknown-unknown` target, for the WASM build/tests.
+- **wasm-pack** and the `wasm32-unknown-unknown` target for WASM builds and tests.
+  To match CI, put the versions of `wasm-pack` and Binaryen `wasm-opt` from the
+  [WASM setup action](.github/actions/setup-wasm/action.yml) on `PATH`.
+  Local build scripts warn if the tools differ from the CI pins. CI stops on a difference.
 - **@napi-rs/cli** (installed via `npm ci`), for the native addon.
 
 ## Repository layout
@@ -123,6 +126,7 @@ locally:
 ```bash
 node scripts/verify-no-control-bytes.mjs          # full tracked-tree scan
 node scripts/verify-no-control-bytes.mjs --staged  # staged-only (pre-commit)
+node scripts/verify-versions.mjs                   # release manifests and workspace member versions in both lockfiles
 npm run test:gates                                 # positive-control spec suite
 ```
 
