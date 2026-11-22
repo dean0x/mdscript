@@ -20,6 +20,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -133,7 +134,7 @@ function transitivelyNeeds(graph, start, target) {
 function cargoPublishJobIds(source) {
   return findAllJobIds(source).filter(id => {
     const section = stripCommentLines(extractJobSection(source, id));
-    return /^(?: {10,}| {6}- run: | {8}run: )(?:if )?(?:OUTPUT=\$\()?cargo publish\b/m.test(section);
+    return /^(?: {10,}| {6}- run: | {8}run: )(?:if (?:! )?)?(?:OUTPUT=\$\()?(?:timeout [0-9]+ )?cargo publish\b/m.test(section);
   });
 }
 
@@ -188,7 +189,7 @@ describe('registry checks in credential-probe', () => {
     assert.ok(!hasCargoProbe(withInput));
   });
 
-  test('S4: every Cargo publish job needs both gates', () => {
+  test('S4: every Cargo publish job needs both gates', async t => {
     const checkOrdering = source => {
       const graph = buildNeedsGraph(source);
       const publishers = cargoPublishJobIds(source);
@@ -200,8 +201,16 @@ describe('registry checks in credential-probe', () => {
         }
       }
     };
-    assert.throws(() => checkOrdering(`${yml}\n  unguarded-publisher:\n    steps:\n` +
-      '      - run: cargo publish -p fixture\n'), /unguarded-publisher must transitively need version-gate/);
+    for (const [label, run] of [
+      ['direct command', '      - run: cargo publish -p fixture\n'],
+      ['negated condition', '      - run: |\n          if ! cargo publish -p fixture; then exit 1; fi\n'],
+      ['timeout wrapper', '      - run: timeout 600 cargo publish -p fixture\n'],
+    ]) {
+      await t.test(`rejects an unguarded publisher with a ${label}`, () => {
+        const fixture = `${yml}\n  unguarded-publisher:\n    steps:\n${run}`;
+        assert.throws(() => checkOrdering(fixture), /unguarded-publisher must transitively need version-gate/);
+      });
+    }
     checkOrdering(yml);
     const onlyVersion = yml.replace('    needs: [credential-probe]\n', '');
     assert.throws(() => checkOrdering(onlyVersion), /publish-crates must transitively need credential-probe/);
@@ -419,6 +428,15 @@ describe('B1: release-surface PR gate and rehearsal jobs', () => {
   // S10: The on: block must include a pull_request trigger with at least one
   // path from RELEASE_SURFACE (ensuring release-surface PRs exercise the gate).
   // -------------------------------------------------------------------------
+  test('S10a: Release only matches changes on the release surface for a Dependabot PR', () => {
+    const paths = extractPullRequestPaths(yml);
+    assert.ok(paths?.length, 'Release must have a PR paths filter');
+    const matches = file => paths.some(pattern => pattern.endsWith('/**')
+      ? file.startsWith(pattern.slice(0, -2))
+      : file === pattern);
+    assert.equal(matches('Cargo.toml'), false, 'a change to Cargo.toml alone must not start Release');
+    assert.equal(matches('crates/mds-napi/src/lib.rs'), true, 'an on-surface change must start Release');
+  });
   test('S10: on.pull_request.paths equals RELEASE_SURFACE exactly (as a set)', () => {
     const onBlock = extractOnBlock(yml);
     assert.ok(onBlock !== null, 'release.yml must have an on: block');
@@ -2151,26 +2169,104 @@ test('S30: every release job runs after Credential probe', () => {
   assert.throws(() => checkGraph(isolatedJob), /isolated-job must need credential-probe/);
 });
 
-function assertRejectsForkOrDependabot(section) {
-  const step = namedStep(jobSteps(section), 'Require a maintainer PR for release checks');
-  assert.ok(step && stepIf(step.body) === prGuard, 'version-gate must check release-surface PRs');
-  assert.equal(stepEnv(step.body).trim(), 'IS_FORK: ${{ github.event.pull_request.head.repo.fork }}');
-  assert.match(step.body,
-    /^ {10}if \[ "\$GITHUB_ACTOR" = "dependabot\[bot\]" \] \|\| \[ "\$IS_FORK" = "true" \]; then\n {12}echo "::error::[^\n]+"\n {12}exit 1\n {10}fi$/m,
-    'version-gate must fail for either Dependabot or a fork');
+function stepRun(body) {
+  return /^ {8}run: \|\n((?: {10}[^\n]*\n?)+)/m.exec(body)?.[1] ?? '';
 }
 
-test('S31: version-gate fails for either Dependabot or a fork without registry inputs', () => {
+describe('S31: Version gate requires a maintainer PR with a head in this repository', () => {
   const section = extractJobSection(yml, 'version-gate');
-  assertRejectsForkOrDependabot(section);
   const step = namedStep(jobSteps(section), 'Require a maintainer PR for release checks');
-  const mutate = (before, after) => section.replace(step.body.trimEnd(), step.body.trimEnd().replace(before, after));
-  assert.throws(() => assertRejectsForkOrDependabot(mutate(prGuard, nonPrGuard)), /must check release-surface PRs/);
-  assert.throws(() => assertRejectsForkOrDependabot(mutate('        env:\n', '        env:\n          FIXTURE: present\n')),
-    /IS_FORK/);
-  assert.throws(() => assertRejectsForkOrDependabot(mutate('] || [', '] && [')), /must fail for either/);
-  assert.throws(() => assertRejectsForkOrDependabot(mutate('exit 1', 'exit 0')), /must fail for either/);
+  const env = {
+    GITHUB_ACTOR: 'maintainer',
+    PR_AUTHOR: 'maintainer',
+    IS_FORK: 'false',
+    HEAD_REPOSITORY: 'example/repo',
+    GITHUB_REPOSITORY: 'example/repo',
+  };
+
+  function assertMaintainerResult(run, overrides, expected) {
+    assert.ok(run, 'the PR rule must have a shell script');
+    assert.doesNotMatch(run, /\$\{\{/, 'the PR rule must read inputs from env');
+    const result = spawnSync('bash', ['--noprofile', '--norc', '-c', run], {
+      env: { ...env, ...overrides }, encoding: 'utf8', timeout: 5000,
+    });
+    assert.ifError(result.error);
+    assert.equal(result.status, expected, `the PR rule must exit ${expected}: ${result.stderr}`);
+    if (expected === 1) assert.match(result.stdout, /^::error::Release checks require a maintainer PR\./);
+  }
+
+  test('reads PR inputs from step env and runs only in the PR step', () => {
+    assert.equal(extractJobIf(section), null, 'Version gate must have no job if');
+    assert.equal(stepIf(step.body), prGuard, 'Version gate must check release-surface PRs');
+    assert.deepEqual(stepEnv(step.body).trim().split('\n').map(line => line.trim()).sort(), [
+      'HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}',
+      'IS_FORK: ${{ github.event.pull_request.head.repo.fork }}',
+      'PR_AUTHOR: ${{ github.event.pull_request.user.login }}',
+    ]);
+  });
+
+  test('accepts a valid same-repository PR', () => {
+    assertMaintainerResult(stepRun(step.body), {}, 0);
+  });
+
+  for (const [label, overrides, condition] of [
+    ['a Dependabot actor', { GITHUB_ACTOR: 'dependabot[bot]' }, '[ "$GITHUB_ACTOR" = "dependabot[bot]" ]'],
+    ['a maintainer actor with a Dependabot author', { PR_AUTHOR: 'dependabot[bot]' }, '[ "$PR_AUTHOR" = "dependabot[bot]" ]'],
+    ['a fork', { IS_FORK: 'true' }, '[ "$IS_FORK" = "true" ]'],
+    ['a different head repository', { HEAD_REPOSITORY: 'example/other' }, '[ "$HEAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]'],
+    ['a missing head repository', { HEAD_REPOSITORY: '', IS_FORK: '' }, null],
+  ]) {
+    test(`rejects ${label}`, () => {
+      const run = stepRun(step.body);
+      assertMaintainerResult(run, overrides, 1);
+      if (condition === null) return;
+      const mutated = run.replace(condition, 'false');
+      assert.notEqual(mutated, run, 'the mutation must remove one condition');
+      assert.throws(() => assertMaintainerResult(mutated, overrides, 1), /the PR rule must exit 1/);
+    });
+  }
 });
+
+describe('S32: Credential probe has time limits', () => {
+  const section = extractJobSection(yml, 'credential-probe');
+
+  test('the job has a ten-minute limit', () => {
+    const check = source => assert.match(source, /^ {4}timeout-minutes: 10$/m, 'Credential probe must have a ten-minute limit');
+    check(section);
+    assert.throws(() => check(section.replace('    timeout-minutes: 10\n', '')), /ten-minute limit/);
+  });
+
+  for (const [name, result] of [['OIDC request', 'RESP'], ['mint POST', 'CODE']]) {
+    test(`${name} has connection and total time limits`, () => {
+      const step = namedStep(jobSteps(section), 'Verify PyPI trusted publisher');
+      const command = stepRun(step.body).replaceAll('\\\n', '').split('\n')
+        .find(line => line.trimStart().startsWith(`${result}=$(curl `)) ?? '';
+      const limits = ['--connect-timeout 10', '--max-time 30'];
+      const check = call => {
+        for (const limit of limits) {
+          assert.ok(call.includes(` ${limit} `), `${name} must set ${limit}`);
+        }
+      };
+      check(command);
+      for (const limit of limits) {
+        assert.throws(() => check(command.replace(` ${limit} `, ' ')), { message: `${name} must set ${limit}` });
+      }
+      if (result === 'CODE') assert.doesNotMatch(command, /\s--retry(?:[\s=]|$)/);
+    });
+  }
+});
+
+for (const [job, name, variable] of [
+  ['publish-crates', 'Verify tag matches workspace version', 'TAG'],
+  ['publish-npm', npmPublish, 'VER'],
+]) {
+  test(`S33: ${job} reads the tag name from env`, () => {
+    const step = namedStep(jobSteps(extractJobSection(yml, job)), name);
+    const run = stepRun(step.body);
+    assert.ok(run.split('\n').some(line => line.trim() === `${variable}="$GITHUB_REF_NAME"`));
+    assert.doesNotMatch(run, /\$\{\{\s*github\.ref_name\s*\}\}/);
+  });
+}
 
 /**
  * Split the comment-stripped build-napi section into matrix settings entries.

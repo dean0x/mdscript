@@ -51,6 +51,7 @@ jobs:
   credential-probe:
     name: Credential probe
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       id-token: write
     steps:
@@ -91,12 +92,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          RESP=$(curl -fsS "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=pypi" \
+          RESP=$(curl -fsS --connect-timeout 10 --max-time 30 \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=pypi" \
             -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}")
           TOK=$(jq -er '.value' <<< "$RESP")
           MINT_LOG=$(mktemp)
           trap 'rm -f "$MINT_LOG"' EXIT
-          CODE=$(curl -sS -o "$MINT_LOG" -w '%{http_code}' \
+          CODE=$(curl -sS --connect-timeout 10 --max-time 30 -o "$MINT_LOG" -w '%{http_code}' \
             -X POST https://pypi.org/_/oidc/mint-token \
             -d "{\"token\":\"${TOK}\"}")
           [ "$CODE" = "200" ] || {
@@ -129,9 +131,14 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
         shell: bash
         run: |
-          if [ "$GITHUB_ACTOR" = "dependabot[bot]" ] || [ "$IS_FORK" = "true" ]; then
+          if [ "$GITHUB_ACTOR" = "dependabot[bot]" ] ||
+             [ "$PR_AUTHOR" = "dependabot[bot]" ] ||
+             [ "$IS_FORK" = "true" ] ||
+             [ "$HEAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]; then
             echo "::error::Release checks require a maintainer PR. Open a maintainer PR with the same changes."
             exit 1
           fi
@@ -761,6 +768,7 @@ jobs:
       # In v1.51.0, the PyO3/maturin-action purge checks debugBuildDir, not
       # releaseBuildDir. It misses proc-macro files in target/release/deps
       # (PyO3/maturin-action#476). Keep the host install guard and per-leg keys.
+      # Spec S20 in scripts/__test__/release-auth-probe.spec.mjs checks those keys.
       # This workaround does not change the wheel build. Simplify it only after
       # an upstream fix ships and a release rehearsal with that fix passes.
       # Use the current stable compiler for host wheel builds.
@@ -772,8 +780,7 @@ jobs:
       # Per-leg cache key: target + manylinux flavour so a containerised Linux
       # leg (glibc 2.17 manylinux / musl) never restores host-built build scripts
       # or proc-macro .so files written by another leg; legs without manylinux
-      # render a trailing dash (harmless, validated warm in #347). Intentional;
-      # spec S20 in scripts/__test__/release-auth-probe.spec.mjs pins it.
+      # render a trailing dash (harmless, validated warm in #347).
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         if: ${{ !matrix.sdist }}
         with:
@@ -1256,7 +1263,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
       - name: Verify tag matches workspace version
         run: |
-          TAG="${{ github.ref_name }}"
+          TAG="$GITHUB_REF_NAME"
           TAG="${TAG#v}"
           CRATE_VER="$(cargo metadata --no-deps --format-version 1 \
             | grep -o '"name":"mds-core","version":"[^"]*"' \
@@ -1426,7 +1433,7 @@ jobs:
           # Idempotency: publish_if_absent checks npm view before publishing so
           # a re-run skips already-published versions without swallowing genuine
           # failures. Never use continue-on-error — it masks partial state. PF-023.
-          VER="${{ github.ref_name }}"
+          VER="$GITHUB_REF_NAME"
           VER="${VER#v}"
           publish_if_absent() {
             local pkg="$1"
