@@ -371,6 +371,23 @@ fn module_count_skeleton_graph_boundaries() {
 }
 
 #[test]
+fn module_count_intermediate_skeleton_charges_imports_and_parent() {
+    for total in [257, 258] {
+        let mut files = module_count_graph(total, true);
+        files.insert("m0.mds".into(), "@extends \"./m1.mds\"\n".into());
+        let imports: String = (3..total)
+            .map(|i| format!("  - path: ./m{i}.mds\n    as: m{i}\n"))
+            .collect();
+        files.insert(
+            "m1.mds".into(),
+            format!("---\nimports:\n{imports}---\n@extends \"./m2.mds\"\n"),
+        );
+
+        assert_module_count_outcome(crate::compile_virtual(files, "m0.mds", None), total);
+    }
+}
+
+#[test]
 fn module_count_reused_cache_checks_each_entry_path() {
     for mode in 0..5 {
         let mut files = module_count_graph(257, false);
