@@ -1,6 +1,5 @@
-// `LINT_RULE_NAMES` is a value export; exported directly from both entry points
-// (dist/node.js and dist/browser.js) so that consumers can import it via
-// `@mdscript/mds` regardless of environment.
+// The Node.js and browser entry points re-export `LINT_RULE_NAMES` from this module.
+// Consumers can import this value from `@mdscript/mds` in either environment.
 export { isMdsError, LINT_RULE_NAMES } from './types.js';
 export type {
   BackendType,

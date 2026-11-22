@@ -121,6 +121,8 @@ export interface CheckOptions {
    * which succeeds silently but resolves against the wrong directory if the
    * source string was not loaded from cwd. Provide an explicit path when the
    * source contains `@import` or `@extends`.
+   * An explicit `undefined` has the same effect as an omitted key: imports resolve
+   * against the process cwd, subject to the same import path checks.
    *
    * **WASM backend:** rejected at runtime with `mds::invalid_options` -- the WASM
    * backend has no filesystem access. Set `MDS_BACKEND=native` to force the native
@@ -354,6 +356,8 @@ export interface LintOptions {
    * which succeeds silently but resolves against the wrong directory if the
    * source string was not loaded from cwd. Provide an explicit path when the
    * source contains `@import` or `@extends`.
+   * An explicit `undefined` has the same effect as an omitted key: imports resolve
+   * against the process cwd, subject to the same import path checks.
    *
    * The WASM backend **rejects** a non-null `basePath` with
    * `mds::invalid_options` rather than silently ignoring it. This surfaces the

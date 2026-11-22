@@ -8,10 +8,12 @@
  * Unknown-key validation runs inside the wrapper (before backend dispatch) and is
  * therefore backend-agnostic: the same rejection fires on native and WASM paths.
  *
- * basePath behaviour is NOT backend-agnostic (OD-1): the native backend honors it
- * on the string surface, while the WASM backend rejects it (no filesystem access).
- * Tests touching basePath are therefore either native-gated via requireNativeAddon()
- * or written backend-aware via assertWrapperAcceptsBasePath().
+ * The native backend accepts a non-null `basePath` for string inputs (OD-1).
+ * The WASM backend rejects it because it has no file system access.
+ * Some tests require the native addon with `requireNativeAddon()`.
+ * Others use `assertWrapperAcceptsBasePath()` to check the result for the active backend.
+ * U-OV-29 tests `basePath: undefined` on all seven methods in one child process per backend.
+ * It checks that `getBackend()` reports the requested backend.
  *
  * U-OV-14 performs a byte-identical message parity check across all seven
  * methods against the native napi backend. That test hard-fails when the

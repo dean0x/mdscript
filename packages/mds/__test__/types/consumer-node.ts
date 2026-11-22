@@ -10,9 +10,9 @@
  * AC-P3-21: all option types a consumer needs are exported from dist/node.d.ts
  * (the entry the `exports` map resolves for Node.js consumers).
  *
- * Note: this file is compiled by tsconfig.types.json (noEmit: true) and is NOT
- * in the main build (tsconfig.json excludes __test__). It runs as part of
- * `npm test` via the test script preamble.
+ * `npm test` checks this file with tsconfig.types.json and tsconfig.types.eopt-off.json.
+ * The code below each `@ts-expect-error` must cause a type error in both modes.
+ * Both configs set `noEmit: true`. The main build excludes `__test__`.
  */
 import type {
   CheckFileOptions,

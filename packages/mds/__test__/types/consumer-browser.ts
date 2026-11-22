@@ -1,9 +1,9 @@
 /**
- * Type-level matrix verification for the browser entry point.
+ * Both tsconfig.types.json and tsconfig.types.eopt-off.json check the browser entry.
+ * The code below each `@ts-expect-error` must cause a type error in both modes.
  *
- * AC-P3-16: all lint types a TypeScript consumer must name to use the browser
- * lint API surface are exported from dist/browser.d.ts and compile correctly
- * under the repo's strict settings.
+ * AC-P3-16: dist/browser.d.ts exports all lint types a TypeScript consumer needs.
+ * These types must pass the strict type checks.
  *
  * AC-P3-20 (browser surface): `basePath` IS accepted at the type level on
  * `CompileOptions`, `CheckOptions`, and `LintOptions` from the browser entry.
@@ -49,10 +49,10 @@ const _lintOpts: LintOptions = { basePath: '/dir', rules: {} };
 // @ts-expect-error — basePath is intentionally absent from LintFileOptions
 const _lintFileOpts: LintFileOptions = { basePath: '/dir' };
 
-// Variable-passing case: LintOptions (basePath?: string) must be rejected by
-// LintFileOptions (basePath?: never) — not only fresh object literals.
+// LintFileOptions (basePath?: never) rejects LintOptions (basePath?: string | undefined)
+// even when the source is a variable, not a fresh object literal.
 declare const _lintSrcVar: LintOptions;
-// @ts-expect-error — LintOptions (basePath?: string) not assignable to LintFileOptions (basePath?: never)
+// @ts-expect-error — LintOptions is not assignable to LintFileOptions
 const _lintFileFromVar: LintFileOptions = _lintSrcVar;
 
 // ── AC-P3-16: all seven lint types are nameable from the browser entry ────────
