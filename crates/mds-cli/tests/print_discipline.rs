@@ -319,7 +319,8 @@ const PRINT_MACROS: &[&str] = &[
 /// when its prints moved to the writer; lowering one is a decision made in the commit
 /// that removes the print, never a side effect.
 const SITE_FLOORS: &[(&str, usize)] = &[
-    ("build.rs", 27),
+    ("build.rs", 23),
+    ("vars.rs", 4),
     ("fmt.rs", 11),
     ("lint.rs", 1),
     ("lint_sink.rs", 12),
@@ -795,7 +796,7 @@ const PATH_TEXT_HELPERS: &[(&str, &str, usize, &str)] = &[
          on disk before it is replaced; no message shows it.",
     ),
     (
-        "build.rs",
+        "vars.rs",
         "vars_file_error",
         1,
         "Names the typed `--vars` path through `mds::escape_path_for_message` of its \
@@ -897,7 +898,15 @@ const PATH_FREE_ERRORS: &[(&str, &str, usize, &str)] = &[
     (
         "build.rs",
         "crate::output::safe_inline(&e)",
-        3,
+        1,
+        "Escaped, and none names a path: a `FromUtf8Error` reading `mds.json` (a byte \
+         count and an offset), a `serde_json` error parsing it (a message, a line and a \
+         column), and one serializing `messages` output (fixed text).",
+    ),
+    (
+        "config.rs",
+        "crate::output::safe_inline(&e)",
+        2,
         "Escaped, and none names a path: a `FromUtf8Error` reading `mds.json` (a byte \
          count and an offset), a `serde_json` error parsing it (a message, a line and a \
          column), and one serializing `messages` output (fixed text).",
