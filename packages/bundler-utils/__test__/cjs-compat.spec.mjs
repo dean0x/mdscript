@@ -18,7 +18,13 @@ const require = createRequire(import.meta.url);
 const cjsPath = resolve(__dirname, '../dist-cjs/index.js');
 const hasCjsBuild = existsSync(cjsPath);
 
-describe('bundler-utils CJS build', { skip: !hasCjsBuild && 'dist-cjs/ not built — run build first' }, () => {
+describe('bundler-utils CJS build', { skip: !hasCjsBuild && !process.env.CI && 'dist-cjs/ not built — run build first' }, () => {
+  if (!hasCjsBuild) {
+    test('has a CJS build', () => {
+      assert.ok(hasCjsBuild, 'dist-cjs/ missing in CI — build step did not run');
+    });
+    return;
+  }
   const cjsBuild = require(cjsPath);
   const { createMdsTransformer, formatMdsError, shouldTransform, LazyInit } = cjsBuild;
 
