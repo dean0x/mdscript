@@ -1,7 +1,7 @@
 ---
 feature: mds-js
 name: "@mdscript/mds universal JS package — option forwarding, backends, published TS types"
-description: "Use when you change JS/TS exports, option types, backend contracts, or the WASM file scanner. Keywords: CompileFileOptions, basePath, public-types.ts, forwardOpts, assertResultShape, module-scanner.ts."
+description: "Use when modifying the JS/TS public API surface, adding backend methods, changing option types, debugging basePath rejection behaviour, changing result types, updating the backend contract, working on WASM/native backend validation, debugging why a backend result is rejected, or changing the WASM backend's JS file pre-scanner (module-scanner.ts / path-chars.ts / sliding-window.ts: path refusals, forbidden path characters, symlink and not-found handling, read-ahead concurrency, module aliases). Keywords: compileFile, compile, check, checkFile, lint, lintFile, lintVirtual, CompileResult, MarkdownResult, MessagesResult, CheckResult, LintResult, LintDiagnostic, LintFileOptions, CompileFileOptions, assertResultShape, validateBackendMethods, METHOD_KEYS, forwardOpts, assertKnownKeys, getBasePathError, BASEPATH_REJECTORS, BASE_METHODS, NODE_METHODS, WASM_EXPORTS, discriminated union, kind, mds::invalid_backend_result, mds::invalid_options, basePath, synchronous throw, native.ts, wasm.ts, contract.ts, types.ts, node.ts, browser.ts, options.ts, module-scanner.ts, path-chars.ts, sliding-window.ts, slidingWindow, buildModulesMap, ScannerEngine, ImportRecord, preflightModule, scanImportRecords, moduleAliases, aliasKey, withImportContext, assertKeyMatchesDisk, canonicalFile, findProjectRoot, readAtMost, ReadBudget, MAX_IMPORTS_READ_AHEAD, sanitizeControlCharsWire, escapePathForMessage, isForbiddenPathChar, forbiddenCharMessage, importPathViolation, PathError, realpathParent, openNoFollow, readError, cannotReadError, symlinkError, escapesProjectError, notRegularFileError, closeModule, mds::file_not_found, mds::io, mds::import, mds::resource_limit, O_NOFOLLOW, ELOOP, ENOTDIR, ENAMETOOLONG, EACCES, U-FP, U-SM, U-SW, U-WCF, #265, #408, #414, #417, #418, #424, #427, #428, #432, #479, #483."
 category: component-patterns
 directories: ["packages/mds/src", "packages/mds/__test__"]
 referencedFiles:
@@ -79,7 +79,7 @@ Option key lists are hardcoded independently in **four** places: TS `METHOD_KEYS
 
 `tsconfig.base.json` enables `exactOptionalPropertyTypes` (EOPT). The consumer's own flag controls the type check. With EOPT on, `basePath?: never` requires an absent key. With EOPT off, this declaration accepts an explicit `undefined` value. The runtime guard is the primary control in both cases.
 
-For file and virtual methods, `getBasePathError` rejects all `basePath` values except `undefined`, so it also rejects explicit `null`. `forwardOpts` omits nullish values, so the napi addon does not receive `basePath: undefined`. U-OV-29 checks this case across both backends for `compile`, `check`, `compileFile`, and `checkFile`.
+For file and virtual methods, `getBasePathError` rejects all `basePath` values except `undefined`, so it also rejects explicit `null`. `forwardOpts` omits nullish values, so the napi addon does not receive `basePath: undefined`. U-OV-29 requires both the native and WASM backends to accept `basePath: undefined` on all seven methods: `compile`, `check`, `lint`, `compileFile`, `checkFile`, `lintFile`, and `lintVirtual`.
 
 ## Published Types
 
@@ -102,6 +102,8 @@ export type CompileResult = MarkdownResult | MessagesResult;
 Use `CompileFileOptions` for `compileFile`, `CheckFileOptions` for `checkFile`, and `LintFileOptions` for `lintFile` and `lintVirtual`.
 
 Declare file option fields directly. Do not extend `CompileOptions` in `CompileFileOptions` because `CompileOptions` accepts `basePath`.
+
+`MdsBackend` (previously declared once, exported from neither entry point) is deleted. Do not re-introduce it.
 
 ### Optional input fields
 
@@ -279,7 +281,7 @@ export const WASM_EXPORTS = [
 - **Missing-engine checks differ by test.** Some older differentials warn-and-return locally but fail under `process.env.CI`. New conversion, importer-span and module-count tests require live engines and fail locally too. Rebuild the native addon and `crates/mds-wasm/pkg/` before those tests.
 - **`CheckResult` has only `{ warnings: string[] }` — no `dependencies`** — this matches the napi wire; check does not expose deps.
 - **The `assertReady()` error message is byte-literal** — `'@mdscript/mds: call await init() before using compile/check/compileFile/checkFile/getBackend'` — tests pin it; don't change without updating tests.
-- **`basePath: undefined` is treated as "key absent"** — `getBasePathError` uses `!== undefined`, not `!= null`. Both backends must agree (enforced by U-OV-29). This is consistent with `forwardOpts`'s `!= null` filter that prevents `{basePath: undefined}` from reaching napi.
+- **`basePath: undefined` is treated as "key absent"** — `getBasePathError` uses `!== undefined`, not `!= null`. U-OV-29 requires both backends to accept `basePath: undefined` on all seven methods. This is consistent with `forwardOpts`'s `!= null` filter that prevents `{basePath: undefined}` from reaching napi.
 - **Option key lists live in four independent places** (TS `METHOD_KEYS`, napi, wasm, Python). TS↔napi parity is runtime-enforced; WASM and Python drift is caught only by prose review until #311 lands.
 - **The scanner's "cannot read" message and native's disagree on wording, not code** — the scanner names the path as written and an errno name (`EACCES`), native names the root-relative path and the OS error text; only `code` should be compared cross-backend for that shape (difference 6).
 - **`U-SM34` (root-rooted project) needs an actual root filesystem to run meaningfully** — it `# SKIP`s outside a throwaway container; a green local run without root access proves nothing about that arm.
