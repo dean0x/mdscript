@@ -1362,7 +1362,8 @@ jobs:
       # BEFORE any irreversible npm publish so a bloated binary aborts before
       # anything reaches the registry. The limit and its reason live in ci.yml's
       # wasm job ("WHY THIS LIMIT EXISTS"); this value must stay equal to it
-      # (scripts/__test__/wasm-build-parity.spec.mjs checks it).
+      # (scripts/__test__/wasm-build-parity.spec.mjs checks it). See the #128
+      # catch-up entry in that job's size ledger for the current CI baseline.
       - name: "Assert WASM binary size limit (PF-021)"
         run: |
           WASM_SIZE_LIMIT=821000
