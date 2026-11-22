@@ -4,8 +4,9 @@ use super::{
     build_scope_from_frontmatter, bytes, evaluate_messages_seeded, evaluate_seeded,
     evaluate_with_map_seeded, fragment_map_from, has_message_block, is_visible_export,
     parse_frontmatter_mapping, seed_effective_blocks, spliced_regions, validate_exports, validator,
-    Arc, CollectedDefs, CompileOptions, ExtendsComponents, MapBuilder, MdsError, MemBudget,
-    ModuleCache, ModuleCtx, Node, Part, PromptText, ResolvedModule, MAX_SOURCES_CONTENT_BYTES,
+    Arc, CollectedDefs, CompileOptions, ExtendsComponents, MapBuilder, MdsError, MemBudget, Module,
+    ModuleCache, ModuleCtx, Node, Origin, Part, PromptText, ResolvedModule, Scope,
+    MAX_SOURCES_CONTENT_BYTES,
 };
 
 /// Warning emitted when `source_map: true` is used with a messages-mode template.
@@ -16,6 +17,12 @@ use super::{
 const MSG_MODE_SOURCE_MAP_WARNING: &str =
     "source maps are not supported for messages-mode templates (@message blocks); \
      no source map will be generated";
+
+type StandalonePrompt<'ctx> = (
+    Option<PromptText>,
+    Option<Arc<crate::sourcemap::FragmentMap>>,
+    &'ctx Origin,
+);
 
 impl ModuleCache {
     /// Common intrinsic processing: tokenize, parse, build scope, then dispatch on
@@ -79,78 +86,101 @@ impl ModuleCache {
 
         // ── Extends branch ────────────────────────────────────────────────────
         if let Some(ext) = module.extends.clone() {
-            let (frontmatter_values, frontmatter_bytes) =
-                parse_frontmatter_mapping(module.frontmatter.as_ref(), &mut self.budget.mem)?;
-            let components = self.resolve_extends_components(
-                &module,
-                &ext,
-                ctx,
-                &frontmatter_values,
-                frontmatter_bytes,
-                warnings,
-            )?;
+            return self.intrinsic_extends(&module, &ext, ctx, opts, warnings);
+        }
 
-            {
-                let mut scope = components.scope.clone();
-                Self::validate_extends_components(&components, &mut scope)?;
+        self.intrinsic_standalone(&module, raw_frontmatter, ctx, is_md, opts, warnings)
+    }
+
+    fn intrinsic_extends(
+        &mut self,
+        module: &Module,
+        ext: &crate::ast::ExtendsDirective,
+        ctx: &ModuleCtx<'_>,
+        opts: &crate::sourcemap::CompileOptions,
+        warnings: &mut Vec<String>,
+    ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
+        let (frontmatter_values, frontmatter_bytes) =
+            parse_frontmatter_mapping(module.frontmatter.as_ref(), &mut self.budget.mem)?;
+        let components = self.resolve_extends_components(
+            module,
+            ext,
+            ctx,
+            &frontmatter_values,
+            frontmatter_bytes,
+            warnings,
+        )?;
+
+        {
+            let mut scope = components.scope.clone();
+            Self::validate_extends_components(&components, &mut scope)?;
+        }
+
+        let ExtendsComponents {
+            mut scope,
+            merged_frontmatter,
+            effective_skeleton,
+            effective_blocks,
+            skeleton_origin,
+            ..
+        } = components;
+
+        // Per-region evaluation in both modes, with or without a source map:
+        // base-skeleton nodes, base defaults and child overrides index into
+        // different files, so each region is evaluated against its own origin
+        // (#114, #115).
+        let regions = spliced_regions(&effective_skeleton, &effective_blocks, &skeleton_origin);
+
+        if regions.iter().any(|(nodes, _)| has_message_block(nodes)) {
+            // AC-FUNC-07: source_map=true is incompatible with messages-mode templates.
+            // The evaluator only has text-stream semantics; messages boundaries don't
+            // have stable byte offsets relative to the source.  Degrade gracefully.
+            if opts.source_map {
+                warnings.push(MSG_MODE_SOURCE_MAP_WARNING.to_string());
             }
-
-            let ExtendsComponents {
-                mut scope,
-                merged_frontmatter,
-                effective_skeleton,
-                effective_blocks,
-                skeleton_origin,
-                ..
-            } = components;
-
-            // Per-region evaluation in both modes, with or without a source map:
-            // base-skeleton nodes, base defaults and child overrides index into
-            // different files, so each region is evaluated against its own origin
-            // (#114, #115).
-            let regions = spliced_regions(&effective_skeleton, &effective_blocks, &skeleton_origin);
-
-            if regions.iter().any(|(nodes, _)| has_message_block(nodes)) {
-                // AC-FUNC-07: source_map=true is incompatible with messages-mode templates.
-                // The evaluator only has text-stream semantics; messages boundaries don't
-                // have stable byte offsets relative to the source.  Degrade gracefully.
-                if opts.source_map {
-                    warnings.push(MSG_MODE_SOURCE_MAP_WARNING.to_string());
-                }
-                let messages = Self::evaluate_message_regions(
-                    &regions,
-                    &mut scope,
-                    warnings,
-                    self.budget.start_module(),
-                )?;
-                return Ok((
-                    crate::CompiledOutput::Messages(
-                        messages.into_iter().map(crate::Message::from).collect(),
-                    ),
-                    None, // source maps cover Markdown only (AC-FUNC-07)
-                ));
-            }
-
-            // Seed the builder with the skeleton's root file (source maps only).
-            let seed = opts.source_map.then_some(&skeleton_origin);
-            let (body_raw, builder) = Self::evaluate_extends_regions(
+            let messages = Self::evaluate_message_regions(
                 &regions,
-                seed,
                 &mut scope,
                 warnings,
                 self.budget.start_module(),
             )?;
-            return self.finalize_markdown(
-                body_raw,
-                merged_frontmatter.as_deref(),
-                builder.map(|b| (b, 0)),
-                ctx.base_dir,
-                opts,
-                warnings,
-            );
+            return Ok((
+                crate::CompiledOutput::Messages(
+                    messages.into_iter().map(crate::Message::from).collect(),
+                ),
+                None, // source maps cover Markdown only (AC-FUNC-07)
+            ));
         }
 
-        // ── Standalone path ───────────────────────────────────────────────────
+        // Seed the builder with the skeleton's root file (source maps only).
+        let seed = opts.source_map.then_some(&skeleton_origin);
+        let (body_raw, builder) = Self::evaluate_extends_regions(
+            &regions,
+            seed,
+            &mut scope,
+            warnings,
+            self.budget.start_module(),
+        )?;
+        self.finalize_markdown(
+            body_raw,
+            merged_frontmatter.as_deref(),
+            builder.map(|b| (b, 0)),
+            ctx.base_dir,
+            opts,
+            warnings,
+        )
+    }
+
+    // ── Standalone path ───────────────────────────────────────────────────
+    fn intrinsic_standalone(
+        &mut self,
+        module: &Module,
+        raw_frontmatter: Option<&str>,
+        ctx: &ModuleCtx<'_>,
+        is_md: bool,
+        opts: &crate::sourcemap::CompileOptions,
+        warnings: &mut Vec<String>,
+    ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
         // The parsed tree is dropped once the scope layer is built from it.
         let (mut scope, fm_imports) = {
             let (mapping, spent) =
@@ -200,6 +230,25 @@ impl ModuleCache {
             ));
         }
 
+        self.eval_standalone_markdown(
+            &module.body,
+            &mut scope,
+            raw_frontmatter,
+            ctx,
+            opts,
+            warnings,
+        )
+    }
+
+    fn eval_standalone_markdown(
+        &mut self,
+        body: &[Node],
+        scope: &mut Scope,
+        raw_frontmatter: Option<&str>,
+        ctx: &ModuleCtx<'_>,
+        opts: &crate::sourcemap::CompileOptions,
+        warnings: &mut Vec<String>,
+    ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
         let mut body_raw = String::new();
         let builder = if opts.source_map {
             // The builder's seed (current source 0) is ctx.key / ctx.file_str / ctx.source;
@@ -212,8 +261,8 @@ impl ModuleCache {
             };
             let builder = MapBuilder::new(origin);
             let returned = evaluate_with_map_seeded(
-                &module.body,
-                &mut scope,
+                body,
+                scope,
                 warnings,
                 builder,
                 self.budget.start_module(),
@@ -222,8 +271,8 @@ impl ModuleCache {
             Some((returned, map_origin_bytes))
         } else {
             evaluate_seeded(
-                &module.body,
-                &mut scope,
+                body,
+                scope,
                 warnings,
                 ctx.file_str,
                 ctx.source,
@@ -367,10 +416,66 @@ impl ModuleCache {
         // ── Standalone (non-extending) path ──────────────────────────────────
         let raw_frontmatter = self.copy_raw_frontmatter(&module)?;
 
+        let (mut scope, defs) = self.standalone_scope(
+            &module,
+            frontmatter_values.as_ref(),
+            frontmatter_bytes,
+            ctx,
+            is_md,
+            warnings,
+        )?;
+
+        // Whether "prompt" is an available export of this module (the rule
+        // `ResolvedModule::is_exported` applies).
+        let prompt_exported =
+            is_visible_export(defs.has_explicit_exports, &defs.explicit_exports, "prompt");
+
+        let (prompt_body, prompt_map, origin) =
+            self.eval_standalone_prompt(&module.body, &mut scope, prompt_exported, ctx, warnings)?;
+
+        // Build effective_blocks first so module.body can be moved into the Arc below.
+        let effective_blocks = seed_effective_blocks(&module.body, &defs.block_names, origin);
+
+        // Move module.body into Arc<[Node]> (reuses the Vec allocation, no element clones, P1).
+        let effective_skeleton: Arc<[Node]> = Arc::from(module.body);
+
+        let namespace = ResolvedModule::build_namespace(
+            &defs.functions,
+            defs.has_explicit_exports,
+            &defs.explicit_exports,
+            prompt_body.as_ref(),
+            prompt_map.as_ref(),
+        );
+        Ok(ResolvedModule {
+            functions: defs.functions,
+            prompt_body,
+            namespace,
+            prompt_map,
+            raw_frontmatter,
+            has_explicit_exports: defs.has_explicit_exports,
+            explicit_exports: defs.explicit_exports,
+            effective_skeleton,
+            effective_blocks,
+            skeleton_origin: origin.clone(),
+            frontmatter_values,
+            frontmatter_bytes,
+            is_skeleton: false,
+        })
+    }
+
+    fn standalone_scope(
+        &mut self,
+        module: &Module,
+        frontmatter_values: Option<&serde_yaml_ng::Mapping>,
+        frontmatter_bytes: usize,
+        ctx: &ModuleCtx<'_>,
+        is_md: bool,
+        warnings: &mut Vec<String>,
+    ) -> Result<(Scope, CollectedDefs), MdsError> {
         // Build scope from frontmatter + runtime vars; extract any frontmatter imports.
         let (mut scope, fm_imports) = build_scope_from_frontmatter(
             module.frontmatter.as_ref(),
-            frontmatter_values.as_ref(),
+            frontmatter_values,
             frontmatter_bytes,
             is_md,
             ctx.runtime_vars,
@@ -383,27 +488,28 @@ impl ModuleCache {
         self.resolve_frontmatter_imports(&fm_imports, &mut scope, ctx, warnings)?;
 
         // Walk the AST: collect @define functions (with closure capture), process imports/exports
-        let CollectedDefs {
-            functions,
-            has_explicit_exports,
-            explicit_exports,
-            block_names,
-        } = self.collect_definitions_and_imports(&module.body, &mut scope, ctx, warnings)?;
+        let defs = self.collect_definitions_and_imports(&module.body, &mut scope, ctx, warnings)?;
         // A function can capture the scope layer, so the entry keeps the layer too.
-        if !functions.is_empty() {
+        if !defs.functions.is_empty() {
             self.keep(frontmatter_bytes);
         }
 
         // Validate that all named exports refer to defined functions or "prompt"
-        validate_exports(&explicit_exports, &functions)?;
+        validate_exports(&defs.explicit_exports, &defs.functions)?;
 
         // Validate semantic correctness before evaluation
         validator::validate(&module.body, &mut scope, ctx.file_str, ctx.source)?;
+        Ok((scope, defs))
+    }
 
-        // Whether "prompt" is an available export of this module (the rule
-        // `ResolvedModule::is_exported` applies).
-        let prompt_exported = is_visible_export(has_explicit_exports, &explicit_exports, "prompt");
-
+    fn eval_standalone_prompt<'ctx>(
+        &mut self,
+        body: &[Node],
+        scope: &mut Scope,
+        prompt_exported: bool,
+        ctx: &'ctx ModuleCtx<'_>,
+        warnings: &mut Vec<String>,
+    ) -> Result<StandalonePrompt<'ctx>, MdsError> {
         let origin = ctx.origin(self)?;
 
         // Evaluate the body to get prompt text (and optionally a FragmentMap).
@@ -418,8 +524,8 @@ impl ModuleCache {
             // evaluate_with_map derives file/source from the builder's current source
             // (issue #58).
             Some(evaluate_with_map_seeded(
-                &module.body,
-                &mut scope,
+                body,
+                scope,
                 warnings,
                 builder,
                 self.budget.start_module(),
@@ -427,8 +533,8 @@ impl ModuleCache {
             )?)
         } else {
             evaluate_seeded(
-                &module.body,
-                &mut scope,
+                body,
+                scope,
                 warnings,
                 ctx.file_str,
                 ctx.source,
@@ -439,35 +545,7 @@ impl ModuleCache {
         };
         let (prompt_body, prompt_map) =
             self.prompt_body_and_map(body_raw, builder, ctx.file_str, warnings);
-
-        // Build effective_blocks first so module.body can be moved into the Arc below.
-        let effective_blocks = seed_effective_blocks(&module.body, &block_names, origin);
-
-        // Move module.body into Arc<[Node]> (reuses the Vec allocation, no element clones, P1).
-        let effective_skeleton: Arc<[Node]> = Arc::from(module.body);
-
-        let namespace = ResolvedModule::build_namespace(
-            &functions,
-            has_explicit_exports,
-            &explicit_exports,
-            prompt_body.as_ref(),
-            prompt_map.as_ref(),
-        );
-        Ok(ResolvedModule {
-            functions,
-            prompt_body,
-            namespace,
-            prompt_map,
-            raw_frontmatter,
-            has_explicit_exports,
-            explicit_exports,
-            effective_skeleton,
-            effective_blocks,
-            skeleton_origin: origin.clone(),
-            frontmatter_values,
-            frontmatter_bytes,
-            is_skeleton: false,
-        })
+        Ok((prompt_body, prompt_map, origin))
     }
 }
 
