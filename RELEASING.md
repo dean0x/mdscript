@@ -89,11 +89,68 @@ These are **not** automated and must be done before the first release:
 
 ## Pre-flight (before tagging)
 
-Run the local dry-runs and gates:
+Install the CI pin, `cargo-deny 0.20.2`, before the Rust checks (#136).
+Run this block in Bash. Use Git Bash on Windows.
+Use `curl`, `jq`, `tar`, and either `sha256sum` or `shasum`.
+If any command fails, stop. Use the same shell for the checks below.
+
+```bash
+if cargo_deny_tmp=$(mktemp -d) && bash -s -- "$cargo_deny_tmp" <<'INSTALL_CARGO_DENY'
+set -euo pipefail
+work=$1
+version=0.20.2
+action_sha=5b4d68e2e660441203ab128a23676f1e4faf1532
+binary=cargo-deny
+case "$(uname -s):$(uname -m)" in
+  Darwin:arm64)       platform=aarch64_macos;      target=aarch64-apple-darwin ;;
+  Darwin:x86_64)      platform=x86_64_macos;       target=x86_64-apple-darwin ;;
+  Linux:aarch64)      platform=aarch64_linux_musl; target=aarch64-unknown-linux-musl ;;
+  Linux:x86_64)       platform=x86_64_linux_musl;  target=x86_64-unknown-linux-musl ;;
+  MINGW*:x86_64|MSYS*:x86_64)
+    platform=x86_64_windows; target=x86_64-pc-windows-msvc; binary=cargo-deny.exe ;;
+  *) printf 'No pinned cargo-deny archive for this host\n' >&2; exit 1 ;;
+esac
+bundle="cargo-deny-$version-$target"
+mkdir "$work/download" "$work/bin"
+archive="$work/download/$bundle.tar.gz"
+manifest="https://raw.githubusercontent.com/taiki-e/install-action/$action_sha/manifests/cargo-deny.json"
+expected=$(curl -fsSL --proto '=https' --proto-redir '=https' "$manifest" |
+  jq -er --arg v "$version" --arg p "$platform" \
+    '.[$v][$p].hash | strings | select(test("^[0-9a-f]{64}$"))')
+curl -fsSL --proto '=https' --proto-redir '=https' -o "$archive" \
+  "https://github.com/EmbarkStudios/cargo-deny/releases/download/$version/$bundle.tar.gz"
+if command -v sha256sum >/dev/null; then
+  actual=$(sha256sum < "$archive")
+else
+  actual=$(shasum -a 256 < "$archive")
+fi
+if [ "${actual%% *}" != "$expected" ]; then
+  printf 'cargo-deny archive SHA-256 mismatch\n' >&2
+  exit 1
+fi
+tar -xzf "$archive" -C "$work/bin" --strip-components=1 "$bundle/$binary"
+if ! "$work/bin/$binary" --version | cmp -s - <(printf 'cargo-deny %s\n' "$version"); then
+  printf 'Expected cargo-deny %s\n' "$version" >&2
+  exit 1
+fi
+INSTALL_CARGO_DENY
+then
+  export PATH="$cargo_deny_tmp/bin:${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+else
+  printf 'Stop: cargo-deny install failed\n' >&2
+  false
+fi
+```
+
+The first `PATH` entry is the private directory that this block creates.
+The explicit Cargo home `bin` entry stops Cargo from putting it first.
+If you set `CARGO_HOME` in Git Bash, use a path in Git Bash format.
+Run the local dry-runs and gates from the repository root:
 
 ```bash
 # Rust
 cargo metadata --locked --format-version 1 >/dev/null
+cargo deny --locked --config deny.toml check advisories licenses bans sources
 cargo test --workspace
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
@@ -505,6 +562,65 @@ every open PR — Dependabot's included — runs the old `ci.yml`, never reports
 context, and cannot merge. After the merge, an open PR still needs a rebase onto
 the new `main` before its head runs the new job; Dependabot rebases its own PRs when
 `main` moves (or comment `@dependabot rebase`).
+
+### Dependency policy (cargo-deny)
+
+The policy in [`deny.toml`](deny.toml) applies to the locked Rust dependency graph (#136).
+The [Pre-flight](#pre-flight-before-tagging) install block verifies the archive SHA-256
+against the pinned action manifest. It checks the binary version before use.
+The local pre-flight command runs all four checks.
+
+- `Rust — cargo-deny licenses, bans, sources` runs in `ci.yml` on every pull request
+  and on pushes to `main`. A failed check stops the pre-merge verifier.
+  The license check accepts only the allowed licenses and crate exceptions.
+  The bans check rejects wildcard requirements and duplicate or unused workspace dependency declarations.
+  Duplicate crate versions give a warning only. The checked graph has four duplicate
+  pairs with skips: `syn`, `unicode-width`, `windows-sys`, and `wit-bindgen`.
+  The sources check rejects dependencies from Git or registries other than crates.io.
+- `Rust — cargo-deny advisories` runs in `.github/workflows/deny-advisories.yml`.
+  It runs daily at 04:23 UTC, on manual dispatch, and on pull requests that change
+  `Cargo.lock`, `**/Cargo.toml` (also the root manifest), `deny.toml`, or that workflow file.
+  On those pull request heads, the verifier requires a run with that name and checks
+  that it completed with success. A missing, incomplete, or failed run blocks the merge.
+  Other pull requests do not require that run. If a run exists on the head, it must pass.
+- The release CI-history check reads only CI workflow runs. The CI dependency job
+  must pass for the release. The separate advisories run does not block a release tag.
+  Run the full local check before you tag.
+
+**Advisory triage.** The maintainer who last changed the cron line receives scheduled
+failure notices. That maintainer checks each notice. If a new advisory applies,
+open a pull request with the dependency fix.
+
+If the fix must wait, open an issue and add an ignore in `deny.toml`.
+Set the reason to `#NNN until YYYY-MM-DD: text` with that issue number.
+Set the date no later than the end of the soak window for the release with the fix.
+The governance spec rejects expired ignores. Remove the entry when the fix lands.
+
+In the public issue, state only the effect, for example, "update crate X."
+Do not name an advisory against this project in public text.
+Use only the private report process in [SECURITY.md](SECURITY.md) for an advisory reference.
+
+**Break-glass procedure.** If the tool or database fails, use a reviewed pull request
+that updates the tool pin. If the pinned tool cannot read a new database record format,
+use the same procedure. If a pin update cannot restore the check, restore the saved
+required checks with the rollback above. Then use a revert pull request that removes
+the failed check and its verifier rule together. If a control fails, use a pull request
+with a new fixture that proves the check rejects the control. Never merge without the verifier.
+
+**Tool pin update.** Dependabot does not update `tool:` values.
+
+1. Install the candidate with the archive and checksum procedure in Pre-flight.
+   Check the exact output of `cargo-deny --version`.
+2. Run the production checks and controls with the candidate tool.
+   Record the command forms, exit codes, and diagnostic text before you change the spec literals.
+3. Update all six pin sites in the same pull request:
+   - The install step and version assertion in `.github/workflows/ci.yml`.
+   - The install step and version assertion in `.github/workflows/deny-advisories.yml`.
+   - The header in `deny.toml`.
+   - The governance spec, `scripts/__test__/cargo-deny-policy.spec.mjs`.
+   - The Pre-flight section of this guide.
+   - The local check line in `CLAUDE.md`.
+4. Run the governance spec. It checks that the six sites agree.
 
 ## Notes
 

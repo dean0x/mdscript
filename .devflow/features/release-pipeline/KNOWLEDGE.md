@@ -115,16 +115,16 @@ six paths still needs a manual `workflow_dispatch` dry run.
 `release-auth-probe.spec.mjs` asserts set-equality between the two. They must be kept in
 sync whenever the `on.pull_request.paths:` list changes.
 
-**ADR-013 three-place rule**: Adding any job to `release.yml` is a three-place change:
+**Three places for a required `ci.yml` job**:
 
 1. The workflow file itself.
-2. Branch protection required contexts (via the scoped `required_status_checks` PATCH — procedure in RELEASING.md "Adding a required CI context"; 15 contexts, 16 once Wave 1's `Rust — clippy, test (windows-latest)` merges).
-3. `EXPECTED_CONTEXTS` in `scripts/verify-pr-checks.mjs` (for `ci.yml` jobs) **or**
-   `TIER_B_EXPECTED_SKIPPED` (for `release.yml` tag/input-guarded jobs).
+2. Branch protection (17 required contexts after #136). Use the scoped
+   `required_status_checks` PATCH in RELEASING.md, "Adding a required CI context".
+3. `EXPECTED_CONTEXTS` in `scripts/verify-pr-checks.mjs`.
 
-A job added without all three places is silently decorative — it can never block a merge.
-The length assertion in `verify-pr-checks.spec.mjs` is the mechanical enforcer; do not
-relax it when adding a job.
+Update the length assertion in `verify-pr-checks.spec.mjs` for each new required job.
+For a `release.yml` job that runs only on a tag or opt-in dispatch, update
+`TIER_B_EXPECTED_SKIPPED` instead. Do not add that job to branch protection.
 
 **ADR-013 in practice (v0.5.0 Wave 1, #147)**: the `rust-windows` job (`Rust — clippy, test (windows-latest)`) is the first `ci.yml` job added under the three-place rule with a written procedure: `EXPECTED_CONTEXTS` first (Tier A+ = 5, spec length assertion 4 → 5) in the PR that adds the job, so the job gates that PR before protection knows it; then — with the head fully green, immediately before merge — save protection JSON, PATCH only `required_status_checks` (`checks[]` with `app_id` 15368, `strict` unchanged, never the whole-protection PUT), GET-verify 16 contexts and `enforce_admins: false`; roll back from the saved JSON if the merge slips, because until the job is on `main` every open PR (Dependabot included) runs the old `ci.yml` and cannot report the new context. RELEASING.md "Adding a required CI context" is the runbook.
 
@@ -144,8 +144,8 @@ bounded `GET /actions/runs?head_sha=` call maps each check-suite id to its workf
 
 | Tier | Membership | Passing condition |
 |---|---|---|
-| **Tier A** (required) | the contexts read from the live branch protection API (15; 16 after Wave 1 merges) | `completed+success` |
-| **Tier A+ (local)** | `EXPECTED_CONTEXTS` (5 entries: Source hygiene, Python — build & test, examples/ gitignore coverage, Python — wheel install smoke, Rust — clippy, test (windows-latest)) — enforced whether or not protection lists them, so a new job binds from the PR that adds it | `completed+success`, presence required |
+| **Tier A** (required) | The contexts that the branch protection API returns (17 after #136) | `completed+success` |
+| **Tier A+ (local)** | `EXPECTED_CONTEXTS` (6 entries): `Source hygiene`, `Python — build & test`, `examples/ gitignore coverage`, `Python — wheel install smoke`, `Rust — clippy, test (windows-latest)`, `Rust — cargo-deny licenses, bans, sources` | `completed+success`, presence required even before branch protection lists the context |
 | **Tier B** | Everything else | `completed+success`; `skipped` tolerated ONLY for the five names in `TIER_B_EXPECTED_SKIPPED` AND only when the check-run belongs to a `release.yml` check suite |
 
 `TIER_B_EXPECTED_SKIPPED` (5 names):
@@ -172,6 +172,14 @@ unguarded check-run on release-surface PRs — it reaches `conclusion=success` o
 and dispatch run. It is deliberately NOT listed in `RELEASE_SURFACE_CONTEXTS` (the 2026-09
 verifier fixtures predate it); spec S21 pins its existence, runner, guard shape, wiring,
 and step order instead (ADR-013). It is not a branch-protection required context.
+
+**Dependency advisory check (#136).** `.github/workflows/deny-advisories.yml` runs on a
+schedule, on manual dispatch, and on pull requests with dependency changes. Its pull request
+paths are `Cargo.lock`, `**/Cargo.toml` (also the root manifest), `deny.toml`, and the workflow
+file. The verifier uses `DEPENDENCY_SURFACE` to match those paths. For a match, it requires
+`Rust — cargo-deny advisories` by name on the pull request head. Tier B requires the run to
+complete with success. This context is not in branch protection. The release CI-history
+check reads only `ci.yml` runs, so it does not require an advisories run.
 
 The verifier prints `gh pr merge N --squash --admin --match-head-commit <sha>` on PASS.
 Always use this command verbatim — confirm the current branch resolves to the intended PR
