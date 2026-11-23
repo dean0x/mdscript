@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { ADVISORIES_CONTEXT, DEPENDENCY_SURFACE, EXPECTED_CONTEXTS } from '../verify-pr-checks.mjs';
@@ -10,6 +11,7 @@ import { ADVISORIES_CONTEXT, DEPENDENCY_SURFACE, EXPECTED_CONTEXTS } from '../ve
 // a comment. All other syntax, duplicate tables, and duplicate keys fail.
 const VERSION = '0.20.2';
 const REQUIRED_CONTEXT = 'Rust — cargo-deny licenses, bans, sources';
+const CI_WORKFLOW = '.github/workflows/ci.yml';
 const ADVISORIES_WORKFLOW = '.github/workflows/deny-advisories.yml';
 const CRATES_IO = 'https://github.com/rust-lang/crates.io-index';
 const RUSTSEC = 'https://github.com/rustsec/advisory-db';
@@ -209,6 +211,7 @@ function blocks(text, depth) {
 }
 const jobs = text => blocks(blocks(text, 0).get('jobs')?.body ?? '', 2);
 const steps = job => job.split(/^      - /m).slice(1);
+const shellLines = run => run.split('\n').map(line => line.trim()).filter(line => line && !line.startsWith('#'));
 const command = checks => `cargo deny --locked --config deny.toml check ${checks}`;
 const PREFLIGHT = command('advisories licenses bans sources');
 const SANITIZE_LOG = String.raw`sed -e 's/::/%3A%3A/g' -e 's/##\[/%23%23%5B/g' "$log"`;
@@ -229,7 +232,7 @@ function checkNames(text, contexts, isCi) {
 }
 
 function checkGate(run, checks) {
-  const lines = run.split('\n').map(line => line.trim()).filter(line => line && !line.startsWith('#'));
+  const lines = shellLines(run);
   const gate = lines.filter(line => /^cargo deny\b/.test(line));
   assert.equal(gate.length, 1, 'expected one cargo deny gate command');
   assert.doesNotMatch(gate[0], /(?:^|\s)(?:-A|-t|--(?:exclude(?:-dev|-unpublished)?|metadata-path|disable-fetch|offline|frozen))(?=[\s=]|$)/,
@@ -289,13 +292,35 @@ function checkJob(job, name, checks, releasePin) {
   return control;
 }
 
-function checkTriggers(ci, advisories) {
+function checkCiChecks(ci, control) {
+  for (const [id, { body }] of jobs(ci)) {
+    for (const step of steps(body)) {
+      if (id === 'cargo-deny' && step === control) continue;
+      const run = blocks(`        ${step}`, 8).get('run');
+      if (!run) continue;
+      const inline = run.value.replace(/^(['"])(.*)\1$/, '$2');
+      for (const line of shellLines(`${inline}\n${run.body}`.replace(/\\\n/g, ''))) {
+        const invocation = /^(?:cargo[ \t]+deny|cargo-deny)[ \t]+([^#;&|<>]*)/.exec(line);
+        if (!invocation) continue;
+        const args = invocation[1].trim().split(/\s+/);
+        const check = args.indexOf('check');
+        if (check === -1) continue;
+        // An omitted list selects all checks.
+        const checks = args.slice(check + 1);
+        assert.ok(checks.length > 0 && checks.every(name => /^(?:licenses|bans|sources)$/.test(name)),
+          `CI must not check advisories: ${id}`);
+      }
+    }
+  }
+}
+
+function checkTriggers(ci, advisories, ciControl) {
   const ciTriggers = blocks(blocks(ci, 0).get('on').body, 2);
   assert.equal(ciTriggers.get('pull_request')?.value, '', 'CI must run on every pull request');
   assert.equal(ciTriggers.get('pull_request')?.body.replace(/^\s*#.*$/gm, '').trim(), '', 'no CI pull request filter');
   assert.equal(ciTriggers.get('push')?.body.trim(), 'branches: [main]', 'CI must run on every main push');
   assert.ok(!ciTriggers.has('pull_request_target'), 'CI cannot use pull_request_target');
-  assert.doesNotMatch(ci, /^\s*cargo deny .*\bcheck advisories\b/m, 'CI must not check advisories');
+  checkCiChecks(ci, ciControl);
 
   const workflow = blocks(advisories, 0);
   exactSet(workflow.keys(), ['name', 'on', 'permissions', 'jobs'], 'advisories workflow keys');
@@ -317,17 +342,41 @@ function checkTriggers(ci, advisories) {
   exactSet(pathLines, DEPENDENCY_SURFACE, 'advisories paths and verifier surface');
 }
 
+function checkControlMiss(lines, branch, label) {
+  const start = lines.indexOf(branch[0]);
+  assert.ok(start >= 0, label);
+  assert.deepEqual(lines.slice(start, start + branch.length), branch, label);
+}
+
 function checkControls(policy, advisories) {
-  for (const [check, status, diagnostic] of [
-    ['licenses', 4, 'rejected'], ['bans', 2, 'banned'], ['sources', 8, 'source-not-allowed'],
-  ]) {
-    assert.ok(policy.includes(`expect_failure ${check} ${status} 'error[${diagnostic}]'`), `${check} control`);
-  }
-  assert.match(policy, /\[\[ "\$rc" -ne "\$expected_status" \]\] \|\| ! grep -Fq -- "\$diagnostic" "\$log"/);
+  const [policyLines, advisoryLines] = [policy, advisories].map(step => {
+    const run = blocks(step, 8).get('run');
+    assert.equal(run?.value, '|', 'expected a control run block');
+    const lines = shellLines(run.body);
+    assert.equal(lines[0], 'set -euo pipefail', 'control shell options');
+    return lines;
+  });
+  assert.deepEqual(policyLines.slice(-3), [
+    "expect_failure licenses 4 'error[rejected]'",
+    "expect_failure bans 2 'error[banned]'",
+    "expect_failure sources 8 'error[source-not-allowed]'",
+  ], 'policy control calls');
+  checkControlMiss(policyLines, [
+    'if [[ "$rc" -ne "$expected_status" ]] || ! grep -Fq -- "$diagnostic" "$log"; then',
+    String.raw`printf '%s control: expected exit %s and %s; got exit %s\n' "$check" "$expected_status" "$diagnostic" "$rc" >&2`,
+    `${SANITIZE_LOG} >&2`, 'return 1', 'fi',
+  ], 'policy control must fail on a miss');
   assert.match(advisories, /^          git -C "\$db" rev-parse --verify 'HEAD\^\{commit\}'$/m, 'verify a populated database');
   assert.match(advisories, /cat > "\$fixture\/Cargo.toml" <<'EOF'\n {10}\[workspace\]/);
   assert.match(advisories, /cat > "\$fixture\/Cargo.lock" <<'EOF'\n {10}version = 4/);
-  assert.match(advisories, /\[\[ "\$rc" -ne 1 \]\] \|\| ! grep -Fq 'error\[vulnerability\]' "\$log" \|\| ! grep -Fq "ID: \$expected_id" "\$log"/);
+  checkControlMiss(advisoryLines, [
+    `if [[ "$rc" -ne 1 ]] || ! grep -Fq 'error[vulnerability]' "$log" || ! grep -Fq "ID: $expected_id" "$log"; then`,
+    String.raw`printf 'Advisory control: expected exit 1 and %s; got exit %s\n' "$expected_id" "$rc" >&2`,
+    `${SANITIZE_LOG} >&2`, 'exit 1', 'fi',
+  ], 'advisory control must fail on a miss');
+  for (const [lines, failure, label] of [[policyLines, 'return 1', 'policy'], [advisoryLines, 'exit 1', 'advisory']]) {
+    assert.deepEqual(lines.filter(line => /^(?:exit|return)\b/.test(line)), [failure], `${label} control must not exit early`);
+  }
   assert.doesNotMatch(advisories, /gh issue|issues:\s*write/);
 }
 
@@ -451,8 +500,62 @@ test('a dependency job cannot add job guards or job permissions', () => {
   }
 });
 
+const controlStep = (workflow, job) => steps(jobs(workflow).get(job).body).at(-1);
+
+for (const [name, from, to, diagnostic] of [
+  ['a masked policy call', "expect_failure licenses 4 'error[rejected]'", "expect_failure licenses 4 'error[rejected]' || true", /policy control calls/],
+  ['a successful return on a policy miss', 'return 1', 'return 0', /policy control must fail on a miss/],
+  ['an early successful exit', 'set -euo pipefail', 'set -euo pipefail\n          exit 0', /policy control must not exit early/],
+]) {
+  test(`the policy control rejects ${name}`, () => {
+    const policy = controlStep(read(CI_WORKFLOW), 'cargo-deny');
+    const advisory = controlStep(read(ADVISORIES_WORKFLOW), 'advisories');
+    assert.throws(() => checkControls(policy.replace(from, to), advisory), diagnostic);
+  });
+}
+
+for (const [name, from, to, diagnostic] of [
+  ['a successful exit on a miss', 'exit 1', 'exit 0', /advisory control must fail on a miss/],
+  ['an early successful exit', 'set -euo pipefail', 'set -euo pipefail\n          exit 0', /advisory control must not exit early/],
+]) {
+  test(`the advisory control rejects ${name}`, () => {
+    const policy = controlStep(read(CI_WORKFLOW), 'cargo-deny');
+    const advisory = controlStep(read(ADVISORIES_WORKFLOW), 'advisories');
+    assert.throws(() => checkControls(policy, advisory.replace(from, to)), diagnostic);
+  });
+}
+
+for (const invocation of [
+  'cargo deny --locked check',
+  'cargo deny --locked --config deny.toml check bans advisories',
+  'cargo-deny check advisories',
+]) {
+  test(`CI rejects ${invocation} in another job`, () => {
+    const ci = read(CI_WORKFLOW);
+    const addedJob = `\n  extra-check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ${invocation}\n`;
+    assert.throws(() => checkTriggers(ci + addedJob, read(ADVISORIES_WORKFLOW), controlStep(ci, 'cargo-deny')), /CI must not check advisories/);
+  });
+}
+
+test('CI rejects a pull request path filter', () => {
+  const ci = read(CI_WORKFLOW);
+  const filtered = ci.replace('  pull_request:\n', '  pull_request:\n    paths: [Cargo.lock]\n');
+  assert.throws(() => checkTriggers(filtered, read(ADVISORIES_WORKFLOW), controlStep(ci, 'cargo-deny')), /no CI pull request filter/);
+});
+
+function checkTrackedCargoConfig(tracked) {
+  const configs = tracked.split('\0').filter(path => path === '.cargo/config.toml' || path === '.cargo/config');
+  assert.deepEqual(configs, [], 'workspace Cargo config must not be tracked');
+}
+
+for (const file of ['.cargo/config.toml', '.cargo/config']) {
+  test(`the workspace must not track ${file}`, () => {
+    assert.throws(() => checkTrackedCargoConfig(`.cargo/README.md\0${file}\0`), /workspace Cargo config must not be tracked/);
+  });
+}
+
 test('the repository satisfies the dependency policy', async t => {
-  const ci = read('.github/workflows/ci.yml');
+  const ci = read(CI_WORKFLOW);
   const advisories = read(ADVISORIES_WORKFLOW);
   const config = read('deny.toml');
   const release = read('.github/workflows/release.yml');
@@ -466,8 +569,8 @@ test('the repository satisfies the dependency policy', async t => {
     const shas = [...release.matchAll(/uses: taiki-e\/install-action@([a-f0-9]{40})\b/g)].map(match => match[1]);
     assert.equal(new Set(shas).size, 1, 'release workflow install-action SHA');
     assert.ok(EXPECTED_CONTEXTS.includes(REQUIRED_CONTEXT), 'verifier requires the CI dependency check');
-    checkTriggers(ci, advisories);
     const ciControl = checkJob(jobs(ci).get('cargo-deny')?.body ?? '', REQUIRED_CONTEXT, 'licenses bans sources', shas[0]);
+    checkTriggers(ci, advisories, ciControl);
     const advisoryJobs = jobs(advisories);
     exactSet(advisoryJobs.keys(), ['advisories'], 'advisories jobs');
     const advisoryControl = checkJob(advisoryJobs.get('advisories').body, ADVISORIES_CONTEXT, 'advisories', shas[0]);
@@ -475,6 +578,13 @@ test('the repository satisfies the dependency policy', async t => {
     const workflows = readdirSync(new URL('../../.github/workflows/', import.meta.url)).filter(file => /\.ya?ml$/.test(file));
     assert.ok(workflows.includes('ci.yml') && workflows.includes('deny-advisories.yml'));
     for (const file of workflows) checkNames(read(`.github/workflows/${file}`), EXPECTED_CONTEXTS, file === 'ci.yml');
+  });
+
+  await t.test('the workspace does not track Cargo config', () => {
+    const tracked = execFileSync('git', ['ls-files', '-z', '--', '.cargo'], {
+      cwd: new URL('../../', import.meta.url), encoding: 'utf8',
+    });
+    checkTrackedCargoConfig(tracked);
   });
 
   await t.test('the release guide uses the pinned pre-flight command and version', () => {
