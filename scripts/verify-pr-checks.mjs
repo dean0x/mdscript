@@ -141,6 +141,9 @@ const MAX_RUNS_PAGES = 5;
 const MIN_GH_MAJOR = 2;
 const MIN_GH_MINOR = 31;
 
+const DEPENDENCY_POLICY_CONTEXT = 'Rust — cargo-deny licenses, bans, sources';
+const GITHUB_ACTIONS_APP_ID = 15368;
+
 /**
  * D-PR3b: Locally-expected contexts — enforced with Tier A semantics regardless
  * of whether they appear in branch protection. An absent job is FAIL, not
@@ -162,15 +165,16 @@ export const EXPECTED_CONTEXTS = [
   'examples/ gitignore coverage',
   'Python — wheel install smoke',
   'Rust — clippy, test (windows-latest)',
-  'Rust — cargo-deny licenses, bans, sources',
+  DEPENDENCY_POLICY_CONTEXT,
 ];
 
 export const ADVISORIES_CONTEXT = 'Rust — cargo-deny advisories';
+const ADVISORIES_WORKFLOW = '.github/workflows/deny-advisories.yml';
 export const DEPENDENCY_SURFACE = [
   'Cargo.lock',
   '**/Cargo.toml',
   'deny.toml',
-  '.github/workflows/deny-advisories.yml',
+  ADVISORIES_WORKFLOW,
 ];
 
 // Tier B allowance (release pre-flight): release.yml's publish jobs are
@@ -278,9 +282,13 @@ export const RELEASE_WORKFLOW_PATH = '.github/workflows/release.yml';
  * @returns {Set<number>}
  */
 export function releaseSuiteIdsFrom(runs) {
+  return workflowSuiteIdsFrom(runs, RELEASE_WORKFLOW_PATH);
+}
+
+function workflowSuiteIdsFrom(runs, path) {
   const ids = new Set();
   for (const run of runs) {
-    if (run.path === RELEASE_WORKFLOW_PATH && Number.isInteger(run.check_suite_id)) {
+    if (run.path === path && Number.isInteger(run.check_suite_id)) {
       ids.add(run.check_suite_id);
     }
   }
@@ -365,6 +373,7 @@ function defaultGhRunner(args) {
 /**
  * @typedef {{
  *   name: string;
+ *   app?: { id: number }; // Identifies the app that wrote a check run.
  *   status: string;       // 'completed' | 'queued' | 'in_progress' | ...
  *   conclusion: string | null;  // 'success' | 'failure' | 'cancelled' | ...
  *   check_suite?: { id: number };  // D-PR8: suite identity (absent on legacy fixtures)
@@ -382,7 +391,8 @@ function defaultGhRunner(args) {
  *   headSha: string;
  *   prNumber?: number;            // included in the emitted merge command (D-PR5)
  *   expectedContexts?: string[];  // defaults to EXPECTED_CONTEXTS
- *   changedFiles?: string[];      // Enables the release and dependency presence checks.
+ *   changedFiles?: string[];      // Includes both paths of each rename.
+ *   advisoriesSuiteIds?: Set<number>; // Check suites for the advisories workflow on this head.
  *   releaseSuiteIds?: Set<number>; // D-PR8: check_suite_id values for release.yml runs
  * }} EvaluateInput
  *
@@ -413,6 +423,7 @@ export function evaluateChecks({
   expectedContexts = EXPECTED_CONTEXTS,
   changedFiles,
   releaseSuiteIds,
+  advisoriesSuiteIds,
 }) {
   const lines = [];
   const failures = [];
@@ -754,12 +765,19 @@ export function evaluateChecks({
     }
   }
 
+  // Unlike a matrix job or a legacy status, the dependency policy has one Actions check run.
+  if (pass && (requiredSet.has(DEPENDENCY_POLICY_CONTEXT) || expectedContexts.includes(DEPENDENCY_POLICY_CONTEXT)) &&
+      !checksByName.get(DEPENDENCY_POLICY_CONTEXT)?.some(run => run.app?.id === GITHUB_ACTIONS_APP_ID)) {
+    failures.push(`Dependency policy: "${DEPENDENCY_POLICY_CONTEXT}" — no exact GitHub Actions check run on this head`);
+    pass = false;
+  }
+
   // Tier B checks the result of each run that exists. Require the exact run here:
   // a missed paths filter, a workflow parse error, or pending fork approval can
   // leave no run for Tier B to check.
   if (changedFiles?.some(file => matchesSurface(file, DEPENDENCY_SURFACE)) &&
-      !checksByName.has(ADVISORIES_CONTEXT)) {
-    failures.push(`Dependency surface: "${ADVISORIES_CONTEXT}" — no check run on this head`);
+      !checksByName.get(ADVISORIES_CONTEXT)?.some(run => advisoriesSuiteIds?.has(run.check_suite?.id))) {
+    failures.push(`Dependency surface: "${ADVISORIES_CONTEXT}" — no advisories workflow check run on this head`);
     pass = false;
   }
 
@@ -991,12 +1009,13 @@ export function fetchRequiredContexts(baseBranch, requiredFrom, runner) {
 export function fetchChangedFiles(prNumber, declaredCount, runner) {
   const MAX_FILES_PAGES = 30;
   const files = [];
+  let fileCount = 0;
   let page = 1;
 
   while (page <= MAX_FILES_PAGES) {
     const url = `/repos/{owner}/{repo}/pulls/${prNumber}/files?per_page=100&page=${page}`;
     const data = runner(['api', url]);
-    if (data.__error) {
+    if (data?.__error) {
       // Fail closed. Skipping the release-surface check here would mean a
       // 500 from the files endpoint silently converts a PR that MUST carry
       // release check-runs into one that needs none — a fail-open in a merge
@@ -1009,9 +1028,20 @@ export function fetchChangedFiles(prNumber, declaredCount, runner) {
           `this PR touches the release surface, and "cannot tell" is not a pass (D-PR7)`,
       };
     }
-    const items = Array.isArray(data) ? data : (data.files ?? []);
-    files.push(...items.map(f => f.filename));
-    if (items.length < 100) break;
+    if (!Array.isArray(data) || data.length > 100) {
+      return { ok: false, exitCode: 2, message: `Invalid changed-file list on page ${page}` };
+    }
+    for (const file of data) {
+      if (typeof file?.filename !== 'string' || !file.filename ||
+          (file.status === 'renamed' && (typeof file.previous_filename !== 'string' || !file.previous_filename))) {
+        return { ok: false, exitCode: 2, message: `Incomplete changed-file record on page ${page}` };
+      }
+      files.push(file.filename);
+      if (file.status === 'renamed') files.push(file.previous_filename);
+    }
+    // GitHub counts a rename once. Both names can affect a workflow.
+    fileCount += data.length;
+    if (data.length < 100) break;
     page++;
   }
 
@@ -1023,12 +1053,12 @@ export function fetchChangedFiles(prNumber, declaredCount, runner) {
     };
   }
 
-  if (declaredCount !== null && files.length !== declaredCount) {
+  if (declaredCount !== null && fileCount !== declaredCount) {
     return {
       ok: false,
       exitCode: 2,
       message:
-        `collected ${files.length} changed files but PR declares changed_files=${declaredCount} — ` +
+        `collected ${fileCount} changed files but PR declares changed_files=${declaredCount} — ` +
         `partial file list (D-PR7 non-vacuity, avoids PF-013)`,
     };
   }
@@ -1223,7 +1253,7 @@ export function main(argv = process.argv.slice(2), runner = defaultGhRunner, ghV
     return filesResult.exitCode;
   }
   const changedFiles = filesResult.files;
-  console.log(`  changed files: ${changedFiles.length}`);
+  console.log(`  changed paths: ${changedFiles.length}`);
 
   // ---- D-PR8: fetch workflow runs for release.yml suite attribution ----
   // Must be the LAST fetch so that earlier exit-2 paths (fetchCheckRuns,
@@ -1251,6 +1281,7 @@ export function main(argv = process.argv.slice(2), runner = defaultGhRunner, ghV
     headSha,
     prNumber,
     changedFiles,
+    advisoriesSuiteIds: workflowSuiteIdsFrom(runsResult.runs, ADVISORIES_WORKFLOW),
     releaseSuiteIds,  // D-PR8: suite attribution for Tier B and D-PR7
   });
 

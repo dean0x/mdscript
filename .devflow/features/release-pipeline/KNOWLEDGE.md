@@ -176,9 +176,9 @@ and step order instead (ADR-013). It is not a branch-protection required context
 **Dependency advisory check (#136).** `.github/workflows/deny-advisories.yml` runs on a
 schedule, on manual dispatch, and on pull requests with dependency changes. Its pull request
 paths are `Cargo.lock`, `**/Cargo.toml` (also the root manifest), `deny.toml`, and the workflow
-file. The verifier uses `DEPENDENCY_SURFACE` to match those paths. For a match, it requires
-`Rust — cargo-deny advisories` by name on the pull request head. Tier B requires the run to
-complete with success. This context is not in branch protection. The release CI-history
+file. The verifier tests both paths of a renamed file against `DEPENDENCY_SURFACE`.
+For a match, it requires `Rust — cargo-deny advisories` from that workflow on the pull
+request head. Tier B requires the run to complete with success. This context is not in branch protection. The release CI-history
 check reads only `ci.yml` runs, so it does not require an advisories run.
 
 The verifier prints `gh pr merge N --squash --admin --match-head-commit <sha>` on PASS.

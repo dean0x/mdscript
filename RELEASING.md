@@ -571,7 +571,7 @@ against the pinned action manifest. It checks the binary version before use.
 The local pre-flight command runs all four checks.
 
 - `Rust — cargo-deny licenses, bans, sources` runs in `ci.yml` on every pull request
-  and on pushes to `main`. A failed check stops the pre-merge verifier.
+  and on pushes to `main`. The verifier requires the GitHub Actions check run with this exact name.
   The license check accepts only the allowed licenses and crate exceptions.
   The bans check rejects wildcard requirements and duplicate or unused workspace dependency declarations.
   Duplicate crate versions give a warning only. The checked graph has four duplicate
@@ -580,8 +580,8 @@ The local pre-flight command runs all four checks.
 - `Rust — cargo-deny advisories` runs in `.github/workflows/deny-advisories.yml`.
   It runs daily at 04:23 UTC, on manual dispatch, and on pull requests that change
   `Cargo.lock`, `**/Cargo.toml` (also the root manifest), `deny.toml`, or that workflow file.
-  On those pull request heads, the verifier requires a run with that name and checks
-  that it completed with success. A missing, incomplete, or failed run blocks the merge.
+  The verifier checks both paths of a renamed file. On a matching head, it requires
+  a successful check from the advisories workflow. A missing, incomplete, or failed run blocks the merge.
   Other pull requests do not require that run. If a run exists on the head, it must pass.
 - The release CI-history check reads only CI workflow runs. The CI dependency job
   must pass for the release. The separate advisories run does not block a release tag.

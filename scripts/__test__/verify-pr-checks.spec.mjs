@@ -111,11 +111,14 @@ const CARGO_DENY_PASS = {
   name: 'Rust — cargo-deny licenses, bans, sources',
   status: 'completed',
   conclusion: 'success',
+  app: { id: 15368 },
 };
+const ADVISORIES_SUITE = 136;
 const ADVISORIES_PASS = {
   name: 'Rust — cargo-deny advisories',
   status: 'completed',
   conclusion: 'success',
+  check_suite: { id: ADVISORIES_SUITE },
 };
 
 function syntheticPasses(omitName) {
@@ -532,10 +535,12 @@ function stubRunner(routes, callLog = []) {
     const url = args[args.length - 1];
     callLog.push(url);
     for (const [needle, value] of routes) {
+      if (needle === '/pulls/' && url.includes('/files?')) continue;
       if (url.includes(needle)) {
         return typeof value === 'function' ? value(url) : value;
       }
     }
+    if (url.includes('/files?')) return [];
     return { __error: true, httpStatus: 404, stderr: `no stub route for ${url}` };
   };
 }
@@ -710,7 +715,6 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
       `verifier must complete in < 15 s wall-clock (AC-30 clause b); took ${elapsed}ms`);
     // Fixed calls: pr, protection, checks, status, files, runs = 6.
     // Budget: fixed 3 + pages ≤ 20 + 30 + 5 = 58 worst case (was 53).
-    // The /pulls/ stub matches the files URL (/pulls/1/files) and returns PR_OK (no .files → ok).
     assert.equal(calls.length, 6, `expected 6 API calls (pr, protection, checks, status, files, runs); got ${calls.length}`);
     const checkCall = calls.find(u => u.includes('/check-runs'));
     assert.ok(checkCall.includes('filter=latest'), 'filter=latest must be pinned explicitly (D-PR4a)');
@@ -1266,6 +1270,19 @@ describe('The verifier requires each expected context', () => {
     });
   }
 
+  test('the required dependency policy needs its own GitHub Actions check run', () => {
+    const runs = [...loadCheckRuns('checks-main-113f472.json'), ...syntheticPasses(CARGO_DENY_PASS.name)];
+    const evaluate = (checks, statuses, requiredContexts = REQUIRED) => evaluateChecks({
+      checkRuns: [...runs, ...checks], statuses, requiredContexts, headSha: HEAD_113F472,
+    }).exitCode;
+    const status = { context: CARGO_DENY_PASS.name, state: 'success' };
+    assert.equal(evaluate([CARGO_DENY_PASS], [status]), 0);
+    assert.equal(evaluate([], [status]), 1);
+    assert.equal(evaluate([], [status], [...REQUIRED, CARGO_DENY_PASS.name]), 1);
+    assert.equal(evaluate([{ ...CARGO_DENY_PASS, name: `${CARGO_DENY_PASS.name} (other)` }], []), 1);
+    assert.equal(evaluate([{ ...CARGO_DENY_PASS, app: { id: 1 } }], []), 1);
+  });
+
   test('the verifier passes when all six expected contexts pass', () => {
     const checkRuns = [...loadCheckRuns('checks-main-113f472.json'), ...syntheticPasses()];
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses: [], headSha: HEAD_113F472 });
@@ -1299,10 +1316,11 @@ describe('Advisories checks on dependency pull requests', () => {
       statuses: [],
       headSha: HEAD_113F472,
       changedFiles,
+      advisoriesSuiteIds: new Set([ADVISORIES_SUITE]),
     });
   }
 
-  const missing = `✖ Dependency surface: "${ADVISORIES_PASS.name}" — no check run on this head`;
+  const missing = `✖ Dependency surface: "${ADVISORIES_PASS.name}" — no advisories workflow check run on this head`;
 
   for (const file of ['Cargo.lock', 'Cargo.toml', 'crates/nested/member/Cargo.toml', 'deny.toml', '.github/workflows/deny-advisories.yml']) {
     test(`${file} requires an advisories check run`, () => {
@@ -1338,16 +1356,34 @@ describe('Advisories checks on dependency pull requests', () => {
     });
   }
 
-  test('the live verifier uses the changed-file list to require advisories', () => {
+  function verifyFiles(files, checks = [], workflowRuns = []) {
     const runner = stubRunner([
-      ['/files', [{ filename: 'Cargo.lock' }]],
+      ['/files', files],
       ['/pulls/', { ...PR_OK, changed_files: 1 }],
       ['/protection', PROTECTION_OK],
-      ['/check-runs', CHECKS_OK_WITH_HYGIENE],
+      ['/check-runs', {
+        total_count: CHECKS_OK_WITH_HYGIENE.total_count + checks.length,
+        check_runs: [...CHECKS_OK_WITH_HYGIENE.check_runs, ...checks],
+      }],
       ['/status', { statuses: [], total_count: 0 }],
-      ['/actions/runs', RUNS_NONE],
+      ['/actions/runs', { total_count: workflowRuns.length, workflow_runs: workflowRuns }],
     ]);
-    assert.equal(main(['1'], runner, OK_GH_VERSION), 1);
+    return main(['1'], runner, OK_GH_VERSION);
+  }
+
+  test('the live verifier checks both paths of a renamed manifest', () => {
+    const files = [{ filename: 'archive/member.toml', previous_filename: 'archive/Cargo.toml', status: 'renamed' }];
+    assert.equal(verifyFiles(files), 1);
+    const run = { path: '.github/workflows/deny-advisories.yml', check_suite_id: ADVISORIES_SUITE };
+    assert.equal(verifyFiles(files, [ADVISORIES_PASS], [run]), 0);
+    assert.equal(verifyFiles(files, [ADVISORIES_PASS], [{ ...run, path: '.github/workflows/ci.yml' }]), 1);
+    assert.equal(verifyFiles(files, [ADVISORIES_PASS], [{ ...run, check_suite_id: CI_SUITE_113F472 }]), 1);
+  });
+
+  test('the live verifier rejects an incomplete changed-file record', () => {
+    assert.equal(verifyFiles([{ filename: 'archive/member.toml', status: 'renamed' }]), 2);
+    assert.equal(verifyFiles([{}]), 2);
+    assert.equal(verifyFiles({}), 2);
   });
 });
 
@@ -1364,6 +1400,7 @@ describe('complexity-08: argument parsing and merge command', () => {
     const runner = (args) => {
       const url = args[args.length - 1];
       calls.push(url);
+      if (url.includes('/pulls/456/files?')) return [];
       if (url.includes('/pulls/456')) return { head: { sha: HEAD_113F472 }, base: { ref: 'main' } };
       if (url.includes('/pulls/')) return { __error: true, httpStatus: 404, stderr: 'Not Found' };
       if (url.includes('/protection')) return PROTECTION_OK;

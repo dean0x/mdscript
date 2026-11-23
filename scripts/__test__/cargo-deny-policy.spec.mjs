@@ -196,11 +196,16 @@ function checkPolicy(text, today) {
 // Read the block mappings used by these workflows. Match keys at their own
 // indentation so a step property or a shell heredoc cannot stand in for a job key.
 function blocks(text, depth) {
-  const headings = [...text.matchAll(new RegExp(`^ {${depth}}([\\w-]+):[ \\t]*(.*)$`, 'gm'))];
-  return new Map(headings.map(([line, key, value], index) => {
-    assert.equal(headings.filter(heading => heading[1] === key).length, 1, `duplicate YAML key ${key}`);
-    return [key, { value: value.trimEnd(), body: text.slice(headings[index].index + line.length, headings[index + 1]?.index) }];
-  }));
+  const entries = [...text.matchAll(new RegExp(`^ {${depth}}([^\\s#].*)$`, 'gm'))];
+  const fields = new Map();
+  for (const [index, entry] of entries.entries()) {
+    const keyValue = /^([\w-]+):[ \t]*(.*)$/.exec(entry[1]);
+    assert.ok(keyValue, 'expected a bare YAML mapping key');
+    const [, key, value] = keyValue;
+    assert.ok(!fields.has(key), `duplicate YAML key ${key}`);
+    fields.set(key, { value: value.trimEnd(), body: text.slice(entry.index + entry[0].length, entries[index + 1]?.index) });
+  }
+  return fields;
 }
 const jobs = text => blocks(blocks(text, 0).get('jobs')?.body ?? '', 2);
 const steps = job => job.split(/^      - /m).slice(1);
@@ -209,15 +214,17 @@ const PREFLIGHT = command('advisories licenses bans sources');
 const SANITIZE_LOG = String.raw`sed -e 's/::/%3A%3A/g' -e 's/##\[/%23%23%5B/g' "$log"`;
 const logAssignment = checks => `log="$RUNNER_TEMP/cargo-deny-${checks === 'advisories' ? 'advisories' : 'policy'}.log"`;
 
-function checkNames(text, contexts) {
+function checkNames(text, contexts, isCi) {
+  const owners = new Set();
   for (const { body } of jobs(text).values()) {
     const fields = blocks(body, 4);
     const name = fields.get('name')?.value.replace(/\s+#.*$/, '').replace(/^(['"])(.*)\1$/, '$2');
-    for (const context of contexts) {
-      if (!name?.startsWith(`${context} (`)) continue;
-      // GitHub adds matrix suffixes to run names, not workflow job names.
-      assert.fail(`job name shadows required context: ${name}`);
+    if (contexts.includes(name)) {
+      assert.ok(isCi && !owners.has(name), `required context needs one CI job: ${name}`);
+      owners.add(name);
     }
+    // GitHub adds matrix suffixes to run names, not workflow job names.
+    assert.ok(!contexts.some(context => name?.startsWith(`${context} (`)), `job name shadows required context: ${name}`);
   }
 }
 
@@ -365,10 +372,26 @@ test('the advisory policy accepts an ignore through its last UTC day', () => {
   checkIgnore(ignore('#1 until 2040-02-29: test'), TODAY);
 });
 
-test('the closed schema rejects a new key and a change to a pinned value', () => {
+test('the closed schema requires the full dependency graph and the pinned policy values', () => {
   const baseline = read('deny.toml');
-  assert.throws(() => checkPolicy(baseline.replace('[graph]', '[graph]\nnew-key = true'), TODAY), /graph keys/);
-  assert.throws(() => checkPolicy(baseline.replace('"P7D"', '"P8D"'), TODAY), /advisories.maximum-db-staleness/);
+  for (const key of ['targets', 'exclude', 'exclude-unpublished', 'new-key']) {
+    assert.throws(() => checkPolicy(baseline.replace('[graph]', `[graph]\n${key} = []`), TODAY), /graph keys/);
+  }
+  for (const [oldText, replacement, diagnostic] of [
+    ['"P7D"', '"P8D"', /advisories.maximum-db-staleness/],
+    ['maximum-db-staleness = "P7D"', '', /advisories keys/],
+    ['unsound = "all"', 'unsound = "workspace"', /advisories.unsound/],
+    ['yanked = "deny"', 'yanked = "warn"', /advisories.yanked/],
+    ['unknown-registry = "deny"', 'unknown-registry = "warn"', /sources.unknown-registry/],
+    ['unknown-git = "deny"', 'unknown-git = "warn"', /sources.unknown-git/],
+    [`db-urls = ["${RUSTSEC}"]`, 'db-urls = []', /advisories.db-urls/],
+    [RUSTSEC, 'https://example.invalid/db', /advisories.db-urls/],
+    [CRATES_IO, 'https://example.invalid/index', /sources.allow-registry/],
+    ['allow-git = []', 'allow-git = ["example"]', /sources.allow-git/],
+    ['clarify = []', 'clarify = ["example"]', /licenses.clarify/],
+  ]) {
+    assert.throws(() => checkPolicy(baseline.replace(oldText, replacement), TODAY), diagnostic);
+  }
 });
 
 test('the license policy requires a reason immediately above an exception', () => {
@@ -399,8 +422,11 @@ test('the gate must propagate its status, use the lockfile, and have no pipe', (
 
 test('a static job name cannot stand in for a required context', () => {
   const shadow = `jobs:\n  shadow:\n    name: '${REQUIRED_CONTEXT} (extra)'\n    strategy:\n      matrix: { os: [linux] }`;
-  assert.throws(() => checkNames(shadow, [REQUIRED_CONTEXT]), /shadows required context/);
-  checkNames(shadow.replace(' (extra)', ''), [REQUIRED_CONTEXT]);
+  assert.throws(() => checkNames(shadow, [REQUIRED_CONTEXT], true), /shadows required context/);
+  const exact = shadow.replace(' (extra)', '');
+  checkNames(exact, [REQUIRED_CONTEXT], true);
+  assert.throws(() => checkNames(exact, [REQUIRED_CONTEXT], false), /needs one CI job/);
+  assert.throws(() => checkNames(`${exact}\n  second:\n    name: ${REQUIRED_CONTEXT}`, [REQUIRED_CONTEXT], true), /needs one CI job/);
 });
 
 test('the installer must use the same action SHA and the pinned tool with no fallback', () => {
@@ -421,6 +447,7 @@ test('a dependency job cannot add job guards or job permissions', () => {
   checkJobFields(job, REQUIRED_CONTEXT);
   for (const field of ['if', 'needs', 'paths', 'permissions']) {
     assert.throws(() => checkJobFields(`${job}\n    ${field}: ignored`, REQUIRED_CONTEXT), /dependency job keys/);
+    assert.throws(() => checkJobFields(`${job}\n    '${field}': ignored`, REQUIRED_CONTEXT), /bare YAML mapping key/);
   }
 });
 
@@ -447,7 +474,7 @@ test('the repository satisfies the dependency policy', async t => {
     checkControls(ciControl, advisoryControl);
     const workflows = readdirSync(new URL('../../.github/workflows/', import.meta.url)).filter(file => /\.ya?ml$/.test(file));
     assert.ok(workflows.includes('ci.yml') && workflows.includes('deny-advisories.yml'));
-    for (const file of workflows) checkNames(read(`.github/workflows/${file}`), EXPECTED_CONTEXTS);
+    for (const file of workflows) checkNames(read(`.github/workflows/${file}`), EXPECTED_CONTEXTS, file === 'ci.yml');
   });
 
   await t.test('the release guide uses the pinned pre-flight command and version', () => {
