@@ -9233,6 +9233,27 @@ fn names_in(dir: &Path) -> Vec<String> {
     names
 }
 
+/// Make `dir` a real directory where the test removed one. A session can make it
+/// first, since a write below a deleted out-dir recreates it: one already there is
+/// kept when it is a directory and not a symlink (`symlink_metadata` does not follow
+/// a link, so a link is never a directory to it).
+fn make_real_dir(dir: &Path) {
+    match std::fs::create_dir(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let kind = std::fs::symlink_metadata(dir)
+                .unwrap_or_else(|e| panic!("look at {}: {e}", dir.display()))
+                .file_type();
+            assert!(
+                kind.is_dir(),
+                "{} is already there, and is not a real directory: {kind:?}",
+                dir.display()
+            );
+        }
+        Err(e) => panic!("create {}: {e}", dir.display()),
+    }
+}
+
 /// The refusal of a write below an out-dir that now leads elsewhere, naming the output
 /// `shown` as its status line does, squashed for comparison.
 fn out_dir_moved_refusal(shown: &Path) -> String {
@@ -9545,6 +9566,9 @@ fn watch_refuses_an_out_dir_replaced_by_a_symlink() {
             "{args:?}: the write is refused, naming the path as the user knows it; \
              stderr: {refused:?}"
         );
+        // A repeated event for that save, rebuilt once the link is gone, would recreate
+        // the out-dir before the control makes it: each queued event is handled first.
+        settle_queued_events(&tap, &source, "refused_barrier");
         assert_eq!(
             names_in(&victim),
             Vec::<String>::new(),
@@ -9552,7 +9576,7 @@ fn watch_refuses_an_out_dir_replaced_by_a_symlink() {
         );
 
         remove_symlink(&out);
-        std::fs::create_dir(&out).unwrap();
+        make_real_dir(&out);
         write_atomic(&source, "A three\n");
         assert!(
             wait_for_file_contains(&out.join("a.md"), "A three", TIMEOUT),
