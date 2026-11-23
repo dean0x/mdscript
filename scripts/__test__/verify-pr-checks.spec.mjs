@@ -24,8 +24,10 @@ import {
   fetchRequiredContexts,
   fetchStatuses,
   fetchCheckRuns,
+  fetchChangedFiles,
   fetchWorkflowRuns,
   parseGhStderrHttpStatus,
+  DEPENDENCY_SURFACE,
   EXPECTED_CONTEXTS,
   TIER_B_EXPECTED_SKIPPED,
   RELEASE_SURFACE,
@@ -555,6 +557,21 @@ const CHECKS_OK_WITH_HYGIENE = {
   check_runs: [...CHECKS_OK.check_runs, ...syntheticPasses()],
   total_count: CHECKS_OK.total_count + 3,
 };
+
+function verifyFiles(files, checks = [], workflowRuns = []) {
+  const runner = stubRunner([
+    ['/files', files],
+    ['/pulls/', { ...PR_OK, changed_files: 1 }],
+    ['/protection', PROTECTION_OK],
+    ['/check-runs', {
+      total_count: CHECKS_OK_WITH_HYGIENE.total_count + checks.length,
+      check_runs: [...CHECKS_OK_WITH_HYGIENE.check_runs, ...checks],
+    }],
+    ['/status', { statuses: [], total_count: 0 }],
+    ['/actions/runs', { total_count: workflowRuns.length, workflow_runs: workflowRuns }],
+  ]);
+  return main(['1'], runner, OK_GH_VERSION);
+}
 
 describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
 
@@ -1308,6 +1325,25 @@ describe('The verifier requires each expected context', () => {
 });
 
 // ---------------------------------------------------------------------------
+function surfaceSamples(pattern) {
+  const parts = pattern.split('/');
+  const isLiteral = part => part.length > 0 && !/[*?+[\]{}!\\]/u.test(part);
+  if (parts.length === 2 && parts[0] === '**' && isLiteral(parts[1])) {
+    return [parts[1], `crates/nested/member/${parts[1]}`];
+  }
+  if (parts.length > 1 && parts.at(-1) === '**' && parts.slice(0, -1).every(isLiteral)) {
+    return [`${parts.slice(0, -1).join('/')}/nested/sample.txt`];
+  }
+  assert.ok(parts.every(isLiteral), `Unsupported surface pattern: ${pattern}`);
+  return [pattern];
+}
+
+test('surface samples reject unsupported glob patterns', () => {
+  for (const pattern of ['crates/*/Cargo.toml', '**/*.toml', 'crates/**/Cargo.toml', 'crates/[ab]/**', '!Cargo.lock']) {
+    assert.throws(() => surfaceSamples(pattern), { message: `Unsupported surface pattern: ${pattern}` });
+  }
+});
+
 describe('Advisories checks on dependency pull requests', () => {
   function evaluateDependencyHead(changedFiles, advisories = []) {
     return evaluateChecks({
@@ -1322,16 +1358,18 @@ describe('Advisories checks on dependency pull requests', () => {
 
   const missing = `✖ Dependency surface: "${ADVISORIES_PASS.name}" — no advisories workflow check run on this head`;
 
-  for (const file of ['Cargo.lock', 'Cargo.toml', 'crates/nested/member/Cargo.toml', 'deny.toml', '.github/workflows/deny-advisories.yml']) {
-    test(`${file} requires an advisories check run`, () => {
-      const result = evaluateDependencyHead([file]);
-      assert.equal(result.exitCode, 1);
-      assert.deepEqual(result.lines.filter(line => line.startsWith('✖ ')), [
-        missing,
-        '✖ FAIL — 1 required context(s) not satisfied',
-      ]);
-    });
-  }
+  test('each dependency surface pattern matches its sample paths', () => {
+    for (const pattern of DEPENDENCY_SURFACE) {
+      for (const file of surfaceSamples(pattern)) {
+        const result = evaluateDependencyHead([file]);
+        assert.equal(result.exitCode, 1, `${pattern} must require advisories for ${file}`);
+        assert.deepEqual(result.lines.filter(line => line.startsWith('✖ ')), [
+          missing,
+          '✖ FAIL — 1 required context(s) not satisfied',
+        ], file);
+      }
+    }
+  });
 
   test('a dependency change passes with a completed and successful advisories run', () => {
     assert.equal(evaluateDependencyHead(['Cargo.lock'], [{ ...ADVISORIES_PASS }]).exitCode, 0);
@@ -1356,21 +1394,6 @@ describe('Advisories checks on dependency pull requests', () => {
     });
   }
 
-  function verifyFiles(files, checks = [], workflowRuns = []) {
-    const runner = stubRunner([
-      ['/files', files],
-      ['/pulls/', { ...PR_OK, changed_files: 1 }],
-      ['/protection', PROTECTION_OK],
-      ['/check-runs', {
-        total_count: CHECKS_OK_WITH_HYGIENE.total_count + checks.length,
-        check_runs: [...CHECKS_OK_WITH_HYGIENE.check_runs, ...checks],
-      }],
-      ['/status', { statuses: [], total_count: 0 }],
-      ['/actions/runs', { total_count: workflowRuns.length, workflow_runs: workflowRuns }],
-    ]);
-    return main(['1'], runner, OK_GH_VERSION);
-  }
-
   test('the live verifier checks both paths of a renamed manifest', () => {
     const files = [{ filename: 'archive/member.toml', previous_filename: 'archive/Cargo.toml', status: 'renamed' }];
     assert.equal(verifyFiles(files), 1);
@@ -1379,12 +1402,22 @@ describe('Advisories checks on dependency pull requests', () => {
     assert.equal(verifyFiles(files, [ADVISORIES_PASS], [{ ...run, path: '.github/workflows/ci.yml' }]), 1);
     assert.equal(verifyFiles(files, [ADVISORIES_PASS], [{ ...run, check_suite_id: CI_SUITE_113F472 }]), 1);
   });
+});
 
-  test('the live verifier rejects an incomplete changed-file record', () => {
-    assert.equal(verifyFiles([{ filename: 'archive/member.toml', status: 'renamed' }]), 2);
-    assert.equal(verifyFiles([{}]), 2);
-    assert.equal(verifyFiles({}), 2);
-  });
+describe('fetchChangedFiles validates each page without a declared count', () => {
+  const oversizedPage = Array.from({ length: 101 }, (_, i) => ({ filename: `docs/file-${i}.md`, status: 'modified' }));
+  for (const [label, page, message] of [
+    ['a non-array page', {}, 'Invalid changed-file list on page 1'],
+    ['a page of 101 valid records', oversizedPage, 'Invalid changed-file list on page 1'],
+    ['a record with no current filename', [{}], 'Incomplete changed-file record on page 1'],
+    ['a rename with no previous filename', [{ filename: 'new.md', status: 'renamed' }],
+      'Incomplete changed-file record on page 1'],
+  ]) {
+    test(`rejects ${label}`, () => {
+      const runner = stubRunner([['/pulls/1/files?per_page=100&page=1', page]]);
+      assert.deepEqual(fetchChangedFiles(1, null, runner), { ok: false, exitCode: 2, message });
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1891,20 +1924,15 @@ describe('D-PR7: release-surface presence check', () => {
     );
   });
 
-  test('D-PR7f: matchesReleaseSurface positives and negatives', () => {
-    // Positives (must return true)
-    assert.ok(matchesReleaseSurface('.github/actions/setup-wasm/action.yml'),
-      '.github/actions/** pattern must match .github/actions/setup-wasm/action.yml');
-    assert.ok(matchesReleaseSurface('crates/mds-napi/src/lib.rs'),
-      'crates/mds-napi/** must match crates/mds-napi/src/lib.rs');
-    assert.ok(matchesReleaseSurface('scripts/verify-napi-names.mjs'),
-      'exact match must work for scripts/verify-napi-names.mjs');
-    assert.ok(matchesReleaseSurface('.github/workflows/release.yml'),
-      'exact match must work for .github/workflows/release.yml');
-    assert.ok(matchesReleaseSurface('crates/mds-python/src/lib.rs'),
-      'crates/mds-python/** must match crates/mds-python/src/lib.rs');
+  test('each release surface pattern matches its sample paths', () => {
+    for (const pattern of RELEASE_SURFACE) {
+      for (const file of surfaceSamples(pattern)) {
+        assert.ok(matchesReleaseSurface(file), `${pattern} must match ${file}`);
+      }
+    }
+  });
 
-    // Negatives (must return false)
+  test('matchesReleaseSurface rejects paths outside the release surface', () => {
     assert.ok(!matchesReleaseSurface('.github/workflows/ci.yml'),
       '.github/workflows/ci.yml must NOT match (only release.yml is listed)');
     assert.ok(!matchesReleaseSurface('scripts/verify-versions.mjs'),
@@ -1991,6 +2019,20 @@ describe('D-PR7: release-surface presence check', () => {
     assert.equal(verifyWithoutRelease('package-lock.json'), 0, 'a change outside both surfaces must pass');
     assert.equal(verifyWithoutRelease('crates/mds-napi/src/lib.rs'), 1,
       'a release-surface file with no release check-runs must exit 1');
+  });
+
+  test('a rename out of the release surface still requires release checks', t => {
+    const log = t.mock.method(console, 'log', () => {});
+    const files = [{
+      filename: 'archive/lib.rs',
+      previous_filename: 'crates/mds-napi/src/lib.rs',
+      status: 'renamed',
+    }];
+    assert.equal(verifyFiles(files), 1, 'the old path must require release checks');
+    for (const name of RELEASE_SURFACE_CONTEXTS) {
+      const prefix = `✖ D-PR7 (release surface): "${name}" absent from every `;
+      assert.ok(log.mock.calls.some(({ arguments: [line] }) => line.startsWith(prefix)), `must report missing ${name}`);
+    }
   });
 
   test('D-PR7h: live path passes when the release runs are present for a surface file', () => {
@@ -2784,39 +2826,22 @@ describe('current fixtures (2026-09): live-shaped evaluation', () => {
   });
 
   test('Tier A alone reports a Source hygiene failure when branch protection requires the job', () => {
-    const releaseSuiteIds = pr366ReleaseSuiteIds();
-
-    // PASS: all 15 required contexts + surface contexts → no double-report
-    const result = evaluateChecks({
-      requiredContexts: REQUIRED_2026_09,
-      checkRuns: CHECK_RUNS_PR366_WITH_WINDOWS,
-      statuses: [],
-      headSha: PR366_HEAD,
-      changedFiles: ['.github/workflows/release.yml'],
-      releaseSuiteIds,
-    });
-    assert.equal(result.exitCode, 0, `must PASS; lines:\n${result.lines.join('\n')}`);
-    // Source hygiene is now Tier A (in the 2026-09 required set); must NOT appear in Tier A+
-    const tierAplusLines = result.lines.filter(l => l.includes('Tier A+') && l.includes('Source hygiene'));
-    assert.equal(tierAplusLines.length, 0,
-      'Source hygiene must not appear in Tier A+ — it is now in Tier A (2026-09 protection)');
-
-    // Tier A catches planted Source hygiene failure
-    const withFailedHygiene = CHECK_RUNS_PR366_WITH_WINDOWS.map(cr =>
+    const checkRuns = CHECK_RUNS_PR366_WITH_WINDOWS.map(cr =>
       cr.name === 'Source hygiene' ? { ...cr, conclusion: 'failure' } : cr,
     );
-    const result2 = evaluateChecks({
+    const result = evaluateChecks({
       requiredContexts: REQUIRED_2026_09,
-      checkRuns: withFailedHygiene,
+      checkRuns,
       statuses: [],
       headSha: PR366_HEAD,
       changedFiles: ['.github/workflows/release.yml'],
-      releaseSuiteIds,
+      releaseSuiteIds: pr366ReleaseSuiteIds(),
     });
-    assert.equal(result2.exitCode, 1, 'planted Source hygiene failure must fail');
-    const allLines2 = result2.lines.join('\n');
-    assert.ok(allLines2.includes('Source hygiene'), 'must name Source hygiene');
-    assert.ok(allLines2.includes('Tier A'), 'must report as Tier A failure (not Tier A+)');
+    assert.equal(result.exitCode, 1);
+    const rows = result.lines.filter(line => line.startsWith('✖ '));
+    assert.equal(rows.length, 2, rows.join('\n'));
+    assert.match(rows[0], /^✖ Tier A \(required\): "Source hygiene" — status=completed, conclusion=failure\b/u);
+    assert.equal(rows[1], '✖ FAIL — 1 required context(s) not satisfied');
   });
 
 });
