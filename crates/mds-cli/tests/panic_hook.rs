@@ -2357,18 +2357,58 @@ const NOTICE_METADATA_READ: &str = concat!(
     r#" --config about.toml --output-file "$notice_raw" about.hbs"#,
     r#" && node scripts/generate-notice.mjs < "$notice_raw" > "$notice_out""#,
 );
+const BUILD_FEATURE_INPUTS: [(&str, &str); 4] = [
+    (
+        "../mds-python/pyproject.toml",
+        "features = [\"pyo3/abi3-py311\"]",
+    ),
+    ("../mds-napi/package.json", "napi build --release --no-js"),
+    (
+        "../../packages/mds-wasm/package.json",
+        "wasm-pack build ../../crates/mds-wasm --target nodejs",
+    ),
+    (RELEASE_WORKFLOW, "napi build --platform --release"),
+];
+
+fn has_one_notice_metadata_read(release: &str) -> bool {
+    release
+        .lines()
+        .filter(|line| line.trim() == NOTICE_METADATA_READ)
+        .count()
+        == 1
+}
 
 /// A read of NOTICE metadata does not count as a release build (#136).
 #[test]
 fn release_notice_metadata_read_does_not_count_as_a_build() {
     let release = read_source(RELEASE_WORKFLOW);
-    assert!(release
-        .lines()
-        .any(|line| line.trim() == NOTICE_METADATA_READ));
+    assert!(
+        has_one_notice_metadata_read(&release),
+        "the release workflow must contain exactly one NOTICE recipe"
+    );
+    let duplicate = format!("{release}\n  {NOTICE_METADATA_READ}\n");
+    assert!(
+        !has_one_notice_metadata_read(&duplicate),
+        "a second exact NOTICE recipe must fail the check"
+    );
     assert_eq!(
         build_feature_findings(RELEASE_WORKFLOW, &release),
         Vec::<String>::new()
     );
+}
+
+#[test]
+fn notice_metadata_read_outside_the_release_workflow_fails_the_scan() {
+    for (path, _) in BUILD_FEATURE_INPUTS {
+        if path == RELEASE_WORKFLOW {
+            continue;
+        }
+        assert_eq!(
+            build_feature_findings(path, NOTICE_METADATA_READ).len(),
+            1,
+            "{path}: only the release workflow permits the NOTICE recipe"
+        );
+    }
 }
 
 /// The scan rejects release builds that enable panic details (#136).
@@ -2399,25 +2439,13 @@ fn release_builds_with_panic_details_fail_the_scan() {
 /// planted selection in memory. Commands also get an all-features control.
 #[test]
 fn build_entry_points_leave_debug_panics_off() {
-    let inputs = [
-        (
-            "../mds-python/pyproject.toml",
-            "features = [\"pyo3/abi3-py311\"]",
-        ),
-        ("../mds-napi/package.json", "napi build --release --no-js"),
-        (
-            "../../packages/mds-wasm/package.json",
-            "wasm-pack build ../../crates/mds-wasm --target nodejs",
-        ),
-        (RELEASE_WORKFLOW, "napi build --platform --release"),
-    ];
     assert!(
-        inputs
+        BUILD_FEATURE_INPUTS
             .iter()
             .any(|(path, _)| *path == "../../packages/mds-wasm/package.json"),
         "the WASM workspace build script must receive the planted feature controls"
     );
-    for (path, anchor) in inputs {
+    for (path, anchor) in BUILD_FEATURE_INPUTS {
         let source = read_source(path);
         assert!(
             source.contains(anchor),
