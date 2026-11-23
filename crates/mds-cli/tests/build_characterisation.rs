@@ -98,11 +98,14 @@ fn cli_rejects_inline_embed_without_the_source_map_flag() {
         assert_eq!(stdout, "", "{input}");
         assert_eq!(
             stderr,
-            concat!(
-            "error: the following required arguments were not provided:\n  --source-map\n\n",
-            "Usage: mds build --source-map --output <OUTPUT> --inline --embed-sources <INPUT>\n\n",
-            "For more information, try '--help'.\n",
-        ),
+            format!(
+                concat!(
+                    "error: the following required arguments were not provided:\n  --source-map\n\n",
+                    "Usage: mds{} build --source-map --output <OUTPUT> --inline --embed-sources <INPUT>\n\n",
+                    "For more information, try '--help'.\n",
+                ),
+                std::env::consts::EXE_SUFFIX,
+            ),
             "{input}"
         );
         assert!(!dir.path().join("out.md").exists(), "{input}");
