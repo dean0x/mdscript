@@ -76,11 +76,11 @@ WASM file APIs (`compileFile`, `checkFile`, and `lintFile`) differ from native i
 - WASM can report a missing import outside the project as a path outside the project. It checks the project boundary first.
 - WASM refuses `..` above the key root because it checks the written path before it resolves links.
 - For a project at the filesystem root, WASM also refuses `/..` as a path above the key root. A native match needs new public API, a spec change, and more WASM bytes.
-- On POSIX, `link/..` can use an alias. A conflict fails because one alias key cannot name two files. Windows resolves `link\..` lexically on both backends.
+- On POSIX, `link/..` can use an alias. On Windows, both backends apply `..` lexically for disk access. WASM can use aliases for paths such as `./link\..\z.mds` or `./a\b/../z.mds`. On either platform, WASM refuses to use one module key for two files.
 - WASM limits the root-relative entry key, resolved import key, and alias target to 256 segments. This bounds key resolution.
-- WASM uses an errno name for Node file errors in `cannot read` messages. The OS text can include an absolute path.
+- WASM uses an errno name for Node file errors in `cannot read` messages. Node's error message can include an absolute path. For a POSIX name with a backslash, native displays `/` and WASM keeps `\`.
 - A later file error can precede an earlier compile error or cycle. WASM reads the modules before it evaluates them. To match native error order, the engine would need to evaluate each module before the scanner reads the next. This difference changes which error WASM reports, not the compiled output.
-- WASM limits total module bytes and limits aliases to 65,536 entries and 10 MiB of keys and targets. Native does not use those limits.
+- WASM limits total module bytes. Its scanner refuses any new alias that would exceed 65,536 distinct aliases or 10 MiB of UTF-8 keys plus targets. The WASM engine checks the same alias limits. Native does not use those limits.
 - WASM refuses a non-UTF-8 directory before it checks the file. Native checks the file first. To match native order, each path check would need both string and byte forms.
 
 ## Error handling

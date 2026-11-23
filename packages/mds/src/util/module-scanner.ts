@@ -26,6 +26,9 @@ const MAX_PATH_SEGMENTS = 256;
 const MAX_IMPORT_DEPTH = 64;
 /** The Rust engine's per-file cap (`mds::MAX_FILE_SIZE`), which NativeFs applies to every module it reads. */
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
+// Match the Rust engine's alias limits before the scanner adds an entry.
+const MAX_MODULE_ALIASES = 65_536;
+const MAX_MODULE_ALIASES_SIZE = 10 * 1024 * 1024;
 const MAX_TRAVERSAL_DEPTH = 256;
 // Maximum concurrent file opens while reading ahead of the walk. Keeps file
 // descriptor usage predictable even when a module imports many siblings at once.
@@ -848,7 +851,7 @@ function hasDotDotAfterName(shown: string): boolean {
 
 function aliasConflictError(shown: string): PathError {
   return importError(
-    `two imports name different files by one module key, one of them through a symlinked directory and '..', which the WASM backend cannot resolve: "${escapePathForMessage(shown)}"`,
+    `two imports name different files by one module key, which the WASM backend cannot resolve: "${escapePathForMessage(shown)}"`,
   );
 }
 
@@ -1098,9 +1101,9 @@ async function readModule(
  * The filesystem root can be a project root. The scanner still checks the lexical
  * key root (difference 3).
  *
- * The scanner reads modules concurrently, with at most MAX_CONCURRENT_OPENS files
- * open and MAX_IMPORTS_READ_AHEAD imports ahead of the walk per module. It admits up
- * to `maxAggregateSize` bytes ahead of the walk and charges the actual bytes read.
+ * The scanner can open at most MAX_CONCURRENT_OPENS (16) read-ahead files plus one walk file.
+ * It checks at most MAX_IMPORTS_READ_AHEAD imports per module ahead of the walk.
+ * It admits up to `maxAggregateSize` bytes ahead of the walk and charges the actual bytes read.
  * A file can grow after admission, but one read holds at most MAX_FILE_SIZE + 1 bytes.
  * The scanner starts at most one read ahead per canonical module key.
  * The walk checks modules depth first, in the order `scanImportRecords` lists their
@@ -1122,27 +1125,27 @@ async function readModule(
  *    Deliberate: check lexical containment before disk resolution. To match `/..`,
  *    the engine would need new public API, a spec change, and more WASM bytes
  *    (U-S16, U-SM34, U-SM52).
- * 4. Only the POSIX after-the-link semantics make a `link/..` alias. Windows
- *    collapses `link\..` lexically on both backends. On POSIX, the scanner refuses
- *    a conflict with a plain path, a real-directory path, an already used module
- *    key, or another link. A path above the root as written is still subject to
- *    difference 3 (#432). Deliberate: the alias map applies to every import, so
- *    one key cannot name two files (U-SM22, U-SM24, U-SM51 to U-SM55).
+ * 4. On POSIX, `link/..` can use an alias because the OS applies `..` after the link.
+ *    On Windows, both backends apply `..` lexically for disk access. The WASM key
+ *    splits only at `/`, so `./link\..\z.mds` and `./a\b/../z.mds` can use aliases too.
+ *    The scanner refuses a conflict on either platform. The alias map applies to
+ *    every import, so one key cannot name two files. Difference 3 still applies
+ *    above the key root (#432; U-SM51 to U-SM55, U-SM58 to U-SM60).
  * 5. WASM caps the entry key, the resolved import key and the canonical alias
  *    target at 256 segments (`mds::resource_limit`). Native caps paths as written.
  *    The alias-target check never pre-empts a refusal of that module itself.
  *    Deliberate: keep an explicit bound on key resolution (U-S16, U-SM56).
  * 6. A `cannot read` reason can be an errno name instead of native OS error text.
- *    Deliberate: Node's error text can include an absolute path (U-SM28, U-SM57).
+ *    Node's error message can include an absolute path (U-SM28, U-SM57).
+ *    For a POSIX name with a backslash, native shows `/` and WASM keeps `\` (U-SM62).
  * 7. The scanner reads modules before the engine evaluates them. A later import
  *    refusal can precede an earlier compile error or cycle that native reports.
  *    Deliberate: equal error order would require engine evaluation per module.
  *    This changes the selected error, not the compiled output (U-SM38).
- * 8. The engine takes at most 65,536 `aliases`, whose keys and module keys total at
- *    most 10 MiB, and refuses more (`mds::resource_limit`, naming
- *    `options.moduleAliases`): a graph whose imports reach its modules by more
- *    spellings than that, other than their on-disk keys, compiles only on native,
- *    which has no aliases to count (#414).
+ * 8. The scanner limits distinct aliases to 65,536 entries and 10 MiB of UTF-8 text.
+ *    Each entry adds the byte length of its key and target. The scanner refuses an
+ *    entry over either limit before it adds the entry (`mds::resource_limit`).
+ *    The engine checks the same limits. Native has no alias map (#414; U-SM63, U-SM64).
  * 9. The scanner refuses a directory whose canonical path is not valid UTF-8
  *    before it checks a file below it. Native can report a missing file, a final
  *    symlink, an escape, or a forbidden character first. Deliberate: a string
@@ -1167,6 +1170,7 @@ export async function buildModulesMap(
   const modules: Record<string, string> = {};
   /** The lexical key of each alias and its canonical target. */
   const aliases = new Map<string, string>();
+  let aliasBytes = 0;
   /** Alias keys whose first import has a `..` segment after a name. */
   const dotDotAliases = new Set<string>();
   /** Keys of modules walked to the end: the native resolver's module cache. */
@@ -1264,11 +1268,27 @@ export async function buildModulesMap(
       throw refusal;
     }
     const { key, aliasKey } = located;
-    if (aliasKey !== '' && aliasKey !== key && !aliases.has(aliasKey)) {
-      aliases.set(aliasKey, key);
-      if (hasDotDotAfterName(shown)) {
-        dotDotAliases.add(aliasKey);
-      }
+    if (aliasKey === '' || aliasKey === key || aliases.has(aliasKey)) {
+      return;
+    }
+    const count = aliases.size + 1;
+    if (count > MAX_MODULE_ALIASES) {
+      throw pathError(
+        'mds::resource_limit',
+        `options.moduleAliases exceeds maximum alias count of ${MAX_MODULE_ALIASES} (${count} provided)`,
+      );
+    }
+    const bytes = aliasBytes + Buffer.byteLength(aliasKey) + Buffer.byteLength(key);
+    if (bytes > MAX_MODULE_ALIASES_SIZE) {
+      throw pathError(
+        'mds::resource_limit',
+        `options.moduleAliases aggregate size exceeds maximum of ${MAX_MODULE_ALIASES_SIZE} bytes`,
+      );
+    }
+    aliasBytes = bytes;
+    aliases.set(aliasKey, key);
+    if (hasDotDotAfterName(shown)) {
+      dotDotAliases.add(aliasKey);
     }
   }
 

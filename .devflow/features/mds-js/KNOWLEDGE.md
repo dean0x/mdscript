@@ -178,7 +178,7 @@ The scanner applies the native path rules in TypeScript, with the differences li
 
 ### Deterministic order despite concurrent reads
 
-The scanner can open up to `MAX_CONCURRENT_OPENS` (16) files at once. It uses `slidingWindow` to start up to `MAX_IMPORTS_READ_AHEAD` (32) reads per module ahead of the walk. The walk checks modules depth first, in the order `scanImportRecords` gives. It reports the first scanner refusal, not necessarily the first native error (U-SM37 and U-SM38, difference 7).
+The scanner can open at most `MAX_CONCURRENT_OPENS` (16) read-ahead files plus one walk file. It uses `slidingWindow` to start up to `MAX_IMPORTS_READ_AHEAD` (32) reads per module ahead of the walk. The walk checks modules depth first, in the order `scanImportRecords` gives. It reports the first scanner refusal, not necessarily the first native error (U-SM37 and U-SM38, difference 7).
 
 `slidingWindow(items, size, start)` yields one item and refills only when the walk asks for the next item. It keeps up to `size` `start()` calls ahead of the most recent item (U-SW1–U-SW4). If `size` is not a positive integer, it throws `RangeError`.
 
@@ -207,7 +207,7 @@ Each import walked starts a `readAhead()` for it via `startReadAhead`, tracked i
 
 `Located.key` is the module's canonical path below the project root, with its on-disk name. The scanner uses that key for reads and for the `walking` and `completed` sets. The WASM engine uses it for dependencies, source-map names, and cycle messages. `Located.aliasKey` is the lexical key before the engine applies aliases.
 
-`checkAndRecordAlias` uses `aliasRefusal` to check new and repeat visits. An alias cannot use a module key or name two module keys. If the lexical key differs from the canonical key, the scanner records the alias. The file APIs pass `BuildModulesMapResult.aliases` to the engine as `moduleAliases`. The engine enforces the separate alias count and byte limits (difference 8).
+`checkAndRecordAlias` uses `aliasRefusal` to check new and repeat visits. An alias cannot use a module key or name two module keys. If the lexical key differs from the canonical key, the scanner checks both alias limits before it adds a new alias (difference 8). An identical alias adds no count or bytes. The file APIs pass `BuildModulesMapResult.aliases` to the engine as `moduleAliases`.
 
 `maxModules` permits 256 distinct modules besides the entry by default (#427). The `admitted` count includes the entry, each candidate, and modules whose resolution has not completed; repeated imports consume no extra slot. Native and the scanner share `mds::resource_limit` and `resource limit exceeded: module count exceeds maximum of 256 modules besides the entry`. Binding virtual-map guards remain separate: at most 257 entries, with their own message for 258. A string entry need not occupy a map slot, but the resolved graph still has the same bound.
 
@@ -216,11 +216,11 @@ Each import walked starts a `readAhead()` for it via `startReadAhead`, tracked i
 1. WASM can report an escape for a missing module outside the project. It checks containment before it checks the file (U-SM30, U-SM32).
 2. Only WASM has an aggregate-size guard (`maxAggregateSize`). The guard never pre-empts a refusal of the same module (U-SM39).
 3. WASM refuses each lexical `..` above the key root before disk resolution. This includes `/..`, which native resolves to `/` (#424; U-S16, U-SM34). It also includes `link/..` above the project root as written (U-SM52).
-4. On POSIX, a `link/..` import can use an alias. WASM refuses when a plain path, real-directory path, existing module key, or other link conflicts with that alias. The map applies to all imports, so one key cannot name two files (#432; U-SM51 to U-SM55). On Windows, both backends collapse `link\..` lexically for disk access. The WASM scanner does not apply this rule to its virtual key.
+4. On POSIX, a `link/..` import can use an alias. On Windows, both backends apply `..` lexically for disk access. The WASM key splits only at `/`, so `./link\..\z.mds` and `./a\b/../z.mds` can use aliases too. WASM refuses to use one module key for two files (#432; U-SM51 to U-SM55, U-SM58 to U-SM60).
 5. WASM limits the entry key, resolved import key, and canonical alias target to 256 segments (`mds::resource_limit`). The alias-target check never pre-empts a refusal of that module itself (U-S16, U-SM56).
-6. A `cannot read` message can use an errno name instead of OS text, which can show an absolute path. Both backends show the path below the project root, or `.` for the root (U-SM28, U-SM31, U-SM33, U-SM57). For a POSIX file name with a backslash, native displays `/` and the scanner keeps the backslash.
+6. A `cannot read` message can use an errno name instead of native OS text. Node's message can show an absolute path. Both backends show the path below the project root, or `.` for the root (U-SM28, U-SM31, U-SM33, U-SM57). For a POSIX name with a backslash, native displays `/` and the scanner keeps the backslash (U-SM62).
 7. The scanner reads modules before the engine evaluates them. A later import refusal can precede an earlier compile error or cycle (U-SM38).
-8. The engine limits `moduleAliases` to 65,536 entries and 10 MiB of keys and targets. Native does not use an alias map.
+8. The scanner limits distinct aliases to 65,536 entries and 10 MiB of UTF-8 keys plus targets. It checks both limits before it adds a new entry (U-SM63, U-SM64). The engine checks the same limits. Native does not use an alias map.
 9. WASM refuses a non-UTF-8 canonical directory before it checks the file below it. Native can report a missing file, final symlink, escape, or forbidden character first. To match native order, each path check would need string and byte forms. A check on one form does not prove the other (U-SM48, Linux CI).
 
 ### Tests
@@ -234,6 +234,7 @@ Each import walked starts a `readAhead()` for it via `startReadAhead`, tracked i
 - U-SM48 and U-SM48b check non-UTF-8 directories on Linux. U-SM49 checks error fields. U-SM50 checks `WALK_FINISHED`.
 - U-SM51–U-SM55 check alias conflicts, containment, the canonical target, import kinds, check and lint, and the raw engine guard.
 - U-SM56 checks the segment limit. U-SM57 checks file-handle errors. U-SW1–U-SW4 check `slidingWindow`.
+- U-SM58–U-SM60 check Windows aliases and containment. U-SM61 and U-SM62 check POSIX backslash paths. U-SM63 and U-SM64 check both scanner alias limits.
 
 `__test__/wasm-compileFile.spec.mjs` U-WCF12–U-WCF14 compare dependencies, source-map names, and cycle text. The WASM backend loads `crates/mds-wasm/pkg/` first. After a Rust change, rebuild it from the current tree before the tests.
 
@@ -302,7 +303,7 @@ export const WASM_EXPORTS = [
 - **`U-SM34` needs a root container.** A non-root local run does not test that case.
 - **`U-SM48` and `U-SM48b` use Linux byte names.** macOS and Windows skip these fixtures because their filesystems cannot create such a name.
 - **A path with `..` can give an alias on POSIX or Windows.** On POSIX, for a path with `/` separators such as `./link/../z.mds`, disk resolution follows the link before it applies `..`. On Windows, the scanner can also record an alias for a backslash path such as `./link\..\z.mds`. The scanner splits the path at `/` only, so the backslashes stay in its virtual key (difference 4).
-- **An alias can name a file other than its lexical key.** Safety therefore depends on the walk seeing every import that the engine resolves. A new import form must update `scan_import_records` and the walk together.
+- **An alias can name a file other than its lexical key.** The walk must see every import that the engine resolves. The Rust test `scan_import_records_classifies_each_import_form` requires a classification for new syntax variants. Update `scan_import_records` and the walk together for a new import form.
 - **A directory, FIFO, device, or socket gets `not a regular file`.** Both backends use `mds::io` for this case (#428).
 
 ## Key Files

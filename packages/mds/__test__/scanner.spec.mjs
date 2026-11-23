@@ -2299,7 +2299,7 @@ const posixLinkOnly = process.platform === 'win32' && 'Windows resolves dot-dot 
 function conflictShape(shown, context = '') {
   return {
     code: 'mds::import',
-    message: `import error: two imports name different files by one module key, one of them through a symlinked directory and '..', which the WASM backend cannot resolve: "${shown}"${context}`,
+    message: `import error: two imports name different files by one module key, which the WASM backend cannot resolve: "${shown}"${context}`,
     help: null,
     span: null,
   };
@@ -2618,6 +2618,189 @@ test('U-SM57: file handle refusals use the display path for entries and imports'
       }
     }
     assert.deepEqual(mismatches, []);
+  });
+});
+
+const windowsOnly = process.platform !== 'win32' && 'A backslash is a disk path separator only on Windows';
+const posixOnly = process.platform === 'win32' && 'A backslash is a name character only on POSIX';
+const backslashDotDot = './sub\\..\\z.mds';
+
+// Native reports absolute dependencies. Compare the paths below the project root.
+async function windowsFileOutcomes(proj, entries) {
+  const root = await realpath(proj);
+  const options = { sourceMap: true };
+  const native = (await compileFileOutcomes('native', entries, options)).map((result) =>
+    result.dependencies === undefined ? result : {
+      ...result,
+      dependencies: result.dependencies.map((dep) => path.relative(root, dep).split(path.sep).join('/')),
+    });
+  const wasm = await compileFileOutcomes('wasm', entries, options);
+  return { native, wasm };
+}
+
+const successWithDeps = (entry, output, ...dependencies) => ({
+  output, dependencies, sources: [entry, ...dependencies],
+});
+
+async function assertAliasMap(entry, expected) {
+  assert.notEqual(wasmEngine, null, 'Build the WASM engine first');
+  const { aliases } = await buildModulesMapWith(entry, wasmEngine);
+  assert.deepEqual(aliases, expected);
+}
+
+test('U-SM58: Windows mixed separators use an alias or give a conflict', { skip: windowsOnly }, async () => {
+  await withNestedProject(async (proj) => {
+    const mixed = './a\\b/../z.mds';
+    await mkdir(path.join(proj, 'a', 'b'), { recursive: true });
+    await writeFixture(proj, 'z.mds', 'ROOT\n');
+    await writeFixture(proj, 'a/z.mds', 'A\n');
+    const alone = await writeFixture(proj, 'alone.mds', importLine(mixed) + '@include z\n');
+    const first = await writeFixture(proj, 'plain-first.mds', renderPair(plainZ, mixed));
+    const last = await writeFixture(proj, 'plain-last.mds', renderPair(mixed, plainZ));
+    await assertAliasMap(alone, { 'z.mds': 'a/z.mds' });
+    const { native, wasm } = await windowsFileOutcomes(proj, [alone, first, last]);
+    assert.deepEqual(native, [
+      successWithDeps('alone.mds', 'A\n', 'a/z.mds'),
+      successWithDeps('plain-first.mds', 'ROOT\nA\n', 'z.mds', 'a/z.mds'),
+      successWithDeps('plain-last.mds', 'A\nROOT\n', 'a/z.mds', 'z.mds'),
+    ]);
+    assert.deepEqual(wasm, [native[0], conflictShape(mixed), conflictShape(plainZ)]);
+  });
+});
+
+test('U-SM59: Windows backslashes agree with slashes for disk access and containment', { skip: windowsOnly }, async () => {
+  await withNestedProject(async (proj, parent) => {
+    const outside = './sub\\..\\..\\z.mds';
+    await mkdir(path.join(proj, 'sub'));
+    await writeFixture(proj, 'z.mds', 'IN\n');
+    await writeFixture(parent, 'z.mds', 'OUT\n');
+    const alone = await writeFixture(proj, 'backslash.mds', importLine(backslashDotDot) + '@include z\n');
+    const pair = await writeFixture(proj, 'same-file.mds', renderPair(plainZ, backslashDotDot));
+    const slash = await writeFixture(proj, 'slash.mds', importLine(linkDotDot) + '@include z\n');
+    const escape = await writeFixture(proj, 'escape.mds', importLine(outside) + '@include z\n');
+    await assertAliasMap(alone, { 'sub\\..\\z.mds': 'z.mds' });
+    await assertAliasMap(pair, { 'sub\\..\\z.mds': 'z.mds' });
+    await assertAliasMap(slash, {});
+    const { native, wasm } = await windowsFileOutcomes(proj, [alone, pair, slash, escape]);
+    assert.deepEqual(native, [
+      successWithDeps('backslash.mds', 'IN\n', 'z.mds'),
+      successWithDeps('same-file.mds', 'IN\nIN\n', 'z.mds'),
+      successWithDeps('slash.mds', 'IN\n', 'z.mds'),
+      { code: 'mds::import', message: `import error: import path escapes project directory: "${outside}"`, help: null, span: null },
+    ]);
+    assert.deepEqual(wasm, native);
+  });
+});
+
+test('U-SM60: Windows applies dot-dot before it follows a junction', { skip: windowsOnly }, async (t) => {
+  await withNestedProject(async (proj) => {
+    const target = path.join(proj, 'deep', 'other');
+    await mkdir(target, { recursive: true });
+    try {
+      await symlink(target, path.join(proj, 'link'), 'junction');
+    } catch (err) {
+      if (!['EPERM', 'EACCES', 'ENOTSUP', 'ENOSYS'].includes(err.code)) throw err;
+      t.skip(`Windows could not create a junction (${err.code})`);
+      return;
+    }
+    await writeFixture(proj, 'z.mds', 'ROOT\n');
+    await writeFixture(proj, 'deep/z.mds', 'DEEP\n');
+    const shown = './link\\..\\z.mds';
+    const entry = await writeFixture(proj, 'junction.mds', importLine(shown) + '@include z\n');
+    await assertAliasMap(entry, { 'link\\..\\z.mds': 'z.mds' });
+    const { native, wasm } = await windowsFileOutcomes(proj, [entry]);
+    assert.deepEqual(native, [successWithDeps('junction.mds', 'ROOT\n', 'z.mds')]);
+    assert.deepEqual(wasm, native);
+  });
+});
+
+test('U-SM61: POSIX treats a backslash as a name character in both backends', { skip: posixOnly }, async () => {
+  await withNestedProject(async (proj) => {
+    await mkdir(path.join(proj, 'sub'));
+    await writeFixture(proj, 'z.mds', 'ROOT\n');
+    const line = importLine(backslashDotDot);
+    const entry = await writeFixture(proj, 'main.mds', line + '@include z\n');
+    const native = await compileFileOutcomes('native', [entry]);
+    assert.deepEqual(native, [{
+      code: 'mds::file_not_found', message: `file not found: ${backslashDotDot}`,
+      help: FILE_NOT_FOUND_HELP, span: firstLineSpan(line.trimEnd()),
+    }]);
+    assert.deepEqual(await compileFileOutcomes('wasm', [entry]), native);
+  });
+});
+
+test('U-SM62: POSIX read refusals keep the backend-specific display of a backslash', { skip: posixOnly }, async () => {
+  await withNestedProject(async (proj) => {
+    await mkdir(path.join(proj, 'back\\slash.mds'));
+    const entry = await writeFixture(proj, 'main.mds', importLine('./back\\slash.mds'));
+    assert.deepEqual(await compileFileOutcomes('native', [entry]), [readIoShape('back/slash.mds')]);
+    assert.deepEqual(await compileFileOutcomes('wasm', [entry]), [readIoShape('back\\slash.mds')]);
+  });
+});
+
+async function aliasLimitFixture(proj) {
+  // Each one-character link resolves to the root. Four links give 16**4 keys.
+  await Promise.all(Array.from('0123456789abcdef', (digit) => symlink('.', path.join(proj, digit), 'dir')));
+  return writeFixture(proj, 'main.mds', 'MAIN\n');
+}
+
+function aliasPaths(count, suffix) {
+  return Array.from({ length: count }, (_, i) => {
+    const prefix = i.toString(16).padStart(4, '0').split('').join('/');
+    return `./${prefix}/${suffix}`;
+  });
+}
+
+function scanAliasPaths(entry, paths) {
+  // Supply import records directly. This test measures the scanner, not the parser.
+  return buildModulesMap(entry, (source) => source === 'MAIN\n' ? paths : []);
+}
+
+function aliasLimitShape(message) {
+  return { code: 'mds::resource_limit', message, help: null, span: null };
+}
+
+test('U-SM63: the scanner caps distinct aliases and does not charge repeat visits', { skip: posixOnly }, async () => {
+  await withNestedProject(async (proj) => {
+    const entry = await aliasLimitFixture(proj);
+    await writeFixture(proj, 'z.mds', 'OK\n');
+    const paths = aliasPaths(65_536, 'z.mds');
+    paths.push(paths[0]);
+    const { aliases } = await scanAliasPaths(entry, paths);
+    assert.equal(Object.keys(aliases).length, 65_536);
+    assert.equal(aliases['f/f/f/f/z.mds'], 'z.mds');
+
+    paths.push('./0/z.mds');
+    await assert.rejects(scanAliasPaths(entry, paths), (err) => {
+      assert.deepEqual(errorShape(err), aliasLimitShape('options.moduleAliases exceeds maximum alias count of 65536 (65537 provided)'));
+      return true;
+    });
+  });
+});
+
+test('U-SM64: the scanner caps the UTF-8 bytes of alias keys and targets', { skip: posixOnly }, async () => {
+  await withNestedProject(async (proj) => {
+    const entry = await aliasLimitFixture(proj);
+    const alias = 'ß'.repeat(100);
+    const dir = `${'ß'.repeat(105)}/${'ß'.repeat(104)}x`;
+    const key = `${dir}/z.mds`;
+    await mkdir(path.join(proj, dir), { recursive: true });
+    await writeFixture(proj, key, 'OK\n');
+    await symlink(dir, path.join(proj, alias), 'dir');
+    await symlink(dir, path.join(proj, `${alias}x`), 'dir');
+
+    const paths = aliasPaths(16_384, `${alias}/z.mds`);
+    assert.equal(paths.length * Buffer.byteLength(paths[0].slice(2) + key), 10 * 1024 * 1024);
+    const { aliases } = await scanAliasPaths(entry, [...paths, paths[0]]);
+    assert.equal(Object.keys(aliases).length, paths.length);
+    assert.equal(aliases[paths.at(-1).slice(2)], key);
+
+    // Add one byte to the last key without a change to the count or target.
+    paths[paths.length - 1] = paths.at(-1).replace(alias, `${alias}x`);
+    await assert.rejects(scanAliasPaths(entry, paths), (err) => {
+      assert.deepEqual(errorShape(err), aliasLimitShape('options.moduleAliases aggregate size exceeds maximum of 10485760 bytes'));
+      return true;
+    });
   });
 });
 
