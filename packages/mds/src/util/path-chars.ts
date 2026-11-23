@@ -9,7 +9,7 @@
  * `mds::sanitize_control_chars_wire`
  * (crates/mds-core/src/lint/diagnostic.rs), `forbidden_char_message`
  * (crates/mds-core/src/fs.rs) and `import_path_violation`
- * (crates/mds-core/src/resolver.rs). `__test__/forbidden-path-chars.spec.mjs`
+ * (crates/mds-core/src/resolver/import_paths.rs). `__test__/forbidden-path-chars.spec.mjs`
  * compares the two against the real engine on both backends, and
  * `__test__/options-validation.spec.mjs` (U-OV-14, U-OV-31) compares the
  * option-key check built on `sanitizeControlCharsWire` against napi; a change

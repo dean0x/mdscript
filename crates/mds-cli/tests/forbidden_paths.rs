@@ -1382,6 +1382,36 @@ fn directory_argument_symlink_is_refused_everywhere() {
     );
 }
 
+#[test]
+fn build_refuses_a_directory_link_before_it_loads_the_config() {
+    use std::path::MAIN_SEPARATOR_STR;
+
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::write(real.join("mds.json"), "!").unwrap();
+
+    let (code, text) = run(dir.path(), &["build", "real", "--out-dir", "out"]);
+    assert_eq!(code, Some(1), "real directory: {text}");
+    let expected = format!(
+        "invalid mds.json at real{MAIN_SEPARATOR_STR}mds.json: expected value at line 1 column 1"
+    );
+    assert!(squash(&text).contains(&squash(&expected)), "{text}");
+
+    if !common::make_symlink(&real, &dir.path().join("link")) {
+        return;
+    }
+    let (code, text) = run(dir.path(), &["build", "link", "--out-dir", "out"]);
+    assert_eq!(code, Some(2), "directory link: {text}");
+    assert_io_refusal(
+        &text,
+        "directory argument must not be a symlink: \"link\"",
+        "build link",
+    );
+    assert!(!text.contains("invalid mds.json"), "{text}");
+    assert!(!dir.path().join("out").exists());
+}
+
 /// A forbidden path character in a directory argument is refused up front, naming the
 /// directory as typed: in the path as typed (`path contains forbidden character`), and
 /// in the canonical form a symlinked directory leads it to (`resolved path contains

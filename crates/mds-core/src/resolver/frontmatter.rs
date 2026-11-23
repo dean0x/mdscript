@@ -1,8 +1,7 @@
 //! Pure helper functions for YAML frontmatter parsing and scope construction.
 //!
-//! These are free functions extracted from `resolver.rs` that handle deep-merging
-//! frontmatter mappings, building variable scopes, and parsing `imports:` declarations
-//! from YAML frontmatter.
+//! These functions merge frontmatter maps, build variable scopes, and parse
+//! `imports:` declarations from YAML frontmatter.
 
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -78,7 +77,7 @@ pub(super) fn deep_merge_yaml(
     // top-level directive; filtering it would silently discard user data.
     //
     // SYNC POINT: also audit `RESERVED_OUTPUT_KEYS` and `strip_reserved_keys` in lib.rs,
-    // `build_scope_from_frontmatter` in resolver.rs, and `RESERVED` in lint/facts.rs.
+    // `build_scope_from_frontmatter` in resolver/module_scope.rs, and `RESERVED` in lint/facts.rs.
     // Each site reserves keys for its own purpose. Only the merge sees `extends`.
     const RESERVED_MERGE_KEYS: &[&str] = &[
         "imports",

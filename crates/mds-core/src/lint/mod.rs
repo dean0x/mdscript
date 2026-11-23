@@ -20,7 +20,7 @@
 //!
 //! ## Architecture invariants
 //!
-//! - `resolver.rs`/`validator.rs`/runtime `Scope` are NEVER touched by this module.
+//! - The resolver modules, `validator.rs`, and runtime `Scope` are NEVER touched by this module.
 //! - No new mds-core dependencies (zero-dep budget for WASM size).
 //! - Per-file fresh resolve (v1): no cross-file ModuleCache "optimization".
 //! - Non-generic rule dispatch: no monomorphization per rule.

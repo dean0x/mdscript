@@ -47,11 +47,9 @@
 //! that source-map recording can attribute body nodes to the
 //! *defining* file rather than the call site.
 //!
-//! *B1 extends S7*: a change referenced as B1 in `resolver.rs` and
-//! `evaluator.rs` removed the `source_map_mode` gate that formerly
-//! guarded `Origin` construction, so `Origin` is now populated
-//! unconditionally whenever `@define` blocks are present — regardless
-//! of whether source-map mode is enabled.
+//! *B1 extends S7*: `resolver/module_scope.rs` supplies an `Origin` for each
+//! `@define`, even when source-map mode is off. `evaluator.rs` uses it for
+//! function-body attribution.
 //!
 //! **S8** — fine-grained function-body descent; mutually exclusive
 //! with S3 on any given call.  When a `FunctionDef` carries an
@@ -92,10 +90,8 @@
 //!
 //! ## Scope of this legend
 //!
-//! This legend covers `S`-prefixed source-map provenance tags in four
-//! files: `sourcemap.rs` (this file), `resolver.rs`, `evaluator.rs`,
-//! and `scope.rs`.  It does **not** cover `PF-*` pitfall IDs,
-//! `ADR-*` architectural decisions, or `AC-*` acceptance criteria.
+//! This legend covers `S`-prefixed source-map provenance tags in
+//! `sourcemap.rs`, `resolver.rs`, `resolver/module.rs`, `evaluator.rs`, and `scope.rs`.
 //!
 //! `S1`, `S2`, and `S14` appearing elsewhere in this repository are
 //! unrelated slice labels from other workstreams, not part of this
@@ -116,8 +112,8 @@ use serde::Serialize;
 /// source-map recording during function-body evaluation (S8) can attribute output
 /// segments to the **defining** file, not the call site.
 ///
-/// Placed here (rather than `resolver.rs`) so [`crate::scope`] can import it
-/// without creating a scope → resolver cycle.
+/// This type lives here so [`crate::scope`] can use it without a dependency
+/// on the resolver.
 ///
 /// `Clone` = three refcount bumps (`O(1)`).
 ///
@@ -1132,11 +1128,11 @@ fn push_capped_segment(segments: &mut Vec<RawSegment>, dropped: &mut bool, segme
 
 /// A pre-computed source-map fragment for an imported module's `prompt` body.
 ///
-/// Computed once when a module is resolved in source-map mode (see
-/// `process_module` and, for an extending module, `process_module_extends` in
-/// `resolver.rs`, via [`MapBuilder::into_fragment`]) and cached inside
-/// `ResolvedModule` / [`crate::scope::NamespaceScope`] behind an `Arc` so every
-/// `@include` call-site can share the same allocation.
+/// `fragment_map_from` (`resolver/context.rs`) uses [`MapBuilder::into_fragment`]
+/// when the resolver compiles the module in source-map mode. Later imports reuse the fragment.
+/// See `process_module` (`resolver/process.rs`) and `process_module_extends` (`resolver/extends.rs`).
+/// `ResolvedModule` and [`crate::scope::NamespaceScope`] keep the fragment in
+/// an `Arc` so each `@include` call site shares the same allocation.
 ///
 /// # Local coordinate space
 ///

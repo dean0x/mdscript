@@ -460,7 +460,7 @@ code shown.
 Enforced by `validate_relative_import`, `validate_entry_path`, `check_segment_count`,
 `NativeFs::check_symlink`, `NativeFs::anchor_base_dir` and `NativeFs::check_path_traversal`
 (`crates/mds-core/src/fs.rs`), `validate_import_path` and `resolve_entry_key`
-(`crates/mds-core/src/resolver.rs`) and `path_to_str` / `resolve_base_dir`
+(`crates/mds-core/src/resolver/import_paths.rs`) and `path_to_str` / `resolve_base_dir`
 (`crates/mds-core/src/lib.rs`); pinned by the `native_resolve_entry_*`,
 `native_normalize_in_dir_*`, `native_anchor_base_dir_*`, `native_resolve_key_*`,
 `vfs_resolve_entry_*`, `vfs_normalize_in_dir_*` and `case_*` tests,
@@ -1717,7 +1717,7 @@ preserves `\n`. Two construction sites produce such messages:
   operating system's own text, `{e}` in `cannot resolve path {path}: {e}` in
   `crates/mds-core/src/fs.rs` — and template identifiers (`invalid import alias:
   '{alias}'` in `parser_helpers.rs`, `'{name}' is not exported from '{path}'` in
-  `resolver.rs`). The paths they name are checked first: an entry, import,
+  `resolver/imports.rs`). The paths they name are checked first: an entry, import,
   base-directory or vars-file path carrying a forbidden character of §4.6 — `\n`
   among them — is refused, named escaped, before any other message can name it, and
   the native backend's module-read refusals (`cannot read`, `invalid UTF-8 in`,
@@ -1875,7 +1875,7 @@ Place `mds.json` in the repository root or any ancestor directory of the input f
 | `build.source_map` | bool | Enable source-map generation for all builds (equivalent to `--source-map`). Ignored for messages-mode templates. Default: `false`. |
 | `build.embed_sources` | bool | Embed source file contents in `sourcesContent[]` (equivalent to `--embed-sources`). Has no effect when `build.source_map` is `false`. Default: `false`. |
 | `lint.rules` | object | Per-rule severity overrides for `mds lint`. Keys are rule names; values are `"off"`, `"info"`, `"warn"`, or `"error"`. Any other value fails config loading (exit 1; under `mds lint` an `mds::io` error, exit 2, §5), naming the rule and the value as the bindings name a `rules` value — `lint.rules["<name>"]: unknown severity "<value>"; expected "off", "info", "warn", or "error"`, or `lint.rules["<name>"] must be a severity string, got <type>` for a value that is not a string — each WIRE-escaped (§7.5). An unknown rule name emits a warning naming it and listing the rules this build recognises, the config still loads, and lint continues — the unknown rule is not enforced (forward compat: a config naming a rule added in a newer release warns instead of failing on an older binary). Under `mds lint`, the warning goes to stderr, names `mds.json` as the run reached it (`warning: in ./mds.json: …`, `sub/../mds.json`, as a config error names it) and is suppressed by `--quiet`; `mds build`, `mds watch` and directory-mode `mds fmt` also read this file but do not emit the unknown-rule warning, and `mds check` does not read it. On the `lint` API surfaces it is returned in `lint_warnings`. |
-| `fmt.sort_frontmatter_keys` | bool | **Reserved — accepted, currently inert.** The key is parsed and type-checked (a non-boolean value is a hard config-load error, like any other field) so that `{"fmt": {"sort_frontmatter_keys": true}}` is valid today, but it drives no formatting behaviour in this version: `mds fmt` does not sort frontmatter keys and there is no matching CLI flag. Frontmatter key sorting is deferred to a future version; when it ships, this key will control it without a breaking `mds.json` schema change. Default: `true`. Pinned by `fmt_config_valid_section_loads_cleanly` and `fmt_config_malformed_bool_field_fails_loading` in `crates/mds-cli/src/build.rs`. |
+| `fmt.sort_frontmatter_keys` | bool | **Reserved — accepted, currently inert.** The key is parsed and type-checked (a non-boolean value is a hard config-load error, like any other field) so that `{"fmt": {"sort_frontmatter_keys": true}}` is valid today, but it drives no formatting behaviour in this version: `mds fmt` does not sort frontmatter keys and there is no matching CLI flag. Frontmatter key sorting is deferred to a future version; when it ships, this key will control it without a breaking `mds.json` schema change. Default: `true`. Pinned by `fmt_config_valid_section_loads_cleanly` and `fmt_config_malformed_bool_field_fails_loading` in `crates/mds-cli/src/build/config.rs`. |
 
 Maximum config file size: 1 MiB (1,048,576 bytes).
 
