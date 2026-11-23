@@ -1435,7 +1435,7 @@ DEALINGS IN THE SOFTWARE.
 
 === LICENSE ===
 MIT License
-Crates: backtrace-ext, block2, dispatch2, libm, mds-cli, mds-core, napi, napi-build, napi-derive, napi-derive-backend, napi-sys, objc2, objc2-encode, windows-link, windows-sys, windows-sys, windows-targets, windows_x86_64_gnu, windows_x86_64_msvc
+Crates: backtrace-ext, block2, dispatch2, libm, napi, napi-build, napi-derive, napi-derive-backend, napi-sys, objc2, objc2-encode, windows-link, windows-sys, windows-sys, windows-targets, windows_x86_64_gnu, windows_x86_64_msvc
 
 MIT License
 
@@ -1881,7 +1881,7 @@ DEALINGS IN THE SOFTWARE.
 
 === LICENSE ===
 MIT License
-Crates: mds-napi, mds-python, mds-wasm
+Crates: mds-cli, mds-core, mds-napi, mds-python, mds-wasm
 
 MIT License
 
