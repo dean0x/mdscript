@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { readdirSync, readFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { ADVISORIES_CONTEXT, DEPENDENCY_SURFACE, EXPECTED_CONTEXTS } from '../verify-pr-checks.mjs';
 
@@ -52,12 +53,31 @@ const POLICY = {
   'sources.allow-org': { github: [], gitlab: [], bitbucket: [] },
 };
 
+const ABOUT = {
+  '': {
+    accepted: SHAPE,
+    targets: [
+      'aarch64-apple-darwin',
+      'x86_64-apple-darwin',
+      'x86_64-unknown-linux-gnu',
+      'x86_64-unknown-linux-musl',
+      'aarch64-unknown-linux-gnu',
+      'aarch64-unknown-linux-musl',
+      'x86_64-pc-windows-msvc',
+      'wasm32-unknown-unknown',
+    ],
+    'ignore-dev-dependencies': false,
+    'ignore-build-dependencies': false,
+  },
+  private: { ignore: false },
+};
+
 const BARE = /^[A-Za-z0-9_-]+$/;
 const BASIC = /^"[^"\\\x00-\x1f]*"$/;
 const read = file => readFileSync(new URL(`../../${file}`, import.meta.url), 'utf8');
 const exactSet = (actual, expected, label) => assert.deepEqual([...actual].sort(), [...expected].sort(), label);
 
-function readPolicy(text) {
+function readPolicy(text, schema = POLICY) {
   const lines = text.split(/\r?\n/);
   const tokens = lines.flatMap((line, index) => [...line.matchAll(
     /"[^"\\\x00-\x1f]*"|#.*|[+-]?\d+(?:\.\d+)?(?![A-Za-z0-9_-])|[A-Za-z0-9_-]+|[^ \t]/g,
@@ -117,11 +137,15 @@ function readPolicy(text) {
 
   const tables = new Map();
   let table;
+  if (Object.hasOwn(schema, '')) {
+    table = new Map();
+    tables.set('', table);
+  }
   for (let i = 0; i < tokens.length && pos < tokens.length; i++) {
     const { part: start, line } = take();
     if (start === '[') {
       const name = /^\s*\[([A-Za-z-]+(?:\.[A-Za-z-]+)?)\]\s*(?:#.*)?$/.exec(lines[line])?.[1];
-      assert.ok(Object.hasOwn(POLICY, name), `unknown or invalid table: ${lines[line]}`);
+      assert.ok(Object.hasOwn(schema, name), `unknown or invalid table: ${lines[line]}`);
       assert.ok(!tables.has(name), `duplicate table ${name}`);
       table = new Map();
       tables.set(name, table);
@@ -191,6 +215,28 @@ function checkPolicy(text, today) {
       const pinned = expected[key];
       if (pinned === SHAPE) checkShape(name, key, actual, today);
       else assert.deepEqual(Array.isArray(actual) ? actual.map(row => row.value) : actual, pinned, `${name}.${key}`);
+    }
+  }
+}
+
+function checkAbout(text, denyText) {
+  const tables = readPolicy(text, ABOUT);
+  exactSet(tables.keys(), Object.keys(ABOUT), 'about.toml tables');
+  const licenses = readPolicy(denyText).get('licenses');
+  const accepted = new Set([
+    ...licenses.get('allow').map(({ value }) => value),
+    ...licenses.get('exceptions').flatMap(({ value }) => value.allow),
+  ]);
+  for (const [name, table] of tables) {
+    exactSet(table.keys(), Object.keys(ABOUT[name]), `about.toml ${name || 'root'} keys`);
+    for (const [key, value] of table) {
+      const actual = Array.isArray(value) ? value.map(row => row.value) : value;
+      if (key === 'accepted') {
+        assert.ok(Array.isArray(actual), 'about.toml accepted must be an array');
+        exactSet(actual, accepted, 'about.toml accepted licenses');
+      } else {
+        assert.deepEqual(actual, ABOUT[name][key], `about.toml ${key}`);
+      }
     }
   }
 }
@@ -451,6 +497,53 @@ test('the global license list excludes extra licenses', () => {
   const allow = [...LICENSES, 'Zlib'].map(value => ({ value }));
   assert.throws(() => checkShape('licenses', 'allow', allow), /global license list/);
 });
+
+test('the notice config matches the dependency license policy (#136)', () => {
+  assert.ok(existsSync(new URL('../../about.toml', import.meta.url)), 'about.toml is required');
+  checkAbout(read('about.toml'), read('deny.toml'));
+});
+
+for (const [name, from, to, message] of [
+  ['an extra accepted license', 'accepted = [', 'accepted = ["BSD-3-Clause", ', /^about\.toml accepted licenses/],
+  ['a missing accepted license', '"CC0-1.0", ', '', /^about\.toml accepted licenses/],
+  ['a quoted key', 'accepted =', '"accepted" =', /^expected a bare key$/],
+  ['a missing target', '    "wasm32-unknown-unknown",\n', '', /^about\.toml targets/],
+]) {
+  test(`the notice config rejects ${name} (#136)`, () => {
+    const baseline = read('about.toml');
+    const modified = baseline.replace(from, to);
+    assert.notEqual(modified, baseline, 'the control must change the config');
+    assert.throws(() => checkAbout(modified, read('deny.toml')), { code: 'ERR_ASSERTION', message });
+  });
+}
+
+const noticeNormalizer = fileURLToPath(new URL('../generate-notice.mjs', import.meta.url));
+const normalizeNotice = input => spawnSync(process.execPath, [noticeNormalizer], { input, encoding: 'utf8' });
+const noticeSection = '\n=== LICENSE ===\nMIT License\nCrates: z, a, a\n\n';
+
+test('the notice normalizes line ends and sorts crate names without loss (#136)', () => {
+  const input = `Header\n${noticeSection}License text. \t\n\n`.replaceAll('\n', '\r\n');
+  const result = normalizeNotice(input);
+  assert.deepEqual([result.status, result.stderr, result.stdout], [
+    0, '', `Header\n${noticeSection.replace('z, a, a', 'a, a, z')}License text.\n`,
+  ]);
+});
+
+for (const [name, content, diagnostic] of [
+  ['lone CR', '\r', 'hazardous character'],
+  ['form feed', '\f', 'hazardous character'],
+  ['byte order mark', String.fromCodePoint(0xfeff), 'hazardous character'],
+  ['bidirectional control', String.fromCodePoint(0x202e), 'hazardous character'],
+  ['absolute path', '/tmp/example', 'path in output'],
+  ['drive path', 'C:\\example', 'path in output'],
+  ['home path', '~/.cargo/example', 'path in output'],
+  ['registry path', 'registry/src/example', 'path in output'],
+]) {
+  test(`the notice rejects ${name} (#136)`, () => {
+    const result = normalizeNotice(`Header\n${noticeSection}License text: ${content}.\n`);
+    assert.deepEqual([result.status, result.stderr, result.stdout], [1, `NOTICE: ${diagnostic}\n`, '']);
+  });
+}
 
 const gateFixture = [
   'set -euo pipefail', 'test -f deny.toml', 'cargo --version > "$RUNNER_TEMP/cargo-version.log"',
