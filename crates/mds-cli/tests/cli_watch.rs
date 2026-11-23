@@ -9233,10 +9233,11 @@ fn names_in(dir: &Path) -> Vec<String> {
     names
 }
 
-/// Make `dir` a real directory where the test removed one. A session can make it
-/// first, since a write below a deleted out-dir recreates it: one already there is
-/// kept when it is a directory and not a symlink (`symlink_metadata` does not follow
-/// a link, so a link is never a directory to it).
+/// Make `dir` a real directory where the test removed one. The caller first settles
+/// the queued events ([`settle_queued_events`]), so no rebuild makes it first. A write
+/// below a deleted out-dir recreates it, so as a backstop one already there is kept
+/// when it is a directory and not a symlink (`symlink_metadata` does not follow a
+/// link, so a link is never a directory to it).
 fn make_real_dir(dir: &Path) {
     match std::fs::create_dir(dir) {
         Ok(()) => {}
