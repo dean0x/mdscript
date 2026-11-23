@@ -1,0 +1,89 @@
+# cargo-deny 0.20.2 checks the locked Rust dependency graph (#136).
+[graph]
+all-features = true
+no-default-features = false
+features = []
+exclude-dev = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+db-path = "$CARGO_HOME/advisory-dbs"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+git-fetch-with-cli = false
+disable-yank-checking = false
+# The daily check has a one-week limit on the age of the database.
+maximum-db-staleness = "P7D"
+unsound = "all"
+yanked = "deny"
+unmaintained = "workspace"
+unused-ignored-advisory = "warn"
+ignore = []
+
+[licenses]
+version = 2
+include-dev = true
+include-build = true
+unused-allowed-license = "warn"
+# The lockfile can contain the foldhash edge outside the resolved feature graph.
+unused-license-exception = "allow"
+allow = ["MIT", "Apache-2.0", "ISC"]
+confidence-threshold = 0.8
+clarify = []
+exceptions = [
+    # Accept the public-domain dedication for the file event crate.
+    { crate = "notify", allow = ["CC0-1.0"] },
+    # Accept the Unicode terms for the identifier tables.
+    { crate = "unicode-ident", allow = ["Unicode-3.0"] },
+    # Accept Zlib terms for the hash algorithm crate.
+    { crate = "foldhash", allow = ["Zlib"] },
+    # Accept the LLVM exception for the target triple crate.
+    { crate = "target-lexicon", allow = ["Apache-2.0 WITH LLVM-exception"] },
+]
+
+[licenses.private]
+ignore = false
+registries = []
+ignore-sources = []
+
+[bans]
+multiple-versions = "warn"
+multiple-versions-include-dev = true
+wildcards = "deny"
+allow-wildcard-paths = false
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+allow-workspace = false
+deny = []
+features = []
+skip = [
+    # Only hashbrown 0.17 enters the checked graph. Do not skip it.
+    { crate = "syn@2.0.117", reason = "napi and PyO3 use 2 and clap uses 3" },
+    { crate = "unicode-width@0.1.14", reason = "miette uses 0.1 and textwrap uses 0.2" },
+    { crate = "windows-sys@0.60.2", reason = "notify uses 0.60 and ctrlc uses 0.61" },
+    { crate = "wit-bindgen@0.51.0", reason = "wasip3 uses 0.51 and wasip2 uses 0.57" },
+]
+skip-tree = []
+
+[bans.workspace-dependencies]
+duplicates = "deny"
+include-path-dependencies = false
+unused = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+private = []
+required-git-spec = "rev"
+unused-allowed-source = "warn"
+unused-allowed-org = "warn"
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []
