@@ -1190,7 +1190,8 @@ describe('buildModulesMap — symlink, root-escape and non-file refusals match n
       const dir = path.join(proj, 'sub', 'dir.mds');
       await mkdir(dir, { recursive: true });
       const main = await writeFixture(proj, 'sub/main.mds', '@import "./dir.mds" as d\n');
-      const files = [dir, main];
+      const dotted = await writeFixture(proj, 'sub/dotted.mds', '@import "./dir.mds/." as d\n');
+      const files = [dir, main, dotted];
       const native = await compileFileOutcomes('native', files);
       for (const [i, file] of files.entries()) {
         assert.deepEqual(native[i], readIoShape('sub/dir.mds'));
@@ -2393,6 +2394,20 @@ test('U-SM51: aliases refuse two targets and keep a module read error first', { 
   });
 });
 
+test('U-SM51b: a return to an active module records an alias or refuses its conflict', { skip: posixLinkOnly }, async () => {
+  await withNestedProject(async (proj) => {
+    await linkFixture(proj);
+    const loop = await writeFixture(proj, 'deep/loop.mds', importLine('../sub/../loop.mds'));
+    const shown = '../sub/../overlap.mds';
+    await writeFixture(proj, 'overlap.mds', 'ROOT\n');
+    const overlap = await writeFixture(proj, 'deep/overlap.mds', renderPair('../overlap.mds', shown));
+    const files = [loop, overlap];
+    const native = await compileFileOutcomes('native', files);
+    assert.deepEqual(native.map((outcome) => outcome.code), ['mds::circular_import', 'mds::circular_import']);
+    assert.deepEqual(await compileFileOutcomes('wasm', files), [native[0], conflictShape(shown)]);
+  });
+});
+
 test('U-SM52: dot-dot after a link keeps both containment checks', { skip: posixLinkOnly }, async () => {
   await withNestedProject(async (proj, parent) => {
     await linkFixture(proj);
@@ -2411,6 +2426,7 @@ test('U-SM52: dot-dot after a link keeps both containment checks', { skip: posix
     const rows = [
       ['./out/../z.mds', escape('./out/../z.mds')],
       [linkDotDot, { output: 'DEEP\n' }],
+      [`${linkDotDot}/.`, { output: 'DEEP\n' }],
       ['./out/../missing.mds', missing('./out/../missing.mds'), escape('./out/../missing.mds')],
       ['./sub/../missing.mds', missing('./sub/../missing.mds')],
       ['./sub/../../z.mds', { output: 'IN\n' }, escape('./sub/../../z.mds')],
@@ -2451,8 +2467,8 @@ test('U-SM54: every import kind uses the canonical alias and refuses a conflict'
     const kinds = [
       ['import', importLine(linkDotDot) + '@include z\n', plain + importLine(linkDotDot) + '@include z\n', 'DEEP\n', conflictShape(linkDotDot)],
       ['extends', `@extends "${linkDotDot}"\n`, plain + importLine('./extends.mds', 'child') + '@include child\n', 'DEEP\n', conflictShape(linkDotDot)],
-      ['frontmatter', `---\nimports:\n  - path: ${linkDotDot}\n---\nBODY\n`,
-        `---\nimports:\n  - path: ${plainZ}\n  - path: ${linkDotDot}\n---\nBODY\n`, 'BODY\n', conflictShape(linkDotDot, ' (in frontmatter imports[1])')],
+      ['frontmatter', `---\nimports:\n  - path: ${linkDotDot}\n    as: z\n---\n@include z\n`,
+        `---\nimports:\n  - path: ${plainZ}\n  - path: ${linkDotDot}\n    as: z\n---\n@include z\n`, 'DEEP\n', conflictShape(linkDotDot, ' (in frontmatter imports[1])')],
       ['export', `@export f from "${linkDotDot}"\nBODY\n`, plain + `@export f from "${linkDotDot}"\nBODY\n`, 'BODY\n', conflictShape(linkDotDot)],
     ];
     const rows = kinds.flatMap(([kind, alone, collision, output, refusal]) => [
@@ -2547,6 +2563,12 @@ test('U-SM56: a key over 256 segments gives a scanner resource limit', { skip: p
     const err = thrownBy(() => wasmEngine.compile(source, options), 'unrepresentable alias target');
     assert.equal(err.code, 'mds::invalid_options');
     assert.match(err.message, /options\.moduleAliases\["alias\/x\.mds"\].*exceeds maximum segment count \(256\)/);
+
+    await writeFile(target, Buffer.from([0xff]));
+    const [invalid] = await compileFileOutcomes('native', [entry]);
+    assert.equal(invalid.code, 'mds::io');
+    assert.equal(invalid.message, `invalid UTF-8 in ${targetKey}: invalid utf-8 sequence of 1 bytes from index 0`);
+    assert.deepEqual(await compileFileOutcomes('wasm', [entry]), [invalid]);
   });
 });
 

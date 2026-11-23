@@ -474,11 +474,6 @@ async function canonicalPath(path: string, shown: string): Promise<string> {
   }
 }
 
-/** `canonicalPath` of `path`'s parent directory. */
-async function realpathParent(path: string, shown: string): Promise<string> {
-  return canonicalPath(dirname(path), shown);
-}
-
 /** The result of `promise`, or what it threw — never a rejection. */
 type Settled<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown };
 
@@ -901,7 +896,7 @@ async function locateImport(projectRoot: string, importer: Located, importPath: 
   if (stringErr !== undefined) {
     throw stringErr;
   }
-  const { name } = nativeParentAndName(importPath);
+  const { parent, name } = nativeParentAndName(importPath);
   // A path ending in `..` has no final name: NativeFs finds no file there.
   if (name === '..') {
     throw fileNotFoundError(importPath);
@@ -914,12 +909,11 @@ async function locateImport(projectRoot: string, importer: Located, importPath: 
   }
   // `./` names the importer's directory. The engine has no key for it.
   const aliasKey = name === undefined ? '' : normalizeVirtualKey(importer.key, importPath);
-  // Pass the path as written to the OS. POSIX applies `..` after it follows links.
-  // Windows applies `..` before it follows links.
-  const dir = name === undefined
-    ? await realpathParent(childAbsolute, importPath)
-    : await realpathParent(importer.dir + sep + importPath, importPath);
-  const path = join(dir, basename(childAbsolute));
+  // Keep `..` for the OS. Use the same component split for the parent and the name.
+  // A final `/.` does not make the file its own parent.
+  const parentPath = name === undefined ? dirname(childAbsolute) : importer.dir + sep + parent;
+  const dir = await canonicalPath(parentPath, importPath);
+  const path = join(dir, name ?? basename(childAbsolute));
   // Security: containment on the canonical path, so a symlinked directory cannot
   // lead outside the project root.
   if (!isWithinRoot(projectRoot, path)) {
