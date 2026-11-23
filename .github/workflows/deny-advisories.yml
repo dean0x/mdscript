@@ -1,0 +1,114 @@
+name: Dependency advisories
+
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - "**/Cargo.toml"
+      - deny.toml
+      - .github/workflows/deny-advisories.yml
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: Rust — cargo-deny advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532  # v2.86.3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
+      - name: Check the tool version
+        run: |
+          set -euo pipefail
+          version_log="$RUNNER_TEMP/cargo-deny-version.log"
+          printf 'cargo-deny 9.9.9\n' > "$version_log"
+          rc=0
+          grep -Fqx 'cargo-deny 0.20.2' "$version_log" || rc=$?
+          test "$rc" -eq 1
+          cargo-deny --version > "$version_log"
+          test "$(wc -l < "$version_log")" -eq 1
+          grep -Fx 'cargo-deny 0.20.2' "$version_log"
+      - name: Check advisories
+        run: |
+          set -euo pipefail
+          test -f deny.toml
+          cargo --version > "$RUNNER_TEMP/cargo-version.log"
+          log="$RUNNER_TEMP/cargo-deny-advisories.log"
+          rc=0
+          cargo deny --locked --config deny.toml check advisories > "$log" 2>&1 || rc=$?
+          # Prevent runner commands in tool output from taking effect.
+          sed -e 's/::/%3A%3A/g' -e 's/##\[/%23%23%5B/g' "$log"
+          exit "$rc"
+      - name: Verify the database and advisory control
+        run: |
+          set -euo pipefail
+          # This is the directory cargo-deny 0.20.2 creates for the configured URL (#136).
+          db="${CARGO_HOME:-$HOME/.cargo}/advisory-dbs/advisory-db-3157b0e258782691"
+          test -d "$db/.git"
+          git -C "$db" rev-parse --verify 'HEAD^{commit}'
+
+          # Select one record for this fixture by its publication date.
+          record=$(git -C "$db" grep -lF 'date = "2022-01-01"' HEAD -- crates/rustc-serialize/)
+          [[ "$record" =~ ^HEAD:crates/rustc-serialize/RUSTSEC-[0-9]{4}-[0-9]{4}\.md$ ]]
+          expected_id=${record##*/}
+          expected_id=${expected_id%.md}
+
+          fixture=$(mktemp -d "$RUNNER_TEMP/cargo-deny-advisories.XXXXXX")
+          mkdir "$fixture/src"
+          touch "$fixture/src/lib.rs"
+          cat > "$fixture/Cargo.toml" <<'EOF'
+          [workspace]
+
+          [package]
+          name = "advisories-control"
+          version = "0.0.0"
+          edition = "2021"
+          publish = false
+
+          [dependencies]
+          rustc-serialize = "=0.3.25"
+          EOF
+          cat > "$fixture/Cargo.lock" <<'EOF'
+          version = 4
+
+          [[package]]
+          name = "advisories-control"
+          version = "0.0.0"
+          dependencies = ["rustc-serialize"]
+
+          [[package]]
+          name = "rustc-serialize"
+          version = "0.3.25"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "fe834bc780604f4674073badbad26d7219cadfb4a2275802db12cbae17498401"
+          EOF
+          cat > "$fixture/deny.toml" <<'EOF'
+          [advisories]
+          unmaintained = "none"
+          yanked = "deny"
+          EOF
+
+          log="$fixture/advisories.log"
+          set +e
+          cargo deny --locked --config "$fixture/deny.toml" --manifest-path "$fixture/Cargo.toml" check advisories > "$log" 2>&1
+          rc=$?
+          set -e
+          if [[ "$rc" -ne 1 ]] || ! grep -Fq 'error[vulnerability]' "$log" || ! grep -Fq "ID: $expected_id" "$log"; then
+            printf 'Advisory control: expected exit 1 and %s; got exit %s\n' "$expected_id" "$rc" >&2
+            sed -e 's/::/%3A%3A/g' -e 's/##\[/%23%23%5B/g' "$log" >&2
+            exit 1
+          fi
+          printf 'Advisory control: exit %s, %s\n' "$rc" "$expected_id"

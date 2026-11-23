@@ -18,6 +18,82 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # See the release guide for the local pre-flight check (#136).
+  # The Dependency advisories workflow checks advisories separately.
+  cargo-deny:
+    name: Rust — cargo-deny licenses, bans, sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532  # v2.86.3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
+      - name: Check the tool version
+        run: |
+          set -euo pipefail
+          version_log="$RUNNER_TEMP/cargo-deny-version.log"
+          printf 'cargo-deny 9.9.9\n' > "$version_log"
+          rc=0
+          grep -Fqx 'cargo-deny 0.20.2' "$version_log" || rc=$?
+          test "$rc" -eq 1
+          cargo-deny --version > "$version_log"
+          test "$(wc -l < "$version_log")" -eq 1
+          grep -Fx 'cargo-deny 0.20.2' "$version_log"
+      - name: Check licenses, bans, and sources
+        run: |
+          set -euo pipefail
+          test -f deny.toml
+          cargo --version > "$RUNNER_TEMP/cargo-version.log"
+          log="$RUNNER_TEMP/cargo-deny-policy.log"
+          rc=0
+          cargo deny --locked --config deny.toml check licenses bans sources > "$log" 2>&1 || rc=$?
+          # Prevent runner commands in tool output from taking effect.
+          sed -e 's/::/%3A%3A/g' -e 's/##\[/%23%23%5B/g' "$log"
+          exit "$rc"
+      - name: Verify the checks reject control inputs
+        run: |
+          set -euo pipefail
+          controls=$(mktemp -d "$RUNNER_TEMP/cargo-deny-controls.XXXXXX")
+          cat > "$controls/licenses.toml" <<'EOF'
+          [licenses]
+          allow = ["Apache-2.0"]
+          EOF
+          cat > "$controls/bans.toml" <<'EOF'
+          [bans]
+          deny = [{ crate = "serde" }]
+          EOF
+          cat > "$controls/sources.toml" <<'EOF'
+          [sources]
+          unknown-registry = "deny"
+          allow-registry = []
+          EOF
+
+          expect_failure() {
+            local check="$1" expected_status="$2" diagnostic="$3" rc
+            local log="$controls/$check.log"
+            set +e
+            cargo deny --locked --config "$controls/$check.toml" check "$check" > "$log" 2>&1
+            rc=$?
+            set -e
+            if [[ "$rc" -ne "$expected_status" ]] || ! grep -Fq -- "$diagnostic" "$log"; then
+              printf '%s control: expected exit %s and %s; got exit %s\n' "$check" "$expected_status" "$diagnostic" "$rc" >&2
+              sed -e 's/::/%3A%3A/g' -e 's/##\[/%23%23%5B/g' "$log" >&2
+              return 1
+            fi
+            printf '%s control: exit %s, %s\n' "$check" "$rc" "$diagnostic"
+          }
+
+          expect_failure licenses 4 'error[rejected]'
+          expect_failure bans 2 'error[banned]'
+          expect_failure sources 8 'error[source-not-allowed]'
+
   rust:
     name: Rust — fmt, clippy, test
     runs-on: ubuntu-latest

@@ -8,6 +8,7 @@ Composable LLM prompt template compiler. Rust core (`crates/`) with WASM, native
 cargo test --workspace                        # 590+ Rust tests
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc -p mds-core --no-deps   # CI rustdoc gate: catches broken intra-doc links
+cargo deny --locked --config deny.toml check advisories licenses bans sources  # CI pin 0.20.2; sha256-verified install: RELEASING.md pre-flight
 # Windows local twin — clippy only (cannot link/run). Windows tests run only in the
 # `rust-windows` CI job (`Rust — clippy, test (windows-latest)`):
 rustup target add x86_64-pc-windows-msvc
