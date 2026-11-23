@@ -398,7 +398,7 @@ fn run_check_directory(
             );
             output::exit(1);
         }
-        // #204: an empty tree is "nothing to check", not success (mirrors build.rs).
+        // #204: an empty tree is "nothing to check", not success (mirrors `build/directory.rs`).
         // Emitted even under --quiet and exit 1, the same "nothing was done" code
         // build and fmt use.
         output::ewriteln!(
@@ -478,7 +478,7 @@ fn run_check_directory(
 fn run_init(filename: PathBuf, force: bool, quiet: bool) -> Result<()> {
     // #265: refuse a hostile filename before anything is read or written — the
     // same up-front check `-o`/`--out-dir`/`build.output_dir` apply
-    // (`reject_forbidden_output_flags`, build.rs).
+    // (`reject_forbidden_output_flags` in `build/out_paths.rs`).
     output::reject_forbidden_output_path("init filename", filename.as_os_str())?;
     if filename
         .components()

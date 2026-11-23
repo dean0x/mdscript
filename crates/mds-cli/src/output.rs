@@ -24,9 +24,8 @@
 //! - [`preview_text_for`]: `--diff` preview output — neutralized on TTY, byte-faithful
 //!   when piped, so redirected diffs stay applicable by `patch`/tooling.
 //!
-//! Single-file path helpers (`OutputKind`, `compile_to_content`,
-//! `resolve_output_path_for_kind`) remain in `build.rs`; they are imported here when
-//! callers need both single-file and directory logic.
+//! `compile_to_content` lives in `build.rs`.
+//! `OutputKind` and `resolve_output_path_for_kind` live in `build/out_paths.rs`.
 
 use std::borrow::Cow;
 use std::ffi::OsStr;
@@ -987,8 +986,8 @@ impl miette::Diagnostic for StdinRelabeledError {
 ///
 /// Call sites (symbolic references; prefer these over line numbers to avoid stale citations):
 /// - `mds check -`: `run_check` in `crates/mds-cli/src/main.rs`
-/// - `mds build -` (single-file path): `compile_to_content` in `crates/mds-cli/src/build.rs`
-/// - `mds build -` (directory stdin path): `run_build` in `crates/mds-cli/src/build.rs`
+/// - `mds build -`: `run_build_stdin` in `crates/mds-cli/src/build/single.rs`
+/// - Shared compile helper: `compile_to_content` in `crates/mds-cli/src/build.rs`
 /// - `mds lint -`: the human result sink's `analysis_failed` in
 ///   `crates/mds-cli/src/lint_sink.rs`, for every failure of a stdin run
 ///

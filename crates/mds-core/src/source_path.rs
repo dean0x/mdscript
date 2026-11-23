@@ -214,8 +214,7 @@ pub fn relativize_source(source: &str, base: Option<&Path>, root: Option<&Path>)
 /// True if `s` looks like a Windows drive-qualified path in any of the three
 /// forms that can survive separator unification.
 ///
-/// Ported verbatim from `crates/mds-cli/src/build.rs` (SEC-2), including all
-/// three disjuncts:
+/// Check all three forms:
 /// - `:\\` — classic backslash-qualified drive path.
 /// - `:/` — forward-slash-normalised drive path (SEC-2 gap).
 /// - leading `<letter>:` — bare drive designator without a separator.
@@ -351,9 +350,7 @@ fn starts_with_comps(path: &[String], prefix: &[String]) -> bool {
 /// Both inputs are already-normalized absolute component lists sharing the
 /// same root (the caller has verified containment via [`starts_with_comps`]).
 ///
-/// Ported from `crates/mds-cli/src/build.rs::relative_path` but the
-/// absolute-path failure fallback is replaced with the basename fallback to
-/// close that leak path (build.rs:978 bug class).
+/// If a path cannot use this component comparison, use the basename fallback.
 fn component_diff(from: &[String], to: &[String]) -> String {
     let common = from
         .iter()
@@ -381,12 +378,8 @@ fn component_diff(from: &[String], to: &[String]) -> String {
 /// component fails the safety re-check (empty, contains `/`, is `.` / `..`,
 /// or is drive-qualified).
 ///
-/// **NEVER derived from the raw source string** — using the raw string's
-/// `file_name()` is the exact bug class that `build.rs:978` had: on Unix,
-/// `..\..\Users\alice\secret.mds` has no `/`-based `file_name()` component,
-/// so `Path::new(raw).file_name()` returns the whole string verbatim, leaking
-/// the path instead of extracting just `"secret.mds"`.  Using the NORMALIZED
-/// component list avoids this.
+/// Use the normalized components, not `file_name()` on the raw source string.
+/// The fallback emits only the file name, even for foreign path separators.
 fn basename_fallback(comps: &[String]) -> String {
     let last = comps
         .iter()

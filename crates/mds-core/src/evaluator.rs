@@ -117,7 +117,7 @@ pub(crate) struct EvalContext<'a> {
     fn_body_owned: bool,
     /// Display path of the current module, used for `type_mismatch_at` spans.
     ///
-    /// Matches the `file_str` field in `ModuleCtx` (resolver.rs).  Set to `""`
+    /// Matches the `file_str` field in `ModuleCtx` (`resolver/context.rs`).  Set to `""`
     /// on the simple `evaluate()` path where no file context is available —
     /// the `build_type_mismatch` helper degrades to spanless when this is empty
     /// (ADR-005 / DECISIONS_CONTEXT: degrade rather than mis-attribute).

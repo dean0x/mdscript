@@ -18,6 +18,7 @@ referencedFiles:
   - crates/mds-cli/src/main.rs
   - crates/mds-cli/src/output.rs
   - crates/mds-cli/src/build.rs
+  - crates/mds-cli/src/build/config.rs
   - crates/mds-cli/src/watch.rs
 created: 2026-07-03
 updated: 2026-09-15
@@ -157,7 +158,7 @@ Pinned in `crates/mds-core/tests/api_surface.rs`: the test fixture checks the th
 `is_default_excluded_dir(name)` returns `true` when a **directory** name starts with `'.'` (hidden dirs like `.git`, `.cache`) or equals `"node_modules"`. Exclusion semantics:
 
 - **Recursion only**: the root directory explicitly passed to `collect_mds_files` is always processed, even if its own name starts with `.`. Hidden *files* (e.g. `.dotfile.mds`) at any traversed level are still collected.
-- **All subcommands**: `run_fmt_directory`, `run_build_directory`, `run_check_directory`, and `run_lint_directory` all call `collect_mds_files` from `output.rs` — the exclusion is inherited automatically. This is what closes the "fmt writes into node_modules" bug: `collect_mds_files` never yields those paths, so `run_fmt_directory` never visits them.
+- **All subcommands**: `run_fmt_directory`, `setup_walk` (`build/directory.rs`), `run_check_directory`, and `run_lint_directory` all use the `collect_mds_files` or `collect_mds_files_detailed` walkers from `output.rs` — the exclusion is inherited automatically. This is what closes the "fmt writes into node_modules" bug: `collect_mds_files` never yields those paths, so `run_fmt_directory` never visits them.
 
 `is_within_default_excluded_dir(root, path)` checks whether a `path` is *inside* a default-excluded subdirectory of `root` — used by watch's two additional guards (PF-004: the limit must be enforced on the parallel event-processing path too):
 
@@ -174,19 +175,19 @@ Notable divergences worth knowing before touching this file:
 
 - **`FmtFlags { check, diff, quiet }`** (`fmt.rs:43-48`) is a named struct passed to every per-input helper. Avoids the silent transposition hazard; callers destructure it explicitly.
 - **`format_one_file(file, flags) -> FileOutcome`** (`fmt.rs:232-282`) is a helper that encapsulates the read → format → diff → (optional write) cycle for a single file in directory mode. Error and status lines are printed as side effects so the directory loop only tallies `FileOutcome`.
-- **`MAX_DEPTH = 64`** is declared as a function-local constant inside `run_fmt_directory` (line 297), matching `run_build_directory`/`run_check_directory`.
+- **`MAX_DEPTH = 64`** is declared as a function-local constant inside `run_fmt_directory` (line 297), matching `setup_walk` (`build/directory.rs`) and `run_check_directory`.
 - **Raw-text read**: `read_source_file` (`fmt.rs:110-118`) cannot go through `mds::compile*`. It reuses `mds::NativeFs::check_symlink` for the TOCTOU-safe canonicalize+symlink check.
 - **Channel discipline**: formatted content (stdin filter mode) and `--diff` output go to **stdout**; every status line, summary, and error goes to **stderr**; `--quiet` suppresses status/summaries but never errors.
 - **`--check` directory summary** is `"{changed_count} would reformat, {unchanged_count} unchanged, {fail_count} failed"` (`fmt.rs:335`). The `changed_count > 0` disjunct in the summary print was removed; only `fail_count > 0` forces a summary under `--quiet`.
 - **`--diff`** renders via the `similar` crate's unified diff, ANSI-colorized only when `std::io::stdout().is_terminal()`. The colorizer (`colorize_unified_diff`, `fmt.rs:396-430`) uses an `in_hunk` state-machine flag set on the first `@@` marker, correctly handling content lines that themselves start with `---` or `+++`.
 - **Write-only-if-changed** preserves mtime on already-clean files.
 - **Directory mode formats partials** (`_`-prefixed files) — a deliberate divergence from `run_build_directory`/`run_check_directory`, which skip them. Formatting rewrites *source*, and a partial's source is just as reformattable as any other file.
-- **`FmtConfig { sort_frontmatter_keys: bool }`** (`build.rs:36-65`) is forward-compat scaffolding: parsed and validated but **not consulted by any formatting behavior** — a deliberate no-op.
+- **`FmtConfig { sort_frontmatter_keys: bool }`** (`build/config.rs`) is forward-compat scaffolding: parsed and validated but **not consulted by any formatting behavior** — a deliberate no-op.
 - **After-help stdin demo** (`main.rs`) uses `printf '@if ready:   \nGo\n@end\n' | mds fmt -`. The trailing spaces on the directive line are stripped by R4, so this IS input that `mds fmt` actually changes — verified that after_help was updated from a no-op example.
 
 ## Error Handling and Recovery
 
-`MdsError::FormatterInvariant { message: String }` (`error.rs:335-345`, code `mds::formatter_invariant`, constructed via the private `MdsError::formatter_invariant()` helper at `error.rs:686-692`) means **the formatter itself has a bug** — the CLI must never write the file when this occurs. The field name is `message`, matching all other free-form-string variants in `MdsError`. Both `FormatterInvariant` and `Syntax` map to the generic `_ => 1` arm in `exit_code` (`build.rs:372-382`) — no new exit codes were added for `fmt`. Since #217, `mds fmt <file>` on a path that is not valid UTF-8 exits 2 (`mds::io`) like `mds lint` and `mds build`, instead of 1; directory mode is unchanged (per-file failure, exit 1 with the summary). The CLI-level contract: `format_str_named` returns `Err`, never a garbled `Ok(String)`, so `fmt.rs` only ever reaches its write call with a value that already passed the gate.
+`MdsError::FormatterInvariant { message: String }` (`error.rs:335-345`, code `mds::formatter_invariant`, constructed via the private `MdsError::formatter_invariant()` helper at `error.rs:686-692`) means **the formatter itself has a bug** — the CLI must never write the file when this occurs. The field name is `message`, matching all other free-form-string variants in `MdsError`. Both `FormatterInvariant` and `Syntax` map to the generic `_ => 1` arm in `exit_code` (`build.rs`) — no new exit codes were added for `fmt`. Since #217, `mds fmt <file>` on a path that is not valid UTF-8 exits 2 (`mds::io`) like `mds lint` and `mds build`, instead of 1; directory mode is unchanged (per-file failure, exit 1 with the summary). The CLI-level contract: `format_str_named` returns `Err`, never a garbled `Ok(String)`, so `fmt.rs` only ever reaches its write call with a value that already passed the gate.
 
 ## Anti-Patterns
 
@@ -204,10 +205,10 @@ Notable divergences worth knowing before touching this file:
 - **`@block` bodies now preserve interior blank runs.** A standalone `@block` body is NOT a raw-content span (it still goes through `clean_output`, unlike `@message`/`@define`), but because `clean_output` is now interior-verbatim, its interior blank runs survive. Do not "fix" a `@block` that keeps a 4-newline run — that is now correct behavior.
 - **`effective_parent` (fs.rs ~287) fixes bare-filename resolution everywhere.** `Path::parent()` returns `Some("")` (an empty path) for bare relative filenames like `"hello.mds"`, NOT `None`. Passing an empty path to `canonicalize` produces a file-not-found error. `effective_parent` maps both `Some("")` and `None` to `Path::new(".")`, so bare filenames resolve from the current working directory. This was release blocker 1 (before the fix, `mds fmt hello.mds` with no directory prefix would fail). `check_symlink` explicitly calls `effective_parent` in its parent-directory step. `atomic_write_file` also calls `effective_parent` for the same reason.
 - **`strip_trailing_insignificant_text` is tail-only, not interior.** The helper only pops from the END of the token stream. An interior blank-line `Text` token (e.g. after a `@if` block in the middle of a file) is never touched. A false `FormatterInvariant` that triggers for a trailing blank line after a final directive (on a source that only compiles with runtime vars) was release blocker 3 — fixed by this helper.
-- **Frontmatter deep-merge (`@extends`, #153) lives outside `formatter.rs` but shares the reserved-key vocabulary.** `deep_merge_yaml` is in `crates/mds-core/src/resolver/frontmatter.rs` (not `resolver.rs`), and its reserved-key strip (`RESERVED_MERGE_KEYS = ["imports", "type", "extends"]`) is gated on **`depth == 0`**. The raw frontmatter block is copied verbatim by the formatter, so `sort_frontmatter_keys` staying a no-op keeps the formatter clear of this logic.
+- **Frontmatter deep-merge (`@extends`, #153) lives outside `formatter.rs` but shares the reserved-key vocabulary.** `deep_merge_yaml` is in `crates/mds-core/src/resolver/frontmatter.rs`, and its reserved-key strip (`RESERVED_MERGE_KEYS = ["imports", "type", "extends"]`) is gated on **`depth == 0`**. The raw frontmatter block is copied verbatim by the formatter, so `sort_frontmatter_keys` staying a no-op keeps the formatter clear of this logic.
 - **FIXED (PF-003 / #133, #146): the resolver's `<source>` path-sentinel is eliminated.** `resolve_source`/`resolve_source_intrinsic` now pass the canonical directory string directly as `ctx.base_dir` and call `fs.normalize_in_dir(ctx.base_dir, rel)` — no synthetic path constructed. `SOURCE_LABEL` const is display/cycle-detection only. Locked in by `resolver_tests.rs::pf003_parent_dir_strips_on_windows_verbatim_path`.
 - **`FmtConfig.sort_frontmatter_keys` parses but does nothing.** Don't "wire it up" opportunistically.
-- **Adding a field to `MdsConfig` ripples into unrelated existing tests.** The `fmt: FmtConfig` field addition required `..Default::default()` in pre-existing struct-literal test sites in `build.rs` and `watch.rs`.
+- **Adding a field to `MdsConfig` ripples into unrelated existing tests.** The `fmt: FmtConfig` field addition required `..Default::default()` in pre-existing struct-literal test sites in `build/config.rs` and `watch.rs`.
 - **Partials are reformatted but `is_partial` still gates output emission elsewhere.** Don't conflate the two meanings of "partial" across `fmt` vs. `build`/`check`.
 - **Hidden FILES are still collected by the walker.** `is_default_excluded_dir` excludes hidden *directories* from recursion, not hidden `.mds` files at the traversed level. A `.dotfile.mds` at the root of a traversed directory is collected and formatted.
 - **`atomic_write_file` is the write primitive — not `std::fs::write`.** `fmt.rs` calls `atomic_write_file` from `output.rs` (shared with `lint.rs`). It provides a TOCTOU guard, Unix permission preservation (`mode & 0o7777`), and `sync_all()` + atomic rename. This means a failed write leaves the original file intact — it does NOT leave a partially-written file. And, since #227, `write_output`/dir-mode build/`.map` sidecars route through it too, with `Durability::RenameOnly` (fmt/lint pass `Fsync`).
@@ -229,14 +230,15 @@ These items were consciously deferred and have back-ref comments in source:
 - `crates/mds-core/src/formatter.rs` — the entire engine: `format_str_named` (~line 135), region computation, the rewrite pass, `strip_trailing_insignificant_text` (~line 522), `in_raw_content` binary-search helper, `assert_equivalent` (~line 446), and `structural_equivalent` (~line 565)
 - `crates/mds-core/src/lib.rs:60` — `pub use formatter::{format_str, format_str_named, format_str_with}` (the public re-export); `:665-681` — `clean_output`
 - `crates/mds-core/src/fs.rs:287` — `effective_parent` (bare-filename fix, maps `Some("")`/`None` → `"."`)
-- `crates/mds-cli/src/output.rs:164,177` — `is_default_excluded_dir` / `is_within_default_excluded_dir` (shared walker exclusions; applies to all subcommands and both watch paths); `:651` — `atomic_write_file` (shared write primitive: TOCTOU guard + permissions restore + atomic rename, with `sync_all` under `Durability::Fsync`; used by `fmt.rs`, `lint.rs`, and — since #227 — `build.rs`/`watch.rs` outputs and `.map` sidecars)
+- `crates/mds-cli/src/output.rs:164,177` — `is_default_excluded_dir` / `is_within_default_excluded_dir` (shared walker exclusions; applies to all subcommands and both watch paths); `:651` — `atomic_write_file` (shared write primitive: TOCTOU guard + permissions restore + atomic rename, with `sync_all` under `Durability::Fsync`; used by `fmt.rs`, `lint.rs`, and — since #227 — build and watch outputs and `.map` sidecars)
 - `crates/mds-core/src/evaluator.rs:845` — the `evaluate_nodes(...).trim()` call (spec §4.11 edge-trim) that makes `@message` bodies bypass `clean_output`
 - `crates/mds-core/src/resolver/frontmatter.rs:53-129` — `deep_merge_yaml` (`@extends` frontmatter merge)
 - `crates/mds-core/src/parser.rs:545-594` — `parse_block`; the `@block`-cannot-nest-in-`@message` guard
 - `crates/mds-core/src/lexer.rs` — token-lossiness sites and fence recognition (`try_scan_fence_at`/`FenceMatch`, `fence_closes`, unclosed-fence error)
 - `crates/mds-core/src/error.rs:335-345, 686-692` — `FormatterInvariant { message: String }`
 - `crates/mds-cli/src/fmt.rs` — the `fmt` subcommand: `FmtFlags`, `format_source_named` calling `mds::format_str_named`, `format_one_file`, channel discipline, diff colorizer; calls `atomic_write_file` (not `std::fs::write`)
-- `crates/mds-cli/src/build.rs:16-65` — `MdsConfig`/`FmtConfig`/`BuildConfig`; `:372-382` — `exit_code`
+- `crates/mds-cli/src/build/config.rs` — `MdsConfig`, `FmtConfig`, and `BuildConfig`
+- `crates/mds-cli/src/build.rs` — `exit_code`
 - `crates/mds-core/tests/api_surface.rs:14` — compile-time pin of `format_str_named` signature
 - `crates/mds-core/tests/fmt.rs`, `crates/mds-cli/tests/cli_fmt.rs` — every empirically-verified claim above is locked in as a regression test here
 

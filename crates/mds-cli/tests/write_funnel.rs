@@ -778,6 +778,35 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
     count
 }
 
+fn duplicate_basenames(paths: &[PathBuf]) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut duplicates = std::collections::BTreeSet::new();
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("source file names are UTF-8");
+        if !seen.insert(name) {
+            duplicates.insert(name);
+        }
+    }
+    duplicates.into_iter().map(str::to_owned).collect()
+}
+
+#[test]
+#[should_panic(expected = "duplicate Rust source basenames: [\"x.rs\"]")]
+fn rust_files_refuses_duplicate_basenames() {
+    let dir = tempfile::tempdir().unwrap();
+    for file in ["a/x.rs", "b/y.rs"] {
+        let path = dir.path().join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "").unwrap();
+    }
+    assert_eq!(rust_files(dir.path()).len(), 2);
+    std::fs::rename(dir.path().join("b/y.rs"), dir.path().join("b/x.rs")).unwrap();
+    rust_files(dir.path());
+}
+
 fn rust_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -797,6 +826,11 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
         }
     }
     out.sort();
+    let duplicates = duplicate_basenames(&out);
+    assert!(
+        duplicates.is_empty(),
+        "duplicate Rust source basenames: {duplicates:?}"
+    );
     out
 }
 
