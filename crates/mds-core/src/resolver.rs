@@ -59,7 +59,8 @@ use crate::limits::{
 };
 use crate::parser::parse_with_ctx;
 use crate::scope::{FunctionDef, NamespaceScope, PromptText, Scope, VarLayer};
-// Import Origin from sourcemap.rs to avoid a scope→resolver import cycle.
+// The defining module supplies its canonical key, display path, and source text for source maps (S7/S8).
+// Keep Origin in sourcemap.rs so scope does not depend on the resolver.
 pub(crate) use crate::sourcemap::Origin;
 use crate::sourcemap::{CompileOptions, MapBuilder, SourceIndex};
 use crate::validator;
@@ -95,10 +96,6 @@ use module_scope::{
 };
 #[cfg(test)]
 use process::{apply_map_degradation, charge_finalize, FinalizeCosts};
-
-// `Origin` is defined in `sourcemap.rs` and re-exported above via `pub(crate) use`.
-// It carries (file: Arc<str>, source: Arc<str>) — the defining module's display
-// path and raw source content for source-map provenance (S7/S8).
 
 /// Maximum import depth to prevent stack overflow from deeply chained imports.
 const MAX_IMPORT_DEPTH: usize = 64;

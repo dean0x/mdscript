@@ -1,4 +1,4 @@
-//! Check directory mode arguments and dispatch the build.
+//! Check directory arguments, collect source files, and write each compiled output.
 
 use std::path::{Path, PathBuf};
 
@@ -85,14 +85,6 @@ pub(super) struct DirectoryWalk {
 /// (exit 2) mirror only the first two — they iterate every file including partials,
 /// so a partials-only tree is real work for them, not "nothing to do".
 /// `mds watch <dir>` deliberately does NOT error on any of the three.
-///
-/// Per-file source_map_base: the output directory for this file, computed
-/// from the kind-independent directory oracle, without creating it — an early
-/// create_dir_all would leave an empty directory on compile failure (Step 6
-/// Caveat 1). A walked file's output stem always has a parent, the directory it
-/// lands in, so the base is always that directory.
-/// Compile (all reads go through mds-core which enforces MAX_FILE_SIZE — PF-004).
-/// A panic in it fails this file alone, and the batch goes on (#389).
 pub(super) fn setup_walk(
     dir: &Path,
     out_dir: Option<&PathBuf>,

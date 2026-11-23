@@ -112,18 +112,7 @@ pub(super) fn collect_define(
     Ok(())
 }
 
-/// Build the `effective_blocks` map for a root (non-extending) module.
-///
-/// Walks `body` and collects all `Node::Block` entries whose name appears in
-/// `block_names`.  Output order follows body declaration order (IndexMap preserves
-/// insertion order, giving deterministic diamond-inheritance merges downstream).
-///
-/// Each entry carries `origin` (Arc::clone — O(1)), so validation can attribute
-/// diagnostics to the correct file. For a root base the origin is the base's own
-/// file and source.
-///
-/// **Perf rule:** `origin` is built ONCE per module resolution (outside any loop)
-/// Process a single `@block` directive, updating the `block_names` set in `defs`.
+/// Check a single `@block` directive and add its name to `defs.block_names`.
 ///
 /// Detects:
 /// - Duplicate `@block` names within the same module (mds::name_collision).
@@ -221,22 +210,7 @@ pub(super) fn build_scope_from_frontmatter(
     ))
 }
 
-/// Deep-merge two YAML `Mapping`s for template inheritance frontmatter.
-///
-/// Semantics (decision #7):
-/// - When BOTH values at a key are `Mapping`, recursively merge key-by-key.
-/// - Otherwise child wins (scalar over scalar, scalar over map, map over scalar).
-/// - Arrays/sequences REPLACE WHOLESALE — no element-level merge.
-/// - Key ORDER: base-then-child (determinism A6). Keys present in base keep their
-///   original position; their value may be replaced by the merged/child value.
-///   Child-only keys are appended in child order after all base keys.
-/// - Reserved keys (`imports`, `type`, `extends`) are excluded from the output —
-///   they are not value data (decision #7). Callers handle them separately.
-/// - Recursion is bounded by `MAX_FRONTMATTER_MERGE_DEPTH`; exceeding it returns
-///   `mds::resource_limit` (P4 — no stack overflow).
-///
-/// The `depth` argument starts at 0 and is incremented on each recursive call.
-/// Validate that all named exports refer to defined functions or the special `"prompt"` export.
+/// Check that each named export refers to a defined function or the special `"prompt"` export.
 pub(super) fn validate_exports(
     explicit_exports: &HashSet<String>,
     functions: &HashMap<String, Arc<FunctionDef>>,

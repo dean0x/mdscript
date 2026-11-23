@@ -35,7 +35,7 @@ pub(super) fn warn_build_flags(flags: &BuildFlags, warn_inline: bool, quiet: boo
         );
     }
 
-    // AC-SEC-02: warn when the output includes full source text.
+    // Check the requested flags before the compiler selects the output kind.
     if use_embed_sources && warn_inline && !quiet {
         crate::output::ewriteln!(
             "warning: --embed-sources with --inline ships full source text in the output \

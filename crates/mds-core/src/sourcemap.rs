@@ -91,7 +91,7 @@
 //! ## Scope of this legend
 //!
 //! This legend covers `S`-prefixed source-map provenance tags in
-//! `sourcemap.rs`, `resolver/module.rs`, `evaluator.rs`, and `scope.rs`.
+//! `sourcemap.rs`, `resolver.rs`, `resolver/module.rs`, `evaluator.rs`, and `scope.rs`.
 //!
 //! `S1`, `S2`, and `S14` appearing elsewhere in this repository are
 //! unrelated slice labels from other workstreams, not part of this
@@ -1129,8 +1129,8 @@ fn push_capped_segment(segments: &mut Vec<RawSegment>, dropped: &mut bool, segme
 /// A pre-computed source-map fragment for an imported module's `prompt` body.
 ///
 /// `fragment_map_from` (`resolver/context.rs`) uses [`MapBuilder::into_fragment`]
-/// to build this once per import in source-map mode. See `process_module`
-/// (`resolver/process.rs`) and `process_module_extends` (`resolver/extends.rs`).
+/// when the resolver compiles the module in source-map mode. Later imports reuse the fragment.
+/// See `process_module` (`resolver/process.rs`) and `process_module_extends` (`resolver/extends.rs`).
 /// `ResolvedModule` and [`crate::scope::NamespaceScope`] keep the fragment in
 /// an `Arc` so each `@include` call site shares the same allocation.
 ///

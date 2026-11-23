@@ -51,10 +51,10 @@ fn read_stdin_from(reader: &mut impl Read) -> Result<String, MdsError> {
 
 /// Write compiled output to a file or stdout.
 ///
-/// When `target` is `Some`, writes the compiled string to `target.path`, creating the
-/// directories it goes in, and prints `"Compiled to {target.shown}"` to stderr unless
-/// `quiet` or `announce` is false (#390).  When `target` is `None`, writes the compiled
-/// string to stdout with no trailing newline: a closed stdout is not an error (the reader
+/// When `target` is `Some`, write the compiled string to `target.path` and create its parent directories as needed.
+/// Print `"Compiled to {target.shown}"` to stderr only if `announce` is true and `quiet` is false (#390).
+/// When `target` is `None`, write the compiled string to stdout without an extra newline.
+/// A closed stdout is not an error (the reader
 /// is gone, so nothing more is written and the run keeps its verdict), any other stdout
 /// failure is `mds::io` (#157). This is where a single-file output's directory is
 /// created — [`resolve_output_path_for_kind`] creates nothing — so an output refused

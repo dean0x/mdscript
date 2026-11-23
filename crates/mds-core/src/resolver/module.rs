@@ -11,7 +11,7 @@ use super::{
 /// the origin is the child's file; if the base default is used, the origin is the
 /// base's file. This is stamped at the last-wins insertion in `apply_block_overrides`.
 ///
-/// `Clone` = three refcount bumps (one `Arc<BlockNode>` + two `Arc<str>` inside `Origin`).
+/// A clone shares the block node and the origin's key, display path, and source text.
 pub(crate) struct EffectiveBlock {
     pub(crate) node: Arc<BlockNode>,
     pub(crate) origin: Origin,

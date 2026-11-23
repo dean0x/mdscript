@@ -302,8 +302,6 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         return directory::build_directory_mode(input, resolved, run);
     }
 
-    // The vars, and the `--vars` file they came from, which no output is written over
-    // (#425).
     if input == Path::new("-") {
         return single::run_build_stdin(input, resolved, &run);
     }
@@ -314,7 +312,8 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 /// Compile every non-partial `.mds` file under `dir`, streaming one at a time
 /// (AC-PERF-02: peak RSS ≈ O(largest single file), not O(total)).
 ///
-/// Continue-on-error: a per-file compile error does NOT abort the run.
+/// Each file uses its own output directory as its source map base. The compile does not create that directory.
+/// If a compile fails or panics, the loop still processes the other files.
 /// All valid files are written; a summary is printed (unless `--quiet` and the run
 /// succeeded); non-zero exit when any failed (AC-FUNC-18).
 ///
