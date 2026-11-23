@@ -6000,15 +6000,15 @@ fn final_output_charges_prefix_and_growth_before_the_reserve() {
     }
 }
 
-fn resolver_production_sources() -> Vec<(PathBuf, String)> {
+fn module_production_sources(module: &str) -> Vec<(PathBuf, String)> {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut paths = vec![PathBuf::from("resolver.rs")];
-    for entry in std::fs::read_dir(src.join("resolver")).unwrap() {
+    let mut paths = vec![PathBuf::from(module).with_extension("rs")];
+    for entry in std::fs::read_dir(src.join(module)).unwrap() {
         let entry = entry.unwrap();
         let kind = entry.file_type().unwrap();
         assert!(
             !kind.is_dir() && !kind.is_symlink(),
-            "unexpected resolver entry: {entry:?}"
+            "unexpected {module} entry: {entry:?}"
         );
         let name = entry.file_name();
         let path = std::path::Path::new(&name);
@@ -6016,12 +6016,12 @@ fn resolver_production_sources() -> Vec<(PathBuf, String)> {
             && path.extension().is_some_and(|ext| ext == "rs")
             && !name.to_string_lossy().ends_with("_tests.rs")
         {
-            paths.push(std::path::Path::new("resolver").join(path));
+            paths.push(std::path::Path::new(module).join(path));
         }
     }
     assert!(
         paths.len() >= 3,
-        "expected resolver.rs and at least two children: {paths:?}"
+        "expected {module}.rs and at least two children: {paths:?}"
     );
     paths.sort();
     paths
@@ -6034,7 +6034,7 @@ fn resolver_production_sources() -> Vec<(PathBuf, String)> {
         .collect()
 }
 
-fn blank_inline_resolver_tests(source: &str) -> Option<String> {
+fn blank_inline_tests(source: &str) -> Option<String> {
     let marker = ["#", "[", "cfg", "(", "test", ")", "]", "mod", "tests", "{"];
     let tokens = prompt_source_scan::source_tokens(source);
     let start = tokens
@@ -6066,15 +6066,12 @@ fn blank_inline_resolver_tests(source: &str) -> Option<String> {
 
 const RESOLVER_FRONTMATTER: &str = "resolver/frontmatter.rs";
 
-fn resolver_source_text(sources: &[(PathBuf, String)], include_frontmatter: bool) -> String {
+fn production_source_text(sources: &[(PathBuf, String)], excluded_path: Option<&str>) -> String {
+    let excluded_path = excluded_path.map(std::path::Path::new);
     let mut joined = String::new();
     for (path, source) in sources {
-        if include_frontmatter || path != std::path::Path::new(RESOLVER_FRONTMATTER) {
-            joined.push_str(
-                blank_inline_resolver_tests(source)
-                    .as_deref()
-                    .unwrap_or(source),
-            );
+        if Some(path.as_path()) != excluded_path {
+            joined.push_str(blank_inline_tests(source).as_deref().unwrap_or(source));
             joined.push('\n');
         }
     }
@@ -6131,22 +6128,25 @@ fn only_commit_retained_updates_cache_headroom() {
             && !evaluator.contains(".resolve_")
     }
 
-    let mut sources = resolver_production_sources();
-    let resolver = resolver_source_text(&sources, true);
-    let evaluator = concat!(
-        include_str!("evaluator.rs"),
-        include_str!("evaluator/budget.rs")
-    );
+    let mut sources = module_production_sources("resolver");
+    let resolver = production_source_text(&sources, None);
+    let mut evaluator_sources = module_production_sources("evaluator");
+    let evaluator = &production_source_text(&evaluator_sources, None);
     assert!(valid(&resolver, evaluator));
     assert!(!valid(
         &format!("{resolver}\nself.retained = 0;"),
         evaluator
     ));
     assert!(!valid(&format!("{resolver}\nmem.headroom = 0;"), evaluator));
-    assert!(!valid(
-        &resolver,
-        &format!("{evaluator}\nmem.headroom -= 1;")
-    ));
+    let (_, held) = evaluator_sources
+        .iter_mut()
+        .find(|(path, _)| path == std::path::Path::new("evaluator/held.rs"))
+        .expect("evaluator source walk must reach held.rs");
+    held.push_str("\nmem.headroom -= 1;");
+    assert!(
+        !valid(&resolver, &production_source_text(&evaluator_sources, None)),
+        "must count the headroom write in an evaluator child"
+    );
     assert!(!valid(
         &resolver,
         &format!("{evaluator}\nuse crate::resolver::ModuleCache;")
@@ -6159,7 +6159,7 @@ fn only_commit_retained_updates_cache_headroom() {
     let mut with_tests = sources.clone();
     plant_in_resolver_child(&mut sources, "self.retained = 0;");
     assert!(
-        !valid(&resolver_source_text(&sources, true), evaluator),
+        !valid(&production_source_text(&sources, None), evaluator),
         "must count the retained write in a child"
     );
     plant_in_resolver_child(
@@ -6169,10 +6169,10 @@ mod tests {
     fn fixture() { let brace = "}"; /* } */ self.retained = 0; }
 }"#,
     );
-    assert!(valid(&resolver_source_text(&with_tests, true), evaluator));
+    assert!(valid(&production_source_text(&with_tests, None), evaluator));
     plant_in_resolver_child(&mut with_tests, "self.retained = 0;");
     assert!(
-        !valid(&resolver_source_text(&with_tests, true), evaluator),
+        !valid(&production_source_text(&with_tests, None), evaluator),
         "must count the retained write after the inline test module"
     );
 }
@@ -6291,8 +6291,8 @@ fn resolution_funnel_has_one_pop_and_five_finish_calls() {
             })
     }
 
-    let sources = resolver_production_sources();
-    let source = resolver_source_text(&sources, true);
+    let sources = module_production_sources("resolver");
+    let source = production_source_text(&sources, None);
     assert!(valid(&source));
     assert!(!valid(&format!("{source}\nself.resolving . pop ();")));
     assert!(!valid(&format!("{source}\nself.finish_root()?;")));
@@ -6306,7 +6306,7 @@ fn resolution_funnel_has_one_pop_and_five_finish_calls() {
         let mut planted = sources.clone();
         plant_in_resolver_child(&mut planted, plant);
         assert!(
-            !valid(&resolver_source_text(&planted, true)),
+            !valid(&production_source_text(&planted, None)),
             "must reject `{plant}` in a child"
         );
     }
@@ -6403,14 +6403,14 @@ fn every_frontmatter_merge_goes_through_the_charged_helper() {
             .split_once("fn merge_frontmatter(")
             .and_then(|(_, rest)| rest.split_once("\n    }"));
         // Outside its tests, frontmatter.rs holds the definition and its recursion.
-        let production = blank_inline_resolver_tests(frontmatter);
+        let production = blank_inline_tests(frontmatter);
         calls(resolver) == 1
             && helper.is_some_and(|(body, _)| calls(body) == 1)
             && production.is_some_and(|code| calls(&code) == 2)
     }
 
-    let mut sources = resolver_production_sources();
-    let resolver = resolver_source_text(&sources, false);
+    let mut sources = module_production_sources("resolver");
+    let resolver = production_source_text(&sources, Some(RESOLVER_FRONTMATTER));
     let (_, frontmatter) = sources
         .iter()
         .find(|(path, _)| path == std::path::Path::new(RESOLVER_FRONTMATTER))
@@ -6422,7 +6422,10 @@ fn every_frontmatter_merge_goes_through_the_charged_helper() {
     let frontmatter = frontmatter.clone();
     plant_in_resolver_child(&mut sources, planted);
     assert!(
-        !valid(&resolver_source_text(&sources, false), &frontmatter),
+        !valid(
+            &production_source_text(&sources, Some(RESOLVER_FRONTMATTER)),
+            &frontmatter
+        ),
         "must count the direct merge call in a child"
     );
 }
