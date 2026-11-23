@@ -6064,10 +6064,15 @@ fn blank_inline_tests(source: &str) -> Option<String> {
     Some(String::from_utf8(bytes).expect("only the test module changed to spaces"))
 }
 
-const RESOLVER_FRONTMATTER: &str = "resolver/frontmatter.rs";
+/// The path of a module child, built as the source walk builds it.
+fn child_path(module: &str, file: &str) -> PathBuf {
+    std::path::Path::new(module).join(file)
+}
 
-fn production_source_text(sources: &[(PathBuf, String)], excluded_path: Option<&str>) -> String {
-    let excluded_path = excluded_path.map(std::path::Path::new);
+fn production_source_text(
+    sources: &[(PathBuf, String)],
+    excluded_path: Option<&std::path::Path>,
+) -> String {
     let mut joined = String::new();
     for (path, source) in sources {
         if Some(path.as_path()) != excluded_path {
@@ -6081,7 +6086,7 @@ fn production_source_text(sources: &[(PathBuf, String)], excluded_path: Option<&
 fn plant_in_resolver_child(sources: &mut [(PathBuf, String)], plant: &str) {
     let (_, child) = sources
         .iter_mut()
-        .find(|(path, _)| path == std::path::Path::new("resolver/inheritance.rs"))
+        .find(|(path, _)| *path == child_path("resolver", "inheritance.rs"))
         .expect("resolver source walk must reach inheritance.rs");
     child.push('\n');
     child.push_str(plant);
@@ -6138,9 +6143,13 @@ fn only_commit_retained_updates_cache_headroom() {
         evaluator
     ));
     assert!(!valid(&format!("{resolver}\nmem.headroom = 0;"), evaluator));
+    assert!(!valid(
+        &resolver,
+        &format!("{evaluator}\nmem.headroom -= 1;")
+    ));
     let (_, held) = evaluator_sources
         .iter_mut()
-        .find(|(path, _)| path == std::path::Path::new("evaluator/held.rs"))
+        .find(|(path, _)| *path == child_path("evaluator", "held.rs"))
         .expect("evaluator source walk must reach held.rs");
     held.push_str("\nmem.headroom -= 1;");
     assert!(
@@ -6410,10 +6419,11 @@ fn every_frontmatter_merge_goes_through_the_charged_helper() {
     }
 
     let mut sources = module_production_sources("resolver");
-    let resolver = production_source_text(&sources, Some(RESOLVER_FRONTMATTER));
+    let frontmatter_path = child_path("resolver", "frontmatter.rs");
+    let resolver = production_source_text(&sources, Some(&frontmatter_path));
     let (_, frontmatter) = sources
         .iter()
-        .find(|(path, _)| path == std::path::Path::new(RESOLVER_FRONTMATTER))
+        .find(|(path, _)| *path == frontmatter_path)
         .expect("resolver source walk must reach frontmatter.rs");
     assert!(valid(&resolver, frontmatter));
     let planted = "let merged = deep_merge_yaml(&base, &child, 0)?;";
@@ -6423,7 +6433,7 @@ fn every_frontmatter_merge_goes_through_the_charged_helper() {
     plant_in_resolver_child(&mut sources, planted);
     assert!(
         !valid(
-            &production_source_text(&sources, Some(RESOLVER_FRONTMATTER)),
+            &production_source_text(&sources, Some(&frontmatter_path)),
             &frontmatter
         ),
         "must count the direct merge call in a child"
