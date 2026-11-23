@@ -2248,6 +2248,95 @@ mod entry_overwrite {
     use super::*;
     use std::path::{Path, PathBuf};
 
+    #[test]
+    fn source_map_routes_refuse_the_entry_and_protect_the_vars_file() {
+        for (flags, config, inline) in [
+            (&["--source-map"][..], "{}", false),
+            (&["--source-map", "--inline"][..], "{}", true),
+            (&[][..], r#"{"build":{"source_map":true}}"#, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::write(root.join("page.md"), PAGE).unwrap();
+            std::fs::write(root.join("mds.json"), config).unwrap();
+            let before = snapshot(root);
+
+            let mut args = vec!["build", "page.md", "-o", "page.md"];
+            args.extend_from_slice(flags);
+            let (code, stdout, stderr) = run_in(root, &args);
+            assert_eq!(code, Some(2), "{args:?}: {stderr}");
+            assert_refused(&stderr, "page.md", &args.join(" "));
+            assert!(stdout.is_empty(), "{args:?}: {stdout}");
+            assert_eq!(snapshot(root), before, "{args:?}: {stderr}");
+            assert!(!root.join("page.md.map").exists(), "{args:?}");
+
+            args[3] = "other.md";
+            let (code, stdout, stderr) = run_in(root, &args);
+            assert_eq!(code, Some(0), "{args:?}: {stderr}");
+            assert!(stdout.is_empty(), "{args:?}: {stdout}");
+            let content = std::fs::read_to_string(root.join("other.md")).unwrap();
+            if inline {
+                assert!(content.starts_with(COMPILED), "{content}");
+                assert!(content.contains("<!--# sourceMappingURL=data:application/json;base64,"));
+                assert!(!root.join("other.md.map").exists());
+            } else {
+                assert_eq!(content, COMPILED);
+                let map = std::fs::read(root.join("other.md.map")).unwrap();
+                let map: serde_json::Value = serde_json::from_slice(&map).unwrap();
+                assert_eq!(map["file"], "other.md");
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("page.md"), PAGE).unwrap();
+        std::fs::write(root.join("mds.json"), "{}").unwrap();
+        let vars = r#"{"name":"Vars"}"#;
+        std::fs::write(root.join("out.md.map"), vars).unwrap();
+        let mut args = [
+            "build",
+            "page.md",
+            "--vars",
+            "out.md.map",
+            "-o",
+            "out.md",
+            "--source-map",
+        ];
+        let (code, stdout, stderr) = run_in(root, &args);
+        assert_eq!(code, Some(2), "{stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(stderr.contains("mds::io"), "{stderr}");
+        assert!(
+            stderr.contains("cannot write out.md.map: refusing to replace a file this run reads"),
+            "{stderr}"
+        );
+        let output = "---\nname: X\n---\nHello Vars!\n";
+        assert_eq!(
+            std::fs::read_to_string(root.join("out.md")).unwrap(),
+            output
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("out.md.map")).unwrap(),
+            vars
+        );
+
+        args[5] = "other.md";
+        let (code, stdout, stderr) = run_in(root, &args);
+        assert_eq!(code, Some(0), "{stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("other.md")).unwrap(),
+            output
+        );
+        let map = std::fs::read(root.join("other.md.map")).unwrap();
+        let map: serde_json::Value = serde_json::from_slice(&map).unwrap();
+        assert_eq!(map["file"], "other.md");
+        assert_eq!(
+            std::fs::read_to_string(root.join("out.md.map")).unwrap(),
+            vars
+        );
+    }
+
     /// A `.md` entry that declares `type: mds`: it compiles to Markdown, so its default
     /// output name is its own name.
     pub(super) const PAGE: &str = "---\ntype: mds\nname: X\n---\nHello {{name}}!\n";

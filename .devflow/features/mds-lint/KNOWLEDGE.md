@@ -127,7 +127,7 @@ The registry is `mds::KNOWN_LINT_RULES`, derived from each rule module's own `RU
 detection is `mds::find_unknown_rule_names`. (#224)  
 **Unknown severity VALUES** → refused by the one severity parser, `Severity`'s `FromStr` (see below); the config load fails loudly (closed enum, no sensible fallback).
 
-`LintConfig` lives in `mds-core` (not mds-cli). The CLI `LintCliConfig` from `build.rs` converts to it via `into_core_config()`.
+`LintConfig` lives in `mds-core` (not mds-cli). The CLI `LintCliConfig` from `build/config.rs` converts to it via `into_core_config()`.
 
 `LintConfig::from_rules` was **deleted** in PR #308 — it shipped deprecated-since-birth and was never published. All callers use `from_rules_checked`. This also removed the `#[expect(deprecated)]` scaffolding from `crates/mds-core/tests/api_surface.rs`.
 
@@ -170,7 +170,7 @@ impl std::str::FromStr for Severity {
   mds-core built at opt-level 3) is the ONE reader for a whole `rules` map. napi's
   `extract_rules_direct`, WASM's `extract_rules` and Python's `extract_rules` all call
   it, and so does the CLI's `deserialize_lint_rules` for `mds.json`'s `lint.rules`
-  (`crates/mds-cli/src/build.rs`) — a `rules` value is read, and its error worded,
+  (`crates/mds-cli/src/build/config.rs`) — a `rules` value is read, and its error worded,
   exactly once, not four times. `field` is the caller's own label, shown as given:
   `"options.rules"` (napi, WASM), `"rules"` (Python's keyword argument), `"lint.rules"`
   (CLI). Both its error messages WIRE-escape the rule name AND the value as the
@@ -452,7 +452,7 @@ The auxiliary diagnostic graph (`source` cause chain, `related`, `diagnostic_sou
 |----------|------|--------|
 | `eprint_error` (output.rs) via `SanitizedReport` | HUMAN for prose | message, help, label text, entire auxiliary graph — every report rendered to CLI stderr |
 | `eprint_warning` (output.rs) | prose HUMAN; interpolated identifiers/paths WIRE | HUMAN for the warning body prose; `safe_path` / `safe_inline` for any untrusted value the caller interpolates into it |
-| `emit_duplicate_vars_file_warnings` (build.rs) | prose HUMAN via `eprint_warning`; interpolated key/path/count WIRE | warns on `--vars`-file duplicate keys (#326) and on the count omitted past `mds::VarsLoad`'s cap; per AD-224-3 every interpolated value is wrapped in `safe_inline`/`safe_path` at the interpolation site, never hoisted into a `let` first; no-op when `quiet` (AD-224-5) |
+| `emit_duplicate_vars_file_warnings` (`build/vars.rs`) | prose HUMAN via `eprint_warning`; interpolated key/path/count WIRE | warns on `--vars`-file duplicate keys (#326) and on the count omitted past `mds::VarsLoad`'s cap; per AD-224-3 every interpolated value is wrapped in `safe_inline`/`safe_path` at the interpolation site, never hoisted into a `let` first; no-op when `quiet` (AD-224-5) |
 | `safe_inline(value)` (output.rs) | WIRE | any single-line untrusted value interpolated into a status, warning, or error line: rule names, config paths, `--format` args, `io::Error` causes |
 | `safe_path(p)` / `safe_file_display(name)` (output.rs) | WIRE + `\t` (`escape_path_for_message`) | CLI status-line path display (`Clean:`, `Fixed:`, `Would fix:`, `Compiled to`, …) — every forbidden path character escaped, since a path may carry none (#265) |
 | `named_source_for_render(file, source)` (diagnostic.rs) | WIRE for filename; neutralize for source | the single `NamedSource` builder used by `MdsError::at()`, `check_equivalence`, `render_diag_human` |
@@ -461,7 +461,7 @@ The auxiliary diagnostic graph (`source` cause chain, `related`, `diagnostic_sou
 | `MdsError::serialize()` (error.rs) | WIRE | message, help — covers all three bindings' error path |
 | `LintResult::to_canonical_json()` (diagnostic.rs) | WIRE | message, help, `files[].file` key; error-only entries bypass this — their `file` key is sanitized at the push site via `sanitize_control_chars_wire` |
 | `CompileResult::to_canonical_json()` (lib.rs) | WIRE | warning strings (distinct method, not a duplicate) |
-| `emit_warnings()` (lib.rs) | HUMAN for prose; WIRE at construction for identifiers interpolated in `resolver.rs`/`evaluator.rs` | warnings printed to stderr |
+| `emit_warnings()` (lib.rs) | HUMAN for prose; WIRE at construction for identifiers interpolated in `resolver/context.rs` and `evaluator.rs` | warnings printed to stderr |
 | Python `LintResult::new()` via `sanitize_lint_value()` | WIRE | message, help, file — construction-time, so typed getters read pre-sanitized data (closes PF-004 parallel-path) |
 | `--diff` preview output (output.rs) | neutralized on TTY, byte-faithful when piped | `preview_text_for(writer_is_tty, text)` — redirected diffs stay `patch`-applicable |
 
@@ -486,7 +486,7 @@ The guard:
 
 **Documented limits** (five, in the file's own rustdoc): sanitizers are matched by the last path segment of the callee (an alias or a local function named `safe_path` would pass); binding traces are one hop within one file; allowlist exemptions are anti-rot but not anti-reuse (a new variable reusing an exempted name in the same file inherits the exemption silently); `write!` stream detection is by name; and the poison set models only `for` / parameter / closure binders, not `if let` / `while let` / `match`-arm ones. These limits close *accidental* reintroduction (which is what all four review rounds of #176 involved) — not intentional defeat.
 
-**The one cross-crate precondition** — that `mds-core` WIRE-escapes the identifiers its warning producers interpolate, since `mds-cli` prints whole warning strings through HUMAN-mode `eprint_warning` — is pinned by `crates/mds-cli/tests/producer_discipline.rs`. `mds-core` has exactly three such producers: `resolver.rs`'s imported-module filename (testable, and tested — a module key is a filesystem path) and `evaluator.rs`'s two `@include` alias warnings (**not** testable: the parser restricts an alias to `[A-Za-z_][A-Za-z0-9_]*`, so a test would be vacuous per PF-013 — upheld by review, and stated as such).
+**The one cross-crate precondition** — that `mds-core` WIRE-escapes the identifiers its warning producers interpolate, since `mds-cli` prints whole warning strings through HUMAN-mode `eprint_warning` — is pinned by `crates/mds-cli/tests/producer_discipline.rs`. `mds-core` has exactly three such producers: the imported-module filename in `resolver/context.rs` (testable, and tested — a module key is a filesystem path) and `evaluator.rs`'s two `@include` alias warnings (**not** testable: the parser restricts an alias to `[A-Za-z_][A-Za-z0-9_]*`, so a test cannot reach that case).
 
 This guard exists because three consecutive review rounds of #176 each found a NEW bare `eprintln!` after the previous one was fixed. It converts an unbounded reviewer search into a bounded enforced invariant.
 
@@ -680,7 +680,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 **Clippy stale cache can report a pass on dirty code**: Deleting `LintConfig::from_rules` (PR #308) surfaced an unused `use super::helpers::*;` in `crates/mds-core/src/parser_tests.rs`. A `cargo clippy --workspace --all-targets` run immediately after reported a stale cached pass. Touch the file to force a real re-check before trusting a `clippy` clean result after a deletion.
 
-**`safe_inline` is generic over `Display`, including `usize`**: `emit_duplicate_vars_file_warnings` calls `safe_inline(resolved.duplicate_vars_file_keys_omitted)` (build.rs:660) on a plain count, not just on untrusted strings. A `usize` can never carry a control byte, but `print_discipline.rs`'s guard is purely lexical — it matches on the callee name at the interpolation site, not on the argument's type — so skipping the wrapper because "it's just a number" fails the guard exactly like an unwrapped string would. Wrap every interpolated value, even a provably-safe one, or the print-discipline test fails closed.
+**`safe_inline` is generic over `Display`, including `usize`**: `emit_duplicate_vars_file_warnings` calls `safe_inline(resolved.duplicate_vars_file_keys_omitted)` (`build/vars.rs`) on a plain count, not just on untrusted strings. A `usize` can never carry a control byte, but `print_discipline.rs`'s guard is purely lexical — it matches on the callee name at the interpolation site, not on the argument's type — so skipping the wrapper because "it's just a number" fails the guard exactly like an unwrapped string would. Wrap every interpolated value, even a provably-safe one, or the print-discipline test fails closed.
 
 ## Related Follow-ups / Known Limitations
 
@@ -708,7 +708,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 - `crates/mds-core/src/lint/rules/` — 11 rule modules + `structural_eq.rs`
 - `crates/mds-cli/src/lint.rs` — CLI subcommand; `render_diag_human` (HUMAN for message/help; filename+source via `named_source_for_render`; all status lines via `safe_path`); `set_diag_display_path`, `LintDirCtx`; the rule-name list lives in `mds::KNOWN_LINT_RULES`, not in this crate (#224)
 - `crates/mds-cli/src/output.rs` — `atomic_write_file`; `eprint_error` (single CLI stderr choke-point, wraps in `SanitizedReport`); `SanitizedReport` / `SanitizedNode` / `MAX_AUX_DEPTH`; `render_error_sanitized` (private, plain `format!("{report:?}")` on sanitized wrapper); `eprint_warning` (HUMAN, new); `safe_path` / `safe_file_display` (WIRE + `\t`, via `mds::escape_path_for_message`) / `safe_inline` (WIRE only); `preview_text_for` (TTY-gated source neutralization for `--diff`); `render_unified_diff` / `colorize_unified_diff`
-- `crates/mds-cli/src/build.rs` — `LintCliConfig` struct, `into_core_config()`, `MdsConfig.lint` field; `deserialize_lint_rules` (`mds.json` `lint.rules` via `mds::parse_rule_severities`, #175)
+- `crates/mds-cli/src/build/config.rs` — `LintCliConfig` struct, `into_core_config()`, `MdsConfig.lint` field; `deserialize_lint_rules` (`mds.json` `lint.rules` via `mds::parse_rule_severities`, #175)
 - `crates/mds-cli/src/watch.rs` — all 11 error prints route through `eprint_error`; lifecycle status lines route through `safe_path` / `safe_inline` / `eprint_warning`
 - `crates/mds-cli/tests/print_discipline.rs` — CI-enforced lexical guard; SANITIZERS allowlist; `ALLOWED_UNSANITIZED` allowlist; `every_allowlist_entry_is_live` rot check
 - `crates/mds-cli/tests/security.rs` — T-ESC-MSG-1/2, T-ESC-RULE-1, T-ESC-FNAME-1/2, T-ESC-WALK-1

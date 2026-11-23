@@ -1,13 +1,14 @@
 ---
 feature: mds-cli
 name: MDS CLI (mds-cli)
-description: "Use when adding new subcommands, changing output-path resolution logic, modifying the watch architecture, adding new compile paths, updating mds.json config handling, debugging stdout/stderr stream separation, investigating exit codes, adding directory-mode build/check support, working on stale-output cleanup, or on the CLI's input refusals (forbidden path characters, directory-argument validation, or the entry-overwrite refusal). Keywords: mds build, mds check, mds watch, mds init, OutputKind, run_build, run_watch, build.rs, output.rs, watch.rs, input.rs, mds.json, output_dir, resolve_output_base, OutputBase, output_path_for, compile_and_write, compile_to_content, intrinsic extension, run_build_directory, run_check_directory, is_partial, collect_mds_files, probe_and_remove_stale, canonicalize_out_dir, output_base_no_ext, continue-on-error, subtree mirror, symlink guard, 10 MiB cap, load_config, reject_forbidden_output_path, reject_forbidden_resolved_output_path, resolve_directory_argument, ensure_existing_mds_file, forbidden path characters, #265, #413, #417, #425, #428, read_canonical_source, read_stdin, read_at_most, safe_path, safe_file_display, escape_path_for_message, display_native_path, #409, mds init filename, admit_output, refuse_output_over_entry, file_identity, EntryPaths, WatchedPath, Watched, WorkingDir, CompileWriteOutcome, has_sidecar_head, verify_then_delete_map."
+description: "Use when adding new subcommands, changing output-path resolution logic, modifying the watch architecture, adding new compile paths, updating mds.json config handling, debugging stdout/stderr stream separation, investigating exit codes, adding directory-mode build/check support, working on stale-output cleanup, or on the CLI's input refusals (forbidden path characters, directory-argument validation, or the entry-overwrite refusal). Keywords: mds build, mds check, mds watch, mds init, OutputKind, run_build, run_watch, build.rs, build/admit.rs, build/config.rs, build/directory.rs, build/entry.rs, build/flags.rs, build/out_paths.rs, build/single.rs, build/source_map.rs, build/stdio.rs, build/vars.rs, output.rs, watch.rs, input.rs, mds.json, output_dir, resolve_output_base, OutputBase, output_path_for, compile_and_write, compile_to_content, intrinsic extension, run_build_directory, run_check_directory, is_partial, collect_mds_files, probe_and_remove_stale, canonicalize_out_dir, output_base_no_ext, continue-on-error, subtree mirror, symlink guard, 10 MiB cap, load_config, reject_forbidden_output_path, reject_forbidden_resolved_output_path, resolve_directory_argument, ensure_existing_mds_file, forbidden path characters, #265, #413, #417, #425, #428, read_canonical_source, read_stdin, read_at_most, safe_path, safe_file_display, escape_path_for_message, display_native_path, #409, mds init filename, admit_output, refuse_output_over_entry, file_identity, EntryPaths, WatchedPath, Watched, WorkingDir, CompileWriteOutcome, has_sidecar_head, verify_then_delete_map."
 category: component-patterns
 directories: ["crates/mds-cli/"]
 referencedFiles:
   - crates/mds-cli/src/main.rs
   - crates/mds-cli/src/input.rs
   - crates/mds-cli/src/build.rs
+  - crates/mds-cli/src/build
   - crates/mds-cli/src/output.rs
   - crates/mds-cli/src/watch.rs
   - crates/mds-cli/tests/cli_build.rs
@@ -42,9 +43,9 @@ Two cross-cutting refusal systems now live at the front of every code path, both
 
 - Subcommand dispatch: `main.rs` parses args (clap) and calls `run_build` (build.rs), `run_check` (defined in `main.rs`, not build.rs), `run_watch` (watch.rs); `run_init` (main.rs) handles `mds init`
 - `input.rs`: the one directory-argument resolver shared by `build`/`check`/`fmt`/`lint`/`watch` (#413)
-- `build.rs`: single-file and directory build logic, output-path resolution, the entry-overwrite refusal (#425), shared helpers (`compile_to_content`, `load_config`, `ensure_existing_mds_file`)
+- `build.rs`: build dispatch, the directory compile loop, and shared helpers (`compile_to_content`, `ensure_existing_mds_file`). The `build/` children handle each input mode, config, variables, output paths and source maps.
 - `output.rs`: directory-mode shared machinery (`OutputBase`, `output_path_for`, `collect_mds_files`, `is_partial`, `probe_and_remove_stale`, `canonicalize_out_dir`), forbidden-path-character refusals, atomic writes, display/escape helpers
-- `watch.rs`: file/directory watch loop; `WatchedPath`/`Watched` own the typed-vs-canonical duality for every watched path; `compile_and_write`/`CompileWriteOutcome` (moved here from build.rs) own the single-file startup route
+- `watch.rs`: file/directory watch loop; `WatchedPath`/`Watched` own the typed-vs-canonical duality for every watched path; `compile_and_write`/`CompileWriteOutcome` own the single-file startup route
 - Does NOT: implement compiler logic, manage modules, or handle imports
 
 ## Standard Structure
@@ -74,12 +75,12 @@ Behavior, all `mds::io`, exit 2, naming the directory **as typed**, escaped:
 
 `mds watch .` (and `./`, `..`, `sub/..`) now works — this was a `main`-only bug (not a #265 regression) fixed alongside #413; the old KB's "cannot start" gotcha no longer applies.
 
-### build.rs — the #425 entry-overwrite refusal
+### build/admit.rs — the #425 entry-overwrite refusal
 
 A `.md` entry that declares `type: mds` compiles to Markdown, and its **default output name is its own name** (stem + `.md`). Before #425, `mds build page.md` (or `-o`/`--out-dir`/`mds.json build.output_dir` naming the entry another way) silently replaced the source with its compiled form, and the next build then failed because the compiled text no longer declares `type: mds`.
 
 ```rust
-// In build.rs — the entry in the two forms admit_output takes, always
+// In build/admit.rs — the entry in the two forms admit_output takes, always
 // (typed, canonical) order so the two cannot be passed swapped.
 pub(crate) struct EntryPaths<'a> {
     pub(crate) typed: &'a Path,     // names the entry in every refusal
@@ -137,7 +138,7 @@ struct WatchedPath {
 - A directory-mode refusal records that source as errored. The session stays active and retries on a later change.
 - The pin compares a parent path, not a file identity. Same-parent replacements remain possible; imported modules keep their path-based lookup limits.
 
-### watch.rs — `compile_and_write`/`CompileWriteOutcome` (moved from build.rs)
+### watch.rs — `compile_and_write`/`CompileWriteOutcome`
 
 ```rust
 enum CompileWriteOutcome {
@@ -179,7 +180,7 @@ If the startup working directory exists again at the same canonical path, `resto
 - `MAX_CONFIG_SIZE` (1 MiB): `load_config` opens `mds.json`, reads its `metadata().len()` up front, and if that already exceeds the cap refuses before reading any bytes; otherwise it reads via `mds::read_at_most(&mut file, MAX_CONFIG_SIZE + 1, size)` — same one-byte-over, no-regrow contract (#428).
 - `has_sidecar_head`/`verify_then_delete_map` (stale **source-map** sidecar cleanup, not to be confused with `probe_and_remove_stale`'s wrong-extension-sibling cleanup): before deleting an old `.map` file, reads only its first N bytes (the exact length of `{"version":3,"file":<name>,`) via `mds::read_at_most(reader, len, len)` and compares — never opens or reads the whole file, and never opens a non-regular file at all (a FIFO with no writer would block).
 - `MAX_TRAVERSAL_DEPTH`: `mds.json` upward walk cap (from `mds-core`)
-- `MAX_DEPTH = 64`: hardcoded local cap in `run_build_directory` for directory recursion
+- `MAX_DEPTH = 64`: local cap in `setup_walk` (`build/directory.rs`) for directory recursion
 
 ## Dependency Patterns
 
@@ -209,7 +210,7 @@ Exit codes:
 - 2: I/O or filesystem error (`MdsError::Io`, `FileNotFound`, `NotMdsFile`) — including (#265) an `-o`/`--out-dir`/`mds.json build.output_dir`/`mds init <filename>` value carrying a forbidden path character (typed or resolved form), a `build.output_dir` with a `..` component, a directory argument that is a symlink or the filesystem root (#413), and the #425 entry-overwrite refusal
 - 3: resource limit exceeded (`MdsError::ResourceLimit`)
 
-`MdsError::NotMdsFile { path }` now holds the path **as the caller typed it**, escaped (#417) — it used to hold the resolved canonical path. `run_build_directory` calls `std::process::exit(1)` directly (not via the `Result` chain) when `fail_count > 0`, matching other CLI exit points in `build.rs`.
+`MdsError::NotMdsFile { path }` now holds the path **as the caller typed it**, escaped (#417) — it used to hold the resolved canonical path. `run_build_directory` calls `output::exit(1)` in `build.rs` when `fail_count > 0`.
 
 ## Anti-Patterns
 
@@ -246,7 +247,17 @@ Exit codes:
 
 - `crates/mds-cli/src/main.rs` — clap argument parsing; `run_check`/`run_check_directory`/`run_init` defined here; dispatches to `build::run_build` and `watch::run_watch`; `mod input`, `mod output`
 - `crates/mds-cli/src/input.rs` — `resolve_directory_argument` (#413), the one directory-argument resolver for `build`/`check`/`fmt`/`lint`/`watch`
-- `crates/mds-cli/src/build.rs` — `OutputKind`, `compile_to_content`, `run_build`, `run_build_directory`, `load_config`, `ensure_existing_mds_file` (fmt/lint only), `read_stdin`/`read_stdin_from` (bounded, source-only), `EntryPaths`/`file_identity`/`resolve_dir_as_created`/`refuse_output_over_entry`/`admit_output` (#425), `has_sidecar_head`/`verify_then_delete_map` (bounded stale-sourcemap cleanup), all output-path helpers for single-file mode
+- `crates/mds-cli/src/build.rs` — `run_build`, `run_build_directory`, `compile_to_content`, `ensure_existing_mds_file` (fmt/lint only), `CompileOutput`
+- `crates/mds-cli/src/build/admit.rs` — `EntryPaths`, `file_identity`, `resolve_dir_as_created`, `refuse_output_over_entry`, `admit_output` (#425)
+- `crates/mds-cli/src/build/config.rs` — `load_config` and config types
+- `crates/mds-cli/src/build/directory.rs` — directory build setup and per-file output
+- `crates/mds-cli/src/build/entry.rs` — `resolve_input` and `auto_detect_mds_file`
+- `crates/mds-cli/src/build/flags.rs` — shared flag and warning logic
+- `crates/mds-cli/src/build/out_paths.rs` — `OutputKind` and single-file output-path helpers
+- `crates/mds-cli/src/build/single.rs` — file and stdin build modes
+- `crates/mds-cli/src/build/source_map.rs` — source map labels, sidecar output, stdout output, `has_sidecar_head` and `verify_then_delete_map`
+- `crates/mds-cli/src/build/stdio.rs` — bounded `read_stdin` and `read_stdin_from`, and `write_output`
+- `crates/mds-cli/src/build/vars.rs` — runtime variables and duplicate-key warnings
 - `crates/mds-cli/src/output.rs` — `OutputBase`, `resolve_output_base`, `output_path_for`, `collect_mds_files`, `is_partial`, `probe_and_remove_stale`, `canonicalize_out_dir`, `output_base_no_ext`, `reject_forbidden_output_path`/`reject_forbidden_resolved_output_path` (thin wrappers over `mds::reject_forbidden_path`), `resolve_existing_prefix`, `safe_path`/`safe_file_display`/`safe_inline`, `atomic_write_file`, `WalkResult`, `walked_pin`
 - `crates/mds-cli/src/lint.rs` — `read_source_file`, `read_canonical_source`, pinned report and fix/preview paths
 - `crates/mds-cli/src/watch.rs` — `WatchedPath`/`Watched` (typed-vs-canonical duality), `WorkingDir`, `compile_and_write`/`CompileWriteOutcome`, `FileCompileCtx`, `DirWatchState` (`forget`/`forget_graph`), `compile_one_source`, `dir_watch_startup`, `rebuild_dir_batch`/`process_dir_batch_incremental`

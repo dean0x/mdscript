@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- **Split `resolver.rs` and `build.rs` into child modules (#223, #229).** Build modes share flag and warning logic, sidecar writes, and stdout output. Behaviour does not change.
 - Enable `exactOptionalPropertyTypes` in the base TypeScript config. Check the `@mdscript/mds` type fixtures with this flag on and off (#312).
 - The lockfile gives each of the six workspaces its own TypeScript 7.0.2 copy. The root copy stays at 6.0.3 because `@napi-rs/cli` requires `^6.0.3` (#364).
 - Use `bundler` module resolution for the CommonJS builds of `bundler-utils`, `webpack-loader` and `rspack-loader`. Their CommonJS output does not change (#364).
@@ -36,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI pins the Rust setup and cache action revisions (#163). The stable channel still selects the current stable compiler.
 - The release runbook explains the separate Rust caches for each Python wheel target and container flavor (#351).
 - Local WASM builds warn if the tools differ from the CI pins. CI stops on a difference (#206).
+- The WASM tool check gives each `--version` call 60 s. The macOS CI job no longer fails at random on a slow first start of `wasm-pack` (#519).
 - The WASM size limit stays at 821,000 B. Changes that leave less than 18,851 B of room must state their size cost in the PR (#128).
 
 ## [0.6.0] — 2026-11-21

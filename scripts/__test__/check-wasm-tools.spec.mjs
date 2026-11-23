@@ -4,6 +4,7 @@ import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { VERSION_TIMEOUT_MS, decideToolCheck, probeToolVersion } from '../check-wasm-tools.mjs';
 
 const SCRIPT = new URL('../check-wasm-tools.mjs', import.meta.url);
 const ROOT = new URL('../../', import.meta.url);
@@ -22,6 +23,10 @@ const PINS = `runs:
 const VERSION = (text) => `printf '%s\\r\\n' '${text}'`;
 const SHELL_FIXTURES = { skip: process.platform === 'win32' && 'POSIX tool fixtures' };
 
+function writeTool(bin, name, body) {
+  writeFileSync(join(bin, name), `#!/bin/sh\n[ "$#" -eq 1 ] && [ "$1" = --version ] || exit 2\n${body}\n`, { mode: 0o700 });
+}
+
 function fixture(t, { pins = PINS, pack = VERSION('wasm-pack 0.14.0'), opt = VERSION('wasm-opt version 129 (version_129)') } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'mds-wasm-tools-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -32,9 +37,7 @@ function fixture(t, { pins = PINS, pack = VERSION('wasm-pack 0.14.0'), opt = VER
   copyFileSync(SCRIPT, script);
   if (pins !== null) writeFileSync(join(root, PIN_FILE), pins);
   for (const [name, body] of [['wasm-pack', pack], ['wasm-opt', opt]]) {
-    if (body !== null) {
-      writeFileSync(join(root, 'bin', name), `#!/bin/sh\n[ "$#" -eq 1 ] && [ "$1" = --version ] || exit 2\n${body}\n`, { mode: 0o700 });
-    }
+    if (body !== null) writeTool(join(root, 'bin'), name, body);
   }
   return (strict, cwd = '.', extraArgs = []) => spawnSync(process.execPath, [script, ...(strict ? ['--strict'] : []), ...extraArgs], {
     cwd: join(root, cwd),
@@ -94,12 +97,43 @@ const failures = [
   ['absent wasm-opt', { opt: null }, /wasm-opt is absent from PATH; wasm-pack uses its bundled wasm-opt, not the CI version/],
   ['absent wasm-pack', { pack: null }, /wasm-pack is absent from PATH/],
   ['nonzero exit', { opt: "printf 'tool error\\n' >&2\nexit 7" }, /wasm-opt --version exited with status 7/],
-  ['tool timeout', { opt: 'exec /bin/sleep 30' }, /wasm-opt --version timed out/],
   ['missing pin file', { pins: null }, /cannot read the pin file/],
   ['one pin', { pins: PINS.replace('        version: 129\n', '') }, /expected exactly two tool pins/],
   ['three pins', { pins: `${PINS}    - uses: extra/action@sha\n      with:\n        version: 130\n` }, /expected exactly two tool pins/],
   ['invalid pin', { pins: PINS.replace('v0.14.0', 'latest') }, /invalid wasm-pack pin/],
 ];
+test('the version time limit allows a slow first start under Rosetta (#519)', () => {
+  assert.ok(VERSION_TIMEOUT_MS >= 30_000, `limit ${VERSION_TIMEOUT_MS} ms is too short for a Rosetta first start`);
+  assert.ok(VERSION_TIMEOUT_MS <= 120_000, `limit ${VERSION_TIMEOUT_MS} ms does not bound a hung tool`);
+});
+
+test('strict mode accepts a tool whose first start takes more than 3 s (#519)', SHELL_FIXTURES, (t) => {
+  const strict = fixture(t, { pack: `/bin/sleep 4\n${VERSION('wasm-pack 0.14.0')}` })(true);
+  assert.equal(strict.status, 0, strict.stderr);
+  assert.match(strict.stdout, /WASM tools match pins: wasm-pack 0\.14\.0; wasm-opt 129/);
+});
+
+test('a hung tool times out and the strict check fails', SHELL_FIXTURES, (t) => {
+  const bin = mkdtempSync(join(tmpdir(), 'mds-wasm-hang-'));
+  t.after(() => rmSync(bin, { recursive: true, force: true }));
+  writeTool(bin, 'wasm-opt', 'exec /bin/sleep 30');
+  const started = Date.now();
+  const hung = probeToolVersion('wasm-opt', { timeoutMs: 500, env: { PATH: bin } });
+  assert.ok(Date.now() - started < 10_000, 'the time limit must stop the tool');
+  assert.deepEqual(hung, { ok: false, error: 'wasm-opt --version timed out' });
+
+  const pins = { 'wasm-pack': '0.14.0', 'wasm-opt': '129' };
+  const decision = decideToolCheck(true, pins, { 'wasm-pack': { ok: true, value: '0.14.0' }, 'wasm-opt': hung });
+  assert.equal(decision.exitCode, 1);
+  assert.match(decision.stderr, /^WASM tool check failed: wasm-opt --version timed out \(pins: /);
+});
+
+for (const timeoutMs of [0, -1, 1.5, Number.NaN]) {
+  test(`an invalid time limit ${timeoutMs} fails closed`, () => {
+    assert.deepEqual(probeToolVersion('wasm-pack', { timeoutMs }), { ok: false, error: 'invalid wasm-pack --version time limit' });
+  });
+}
+
 test('both local build hooks call the check in warn mode before the builds', () => {
   const shell = read('scripts/build-wasm.sh');
   const hook = 'node "$(dirname -- "${BASH_SOURCE[0]}")/check-wasm-tools.mjs"';
