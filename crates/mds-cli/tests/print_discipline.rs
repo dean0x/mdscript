@@ -319,7 +319,9 @@ const PRINT_MACROS: &[&str] = &[
 /// when its prints moved to the writer; lowering one is a decision made in the commit
 /// that removes the print, never a side effect.
 const SITE_FLOORS: &[(&str, usize)] = &[
-    ("build.rs", 23),
+    ("build.rs", 21),
+    ("out_paths.rs", 1),
+    ("stdio.rs", 1),
     ("vars.rs", 4),
     ("fmt.rs", 11),
     ("lint.rs", 1),
@@ -452,7 +454,7 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
     ),
     // ── `&'static str` labels — no runtime data reaches these ────────────────
     (
-        "build.rs",
+        "out_paths.rs",
         "kind_label(kind)",
         "Returns one of exactly two `&'static str` literals (`build.rs::kind_label`); \
          it is a compile-time label for an `OutputKind`, not user data.",
@@ -746,7 +748,7 @@ const PATH_TEXT_HELPERS: &[(&str, &str, usize, &str)] = &[
         "Checks whether a file name starts with `_`; the name reaches no message.",
     ),
     (
-        "build.rs",
+        "out_paths.rs",
         "warn_output_extension_mismatch",
         1,
         "Takes the extension of the `-o` value, which the warning shows through \
@@ -761,14 +763,14 @@ const PATH_TEXT_HELPERS: &[(&str, &str, usize, &str)] = &[
          `to_str` compares the extension with `mds`.",
     ),
     (
-        "build.rs",
+        "entry.rs",
         "auto_detect_mds_file",
         1,
         "Compares the extension of each entry of the working directory with `mds`; the \
          extension reaches no message.",
     ),
     (
-        "build.rs",
+        "entry.rs",
         "several_mds_files",
         1,
         "Takes the file name of each `.mds` file in the working directory and escapes it \
