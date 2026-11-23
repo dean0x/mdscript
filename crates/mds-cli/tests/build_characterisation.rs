@@ -135,6 +135,19 @@ fn directory_warns_only_without_maps_and_embeds_the_inline_map_when_enabled() {
 
     let (code, stdout, stderr) = build(
         dir.path(),
+        &[".", "--out-dir", "out-quiet", "--quiet"],
+        None,
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("out-quiet").join("page.md")).unwrap(),
+        MARKDOWN
+    );
+    assert_eq!(stderr, "", "quiet directory build must not warn");
+
+    let (code, stdout, stderr) = build(
+        dir.path(),
         &[
             ".",
             "--out-dir",

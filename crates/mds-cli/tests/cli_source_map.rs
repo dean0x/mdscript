@@ -1723,9 +1723,21 @@ fn sm20_embed_sources_without_source_map_warns() {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("embed_sources") && stderr.contains("no effect"),
+        stderr.contains("warning: embed_sources has no effect without source maps;"),
         "stderr must warn that embed_sources has no effect without source maps; got: {stderr:?}"
     );
+
+    let quiet_out = dir.path().join("quiet.md");
+    let result = mds_bin()
+        .args(["build", "--quiet", "-o"])
+        .arg(&quiet_out)
+        .arg(&src)
+        .output()
+        .expect("mds binary should run");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert_eq!(std::fs::read_to_string(quiet_out).unwrap(), "# Hello\n");
+    assert_eq!(stderr, "", "quiet file build must not warn");
 }
 
 /// Config `embed_sources=true` WITH `source_map=true` must NOT emit the embed_sources
