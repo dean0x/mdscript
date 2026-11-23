@@ -30,7 +30,7 @@ only; please upgrade to the newest release before reporting.
 MDS treats template sources, imported modules, and runtime variables as untrusted
 input. The compiler enforces several defense-in-depth controls:
 
-### Filesystem boundary (`crates/mds-core/src/fs.rs`, `resolver.rs`, `resolver/import_paths.rs`)
+### Filesystem boundary (`crates/mds-core/src/fs.rs`, `resolver/import_paths.rs`, `resolver/imports.rs`, `resolver/extends.rs`)
 
 - **Path-traversal prevention**: import paths are rejected if they resolve outside
   the project root (`..` traversal, or a symlinked parent directory leading out),

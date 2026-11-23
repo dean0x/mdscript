@@ -238,9 +238,8 @@ pub(super) fn compute_source_map_base(
 
 /// Set the SMv3 `file` field and relabel the stdin source in a [`mds::SourceMap`].
 ///
-/// These are the CLI's two genuinely CLI-only post-processing jobs after core
-/// has already applied `relativize_source` at both finalize sites (ADR-005 /
-/// PF-004 — single choke-point in core):
+/// These two CLI steps follow the call to `relativize_source` in core's
+/// shared `finalize_markdown` helper (`resolver/process.rs`):
 ///
 /// 1. `sm.file = output_basename` — the SMv3 `file` field names the generated
 ///    artifact; core always emits `file: None` because it has no notion of the

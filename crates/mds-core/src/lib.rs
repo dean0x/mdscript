@@ -884,7 +884,7 @@ pub fn check_str_collecting_warnings(
 /// which includes `extends` (the merge gate sees it as a directive to consume, not a value key).
 ///
 /// SYNC POINT: also audit `RESERVED_MERGE_KEYS` in `resolver/frontmatter.rs`,
-/// `build_scope_from_frontmatter` in `resolver.rs`, and `RESERVED` in `lint/facts.rs`.
+/// `build_scope_from_frontmatter` in `resolver/module_scope.rs`, and `RESERVED` in `lint/facts.rs`.
 /// Each site reserves keys for its own purpose.
 const RESERVED_OUTPUT_KEYS: &[&str] = &["type", "imports", lexer::INDENTED_DIRECTIVES];
 

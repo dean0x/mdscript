@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- **Split `resolver.rs` and `build.rs` into child modules (#223, #229).** Build modes share flag and warning logic, sidecar writes, and stdout output. Behaviour does not change.
 - Enable `exactOptionalPropertyTypes` in the base TypeScript config. Check the `@mdscript/mds` type fixtures with this flag on and off (#312).
 - The lockfile gives each of the six workspaces its own TypeScript 7.0.2 copy. The root copy stays at 6.0.3 because `@napi-rs/cli` requires `^6.0.3` (#364).
 - Use `bundler` module resolution for the CommonJS builds of `bundler-utils`, `webpack-loader` and `rspack-loader`. Their CommonJS output does not change (#364).

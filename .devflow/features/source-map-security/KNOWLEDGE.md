@@ -15,7 +15,7 @@ updated: 2026-09-28
 
 ## Overview
 
-Source Map v3 generation (`ADR-005`) is opt-in via `CompileOptions::source_map`. When enabled, `sources[]` entries must never expose absolute paths, machine-layout information, or paths outside the project root — failing to enforce this is a disclosure vulnerability (`PF-005`). The entire path-relativization enforcement is funneled through a single choke-point function, `relativize_source` in `crates/mds-core/src/source_path.rs`, applied unconditionally at BOTH `finalize` sites in `resolver.rs`.
+Source Map v3 generation is opt-in via `CompileOptions::source_map`. The shared `finalize_markdown` helper (`resolver/process.rs`) applies `relativize_source` (`source_path.rs`) to every source entry before it returns a map.
 
 The security model is **project-root containment, not "no `../`"**. A source file at `/proj/src/a.mds` with the map in `/proj/build/` legitimately produces `../src/a.mds` — that path is inside the project root and is correct SMv3 output. The guard fires only when the resolved path escapes above the root, in which case the entry collapses to a bare basename.
 
@@ -75,13 +75,13 @@ fn source_root(&self) -> Option<String> {
 
 `VirtualFs` inherits the default (`None`). `NativeFs` overrides it to return the project root established by the walk-up from the entry-point directory — anchored by the first `resolve_entry` or `anchor_base_dir` call (first writer wins; a later call never moves it).
 
-**Critical gotcha**: because `source_root()` is a *defaulted* method returning `None`, any external `FileSystem` implementor that forgets to override it silently lands on the `root = None` branch (step 6 above). That branch still enforces "never absolute, never drive-qualified" but skips the containment check. `resolver.rs` has a defense-in-depth guard for this:
+**Critical gotcha**: because `source_root()` is a *defaulted* method returning `None`, any external `FileSystem` implementor that forgets to override it silently lands on the `root = None` branch (step 6 above). That branch still enforces "never absolute, never drive-qualified" but skips the containment check. `finalize_markdown` calls `anchor_root_for_source_map` before it makes source paths relative:
 
 ```rust
-// resolver.rs — at both finalize sites, before calling relativize_source:
-self.anchor_root_for_source_map(ctx.base_dir);
+// resolver/process.rs, in finalize_markdown:
+self.anchor_root_for_source_map(base_dir);
 
-// ModuleCache::anchor_root_for_source_map — best-effort by design:
+// resolver/import_paths.rs, in anchor_root_for_source_map:
 if self.fs.source_root().is_none() && !base_dir.is_empty() {
     let _ = self.fs.anchor_base_dir(base_dir);
 }
@@ -93,9 +93,9 @@ The anchor is never propagated (c615ace): only a custom backend without a `sourc
 
 ### `source_path.rs` — the single choke-point
 
-`pub fn relativize_source(source: &str, base: Option<&Path>, root: Option<&Path>) -> String` in `crates/mds-core/src/source_path.rs` is the ONLY place where absolute source paths are converted to relative map entries. Re-exported from `crates/mds-core/src/lib.rs`. Called exactly twice — once per finalize site in `resolver.rs` — both calls unconditional. Unchanged by Wave 1.5.
+`pub fn relativize_source(source: &str, base: Option<&Path>, root: Option<&Path>) -> String` in `crates/mds-core/src/source_path.rs` is the ONLY place where absolute source paths are converted to relative map entries. Re-exported from `crates/mds-core/src/lib.rs`. `finalize_markdown` (`resolver/process.rs`) calls it for every source entry in both Markdown paths.
 
-**Do not add a third call site.** The `PF-004` single-choke-point principle is what makes the security guarantee structural rather than incidental. Any new code path that emits `sources[]` entries must flow through this function.
+Keep one path for all `sources[]` entries. Each new map output path must use the shared helper.
 
 ### `CompileOptions.source_map_base`
 
@@ -113,9 +113,9 @@ pub struct CompileOptions {
 
 CLI sets `source_map_base = Some(compute_source_map_base(...))`. Bindings leave it `None`.
 
-### `compute_source_map_base` / `apply_source_map_file_label` in `crates/mds-cli/src/build.rs`
+### `compute_source_map_base` / `apply_source_map_file_label` in `crates/mds-cli/src/build/source_map.rs`
 
-Unchanged this wave. `compute_source_map_base` is a pure pre-compile directory oracle mirroring `resolve_output_path_for_kind`'s rules without creating directories — must use `compute_output_dir_path_for_kind`, NOT `prepare_output_dir_for_kind` (the latter calls `create_dir_all` and would leave an empty output directory behind on a failed compile). `apply_source_map_file_label` does two jobs only after `relativize_source` has already run: `sm.file = output_basename`, and the `<stdin>` relabel (`STRING_SOURCE_MAP_LABEL` → `"<stdin>"`).
+`compute_source_map_base` is a pure pre-compile directory oracle mirroring `resolve_output_path_for_kind`'s rules without creating directories — must use `compute_output_dir_path_for_kind`, NOT `prepare_output_dir_for_kind` (the latter calls `create_dir_all` and would leave an empty output directory behind on a failed compile). `apply_source_map_file_label` does two jobs only after `relativize_source` has already run: `sm.file = output_basename`, and the `<stdin>` relabel (`STRING_SOURCE_MAP_LABEL` → `"<stdin>"`).
 
 ### Source Registration and Sharing — `SourceTable` / `MapBuilder` (#416)
 
@@ -181,7 +181,7 @@ pub(crate) struct FragmentMap {
 
 Before #412, an `@include`d module that itself declared `@extends` produced **no** `FragmentMap` at all — `process_module_extends` never built a `MapBuilder` for the chain's regions, so an importer's `@include` of such a module spliced nothing, and that text carried no source-map segments even though the same `@include` of a standalone module was fully mapped. The fix shares the region-evaluation and fragment-construction machinery between the entry `@extends` path and the imported-module `@extends` path:
 
-- **`evaluate_extends_regions(regions, seed: Option<&Origin>, scope, warnings)`** (`resolver.rs`, right after `evaluate_regions_with_map`) is the shared entry point both `process_module_intrinsic_opts` (the compile entry point's own `@extends` chain) and `process_module_extends` (an imported extending module) now call. `seed` is `Some(&skeleton_origin)` — the chain's root base `Origin` — when source maps are wanted for this evaluation; `None` otherwise. When `Some`, it builds a fresh `MapBuilder::new(seed.clone())` and runs every region through it under **one** `EvalBudget`, exactly as a direct compile of that same chain would.
+- **`evaluate_extends_regions(regions, seed: Option<&Origin>, scope, warnings)`** (`resolver/extends.rs`) is the shared entry point both `process_module_intrinsic_opts` (the entry module's `@extends` chain in `resolver/process.rs`) and `process_module_extends` (an imported extending module) now call. `seed` is `Some(&skeleton_origin)` — the chain's root base `Origin` — when source maps are wanted for this evaluation; `None` otherwise. When `Some`, it builds a fresh `MapBuilder::new(seed.clone())` and runs every region through it under **one** `EvalBudget`, exactly as a direct compile of that same chain would.
 - Index 0 of the resulting `FragmentMap`/map is always the chain's root base — the file at the top of the `@extends` chain — never the leaf module that was actually `@include`d, matching what a direct compile of the leaf produces.
 - **`fragment_map_from(builder, body: Option<&str>, display, warnings) -> Option<Arc<FragmentMap>>`** is the shared decision for "is there a fragment worth splicing": `None` when the segment cap already dropped a segment (with a warning naming the module), `None` when the body is empty (an `@include` of it adds no text — nothing to warn about), and `Some(Arc::new(builder.into_fragment()))` otherwise. Both `process_module` (standalone) and `process_module_extends` go through it via the shared `prompt_body_and_map(body_raw, builder, display, warnings)` helper.
 - The cap-exceeded warning text is now truthful about what actually happens: `source map segment cap (1000000 segments) exceeded in imported module '<display>'; text included from it is left unmapped in the source map` — it used to say "no source map will be generated", which was false for an imported module (the *importer's* map is still produced; only the included text loses its mapping).
@@ -279,9 +279,9 @@ Unchanged by Wave 1.5. The bundler-utils package mirrors the Rust display-path l
 
 **Windows verbatim UNC root** (`path_to_unified` fix): `std::fs::canonicalize` on Windows returns verbatim UNC paths (`\\?\C:\proj`). After `replace('\\', "/")` this becomes `//?/C:/proj`, and `normalize_abs` yields components `["?", "C:", "proj", ...]`. But the source path after the same treatment yields `["C:", "proj", ...]`. The prefix `"?"` causes the first-component comparison to fail → containment always fails → EVERY source map entry degrades to its basename. `path_to_unified` now strips `//?/UNC/` then `//?/` before normalizing, so root components match source components. This bug is invisible on Unix CI.
 
-**`source_root()` returns `None` before the root is anchored**: `NativeFs::source_root()` returns `None` until a `resolve_entry` or `anchor_base_dir` call establishes the project root. The defense-in-depth guard in `resolver.rs` catches this at both finalize sites; it also returns `None` for a non-UTF-8 root (lossy strings are not anchors).
+**`source_root()` returns `None` before the root is anchored**: `NativeFs::source_root()` returns `None` until a `resolve_entry` or `anchor_base_dir` call establishes the project root. `finalize_markdown` calls the best-effort anchor in `resolver/import_paths.rs`. `NativeFs::source_root()` also returns `None` for a non-UTF-8 root.
 
-**Directory-mode `opts` must be per-file**: In directory mode (`run_build_directory`), each file has a different output directory, so `source_map_base` differs per file. Constructing `opts` as loop-invariant (outside the per-file loop) would give every file the same anchor, producing incorrect relative paths for all but one file.
+**Directory-mode `opts` must be per-file**: In the `run_build_directory` loop (`build.rs`), each file has a different output directory, so `source_map_base` differs per file. Constructing `opts` as loop-invariant (outside the per-file loop) would give every file the same anchor, producing incorrect relative paths for all but one file.
 
 **`sources[]` anchored to the MAP FILE location, per SMv3**: The CLI writing a sidecar map into `build/` legitimately yields `../src/x.mds` while bindings yield `src/x.mds`. Both are correct for their respective anchors. Do not normalize these to the same value when writing cross-surface parity tests — SM-18 (`cli_source_map.rs`) derives its expected anchor from `sources[0]` itself and requires every other entry to share it, rather than hardcoding either form.
 
@@ -303,11 +303,15 @@ Unchanged by Wave 1.5. The bundler-utils package mirrors the Rust display-path l
 
 - `crates/mds-core/src/source_path.rs` — `relativize_source` (the single choke-point; 10-step guard algorithm; `path_to_unified` with verbatim-prefix strip; `basename_fallback` using normalized components); `display_path_for` (R3 display-path wrapper). Unchanged this wave.
 - `crates/mds-core/src/fs.rs:111-132` — `FileSystem::source_root()` (defaulted `None`; NativeFs override). Unchanged this wave.
-- `crates/mds-core/src/resolver.rs` — two finalize sites in `process_module_intrinsic_opts` (grep `Step 5 — single choke-point`); `evaluate_regions_with_map` (per-region source switch, one `EvalBudget`); `evaluate_extends_regions` (#412 shared entry for both extends paths, seeds a `MapBuilder` with the chain's root `Origin`); `is_visible_export`, `fragment_map_from`, `prompt_body_and_map`, `apply_map_degradation` (free fns just above `has_message_block`); `process_module` / `process_module_extends` (both go through the shared helpers)
+- `crates/mds-core/src/resolver.rs` — `evaluate_regions_with_map` (per-region source switch, one `EvalBudget`)
+- `crates/mds-core/src/resolver/context.rs` — `is_visible_export` and `fragment_map_from`
+- `crates/mds-core/src/resolver/extends.rs` — `evaluate_extends_regions` (#412) and `process_module_extends`
+- `crates/mds-core/src/resolver/import_paths.rs` — `anchor_root_for_source_map`
+- `crates/mds-core/src/resolver/process.rs` — `process_module`, `finalize_markdown` (one helper for both Markdown paths), `prompt_body_and_map`, and `apply_map_degradation`
 - `crates/mds-core/src/sourcemap.rs` — `Origin` (`file`/`display`/`source`, `Clone` = three refcount bumps); `SourceTable` (private `origins`/`key_index`; `intern`/`get`/`len`/`iter`/`into_origins`); `SourceIndex` (crate-private newtype, minted only by `MapBuilder`); `MapBuilder` (private `sources`/`current_src`; `register`/`switch_to`/`switch_to_index`/`current_origin`; `remap_cache` keyed by fragment `Arc` pointer; `splice_fragment`; `into_fragment`; `finalize`); `rebased` (free fn, remap-miss → `None`, drop-not-misattribute); `FragmentMap` (private fields, `into_fragment` is the sole constructor); `CompileOptions` (`source_map_base: Option<PathBuf>`, no `#[non_exhaustive]`)
 - `crates/mds-core/src/evaluator.rs` — `evaluate_with_map_seeded` (derives `EvalContext.file`/`.source` from `builder.current_origin()`); `evaluate_include` (splices via `map.splice_fragment(fragment, base)` directly — the old `ctx.map.take()` workaround is gone); the S8 function-body path in the interpolation arm (`map.switch_to(origin)` / `map.switch_to_index(saved_src)`)
 - `crates/mds-core/src/evaluator/held.rs` — held regions (#486): `hold_map` / `release_map`; `evaluate_held` (each condition expression, each loop iterable) and `call_held` (each call argument that is a call). Its own module on purpose: see the anti-pattern above.
-- `crates/mds-cli/src/build.rs` — `compute_source_map_base` (pure oracle); `apply_source_map_file_label` (two-job post-processor: `sm.file` + `<stdin>` relabel). Unchanged this wave.
+- `crates/mds-cli/src/build/source_map.rs` — `compute_source_map_base` (pure oracle); `apply_source_map_file_label` (two-job post-processor: `sm.file` + `<stdin>` relabel).
 - `crates/mds-cli/src/lint.rs` — `read_source_file` / `read_canonical_source`: anchors display roots for lint and fmt. Unchanged this wave.
 - `crates/mds-core/src/verbatim.rs` — `simplify_verbatim` (lossless verbatim → conventional respelling; Windows builds only, unit-tested on every host); users: `native_dependencies` and `display_native_path` in `lib.rs`. Unchanged this wave.
 - `packages/bundler-utils/src/project-root.ts` — TS mirror of R3 display-path logic. Unchanged this wave.
