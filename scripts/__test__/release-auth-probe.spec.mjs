@@ -2022,11 +2022,14 @@ function assertNpmRegistryOrder(section) {
   const install = stepMatching(steps, /^      - run: npm ci$/m);
   const build = namedStep(steps, 'Build WASM + TS packages');
   const platform = namedStep(steps, platformPublish);
+  const notice = namedStep(steps, 'Assert platform NOTICE after napi prepublish');
   const npm = namedStep(steps, npmPublish);
-  assert.ok(install && build && platform && npm && setupNode[0].index < install.index &&
+  // Check the platform pack lists once more after napi prepublish (#136).
+  assert.ok(install && build && platform && notice && npm && setupNode[0].index < install.index &&
     install.index < build.index && build.index < setupNode[1].index &&
-    setupNode[1].index + 1 === platform.index && platform.index + 1 === npm.index,
-    'npm install and build must run before registry setup directly precedes the publish steps');
+    setupNode[1].index + 1 === platform.index && platform.index + 1 === notice.index &&
+    notice.index + 1 === npm.index && /^        run: \*assert-platform-notice$/m.test(notice.body),
+    'registry setup directly precedes platform publish; only the NOTICE check may separate the publish steps');
 }
 
 test('S24: only the two Cargo publish steps bind registry values', () => {
@@ -2063,6 +2066,10 @@ test('S26: npm registry setup runs after the build and directly before publish',
   const separated = section.replace(`      - name: ${platformPublish}`,
     `      - run: npm ci\n      - name: ${platformPublish}`);
   assert.throws(() => assertNpmRegistryOrder(separated), /directly precedes/);
+  const postNotice = namedStep(jobSteps(section), 'Assert platform NOTICE after napi prepublish');
+  const otherCheck = section.replace(postNotice.body, postNotice.body.replace('run: *assert-platform-notice', 'run: npm ci'));
+  assert.notEqual(otherCheck, section);
+  assert.throws(() => assertNpmRegistryOrder(otherCheck), /only the NOTICE check/);
 });
 
 const nonPrGuard = "github.event_name != 'pull_request'";

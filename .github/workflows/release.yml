@@ -163,6 +163,73 @@ jobs:
         run: node scripts/verify-no-control-bytes.mjs
       - name: "Run positive-control and class-completeness suite"
         run: npm run test:gates
+      # Check both NOTICE copies before the build jobs. This job has read grants only (#136).
+      - name: Install cargo-about (pinned)
+        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532  # v2.86.3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tool: cargo-about@0.9.1
+          fallback: none
+      - name: Assert cargo-about is the pinned version
+        shell: bash
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d "$RUNNER_TEMP/cargo-about-version.XXXXXX")
+          printf 'cargo-about 0.9.1\n' > "$work/expected"
+          printf 'cargo-about 9.9.9\n' > "$work/control"
+          rc=0
+          cmp -s "$work/expected" "$work/control" || rc=$?
+          if [ "$rc" -ne 1 ]; then
+            echo "::error::cargo-about version control: expected exit 1 for 9.9.9; got $rc"
+            exit 1
+          fi
+          echo 'cargo-about version control: 9.9.9 rejected with exit 1'
+          cargo-about --version > "$work/actual"
+          rc=0
+          cmp -s "$work/expected" "$work/actual" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Expected cargo-about 0.9.1; version comparison exited $rc"
+            exit 1
+          fi
+          cat "$work/actual"
+      - name: Assert Rust crate NOTICE files are current
+        shell: bash
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d "$RUNNER_TEMP/notice.XXXXXX")
+          cargo_about=$(command -v cargo-about)
+          notice_raw="$work/raw"
+          notice_out="$work/NOTICE"
+          cargo fetch --locked
+          (
+            "$cargo_about" about generate --frozen --workspace --all-features --fail --target aarch64-apple-darwin --target x86_64-apple-darwin --target x86_64-unknown-linux-gnu --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-gnu --target aarch64-unknown-linux-musl --target x86_64-pc-windows-msvc --target wasm32-unknown-unknown --config about.toml --output-file "$notice_raw" about.hbs && node scripts/generate-notice.mjs < "$notice_raw" > "$notice_out"
+          )
+
+          cp "$notice_out" "$work/control"
+          printf '\n' >> "$work/control"
+          rc=0
+          cmp -s "$notice_out" "$work/control" || rc=$?
+          if [ "$rc" -ne 1 ]; then
+            echo "::error::NOTICE comparison control: expected exit 1 for altered bytes; got $rc"
+            exit 1
+          fi
+          echo 'NOTICE comparison control: altered bytes rejected with exit 1'
+
+          for checked in NOTICE crates/mds-python/NOTICE; do
+            rc=0
+            cmp -s "$checked" "$notice_out" || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              echo "$checked matches the generated NOTICE"
+              continue
+            fi
+            echo "::error::$checked does not match (cmp exit $rc). Refresh NOTICE: run refresh_notice from RELEASING.md."
+            diff_rc=0
+            diff -u "$checked" "$notice_out" > "$work/diff" || diff_rc=$?
+            sed -n '1,80p' "$work/diff"
+            echo "NOTICE diff exit: $diff_rc"
+            exit 1
+          done
       # reliability-12: assert the SHA being released went green in CI before
       # any irreversible publish starts. Runs on tag push (verifies the tagged
       # commit) and workflow_dispatch (verifies the dispatched ref's HEAD).
@@ -185,11 +252,9 @@ jobs:
           SHA="${{ github.sha }}"
           REPO="${{ github.repository }}"
 
-          # MIN_CI_JOBS mirrors the 15 required contexts in main's branch
-          # protection and EXPECTED_CONTEXTS in scripts/verify-pr-checks.mjs.
-          # ADR-013: adding a CI job is a multi-place change - bump this floor
-          # when the required set grows.
-          MIN_CI_JOBS=15
+          # MIN_CI_JOBS mirrors the 17 required CI contexts on main (#136).
+          # Update this floor when the required set changes.
+          MIN_CI_JOBS=17
 
           # Bounded: one page of 50 is far above the number of CI runs a single
           # commit can accumulate.
@@ -491,8 +556,8 @@ jobs:
   # ---------------------------------------------------------------------------
   stage-and-verify-napi:
     name: Stage + verify platform packages
-    needs: [build-napi]
-    if: ${{ !cancelled() && needs.build-napi.result == 'success' }}
+    needs: [build-napi, build-python]
+    if: ${{ !cancelled() && needs.build-napi.result == 'success' && needs.build-python.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -512,8 +577,68 @@ jobs:
         run: |
           npx napi create-npm-dirs
           npx napi artifacts --output-dir .
-      - name: Copy LICENSE into each platform package
-        run: for d in crates/mds-napi/npm/*/; do cp LICENSE "$d"; done
+      - name: Add LICENSE and NOTICE to each platform package
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(crates/mds-napi/npm/*/)
+          if [ "${#packages[@]}" -ne 7 ]; then
+            echo "::error::Expected seven staged platform directories; found ${#packages[@]}"
+            exit 1
+          fi
+          work=$(mktemp -d "$RUNNER_TEMP/napi-license.XXXXXX")
+          for d in "${packages[@]}"; do
+            cp LICENSE NOTICE "$d"
+            jq '.files |= ((. // []) + ["NOTICE"] | unique)' "${d}package.json" > "$work/package.json"
+            mv "$work/package.json" "${d}package.json"
+          done
+      - name: Assert platform packages contain NOTICE
+        shell: bash
+        run: &assert-platform-notice |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(crates/mds-napi/npm/*/)
+          if [ "${#packages[@]}" -ne 7 ]; then
+            echo "::error::Expected seven staged platform directories; found ${#packages[@]}"
+            exit 1
+          fi
+          work=$(mktemp -d "$RUNNER_TEMP/napi-notice.XXXXXX")
+          list_paths() {
+            npm pack --dry-run --json --ignore-scripts "$1" > "$2.json" &&
+              jq -er '.[0].files[].path' "$2.json" > "$2.txt"
+          }
+
+          mkdir "$work/control"
+          printf '%s\n' '{"name":"notice-control","version":"1.0.0","files":["NOTICE","NOTICE.bak"]}' > "$work/control/package.json"
+          cp NOTICE "$work/control/NOTICE.bak"
+          list_paths "$work/control" "$work/control"
+          grep -Fx -- NOTICE.bak "$work/control.txt"
+          rc=0
+          grep -Fx -- NOTICE "$work/control.txt" > "$work/control-match" || rc=$?
+          if [ "$rc" -ne 1 ] || [ -s "$work/control-match" ]; then
+            echo "::error::Platform NOTICE control: expected exit 1 and no match; got exit $rc"
+            exit 1
+          fi
+          echo 'Platform NOTICE control: exit 1, no match'
+
+          for d in "${packages[@]}"; do
+            platform=${d%/}
+            rc=0
+            jq -e '.files | arrays | index("NOTICE") != null' "${d}package.json" > "$work/files-check" || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::$platform must list NOTICE in package.json (jq exit $rc)"
+              exit 1
+            fi
+            list_paths "./$platform" "$work/${platform##*/}"
+            rc=0
+            grep -Fx -- NOTICE "$work/${platform##*/}.txt" || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::$platform must pack NOTICE (grep exit $rc)"
+              exit 1
+            fi
+            echo "$platform packs NOTICE"
+          done
       - name: A3 — name <-> loader verification gate
         run: node scripts/verify-napi-names.mjs
       - name: Upload staged napi tree
@@ -914,13 +1039,17 @@ jobs:
       # reads the version dynamically, but this guards against a misconfigured
       # pyproject.toml override. The sdist is published to PyPI and is the
       # fallback for every platform without a wheel (F9).
-      - name: Assert sdist version matches workspace version
+      - name: Assert sdist version and NOTICE
         if: ${{ matrix.sdist }}
         shell: bash
         run: |
           set -euo pipefail
-          WS_VER=$(grep -A20 '^\[workspace\.package\]' Cargo.toml \
-            | grep '^version' | awk 'NR==1{print;exit}' | sed 's/.*"\([^"]*\)".*/\1/')
+          WS_VER=$(awk -F '"' '
+            /^\[workspace\.package\]$/ { workspace = 1; next }
+            /^\[/ { workspace = 0 }
+            workspace && /^version[[:space:]]*=/ { print $2; exit }
+          ' Cargo.toml)
+          [ -n "$WS_VER" ] || { echo '::error::Workspace version is missing'; exit 1; }
           shopt -s nullglob
           set -- dist/*.tar.gz
           [ "$#" -eq 1 ] || { echo "::error::expected exactly 1 .tar.gz in dist/, found $#"; exit 1; }
@@ -932,6 +1061,26 @@ jobs:
           [ "$WS_VER" = "$SDIST_VER" ] \
             || { echo "::error::sdist version $SDIST_VER != workspace version $WS_VER"; exit 1; }
           echo "Sdist version OK"
+
+          work=$(mktemp -d "$RUNNER_TEMP/sdist-notice.XXXXXX")
+          tar -tzf "$1" > "$work/sdist.txt"
+          prefix="markdown_script-${SDIST_VER}"
+          grep -Fx -- "$prefix/crates/mds-python/NOTICE" "$work/sdist.txt"
+          notice="$prefix/NOTICE"
+          rc=0
+          grep -Fx -- "$notice" "$work/sdist.txt" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Sdist must contain $notice (grep exit $rc)"
+            exit 1
+          fi
+          grep -Fvx -- "$notice" "$work/sdist.txt" > "$work/control.txt"
+          rc=0
+          grep -Fx -- "$notice" "$work/control.txt" > "$work/control-match" || rc=$?
+          if [ "$rc" -ne 1 ] || [ -s "$work/control-match" ]; then
+            echo "::error::Sdist NOTICE control: expected exit 1 and no match; got exit $rc"
+            exit 1
+          fi
+          echo 'Sdist NOTICE control: exit 1, no match'
       # --- macOS arch gate (macOS wheel legs only — lipo available) ---
       # Darwin analogue of the Linux readelf gate (PF-038): asserts the .so inside
       # the wheel carries the expected architecture slice.
@@ -1368,6 +1517,9 @@ jobs:
       - name: Generate napi types
         working-directory: crates/mds-napi
         run: npx napi build --platform --release --no-js
+      - name: Assert restored platform packages contain NOTICE
+        shell: bash
+        run: *assert-platform-notice
       - name: Re-run A3 gate against the restored tree
         run: node scripts/verify-napi-names.mjs
       # Build all artifacts BEFORE the first irreversible publish. A tsc/wasm-opt
@@ -1377,6 +1529,8 @@ jobs:
         run: |
           npm run build -w @mdscript/mds-wasm
           npm run build --workspaces --if-present
+      - name: Assert npm pack contents
+        run: node scripts/verify-pack-contents.mjs
       # performance-01 / PF-021: defence-in-depth size guard on the ACTUAL
       # published artifact (built above by the pinned 1.96.0 toolchain). Runs
       # BEFORE any irreversible npm publish so a bloated binary aborts before
@@ -1426,6 +1580,9 @@ jobs:
             echo "::notice::All platform packages already published (E403) — idempotent re-run, skipping"
             echo "$OUTPUT"
           fi
+      - name: Assert platform NOTICE after napi prepublish
+        shell: bash
+        run: *assert-platform-notice
       - name: Publish npm packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
