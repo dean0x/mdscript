@@ -1,6 +1,6 @@
 # List the policy allow list first, then exception licenses in deny.toml order (#136).
 accepted = ["MIT", "Apache-2.0", "ISC", "CC0-1.0", "Unicode-3.0", "Zlib", "Apache-2.0 WITH LLVM-exception"]
-# Include the native addon targets and the WASM target.
+# Include the native addon targets and the WASM target (#136).
 targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",

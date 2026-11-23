@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Pack-contents gate — reject dangling source maps and missing required files.
+// Pack-contents gate — reject dangling source maps and missing required files (#136).
 //
 // All six TS packages inherit sourceMap/declarationMap from tsconfig.base.json.
 // Every emitted map's "sources" entry points at ../src/*.ts, but no package's

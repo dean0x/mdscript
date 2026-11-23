@@ -2358,6 +2358,7 @@ const NOTICE_METADATA_READ: &str = concat!(
     r#" && node scripts/generate-notice.mjs < "$notice_raw" > "$notice_out""#,
 );
 
+/// A read of NOTICE metadata does not count as a release build (#136).
 #[test]
 fn release_notice_metadata_read_does_not_count_as_a_build() {
     let release = read_source(RELEASE_WORKFLOW);
@@ -2370,6 +2371,7 @@ fn release_notice_metadata_read_does_not_count_as_a_build() {
     );
 }
 
+/// The scan rejects release builds that enable panic details (#136).
 #[test]
 fn release_builds_with_panic_details_fail_the_scan() {
     let release = read_source(RELEASE_WORKFLOW);

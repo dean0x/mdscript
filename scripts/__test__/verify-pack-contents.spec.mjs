@@ -133,6 +133,7 @@ describe('summarize', () => {
     [['LICENSE', 'doc/NOTICE', 'NOTICE.bak'], ['NOTICE'], '@mdscript/mds-wasm: missing required file "NOTICE"'],
     [['NOTICE'], ['LICENSE'], '@mdscript/mds-wasm: missing required file "LICENSE"'],
   ]) {
+    // The pack check reports each absent root file: LICENSE or NOTICE (#136).
     test(`the WASM pack with ${paths.join(', ')} reports ${missing.join(', ') || 'no missing files'}`, async () => {
       const { findMissingRequired } = await import('../verify-pack-contents.mjs');
       const workspace = '@mdscript/mds-wasm';
