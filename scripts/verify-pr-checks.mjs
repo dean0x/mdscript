@@ -38,10 +38,8 @@
  * D-PR3b: EXPECTED_CONTEXTS lists jobs that must be present and passing whether or
  * not branch protection lists them — the local mirror of the required set, so a job
  * is binding from the PR that adds it, before protection is PATCHed to require it
- * (RELEASING.md "Adding a required CI context"). Currently five: 'Source hygiene'
- * (control-byte gate, #288), 'Python — build & test', 'examples/ gitignore coverage',
- * 'Python — wheel install smoke', and 'Rust — clippy, test (windows-latest)' (#147,
- * the Windows Rust leg). Tier B alone cannot make them binding because Tier B only
+ * (RELEASING.md "Adding a required CI context"). The six entries include the
+ * Rust dependency policy job (#136). Tier B only
  * iterates runs that ALREADY EXIST; an absent job has nothing to iterate. Tier A+
  * fills this gap by asserting presence (applies ADR-009, avoids PF-013: absence is
  * never evidence of success).
@@ -164,6 +162,15 @@ export const EXPECTED_CONTEXTS = [
   'examples/ gitignore coverage',
   'Python — wheel install smoke',
   'Rust — clippy, test (windows-latest)',
+  'Rust — cargo-deny licenses, bans, sources',
+];
+
+export const ADVISORIES_CONTEXT = 'Rust — cargo-deny advisories';
+export const DEPENDENCY_SURFACE = [
+  'Cargo.lock',
+  '**/Cargo.toml',
+  'deny.toml',
+  '.github/workflows/deny-advisories.yml',
 ];
 
 // Tier B allowance (release pre-flight): release.yml's publish jobs are
@@ -236,15 +243,15 @@ export const RELEASE_SURFACE_CONTEXTS = [
  * @returns {boolean}
  */
 export function matchesReleaseSurface(file) {
-  for (const pattern of RELEASE_SURFACE) {
-    if (pattern.endsWith('/**')) {
-      const prefix = pattern.slice(0, -3) + '/';
-      if (file.startsWith(prefix)) return true;
-    } else if (file === pattern) {
-      return true;
-    }
-  }
-  return false;
+  return matchesSurface(file, RELEASE_SURFACE);
+}
+
+function matchesSurface(file, surface) {
+  return surface.some(pattern => {
+    if (pattern.endsWith('/**')) return file.startsWith(pattern.slice(0, -2));
+    if (pattern.startsWith('**/')) return file.slice(file.lastIndexOf('/') + 1) === pattern.slice(3);
+    return file === pattern;
+  });
 }
 
 /**
@@ -375,7 +382,7 @@ function defaultGhRunner(args) {
  *   headSha: string;
  *   prNumber?: number;            // included in the emitted merge command (D-PR5)
  *   expectedContexts?: string[];  // defaults to EXPECTED_CONTEXTS
- *   changedFiles?: string[];      // D-PR7: when present, release-surface presence check runs
+ *   changedFiles?: string[];      // Enables the release and dependency presence checks.
  *   releaseSuiteIds?: Set<number>; // D-PR8: check_suite_id values for release.yml runs
  * }} EvaluateInput
  *
@@ -552,7 +559,7 @@ export function evaluateChecks({
         if (cr.status !== 'completed' || cr.conclusion !== 'success') {
           failures.push(
             `Tier A+ (expected): "${ctx}" — status=${cr.status}, conclusion=${cr.conclusion ?? 'null'} ` +
-            `(locally-expected job must be completed+success, D-PR3b)`,
+            `(locally-expected job must be completed+success)`,
           );
           pass = false;
         }
@@ -571,7 +578,7 @@ export function evaluateChecks({
       // iterate and would have emitted a PASS. Tier A+ prevents that.
       failures.push(
         `Tier A+ (expected): "${ctx}" — not found in check-runs or statuses (never ran). ` +
-        `This job must exist and pass; its absence is not evidence of success (D-PR3b, avoids PF-013)`,
+        `This job must exist and pass; its absence is not evidence of success`,
       );
       pass = false;
     }
@@ -745,6 +752,15 @@ export function evaluateChecks({
     } else {
       lines.push('  release surface not touched — no release run required');
     }
+  }
+
+  // Tier B checks the result of each run that exists. Require the exact run here:
+  // a missed paths filter, a workflow parse error, or pending fork approval can
+  // leave no run for Tier B to check.
+  if (changedFiles?.some(file => matchesSurface(file, DEPENDENCY_SURFACE)) &&
+      !checksByName.has(ADVISORIES_CONTEXT)) {
+    failures.push(`Dependency surface: "${ADVISORIES_CONTEXT}" — no check run on this head`);
+    pass = false;
   }
 
   // ---- Compose result ----
