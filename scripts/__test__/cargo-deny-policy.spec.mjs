@@ -683,7 +683,10 @@ test('the repository satisfies the dependency policy', async t => {
   await t.test('the release guide uses the pinned pre-flight command and version', () => {
     const preflight = /^## Pre-flight[^\n]*\n([\s\S]*?)(?=^## |$(?![\s\S]))/m.exec(read('RELEASING.md'))?.[1];
     assert.ok(preflight?.split('\n').includes(PREFLIGHT), 'missing release guide pre-flight command');
-    const versions = [...preflight.matchAll(/(?:cargo-deny[-@ ]|\bversion=["']?)(\d+\.\d+\.\d+)\b/gi)];
+    const installer = /<<'INSTALL_CARGO_DENY'\n([\s\S]+?)\nINSTALL_CARGO_DENY\n/.exec(preflight)?.[1];
+    assert.ok(installer, 'missing cargo-deny install block');
+    assert.equal(/^version=(\S+)$/m.exec(installer)?.[1], VERSION, 'cargo-deny install version');
+    const versions = [...preflight.matchAll(/cargo-deny[-@ ](\d+\.\d+\.\d+)\b/gi)];
     exactSet(new Set(versions.map(match => match[1])), [VERSION], 'release guide pre-flight tool version');
   });
 

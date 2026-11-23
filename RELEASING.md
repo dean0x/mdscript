@@ -145,6 +145,7 @@ fi
 The first `PATH` entry is the private directory that this block creates.
 The explicit Cargo home `bin` entry stops Cargo from putting it first.
 If you set `CARGO_HOME` in Git Bash, use a path in Git Bash format.
+
 ### Check NOTICE freshness (#136)
 
 Install `cargo-about 0.9.1` from the pinned manifest.
@@ -273,7 +274,11 @@ npm pack -w @mdscript/mds-napi --dry-run
 python -m venv .venv && . .venv/bin/activate
 pip install "maturin==1.13.3" pytest
 maturin build -m crates/mds-python/Cargo.toml --out dist
-ls dist/ | grep -q 'cp311-abi3' || (echo "expected a cp311-abi3 wheel" && exit 1)
+wheels=(dist/*-cp311-abi3-*.whl)
+[[ ${#wheels[@]} -eq 1 && -f "${wheels[0]}" ]] || { echo 'Expected one cp311-abi3 wheel' >&2; exit 1; }
+wheel=${wheels[0]##*/}
+unzip -Z1 "${wheels[0]}" > "$cargo_about_tmp/wheel-files" &&
+  grep -Fx -- "${wheel%-cp311-abi3-*}.dist-info/licenses/NOTICE" "$cargo_about_tmp/wheel-files"
 pip install --find-links dist --no-index markdown-script
 python -c "import markdown_script as m; r = m.compile('Hello {{n}}!', vars={'n': 'CI'}); print('smoke ok:', r.output)"
 ```
@@ -498,8 +503,7 @@ The `credential-probe` job checks the registry inputs first. After it passes,
       all 7 targets.
    3. **build-python** (parallel with build-napi) — builds `cp311-abi3` wheels for seven platforms and one sdist.
       It checks the Linux wheel linkage and the NOTICE entries in the sdist (#136).
-   4. **stage-and-verify-napi** — waits for both build jobs.
-      It stages the seven platform packages with `LICENSE` and `NOTICE`.
+   4. **stage-and-verify-napi** — stages the seven platform packages with `LICENSE` and `NOTICE` after `build-napi`.
       It checks each packed file list for `NOTICE` before the **A3 name-gate** (#136).
       The last step runs the x64 Alpine load test (`linux-x64-musl`) inside `node:22-alpine`
       after the staged artifact upload, so the artifact is preserved even when

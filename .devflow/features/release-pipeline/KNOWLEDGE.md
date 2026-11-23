@@ -52,10 +52,9 @@ state between `cargo publish` and `npm publish`).
 
 ```
 credential-probe → version-gate
-  ├─→ build-napi (7 legs) ───┐
-  └─→ build-python (8 legs) ─┴─→ stage-and-verify-napi ─→ load-test-musl-arm64 ─┐
-       └─→ rehearse-publish-python ────────────────────────────────────────────┤
-             └─→ publish-testpypi (dispatch+input only)                       │
+  ├─→ build-napi (7 legs)  ─→ stage-and-verify-napi ─→ load-test-musl-arm64 ─┐
+  └─→ build-python (8 legs) ─→ rehearse-publish-python ──────────────────────┤
+                                └─→ publish-testpypi     │ (dispatch+input only)
                                                           ↓
                                               publish-crates  (tag only)
                                                 ↓           ↓
@@ -72,7 +71,7 @@ Job details:
 | `credential-probe` | Credential probe | no job guard; PR notice only | — |
 | `version-gate` | Version gate | no job guard | credential-probe |
 | `build-napi` | Build napi (...) | nothing | version-gate |
-| `stage-and-verify-napi` | Stage + verify platform packages | Both build jobs must pass | build-napi, build-python |
+| `stage-and-verify-napi` | Stage + verify platform packages | `build-napi` must pass | build-napi |
 | `load-test-musl-arm64` | Alpine load test (linux-arm64-musl) | unguarded, not-cancelled + `needs.stage-and-verify-napi.result == 'success'` | stage-and-verify-napi |
 | `build-python` | Build Python (...) | nothing | version-gate |
 | `rehearse-publish-python` | Rehearse PyPI publish (no upload) | nothing | build-python |
@@ -92,8 +91,8 @@ x64 fails (both are re-run together after the fix).
 Key ordering constraints:
 - `version-gate` checks both NOTICE files in a read-only job on all release events (#136).
   The CI-history floor is 17 required contexts.
-- `stage-and-verify-napi` waits for the sdist check in `build-python`.
-  It adds `LICENSE` and `NOTICE` to seven platform packages and checks their pack lists before A3 (#136).
+- `build-python` checks the sdist NOTICE before it uploads the archive (#136).
+- `stage-and-verify-napi` adds `LICENSE` and `NOTICE` to seven platform packages and checks their pack lists before A3 (#136).
   `publish-npm` repeats the list check before the restored A3 and after `napi prepublish`.
 - `publish-crates` blocks on `rehearse-publish-python`: a failed OIDC exchange aborts before the irreversible crates.io write (PF-039).
 - `publish-crates` blocks on `build-python`: a Python wheel build failure aborts before ANY registry write (PF-023).

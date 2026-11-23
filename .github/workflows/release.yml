@@ -556,8 +556,8 @@ jobs:
   # ---------------------------------------------------------------------------
   stage-and-verify-napi:
     name: Stage + verify platform packages
-    needs: [build-napi, build-python]
-    if: ${{ !cancelled() && needs.build-napi.result == 'success' && needs.build-python.result == 'success' }}
+    needs: [build-napi]
+    if: ${{ !cancelled() && needs.build-napi.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -609,8 +609,19 @@ jobs:
               jq -er '.[0].files[].path' "$2.json" > "$2.txt"
           }
 
+          lists_notice() {
+            jq -e '.files | arrays | index("NOTICE") != null' "$1"
+          }
           mkdir "$work/control"
-          printf '%s\n' '{"name":"notice-control","version":"1.0.0","files":["NOTICE","NOTICE.bak"]}' > "$work/control/package.json"
+          printf '%s\n' '{"name":"notice-control","version":"1.0.0","files":["NOTICE.bak"]}' > "$work/control/package.json"
+          rc=0
+          lists_notice "$work/control/package.json" > "$work/files-check" || rc=$?
+          if [ "$rc" -ne 1 ] || ! grep -Fx -- false "$work/files-check"; then
+            echo "::error::Platform files control: expected false and exit 1; got exit $rc"
+            exit 1
+          fi
+          jq '.files += ["NOTICE"]' "$work/control/package.json" > "$work/package.json"
+          mv "$work/package.json" "$work/control/package.json"
           cp NOTICE "$work/control/NOTICE.bak"
           list_paths "$work/control" "$work/control"
           grep -Fx -- NOTICE.bak "$work/control.txt"
@@ -625,9 +636,9 @@ jobs:
           for d in "${packages[@]}"; do
             platform=${d%/}
             rc=0
-            jq -e '.files | arrays | index("NOTICE") != null' "${d}package.json" > "$work/files-check" || rc=$?
-            if [ "$rc" -ne 0 ]; then
-              echo "::error::$platform must list NOTICE in package.json (jq exit $rc)"
+            lists_notice "${d}package.json" > "$work/files-check" || rc=$?
+            if [ "$rc" -ne 0 ] || ! grep -Fx -- true "$work/files-check"; then
+              echo "::error::$platform must list NOTICE in package.json (expected true, jq exit $rc)"
               exit 1
             fi
             list_paths "./$platform" "$work/${platform##*/}"

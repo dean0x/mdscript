@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -39,6 +39,8 @@ test('NOTICE has the stated scope and canonical bytes (#136)', () => {
 for (const [name, text, expected] of [
   ['home path', `${fixture}~/crates/example\n`, 'NOTICE: path in output'],
   ['absolute path', `${fixture}/Users/example\n`, 'NOTICE: path in output'],
+  ['bracketed path', `${fixture}[/opt/example]\n`, 'NOTICE: path in output'],
+  ['file URL', `${fixture}file:///opt/example\n`, 'NOTICE: path in output'],
   ['registry path', `${fixture}registry/src/example\n`, 'NOTICE: path in output'],
   ['drive path', `${fixture}C:\\example\n`, 'NOTICE: path in output'],
   ['CR', fixture.replace('Example', '\rExample'), 'NOTICE: hazardous character'],
@@ -54,6 +56,18 @@ for (const [name, text, expected] of [
 ]) {
   test(`NOTICE rejects ${name} (#136)`, () => {
     assert.equal(noticeProblem(Buffer.from(text)), expected);
+  });
+}
+
+for (const [name, input, error] of [
+  ['invalid UTF-8', Buffer.from([0xff]), 'input is not UTF-8'],
+  ['oversize input', Buffer.alloc(2 * 1024 * 1024 + 1), 'input exceeds 2 MiB'],
+  ['empty input', Buffer.alloc(0), 'missing license sections'],
+  ['malformed section', Buffer.from(`${header}${marker}MIT\n`), 'invalid license section'],
+]) {
+  test(`The generator rejects ${name} without output (#136)`, () => {
+    const result = normalize(input);
+    assert.deepEqual([result.status, result.stderr.toString(), result.stdout.length], [1, `NOTICE: ${error}\n`, 0]);
   });
 }
 
@@ -109,25 +123,40 @@ function namedStep(job, name) {
   return job.slice(starts[i].index, starts[i + 1]?.index);
 }
 
+const generator = /\bgenerate-notice\.mjs\b|(?:\bcargo(?:-about)?|\$cargo_about")\s+about\s+generate\b/;
+
+test('Only the release workflow can generate NOTICE (#136)', () => {
+  const workflows = readdirSync(file('.github/workflows')).filter(name => /\.ya?ml$/.test(name));
+  assert.ok(workflows.includes('release.yml'));
+  assert.ok(workflows.includes('ci.yml'));
+  for (const name of workflows.filter(name => name !== 'release.yml')) {
+    assert.equal(generator.test(stripComments(read(`.github/workflows/${name}`))), false, name);
+  }
+  assert.equal(generator.test('run: cargo about generate --frozen'), true);
+});
+
 function freshnessProblems(workflow, ciWorkflow) {
   const problems = [];
-  const jobs = jobBlocks(workflow.split(/^jobs:\s*$/m)[1] ?? '');
+  const [defaults, jobText = ''] = workflow.split(/^jobs:\s*$/m);
+  const jobs = jobBlocks(jobText);
   const gate = jobs.get('version-gate') ?? '';
   const install = namedStep(gate, 'Install cargo-about (pinned)');
   const version = namedStep(gate, 'Assert cargo-about is the pinned version');
   const freshness = namedStep(gate, 'Assert Rust crate NOTICE files are current');
-  const generator = /\bgenerate-notice\.mjs\b|(?:cargo-about[^\n]*|\$cargo_about")\s+about generate\b/;
   if (!generator.test(freshness) || [...jobs].some(([id, job]) => id !== 'version-gate' && generator.test(job))
       || generator.test(gate.replace(freshness, ''))) problems.push('NOTICE generator must run only in the freshness step');
   if (generator.test(stripComments(ciWorkflow))) problems.push('CI must not regenerate NOTICE');
   if (/^    if:/m.test(gate) || [install, version, freshness].some(step => /^        if:/m.test(step))) {
     problems.push('The NOTICE steps must run on every release event');
   }
-  if (/^\s*(?:id-token:\s*write|permissions:\s*write-all)\b/m.test(gate) || /\bsecrets(?:\.|\[)/.test(gate)) {
+  const grants = /^    permissions:\n((?:      .*\n|\n)+)/m.exec(gate)?.[1].trim().split(/\n\s*/);
+  if (!grants || !grants.every(line => /^[\w-]+: (?:read|none)(?:\s+#.*)?$/.test(line))
+      || /\bsecrets(?:\.|\[)/.test(stripComments(defaults) + gate)) {
     problems.push('The NOTICE job must not hold publish grants');
   }
-  if (!install.includes('taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532')
-      || !install.includes('tool: cargo-about@0.9.1') || !install.includes('fallback: none')
+  const inputs = install.split('        with:\n')[1]?.trimEnd();
+  if (!/^        uses: taiki-e\/install-action@[a-f0-9]{40} +#/m.test(install)
+      || inputs !== '          tool: cargo-about@0.9.1\n          fallback: none'
       || (gate.includes('Swatinem/rust-cache@') && gate.indexOf(install) > gate.indexOf('Swatinem/rust-cache@'))) {
     problems.push('Install the pinned cargo-about before any Rust cache');
   }
@@ -147,6 +176,19 @@ function freshnessProblems(workflow, ciWorkflow) {
   return problems;
 }
 
+test('Local and release generation use all configured targets (#136)', () => {
+  const line = text => text.split('\n').find(row => row.trimStart().startsWith('"$cargo_about" about generate '))?.trim();
+  const recipe = line(release);
+  assert.ok(recipe, 'release generation command');
+  assert.equal(line(read('RELEASING.md')), recipe);
+  const config = /^targets = \[([^\]]+)\]/m.exec(read('about.toml'))[1];
+  const targets = [...config.matchAll(/"([\w-]+)"/g)].map(match => match[1]).sort();
+  const cliTargets = command => [...command.matchAll(/ --target ([\w-]+)/g)].map(match => match[1]).sort();
+  assert.equal(targets.length, 8);
+  assert.deepEqual(cliTargets(recipe), targets);
+  assert.notDeepEqual(cliTargets(recipe.replace(` --target ${targets[0]}`, '')), targets);
+});
+
 test('Release freshness checks the locked NOTICE in a read-only job (#136)', () => {
   assert.deepEqual(freshnessProblems(release, ci), []);
   for (const [before, after, reason] of [
@@ -154,6 +196,8 @@ test('Release freshness checks the locked NOTICE in a read-only job (#136)', () 
     ['    name: Version gate', '    if: false\n    name: Version gate', 'The NOTICE steps must run on every release event'],
     ['- name: Assert Rust crate NOTICE files are current\n', '- name: Assert Rust crate NOTICE files are current\n        if: false\n', 'The NOTICE steps must run on every release event'],
     ['      checks: read', '      id-token: write\n      checks: read', 'The NOTICE job must not hold publish grants'],
+    ['      checks: read', '      checks: write', 'The NOTICE job must not hold publish grants'],
+    ['env:\n  CARGO_TERM_COLOR:', 'env:\n  NPM_TOKEN: $' + '{{ secrets.NPM_TOKEN }}\n  CARGO_TERM_COLOR:', 'The NOTICE job must not hold publish grants'],
     ['      checks: read', '      checks: read\n    env:\n      NPM_TOKEN: $' + '{{ secrets.NPM_TOKEN }}', 'The NOTICE job must not hold publish grants'],
     ['tool: cargo-about@0.9.1', 'tool: cargo-about@0.9.2', 'Install the pinned cargo-about before any Rust cache'],
     ['cargo-about 9.9.9', 'cargo-about 0.9.1', 'Check the binary version with a wrong-version control'],
@@ -186,8 +230,8 @@ function platformOrderIsValid(workflow) {
     const steps = names.map(name => namedStep(job, name));
     return steps.every((step, i) => step && (i === 0 || job.indexOf(step) > job.indexOf(steps[i - 1])));
   };
-  return stage.includes('needs: [build-napi, build-python]')
-    && stage.includes("needs.build-python.result == 'success'")
+  return stage.includes('needs: [build-napi]')
+    && stage.includes("needs.build-napi.result == 'success'")
     && inOrder(stage, 'Add LICENSE and NOTICE to each platform package', 'Assert platform packages contain NOTICE',
       'A3 — name <-> loader verification gate', 'Upload staged napi tree')
     && inOrder(publish, 'Assert restored platform packages contain NOTICE', 'Re-run A3 gate against the restored tree',
@@ -199,7 +243,7 @@ function platformOrderIsValid(workflow) {
 
 test('The platform list checks run before A3 and after napi prepublish (#136)', () => {
   assert.equal(platformOrderIsValid(release), true);
-  assert.equal(platformOrderIsValid(release.replace(" && needs.build-python.result == 'success'", '')), false);
+  assert.equal(platformOrderIsValid(release.replace('needs: [build-napi]', 'needs: [build-napi, build-python]')), false);
   assert.equal(platformOrderIsValid(release.replace('name: Assert restored platform packages contain NOTICE', 'name: Removed')), false);
   assert.equal(platformOrderIsValid(release.replace('name: Assert platform NOTICE after napi prepublish', 'name: Removed')), false);
 });

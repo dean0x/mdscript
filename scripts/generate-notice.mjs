@@ -5,7 +5,7 @@ import { isHazardous } from './verify-no-control-bytes.mjs';
 const MAX_BYTES = 2 * 1024 * 1024;
 const SECTION = '\n=== LICENSE ===\n';
 const SECTION_HEADER = /^([^\n]+)\nCrates: ([A-Za-z0-9_-]+(?:, [A-Za-z0-9_-]+)*)\n\n/;
-const PATH = /(?:^|[\s"'(<`=:])(?:[A-Za-z]:[\\/]|\\\\[^\s\\]+\\|~[\\/]|\/[^\s/]|(?:\.cargo|registry)[\\/])/;
+const PATH = /\bfile:\/\/|(?:^|[\s"'(<`=:[{])(?:[A-Za-z]:[\\/]|\\\\[^\s\\]+\\|~[\\/]|\/[^\s/]|(?:\.cargo|registry)[\\/])/i;
 
 function readInput() {
   const buffer = Buffer.alloc(MAX_BYTES + 1);
