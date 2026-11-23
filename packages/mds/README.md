@@ -71,6 +71,18 @@ Set the `MDS_BACKEND` environment variable in Node.js to force a specific backen
 MDS_BACKEND=wasm node my-script.js
 ```
 
+WASM file APIs (`compileFile`, `checkFile`, and `lintFile`) differ from native in these cases:
+
+- WASM can report a missing import outside the project as a path outside the project. It checks the project boundary first.
+- WASM refuses `..` above the key root because it checks the written path before it resolves links.
+- For a project at the filesystem root, WASM also refuses `/..` as a path above the key root. A native match needs new public API, a spec change, and more WASM bytes.
+- On POSIX, `link/..` can use an alias. A conflict fails because one alias key cannot name two files. Windows resolves `link\..` lexically on both backends.
+- WASM limits the root-relative entry key, resolved import key, and alias target to 256 segments. This bounds key resolution.
+- WASM uses an errno name for Node file errors in `cannot read` messages. The OS text can include an absolute path.
+- A later file error can precede an earlier compile error or cycle. WASM reads the modules before it evaluates them.
+- WASM limits total module bytes and limits aliases to 65,536 entries and 10 MiB of keys and targets. Native does not use those limits.
+- WASM refuses a non-UTF-8 directory before it checks the file. Native checks the file first. To match native order, each path check would need both string and byte forms.
+
 ## Error handling
 
 Use `isMdsError` to distinguish MDS compiler errors from other exceptions:

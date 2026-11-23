@@ -124,21 +124,13 @@ function isWithinRoot(root: string, candidate: string): boolean {
 }
 
 /**
- * Open a file descriptor with O_NOFOLLOW | O_RDONLY, translating the ELOOP error
- * the kernel emits when the path is a symlink into NativeFs's symlink refusal
- * (`symlinkError`). A symlink or missing file uses `shown`. A read refusal uses
- * `display`. Neither case uses the raw Node error text.
+ * Open a file descriptor with O_NOFOLLOW | O_RDONLY. Map ELOOP to `symlinkError(shown)`.
+ * For other open errors, use `lstat` to distinguish the two NativeFs error codes.
+ * If `lstat` fails, report `mds::file_not_found` with `shown` as written.
+ * If `lstat` succeeds, report `mds::io` with the root-relative `display` and an errno name.
+ * Do not use the raw Node error text.
  *
- * NativeFs stats the final component (`symlink_metadata`) before it reads it and
- * maps any failure of that step to `mds::file_not_found`: so does this, when the
- * failed path cannot be `lstat`ed either — no such file (ENOENT; e.g. a
- * case-mismatched spelling on a case-sensitive volume, #408), a regular file where
- * a directory is expected (ENOTDIR), a name too long (ENAMETOOLONG), a directory
- * that cannot be searched (EACCES). A file that stats but cannot be opened (EACCES
- * on the file itself) failed at NativeFs's read step instead: `mds::io`.
- *
- * Module-level helper (not a closure) so that the caller's own try/catch only
- * handles post-open validation, keeping nesting shallow.
+ * The caller's try/catch handles only checks after the open.
  */
 async function openNoFollow(
   absolutePath: string,
@@ -213,9 +205,9 @@ async function closeModule(handle: Awaited<ReturnType<typeof open>>, display: st
 type PathErrorCode = 'mds::import' | 'mds::io' | 'mds::file_not_found' | 'mds::resource_limit';
 
 /**
- * A path refusal carrying the code the Rust engine reports for the same input, and that
- * engine error's message, except for the differences in `buildModulesMap`.
- * A `cannot read` message uses the root-relative path. Its reason can differ.
+ * A path refusal with a Rust engine error code. The differences in `buildModulesMap`
+ * explain when the scanner selects a different refusal or uses a different message.
+ * A `cannot read` message uses a root-relative path. Its reason can differ.
  */
 type PathError = MdsError & { code: PathErrorCode };
 
@@ -318,8 +310,9 @@ function withImportContext(err: unknown, record: ImportRecord): unknown {
 }
 
 /**
- * `mds::io` for a file that resolves but cannot be read. Use its path below the root.
- * Use an errno name instead of Node's error text, which can include an absolute path.
+ * Report `mds::io` for a file that resolves but cannot be read. Display its path
+ * below the project root, or `.` for the root. For a Node error, use its errno name
+ * or `I/O error`, not the raw error text, which can include an absolute path.
  */
 function cannotReadError(display: string, reason: string): PathError {
   return pathError(
@@ -636,10 +629,10 @@ export interface BuildModulesMapResult {
    */
   modules: Record<string, string>;
   /**
-   * The WASM engine's `moduleAliases` option. An alias can name a file other than
-   * its lexical key. Safety depends on the walk: it must see every import that the
-   * engine resolves. For a new import form, update `scan_import_records` and the walk
-   * together.
+   * Map each lexical alias key to its canonical module key for `moduleAliases`.
+   * An alias can name a file other than its lexical key.
+   * Safety therefore depends on the walk seeing every import that the engine resolves.
+   * A new import form must update `scan_import_records` and the walk together.
    */
   aliases: Record<string, string>;
 }
@@ -866,9 +859,9 @@ function aliasConflictError(shown: string): PathError {
 
 /**
  * Refuse a key that names two files or an alias target beyond the segment cap.
- * An alias can name a file other than its lexical key. Safety depends on the walk:
- * it must see every import that the engine resolves. For a new import form, update
- * `scan_import_records` and the walk together.
+ * An alias can name a file other than its lexical key.
+ * Safety therefore depends on the walk seeing every import that the engine resolves.
+ * A new import form must update `scan_import_records` and the walk together.
  *
  * @internal
  */
@@ -899,13 +892,9 @@ export function aliasRefusal(
 }
 
 /**
- * Locate an import of `importer`, in the project rooted at `projectRoot`, as the native
- * resolver does — `validate_import_path`, then NativeFs's `normalize_in_dir` — refusing
- * it with native's error, except that containment in the project root is decided
- * before the file is looked at (difference 1 in `buildModulesMap`'s list). The module
- * is keyed by its canonical path, which a hostile character is looked for in: a
- * spelling the engine resolves to another key is checked there too, never trusted
- * from the key it was typed as (case folding and other respellings are lossy, #414).
+ * Locate an import of `importer` within `projectRoot`. See `buildModulesMap` for
+ * differences from native resolution. Check the path as written, then check the
+ * canonical path. Use the canonical path for the module key, not the lexical alias.
  */
 async function locateImport(projectRoot: string, importer: Located, importPath: string): Promise<Located> {
   const stringErr = importPathError(importPath) ?? segmentCountError(importPath);
@@ -1068,11 +1057,10 @@ async function readModule(
  * directory — is listed in `aliases`, which the engine's `moduleAliases` option maps
  * to the module's key (#414).
  *
- * Except for the differences listed at the end, each refusal below is the error the
- * native backend throws for the same input — its code, its message and its `help` —
- * naming the path as written, never a resolved absolute path; a refusal of a file's
- * bytes names the file by its path below the project root, as native does (#265,
- * #408, #414):
+ * The checks below mirror the native checks for the same step. See the differences
+ * below for exceptions to the error code, message, `help` or order.
+ * Path errors use the path as written. File read and byte errors use the path below
+ * the project root. Neither uses the resolved absolute path (#265, #414).
  * - an entry path that is empty, contains NUL or carries a forbidden path character
  *   (`mds::io`), and an import string that is not `./`/`../`-relative, contains NUL
  *   or carries one (`mds::import`), before the filesystem is touched;
@@ -1083,8 +1071,8 @@ async function readModule(
  *   cannot be searched, or a path with no final name (one ending in `..`);
  * - a module whose final path component is a symlink, judged by that component's own
  *   file type (O_NOFOLLOW open; `lstat` where O_NOFOLLOW is unavailable) (`mds::import`,
- *   `symlinks are not allowed in imports: <path as written>`). Symlinked parent
- *   directories are followed, as NativeFs follows them;
+ *   `symlinks are not allowed in imports: <path as written>`, #408). The scanner
+ *   follows links in parent directories and applies the containment checks;
  * - a module outside the project root (discovered via .git/.mdsroot markers), checked
  *   lexically and on the canonical path (`mds::import`, `import path escapes project
  *   directory: "<import as written>"`);
@@ -1096,9 +1084,9 @@ async function readModule(
  *   distinct modules besides the entry, including modules still being resolved
  *   (`mds::resource_limit`);
  * - a module that is not a regular file — a directory, device, FIFO or socket —
- *   before it is opened (`mds::io`, `cannot read <path as written>: not a regular
- *   file`, #428), and one that cannot be read (`mds::io`, `cannot read <path as
- *   written>: <errno name>`);
+ *   before the open (`mds::io`, `cannot read <root-relative path>: not a regular
+ *   file`, #428), and one that cannot be read (`mds::io`,
+ *   `cannot read <root-relative path>: <errno name>`);
  * - a file over the engine's 10 MiB per-file cap (`mds::resource_limit`) or whose
  *   bytes are not valid UTF-8 (`mds::io`), then a file that is neither a `.mds` file
  *   nor a `.md` file declaring `type: mds` (`mds::not_mds`, `not an MDS file: <path as
@@ -1107,26 +1095,24 @@ async function readModule(
  *   leading byte-order mark kept). A file that is not an MDS file is refused before
  *   any import-like line in it is followed.
  *
- * A refusal raised while an import is resolved carries the context the native resolver
- * gives it, from the engine's `scanImportRecords`: a missing module imported by
- * `@import` or `@extends` points at that directive (`span`); one reached through a
- * frontmatter import is `mds::import`, `file not found: "<path>" (in frontmatter
- * imports[<i>])`, and an `mds::import` refusal there gets ` (in frontmatter
- * imports[<i>])` (#414).
+ * The scanner uses `scanImportRecords` for import context (#414, #423).
+ * A missing target of `@import`, `@extends` or `@export … from` gets the directive's
+ * `span` if the error has no span. A missing frontmatter import becomes `mds::import`
+ * with `file not found: "<path>" (in frontmatter imports[<i>])`.
+ * An `mds::import` refusal there gets the same frontmatter suffix.
  *
- * A project may be rooted at the filesystem root, as on native.
+ * The filesystem root can be a project root. The scanner still checks the lexical
+ * key root (difference 3).
  *
- * Modules are read concurrently — at most MAX_CONCURRENT_OPENS files open at once,
- * at most MAX_IMPORTS_READ_AHEAD of a module's imports, and no more than
- * `maxAggregateSize` bytes, counted as read, admitted ahead of the walk (a read that
- * outgrows the size it was admitted for holds at most MAX_FILE_SIZE + 1 bytes more),
- * each module read ahead at most once, whichever of its imports reaches it first — but
- * checked in the order the native resolver resolves them: depth first, each module's
- * imports in the order `scanImportRecords` lists them for the way the module is reached
- * — as the `@extends` base of another, or for itself — each step's checks in
- * `resolve_by_key`'s order. Of several faults, the one reported is the one the native backend reports.
- * A scan settles only once every read it started has stopped, a refused scan too: none
- * holds a file open, or calls into the engine, after it.
+ * The scanner reads modules concurrently, with at most MAX_CONCURRENT_OPENS files
+ * open and MAX_IMPORTS_READ_AHEAD imports ahead of the walk per module. It admits up
+ * to `maxAggregateSize` bytes ahead of the walk and charges the actual bytes read.
+ * A file can grow after admission, but one read holds at most MAX_FILE_SIZE + 1 bytes.
+ * The scanner starts at most one read ahead per canonical module key.
+ * The walk checks modules depth first, in the order `scanImportRecords` lists their
+ * imports for an `@extends` base or for a module in its own right. The first scanner
+ * refusal wins. The first error can differ from native as described below.
+ * The scan waits for all its reads to stop before it returns or throws.
  *
  * Differences from the native backend that remain (#414):
  * 1. A MISSING module outside the project root — named lexically, or through a
@@ -1136,37 +1122,39 @@ async function readModule(
  * 2. The aggregate-size guard (`maxAggregateSize`) is the WASM backend's own; native
  *    has none. It judges a module only once native's own checks on it pass, so it
  *    never pre-empts a refusal native makes of that module (U-SM39).
- * 3. A `../` import from a project rooted at the filesystem root is refused as
- *    escaping it, where native resolves `/..` to `/` (#424).
- * 4. On POSIX, an import that names a symlinked directory and leaves it again through
- *    `..` (`./link/../x.mds`) is refused (`mds::import`): the engine resolves the name,
- *    NativeFs the disk, so the key it resolves to names another file than the one
- *    native reads (#408, U-SM22). Windows collapses `link\..` lexically before it
- *    follows the link, on both backends, so there such an import compiles as on native.
- * 5. A module more than 256 directories below the project root is refused: the
- *    engine's key of it is capped at 256 segments, where native caps only the path
- *    as written.
- * 6. A `cannot read` message names the path as written, where native names the
- *    root-relative path, and a file that cannot be read by its errno name, where
- *    native gives the OS error text; the code agrees, and so does the reason for a
- *    module that is not a regular file.
- * 7. Every module is read before the engine runs, so a refusal of a later import is
- *    reported before an error the engine raises at a point native reaches first: a
- *    compile error in a module native reads first, or a circular import native meets
- *    first (U-SM38).
+ * 3. The lexical key cannot climb above its root with `..`, even if the resolved
+ *    file is inside the project. This includes `/..`, which native resolves to `/`
+ *    (#424), and a `link/..` path that climbs above the project root as written (#432).
+ *    Deliberate: check lexical containment before disk resolution. To match `/..`,
+ *    the engine would need new public API, a spec change, and more WASM bytes
+ *    (U-S16, U-SM34, U-SM52).
+ * 4. Only the POSIX after-the-link semantics make a `link/..` alias. Windows
+ *    collapses `link\..` lexically on both backends. On POSIX, the scanner refuses
+ *    a conflict with a plain path, a real-directory path, an already used module
+ *    key, or another link. A path above the root as written is still subject to
+ *    difference 3 (#432). Deliberate: the alias map applies to every import, so
+ *    one key cannot name two files (U-SM22, U-SM24, U-SM51 to U-SM55).
+ * 5. WASM caps the entry key, the resolved import key and the canonical alias
+ *    target at 256 segments (`mds::resource_limit`). Native caps paths as written.
+ *    The alias-target check never pre-empts a refusal of that module itself.
+ *    Deliberate: keep an explicit bound on key resolution (U-S16, U-SM56).
+ * 6. A `cannot read` reason can be an errno name instead of native OS error text.
+ *    Deliberate: Node's error text can include an absolute path (U-SM28, U-SM57).
+ * 7. The scanner reads modules before the engine evaluates them. A later import
+ *    refusal can precede an earlier compile error or cycle that native reports.
+ *    Deliberate: equal error order would require engine evaluation per module.
+ *    This changes the selected error, not the compiled output (U-SM38).
  * 8. The engine takes at most 65,536 `aliases`, whose keys and module keys total at
  *    most 10 MiB, and refuses more (`mds::resource_limit`, naming
  *    `options.moduleAliases`): a graph whose imports reach its modules by more
  *    spellings than that, other than their on-disk keys, compiles only on native,
  *    which has no aliases to count (#414).
- * 9. A module below a directory whose canonical path is not valid UTF-8 — reached
- *    through a symlink, or the working directory of a relative entry — is refused as
- *    soon as that directory is resolved, before the file in it is looked at: the
- *    scanner reaches every file through a string, and none names that directory.
- *    Native refuses it with the same error only once it has checked the file, so where
- *    the file is also missing or a symlink, lies outside the project root, or has a
- *    forbidden character in its path, native reports that instead (U-SM48, which runs
- *    where a file name can hold such bytes: APFS refuses them).
+ * 9. The scanner refuses a directory whose canonical path is not valid UTF-8
+ *    before it checks a file below it. Native can report a missing file, a final
+ *    symlink, an escape, or a forbidden character first. Deliberate: a string
+ *    cannot name that directory exactly. To match native order, each path check
+ *    would need a string and a byte form. A check on one form does not prove the
+ *    other (U-SM48, Linux CI).
  */
 export async function buildModulesMap(
   entryPath: string,
@@ -1177,8 +1165,7 @@ export async function buildModulesMap(
   const maxAggregateSize = options?.maxAggregateSize ?? DEFAULT_MAX_AGGREGATE_SIZE;
 
   const entry = await locateEntry(entryPath);
-  // A project may be rooted at the filesystem root, as on native: containment in it
-  // then admits every path, exactly as NativeFs's does.
+  // The filesystem root can be the project root. The lexical key check still applies.
   const projectRoot = findProjectRoot(entry.dir);
   // Virtual keys are always slash-separated to mirror Rust's VirtualFs.
   const entryFilename = keyOf(projectRoot, entry.resolved);

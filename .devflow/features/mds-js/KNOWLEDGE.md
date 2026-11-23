@@ -169,7 +169,7 @@ The `engines` floor of the JS packages is `>=22.12.0`. `@mdscript/mds-napi` keep
 
 ## WASM-backend File Pre-scanner (`util/module-scanner.ts`, `util/path-chars.ts`, `util/sliding-window.ts`)
 
-The scanner is a second, JS implementation of the native backend's path rules; its refusals must match the native engine's error CODE, MESSAGE, `help`, and — where native attaches one — `span`, byte for byte. `ScannerEngine = Pick<WasmModule, 'scanImportRecords' | 'preflightModule'>` — the only two WASM engine calls the scanner makes; every other check (paths, symlinks, project root, limits, import context) is a TypeScript mirror of the native backend's, held to it by native-vs-WASM differentials.
+The scanner applies the native path rules in TypeScript, with the differences listed below. The differential tests compare error codes, messages, `help`, and spans where they apply. `ScannerEngine = Pick<WasmModule, 'scanImportRecords' | 'preflightModule'>` lists the two engine calls the scanner uses.
 
 ### Engine calls
 
@@ -178,7 +178,9 @@ The scanner is a second, JS implementation of the native backend's path rules; i
 
 ### Deterministic order despite concurrent reads
 
-Modules are **read concurrently** — at most `MAX_CONCURRENT_OPENS` (16) files open at once, at most `MAX_IMPORTS_READ_AHEAD` (`2 × MAX_CONCURRENT_OPENS` = 32) of a module's imports read ahead of the walk via the `slidingWindow` generator (`sliding-window.ts`) — but **checked in the native resolver's order**: depth-first, each module's imports in `scanImportRecords`' order, first-fault-wins matching what native reports for the same graph (U-SM37/U-SM38, difference 7). `slidingWindow(items, size, start)` hands out `items` one at a time, keeping up to `size` `start()` calls in flight ahead of the one just yielded — refilled *after* each yield, not before, so the walk's own pace throttles how far ahead reads run (U-SW1–U-SW4 pin exact fill/yield timing; `size` must be a positive integer or it throws `RangeError`).
+The scanner can open up to `MAX_CONCURRENT_OPENS` (16) files at once. It uses `slidingWindow` to start up to `MAX_IMPORTS_READ_AHEAD` (32) reads per module ahead of the walk. The walk checks modules depth first, in the order `scanImportRecords` gives. It reports the first scanner refusal, not necessarily the first native error (U-SM37 and U-SM38, difference 7).
+
+`slidingWindow(items, size, start)` yields one item and refills only when the walk asks for the next item. It keeps up to `size` `start()` calls ahead of the most recent item (U-SW1–U-SW4). If `size` is not a positive integer, it throws `RangeError`.
 
 Each import walked starts a `readAhead()` for it via `startReadAhead`, tracked in a `pending` Set<Promise> so a walk that throws can wait for every outstanding read-ahead to settle before rethrowing (none holds a file open or calls into the engine after the walk finishes — `walkFinished` flag plus `Promise.allSettled(pending)` in the `finally`). `readAheadReads` (a `Map<key, Promise>`) deduplicates: at most one read-ahead per module key, whichever import reaches it first; a module the walk itself reaches later reuses that settled read (`readAheadRead(key)`) instead of reading it twice.
 
@@ -196,32 +198,44 @@ Each import walked starts a `readAhead()` for it via `startReadAhead`, tracked i
 ### Filesystem checks
 
 - **Symlinks**: `assertFileNotSymlink` + `canonicalFile` mirror `NativeFs::check_symlink_named` — refuse by the final component's OWN file type (`openNoFollow`'s `O_NOFOLLOW` → `ELOOP`, or the post-open `lstat` where `O_NOFOLLOW` is unavailable, i.e. Windows, which also reports junctions), never by comparing the canonical path with the path as written (a case-mismatched name on a case-insensitive volume is NOT a symlink, #408).
-- **Non-UTF-8**: `resolvePath` reads the OS's raw bytes (`realpath(path, { encoding: 'buffer' })`) and refuses (`notUtf8Error`, `mds::io`, `resolved path is not valid UTF-8: "<path as written>"`) rather than decoding lossily — a lossy decode would name a different, valid-UTF-8 "twin" path that no check here has seen (#414).
-- **Non-regular file**: `readModule` `lstat`s the path before opening it — a directory, device, FIFO, or socket is refused (`notRegularFileError`, `mds::io`, `cannot read <path>: not a regular file`) before it is ever opened, so a FIFO nobody writes to cannot block the scan (#428). The check is repeated on the opened fd's `stat()` (TOCTOU: the component may have changed between the `lstat` and the `open`).
-- **`assertKeyMatchesDisk`** (#408) refuses an import whose virtual key names a different directory than the one native reads it from: the WASM engine resolves an import BY NAME from the importing module's key, native resolves it ON DISK from the importing module's canonical directory — they disagree exactly when an import leaves a symlinked directory through `..` (`./link/../x.mds`; the OS applies `..` AFTER the link on POSIX, the key-based resolution applies it before). Mismatch throws `mds::import` (`import path leaves a symlinked directory through '..', which the WASM backend cannot resolve: "<path>"`).
+- **Non-UTF-8**: `resolvePath` gets raw bytes from `realpath(path, { encoding: 'buffer' })`. It refuses an invalid UTF-8 path with `mds::io`, `resolved path is not valid UTF-8: "<path as written>"`. A lossy decode can name a different file (#414).
+- **Non-regular file**: `readModule` uses `lstat` before the open and checks the open file with `stat()`. Both checks use `mds::io`, `cannot read <root-relative path>: not a regular file` (#428).
+- **Containment and keys**: `locateImport` checks the lexical path before it resolves the canonical directory. It then checks containment on the canonical path. On POSIX, the system applies `..` after the link. Windows collapses `link\..` lexically on both backends (#432).
 - **Bounded reads**: `readAtMost(handle, limit, sizeHint)` grows a buffer by doubling (floor `MIN_READ_GROWTH` = 64 KiB) up to `limit` (`MAX_FILE_SIZE + 1`), so a file that grows while being read is never held whole and never more than one byte past the cap reaches the engine (#428).
 
 ### Module identity and aliases
 
-Every module is keyed by its **canonical path below the project root, in its on-disk spelling** — the same key native uses, so `dependencies`, `sourceMap.sources` and a cycle's text name it that way whatever spelling reached it. `Located.aliasKey` is the key the engine would resolve the import to BY NAME (before any alias remaps it); when that differs from `Located.key` (a case variant on a case-insensitive volume, or a path through a symlinked directory), `recordAlias` records `aliasKey → key` in the scan's `aliases` map, returned as `BuildModulesMapResult.aliases` and passed to the WASM engine as the `moduleAliases` option (`fileOpts`, the `lintFile` path in `node.ts`). The `walking`/`completed` sets (native's resolving-stack and module-cache) are keyed by `key`, so a module reached under two spellings is read and checked exactly once. The engine itself caps `moduleAliases` at 65,536 entries totaling 10 MiB (`mds::resource_limit`) — the JS scanner does not pre-count this; a graph with more distinct alias spellings than that compiles only on native (difference 8).
+`Located.key` is the module's canonical path below the project root, with its on-disk name. The scanner uses that key for reads and for the `walking` and `completed` sets. The WASM engine uses it for dependencies, source-map names, and cycle messages. `Located.aliasKey` is the lexical key before the engine applies aliases.
+
+`checkAndRecordAlias` uses `aliasRefusal` to check new and repeat visits. An alias cannot use a module key or name two module keys. If the lexical key differs from the canonical key, the scanner records the alias. The file APIs pass `BuildModulesMapResult.aliases` to the engine as `moduleAliases`. The engine enforces the separate alias count and byte limits (difference 8).
 
 `maxModules` permits 256 distinct modules besides the entry by default (#427). The `admitted` count includes the entry, each candidate, and modules whose resolution has not completed; repeated imports consume no extra slot. Native and the scanner share `mds::resource_limit` and `resource limit exceeded: module count exceeds maximum of 256 modules besides the entry`. Binding virtual-map guards remain separate: at most 257 entries, with their own message for 258. A string entry need not occupy a map slot, but the resolved graph still has the same bound.
 
-### The nine remaining differences (JSDoc on `buildModulesMap`, residual tracked by #432)
+### Nine backend differences (see `buildModulesMap`)
 
-1. A MISSING module outside the project root (lexically, or through a symlinked directory) is refused as escaping it; native reports it not found — deliberate, containment is decided before the file is looked at (U-SM30, U-SM32).
-2. The aggregate-size guard (`maxAggregateSize`) is the WASM backend's own; it never pre-empts a native refusal of that module (U-SM39).
-3. A `../` import from a project rooted at the filesystem root is refused as escaping it; native resolves `/..` to `/` (#424; U-S16, U-SM34 container arm).
-4. On POSIX, an import that names a symlinked directory and leaves it again through `..` is refused (see `assertKeyMatchesDisk` above) — narrowed to exactly this shape; Windows collapses `link\..` lexically before following the link on both backends, so it compiles there on both (#408).
-5. A module more than 256 directories below the project root is refused (the engine's key is capped at 256 segments); native caps only the path as written.
-6. A `cannot read` message names the path as written where native names the root-relative path, and an errno name where native gives the OS error text; the `code` agrees on both (U-SM28, U-SM31, U-SM33 `./`).
-7. Every module is read before the engine runs, so a refusal of a later import can be reported before an error the engine would raise at a point native reaches first — a compile error in a module native reads first, or a circular import native meets first (U-SM38).
-8. The engine caps `moduleAliases` at 65,536 entries / 10 MiB and refuses more; native has no aliases to count.
-9. A module below a directory whose canonical path is not valid UTF-8 is refused as soon as that directory resolves, before the file is looked at; native refuses the same error only once it has checked the file, so where the file is ALSO missing, a symlink, escapes the root, or has a forbidden character, native reports that instead (U-SM48, Linux-only — APFS refuses such bytes at the filesystem level).
+1. WASM can report an escape for a missing module outside the project. It checks containment before it checks the file (U-SM30, U-SM32).
+2. Only WASM has an aggregate-size guard (`maxAggregateSize`). The guard never pre-empts a refusal of the same module (U-SM39).
+3. WASM refuses each lexical `..` above the key root before disk resolution. This includes `/..`, which native resolves to `/` (#424; U-S16, U-SM34). It also includes `link/..` above the project root as written (U-SM52).
+4. On POSIX, a `link/..` import can use an alias. WASM refuses when a plain path, real-directory path, existing module key, or other link conflicts with that alias. The map applies to all imports, so one key cannot name two files (#432; U-SM51 to U-SM55). Windows collapses `link\..` lexically on both backends.
+5. WASM limits the entry key, resolved import key, and canonical alias target to 256 segments (`mds::resource_limit`). The alias-target check never pre-empts a refusal of that module itself (U-S16, U-SM56).
+6. A `cannot read` message can use an errno name instead of OS text, which can show an absolute path. Both backends show the path below the project root, or `.` for the root (U-SM28, U-SM31, U-SM33, U-SM57). For a POSIX file name with a backslash, native displays `/` and the scanner keeps the backslash.
+7. The scanner reads modules before the engine evaluates them. A later import refusal can precede an earlier compile error or cycle (U-SM38).
+8. The engine limits `moduleAliases` to 65,536 entries and 10 MiB of keys and targets. Native does not use an alias map.
+9. WASM refuses a non-UTF-8 canonical directory before it checks the file below it. Native can report a missing file, final symlink, escape, or forbidden character first. To match native order, each path check would need string and byte forms. A check on one form does not prove the other (U-SM48, Linux CI).
 
 ### Tests
 
-`__test__/forbidden-path-chars.spec.mjs` (U-FP1–U-FP5) is the Rust↔JS differential over all 80 forbidden codepoints. `__test__/scanner.spec.mjs` is the bulk of the parity suite: U-S11–16 (`normalizeVirtualKey`), U-SM3/7/9–37 (the original #265/#408 symlink/not-found/I/O matrix), U-SM38 (cycle-vs-missing-import ordering), U-SM39 (aggregate-vs-preflight order), U-SM40–42 (frontmatter/`@extends`-chain context), U-SM43/U-SM46 (simulated fstat-then-grows races, via a patched `FileHandle.prototype.stat`/`read`), U-SM44 (open-descriptor accounting after a mid-walk error, skipped on win32), U-SM45/47 (one `preflightModule`/`realpath` call per display, no duplicate reads), U-SM48 (non-UTF-8 directory, Linux-only), U-SM49 (exact own-enumerable-field set per refusal shape), U-SM50 (`_unwrapWalkFinishedForTesting()` throws an `Error`, never returns `undefined`), U-SM34 (root-project arm, `# SKIP` unless run as root in a throwaway container — not exercised outside a Linux container locally). `__test__/wasm-compileFile.spec.mjs` U-WCF12–14 compare whole compiled output (dependencies, `sourceMap.sources`, cycle text) between native and WASM on case-variant and symlinked-directory fixtures. `__test__/sliding-window` behaviour (U-SW1–4) lives inline in `scanner.spec.mjs`. The WASM side of any differential loads `crates/mds-wasm/pkg/` first — **rebuild it from the current tree before running these** (PF-035).
+`__test__/forbidden-path-chars.spec.mjs` (U-FP1–U-FP5) compares Rust and JavaScript for all 80 forbidden codepoints. `__test__/scanner.spec.mjs` supplies most parity tests:
+
+- U-S11–U-S16 check `normalizeVirtualKey`. U-S17 checks the alias guard.
+- U-SM3, U-SM7, and U-SM9–U-SM37 cover path and I/O checks. U-SM34 needs a root container.
+- U-SM38 and U-SM39 check error order. U-SM40–U-SM42 check import context.
+- U-SM43 and U-SM46 check file growth. U-SM44 checks open files after a refusal. U-SM45 and U-SM47 check duplicate calls.
+- U-SM48 and U-SM48b check non-UTF-8 directories on Linux. U-SM49 checks error fields. U-SM50 checks `WALK_FINISHED`.
+- U-SM51–U-SM55 check alias conflicts, containment, the canonical target, import kinds, check and lint, and the raw engine guard.
+- U-SM56 checks the segment limit. U-SM57 checks file-handle errors. U-SW1–U-SW4 check `slidingWindow`.
+
+`__test__/wasm-compileFile.spec.mjs` U-WCF12–U-WCF14 compare dependencies, source-map names, and cycle text. The WASM backend loads `crates/mds-wasm/pkg/` first. After a Rust change, rebuild it from the current tree before the tests.
 
 The new `backend-contract.spec.mjs` tests compare live conversion errors (BigInt, depth and count refusals in `vars` and `rules` included), importer spans, spanless nested frontmatter errors, and flat/nested graphs at 255–259 total modules. Both backends accept 255–257 and refuse 258–259 with the shared code and message. These tests fail if a required engine is absent; they do not skip locally. `scanner.spec.mjs` U-SM5 covers distinct and in-flight counts. Its shared-message test reads the reference from the live WASM core. U-WCF13 now pins the importer's not-MDS span and keeps entry errors spanless.
 
@@ -284,11 +298,12 @@ export const WASM_EXPORTS = [
 - **The `assertReady()` error message is byte-literal** — `'@mdscript/mds: call await init() before using compile/check/compileFile/checkFile/getBackend'` — tests pin it; don't change without updating tests.
 - **`basePath: undefined` is treated as "key absent"** — `getBasePathError` uses `!== undefined`, not `!= null`. U-OV-29 requires both backends to accept `basePath: undefined` on all seven methods. This is consistent with `forwardOpts`'s `!= null` filter that prevents `{basePath: undefined}` from reaching napi.
 - **Option key lists live in four independent places** (TS `METHOD_KEYS`, napi, wasm, Python). TS↔napi parity is runtime-enforced; WASM and Python drift is caught only by prose review until #311 lands.
-- **The scanner's "cannot read" message and native's disagree on wording, not code** — the scanner names the path as written and an errno name (`EACCES`), native names the root-relative path and the OS error text; only `code` should be compared cross-backend for that shape (difference 6).
-- **`U-SM34` (root-rooted project) needs an actual root filesystem to run meaningfully** — it `# SKIP`s outside a throwaway container; a green local run without root access proves nothing about that arm.
-- **`U-SM48` (non-UTF-8 directory name) only runs on Linux** — APFS (macOS) and NTFS/Windows both refuse to create such a filename, so the fixture cannot even be built there; it is skipped by design on darwin/win32.
-- **Symlink `..` behaviour is NOT universally POSIX-only** — Windows collapses `link\..` lexically before following the link on BOTH backends, so that one import shape compiles identically everywhere; only the POSIX after-the-link semantics produce a WASM-vs-native divergence (difference 4). Do not describe the whole symlink-`..` story as "POSIX-only" in new docs.
-- **A directory/FIFO/device/socket module is `not a regular file`, not `EISDIR`** — the old raw-errno message (`EISDIR`) is gone; `notRegularFileError` gives the same `mds::io` shape on every OS, checked before the file is opened (#428).
+- **`cannot read` names the path below the project root.** Compare the display path and the code across backends. The reason for a Node error can differ (difference 6).
+- **`U-SM34` needs a root container.** A non-root local run does not test that case.
+- **`U-SM48` and `U-SM48b` use Linux byte names.** macOS and Windows skip these fixtures because their filesystems cannot create such a name.
+- **Only the POSIX after-the-link semantics make a `link/..` alias.** Windows collapses `link\..` lexically on both backends (difference 4).
+- **An alias can name a file other than its lexical key.** Safety therefore depends on the walk seeing every import that the engine resolves. A new import form must update `scan_import_records` and the walk together.
+- **A directory, FIFO, device, or socket gets `not a regular file`.** Both backends use `mds::io` for this case (#428).
 
 ## Key Files
 

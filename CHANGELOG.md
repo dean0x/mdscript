@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - The `@mdscript/mds` README and the JavaScript example in `examples/README.md` now call `await init()` before the Node.js entry compiles. The README said that Node.js needs no initialization.
+- On POSIX, WASM file APIs use the same file as native for `link/..` imports when the alias key identifies one file (#432).
+- WASM file API `cannot read` messages show the path below the project root (#432).
+- A WASM file API alias target above 256 segments reports `mds::resource_limit` (#432).
 
 ### Internal
 
