@@ -2948,6 +2948,67 @@ mod tests {
 
     // ── scan_import_records (#414) ────────────────────────────────────────────
 
+    #[test]
+    fn scan_import_records_classifies_each_import_form() {
+        use ast::{ExportDirective, ImportDirective, Node};
+
+        // Use no wildcard. A new variant must get a classification before tests can compile.
+        fn import_kind(node: &Node) -> Option<ImportKind> {
+            match node {
+                Node::Import(
+                    ImportDirective::Alias { .. }
+                    | ImportDirective::Merge { .. }
+                    | ImportDirective::Selective { .. },
+                ) => Some(ImportKind::Import),
+                Node::Export(
+                    ExportDirective::ReExport { .. } | ExportDirective::Wildcard { .. },
+                ) => Some(ImportKind::ExportFrom),
+                Node::Text(_)
+                | Node::Interpolation(_)
+                | Node::EscapedBrace { .. }
+                | Node::If(_)
+                | Node::For(_)
+                | Node::Define(_)
+                | Node::Export(ExportDirective::Named { .. })
+                | Node::Include(_)
+                | Node::Message(_)
+                | Node::Block(_) => None,
+            }
+        }
+
+        let body = concat!(
+            "@import \"./alias.mds\" as a\n",
+            "@import \"./merge.mds\"\n",
+            "@import { x } from \"./selective.mds\"\n",
+            "@export x from \"./reexport.mds\"\n",
+            "@export * from \"./wildcard.mds\"\n",
+            "@export x\n",
+            "@include a\n",
+        );
+        let tokens = lexer::tokenize(body, "").expect("the fixture tokenizes");
+        let module = parser::parse_with_ctx(&tokens, "", body).expect("the fixture parses");
+        let ast::Module {
+            frontmatter: _,
+            extends: _,
+            body: nodes,
+        } = module;
+        let source = format!(
+            "---\nimports: [{{path: ./fm.mds, as: fm}}]\n---\n@extends \"./base.mds\"\n{body}"
+        );
+        let kinds: Vec<_> = scan_import_records(&source, ResolveAs::Standalone)
+            .expect("the fixture scans")
+            .into_iter()
+            .map(|record| record.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [ImportKind::Extends, ImportKind::Frontmatter]
+                .into_iter()
+                .chain(nodes.iter().filter_map(import_kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// The error the resolver reports when `main.mds`'s import of a missing module
     /// fails, `main.mds` holding `source` beside `others`.
     fn missing_import_error(source: &str, others: &[(&str, &str)]) -> SerializedError {

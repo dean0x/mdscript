@@ -183,23 +183,27 @@ export async function symlinkOrSkip(t, target, link, type) {
 }
 
 /**
- * `compileFile` each of `files` through the public `@mdscript/mds` API with the
- * backend forced by MDS_BACKEND, in a fresh process (the backend is a module-level
- * singleton). Returns the backend that actually ran and, per file, the error shape
- * it threw or `{ output }`. A relative file is typed relative to `options.cwd` when
- * given, and to the package root otherwise.
+ * Run a public file method for each file with the requested backend in a fresh process.
+ * Use `compileFile` by default. Return `{ output }` for compile unless `sourceMap` is true.
+ * For `checkFile` and `lintFile`, return their JSON result. On failure, return the error fields.
+ * Resolve relative files from `options.cwd` or the package root.
  */
 export async function compileFileOutcomes(backend, files, options = {}) {
   const script = `
-    import { init, compileFile, getBackend } from './dist/node.js';
+    import { init, compileFile, checkFile, lintFile, getBackend } from './dist/node.js';
     const files = JSON.parse(process.env.MDS_TEST_FILES);
+    const method = process.env.MDS_TEST_METHOD;
+    const run = { compileFile, checkFile, lintFile }[method];
+    const sourceMap = process.env.MDS_TEST_SOURCE_MAP === 'true';
     await init();
     if (process.env.MDS_TEST_CWD) process.chdir(process.env.MDS_TEST_CWD);
     const outcomes = [];
     for (const file of files) {
       try {
-        const r = await compileFile(file);
-        outcomes.push({ output: r.output });
+        const r = await run(file, sourceMap ? { sourceMap: true } : undefined);
+        if (method !== 'compileFile') outcomes.push(r);
+        else if (sourceMap) outcomes.push({ output: r.output, dependencies: r.dependencies, sources: r.sourceMap?.sources });
+        else outcomes.push({ output: r.output });
       } catch (err) {
         outcomes.push({ code: err.code, message: err.message, help: err.help ?? null, span: err.span ?? null });
       }
@@ -208,7 +212,14 @@ export async function compileFileOutcomes(backend, files, options = {}) {
   `;
   const { stdout } = await exec(process.execPath, ['--input-type=module', '-e', script], {
     cwd: pkgRoot,
-    env: { ...process.env, MDS_BACKEND: backend, MDS_TEST_FILES: JSON.stringify(files), MDS_TEST_CWD: options.cwd ?? '' },
+    env: {
+      ...process.env,
+      MDS_BACKEND: backend,
+      MDS_TEST_FILES: JSON.stringify(files),
+      MDS_TEST_CWD: options.cwd ?? '',
+      MDS_TEST_METHOD: options.method ?? 'compileFile',
+      MDS_TEST_SOURCE_MAP: String(options.sourceMap === true),
+    },
     timeout: 60000,
     maxBuffer: 16 * 1024 * 1024,
   });

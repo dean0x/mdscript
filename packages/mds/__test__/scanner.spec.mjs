@@ -1,6 +1,6 @@
 /**
  * Module scanner unit tests for @mdscript/mds universal package.
- * Tests: U-S1 through U-S10
+ * Tests: U-S*, U-SM*, U-SW*, U-PR*
  *
  * Tests the normalizeVirtualKey and buildModulesMap utilities directly
  * using the compiled JS output.
@@ -13,7 +13,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import fs, { existsSync, readdirSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
-import { chmod, mkdtemp, mkdir, open, realpath, symlink, writeFile, rm } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, open, readdir, realpath, symlink, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import {
   FORBIDDEN_PATH_CODEPOINTS,
@@ -37,6 +37,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Note: module-scanner is a Node-only utility (uses fs/promises).
 const {
   normalizeVirtualKey,
+  aliasRefusal,
   buildModulesMap: buildModulesMapWith,
   findProjectRoot,
   _unwrapWalkFinishedForTesting,
@@ -848,15 +849,10 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
     });
   });
 
-  // The WASM engine resolves an import BY NAME, from the importing module's key;
-  // NativeFs resolves it ON DISK, from the importing module's canonical directory.
-  // A module's key is its canonical path (#414), so through a symlinked directory the
-  // two agree for every import except one whose own path names the link and leaves
-  // it through `..`: its key names the directory beside the link, the file NativeFs
-  // reads sits beside the link's target. That is POSIX, where the OS applies each
-  // `..` after the link before it. Windows collapses `sub\..` lexically before it
-  // follows the link (a junction here), on both backends, so there the two agree for
-  // that import too, and an entry typed that way names the file beside the link.
+  // The WASM engine resolves a name from the importer's canonical key (#414).
+  // On POSIX, NativeFs applies `..` after it follows the link. The scanner
+  // supplies an alias when that path names a file other than the lexical key.
+  // Windows collapses `sub\..` lexically on both backends.
   const lexicalDotDot = process.platform === 'win32';
 
   /** sub -> deep/other; sub/y.mds imports ../z.mds; both z.mds files exist. */
@@ -875,7 +871,7 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
     return path.join(dir, 'main.mds');
   }
 
-  test("U-SM22: an import naming a symlinked directory and leaving it through '..' is never read from the other side — refused on POSIX, lexical on Windows", async () => {
+  test("U-SM22: a directory link followed by '..' gives a canonical alias on POSIX and a lexical key on Windows", async () => {
     await withProject(async (dir) => {
       // A module reached through the link is keyed by its canonical path, so its own
       // `../z.mds` names, by key and on disk alike, the z.mds beside the link's target.
@@ -897,12 +893,9 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
         assert.deepEqual(built.aliases, {});
       } else {
         // POSIX: its key names the root's z.mds, the file on disk is deep/z.mds.
-        const err = await rejectionOf(build, 'U-SM22');
-        assert.equal(err.code, 'mds::import', err.message);
-        assert.equal(
-          err.message,
-          `import error: import path leaves a symlinked directory through '..', which the WASM backend cannot resolve: "./sub/../z.mds"`,
-        );
+        const built = await build;
+        assert.deepEqual(built.modules, { 'through.mds': throughSource, 'deep/z.mds': 'DEEP-Z\n' });
+        assert.deepEqual(built.aliases, { 'z.mds': 'deep/z.mds' });
       }
     });
     // Control: the same tree with `sub` a real directory builds, and `../z.mds`
@@ -931,7 +924,7 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
     });
   });
 
-  test('U-SM24: through a symlinked directory, the WASM backend compiles what the native backend compiles, or refuses', async (t) => {
+  test('U-SM24: both backends compile the same files through symlinked directories', async (t) => {
     const engines = await loadEngines();
     if (!requireEngines(t, engines, 'U-SM24')) return;
     await withProject(async (dir) => {
@@ -945,10 +938,7 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
       // A module reached through the link imports `../z.mds`: both backends read
       // deep/z.mds, the module's key being its canonical path (#414).
       const dotDot = await dotDotOutOfLink(dir, true);
-      // An import whose own path runs through the link and back out. On POSIX NativeFs
-      // reads deep/z.mds; the WASM backend refuses rather than compile the root z.mds
-      // its engine would look up by name (difference 5). On Windows both collapse
-      // `sub\..` lexically and compile the root z.mds.
+      // On POSIX the import names deep/z.mds. On Windows it names the root z.mds.
       const through = path.join(dir, 'through.mds');
       await writeFile(through, '@import "./sub/../z.mds" as z\n@include z\n');
       // An ENTRY typed through the link and back out with `..`: the OS applies the
@@ -961,20 +951,28 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
       const outOfLink = { output: lexicalDotDot ? 'ROOT-Z\n' : 'DEEP-Z\n' };
 
       const files = [alias, dotDot, entryOutOfLink, through];
-      const [nativeAlias, nativeDotDot, nativeEntry, nativeThrough] = await compileFileOutcomes('native', files);
-      const [wasmAlias, wasmDotDot, wasmEntry, wasmThrough] = await compileFileOutcomes('wasm', files);
+      const [nativeAlias, nativeDotDot, nativeEntry, nativeOutput] = await compileFileOutcomes('native', files);
+      const [wasmAlias, wasmDotDot, wasmEntry, wasmOutput] = await compileFileOutcomes('wasm', files);
       assert.equal(nativeAlias.output, 'X\nY\nX\n', JSON.stringify(nativeAlias));
       assert.deepEqual(wasmAlias, nativeAlias);
       assert.equal(nativeDotDot.output, 'ROOT-Z\nY=\nDEEP-Z\n', JSON.stringify(nativeDotDot));
       assert.deepEqual(wasmDotDot, nativeDotDot);
       assert.deepEqual(nativeEntry, outOfLink);
       assert.deepEqual(wasmEntry, nativeEntry);
-      assert.deepEqual(nativeThrough, outOfLink);
-      if (lexicalDotDot) {
+      assert.deepEqual(nativeOutput, outOfLink);
+      assert.deepEqual(wasmOutput, nativeOutput);
+      if (!lexicalDotDot) {
+        const root = await realpath(dir);
+        const [native] = await compileFileOutcomes('native', [through], { sourceMap: true });
+        const [wasmThrough] = await compileFileOutcomes('wasm', [through], { sourceMap: true });
+        // Native dependencies are absolute. Compare their spelling below the root.
+        const nativeThrough = { ...native, dependencies: native.dependencies.map((dep) => path.relative(root, dep)) };
+        assert.deepEqual(nativeThrough, {
+          ...outOfLink,
+          dependencies: ['deep/z.mds'],
+          sources: ['through.mds', 'deep/z.mds'],
+        });
         assert.deepEqual(wasmThrough, nativeThrough);
-      } else {
-        assert.equal(wasmThrough.code, 'mds::import', JSON.stringify(wasmThrough));
-        assert.equal(wasmThrough.output, undefined, JSON.stringify(wasmThrough));
       }
     });
   });
@@ -1088,25 +1086,26 @@ describe('buildModulesMap — a filesystem error is coded, never a raw Node erro
       await writeFile(secret, 'S\n');
       await chmod(secret, 0o000);
       try {
-        const err = await refusal(secret, 'U-SM28 entry');
-        assert.equal(err.code, 'mds::io', err.message);
-        assert.equal(err.message, `cannot read ${secret}: EACCES`);
-        assertNoHelp(err, 'U-SM28 entry');
+        const raw = await rejectionOf(open(secret), 'U-SM28 raw open');
+        assert.equal(raw.code, 'EACCES');
+        assert.ok(raw.message.includes(dir));
 
-        await writeFile(path.join(dir, 'main.mds'), '@import "./secret.mds" as s\n');
-        const imported = await refusal(path.join(dir, 'main.mds'), 'U-SM28 import');
-        assert.equal(imported.code, 'mds::io', imported.message);
-        assert.equal(imported.message, 'cannot read ./secret.mds: EACCES');
-        assertNoHelp(imported, 'U-SM28 import');
-
+        const main = path.join(dir, 'main.mds');
+        await writeFile(main, '@import "./secret.mds" as s\n');
+        const files = [secret, main];
         const engines = await loadEngines();
         if (!requireEngines(t, engines, 'U-SM28')) return;
-        const [native] = await compileFileOutcomes('native', [secret]);
-        const [wasm] = await compileFileOutcomes('wasm', [secret]);
-        // The code agrees; the message names the path as written and the errno name,
-        // where native names its root-relative display path and the OS error text.
-        assert.equal(native.code, 'mds::io', JSON.stringify(native));
-        assert.equal(wasm.code, native.code, JSON.stringify({ wasm, native }));
+        const native = await compileFileOutcomes('native', files);
+        const wasm = await compileFileOutcomes('wasm', files);
+        for (const [i, file] of files.entries()) {
+          assert.equal(native[i].code, 'mds::io', JSON.stringify(native[i]));
+          assert.ok(native[i].message.startsWith('cannot read secret.mds: '));
+          assert.deepEqual(wasm[i], readIoShape('secret.mds', 'EACCES'));
+          assert.ok(!wasm[i].message.includes(dir));
+          const err = await refusal(file, 'U-SM28 scanner');
+          assert.deepEqual(errorShape(err), wasm[i]);
+          assertNoHelp(err, 'U-SM28 scanner');
+        }
       } finally {
         await chmod(secret, 0o644);
       }
@@ -1140,9 +1139,12 @@ describe('buildModulesMap — a filesystem error is coded, never a raw Node erro
   );
 });
 
-// The refusals NativeFs makes itself — a symlinked final component, a module
-// outside the project root, a module that is not a regular file — carry its code
-// and name the path as written, never the resolved one (#408).
+function readIoShape(display, reason = 'not a regular file') {
+  return { code: 'mds::io', message: `cannot read ${display}: ${reason}`, help: null, span: null };
+}
+
+// Symlink and escape refusals name the path as written. Read refusals name the
+// file below the project root.
 describe('buildModulesMap — symlink, root-escape and non-file refusals match native (#408)', () => {
   const dirLinkType = process.platform === 'win32' ? 'junction' : 'dir';
 
@@ -1183,19 +1185,19 @@ describe('buildModulesMap — symlink, root-escape and non-file refusals match n
     });
   });
 
-  test('U-SM31: a module that is not a regular file is mds::io, naming the path as written', async () => {
+  test('U-SM31: the scanner names a non-regular file below the project root', async () => {
     await withNestedProject(async (proj) => {
-      await mkdir(path.join(proj, 'dir.mds'));
-      await writeFile(path.join(proj, 'main.mds'), '@import "./dir.mds" as d\n');
-      const imported = await rejectionOf(buildModulesMap(path.join(proj, 'main.mds'), scanImports), 'U-SM31 import');
-      const entry = await withCwd(proj, () => rejectionOf(buildModulesMap('dir.mds', scanImports), 'U-SM31 entry'));
-      const canonicalProj = await realpath(proj);
-      for (const [err, shown, label] of [[imported, './dir.mds', 'U-SM31 import'], [entry, 'dir.mds', 'U-SM31 entry']]) {
-        assert.equal(err.code, 'mds::io', `${label}: ${err.message}`);
-        assertNoHelp(err, label);
-        // Refused before it is opened, with native's reason, on every OS (#428).
-        assert.equal(err.message, `cannot read ${shown}: not a regular file`, label);
-        assert.ok(!err.message.includes(canonicalProj), `${label}: no absolute path; got: ${err.message}`);
+      const dir = path.join(proj, 'sub', 'dir.mds');
+      await mkdir(dir, { recursive: true });
+      const main = await writeFixture(proj, 'sub/main.mds', '@import "./dir.mds" as d\n');
+      const dotted = await writeFixture(proj, 'sub/dotted.mds', '@import "./dir.mds/." as d\n');
+      const files = [dir, main, dotted];
+      const native = await compileFileOutcomes('native', files);
+      for (const [i, file] of files.entries()) {
+        assert.deepEqual(native[i], readIoShape('sub/dir.mds'));
+        const err = await rejectionOf(buildModulesMap(file, scanImports), 'U-SM31');
+        assert.deepEqual(errorShape(err), native[i]);
+        assertNoHelp(err, 'U-SM31');
       }
     });
   });
@@ -1207,31 +1209,27 @@ describe('buildModulesMap — symlink, root-escape and non-file refusals match n
       await mkdir(path.join(proj, 'dir.mds'));
       await writeFile(path.join(proj, 'imp-dir.mds'), '@import "./dir.mds" as d\nhi\n');
       await writeFile(path.join(proj, 'ok.mds'), 'OK\n');
-      // [entry, typed from the project directory; the path native names the module by,
-      // below the project root; the path the WASM backend names it by, as written].
-      // For an entry typed from the root the two are one, so the whole error is too.
       const rows = [
-        ['dir.mds', 'dir.mds', 'dir.mds'],
-        ['imp-dir.mds', 'dir.mds', './dir.mds'],
+        ['dir.mds', 'dir.mds'],
+        ['imp-dir.mds', 'dir.mds'],
       ];
       if (process.platform !== 'win32') {
         // A FIFO nobody writes to: opening it blocked both backends.
         execFileSync('mkfifo', [path.join(proj, 'fifo.mds')]);
         await writeFile(path.join(proj, 'imp-fifo.mds'), '@import "./fifo.mds" as f\nhi\n');
-        rows.push(['fifo.mds', 'fifo.mds', 'fifo.mds'], ['imp-fifo.mds', 'fifo.mds', './fifo.mds']);
+        rows.push(['fifo.mds', 'fifo.mds'], ['imp-fifo.mds', 'fifo.mds']);
       }
       const files = [...rows.map(([entry]) => entry), 'ok.mds'];
       const native = await compileFileOutcomes('native', files, { cwd: proj });
       const wasm = await compileFileOutcomes('wasm', files, { cwd: proj });
-      const refusal = (shown) => ({ code: 'mds::io', message: `cannot read ${shown}: not a regular file`, help: null, span: null });
-      // Every row is judged before anything is asserted.
+      // Compare all rows before the final assertion.
       const mismatches = [];
       const judge = (label, actual, expected) => {
         if (!isDeepStrictEqual(actual, expected)) mismatches.push({ label, actual, expected });
       };
-      for (const [i, [entry, nativeShown, wasmShown]] of rows.entries()) {
-        judge(`${entry} (native)`, native[i], refusal(nativeShown));
-        judge(`${entry} (wasm)`, wasm[i], refusal(wasmShown));
+      for (const [i, [entry, display]] of rows.entries()) {
+        judge(`${entry} (native)`, native[i], readIoShape(display));
+        judge(`${entry} (wasm)`, wasm[i], native[i]);
       }
       // Control: a regular file compiles on both.
       judge('ok.mds (native)', native[rows.length], { output: 'OK\n' });
@@ -1417,12 +1415,10 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
         path.join(proj, 'chain', 'c1.mds'),
         await write('exact.mds', 'x'.repeat(MAX_FILE_SIZE)),
       ];
-      // `./` names the importing module's own directory: NativeFs reads it and fails
-      // with `mds::io`. The message names the path differently on the two backends —
-      // every `cannot read` message does (see buildModulesMap).
-      const ownDir = await write('own.mds', '@import "./" as o\nhi\n');
+      // `./` names the importer's directory. The root has display `.`.
+      const ownDirs = await Promise.all(['own.mds', 'sub/own.mds'].map((file) => write(file, '@import "./" as o\nhi\n')));
 
-      const files = [...rows.map(([, file]) => file), ...atTheCap, ownDir];
+      const files = [...rows.map(([, file]) => file), ...atTheCap, ...ownDirs];
       const native = await compileFileOutcomes('native', files);
       const wasm = await compileFileOutcomes('wasm', files);
       // Every row is judged before anything is asserted, so a row that fails on one
@@ -1440,9 +1436,11 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
         judge(`control ${atTheCap[j]} (native)`, native[i], 'an output', typeof native[i]?.output === 'string');
         judge(`control ${atTheCap[j]}`, wasm[i], native[i]);
       }
-      const i = files.length - 1;
-      judge('import: ./ (native)', native[i], { code: 'mds::io' }, native[i]?.code === 'mds::io');
-      judge('import: ./', wasm[i], { code: 'mds::io' }, wasm[i]?.code === 'mds::io');
+      for (const [j, display] of ['.', 'sub'].entries()) {
+        const i = rows.length + atTheCap.length + j;
+        judge(`import: ./ from ${display} (native)`, native[i], readIoShape(display));
+        judge(`import: ./ from ${display} (WASM)`, wasm[i], native[i]);
+      }
       assert.deepEqual(mismatches, []);
     });
   });
@@ -1635,7 +1633,7 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
     });
   });
 
-  test('U-SM38: an error the engine raises is identical on both backends, but a later refusal pre-empts it on WASM (difference 8)', async (t) => {
+  test('U-SM38: an error the engine raises is identical on both backends, but a later refusal pre-empts it on WASM (difference 7)', async (t) => {
     const engines = await loadEngines();
     if (!requireEngines(t, engines, 'U-SM38')) return;
     await withNestedProject(async (proj) => {
@@ -2133,7 +2131,7 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       const calls = [];
       const realRealpath = fs.promises.realpath;
       fs.promises.realpath = function countedRealpath(p, ...rest) {
-        calls.push(String(p));
+        calls.push(path.resolve(String(p)));
         return realRealpath.call(this, p, ...rest);
       };
       syncBuiltinESMExports();
@@ -2157,13 +2155,20 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
     (process.platform === 'darwin' && 'APFS refuses a file name that is not valid UTF-8: this row runs on Linux (CI)') ||
     (process.platform === 'win32' && 'Windows file names are UTF-16, never bytes: this row runs on Linux (CI)');
 
-  test('U-SM48: a path resolved into a directory whose name is not valid UTF-8 is refused as native refuses it, never read as its U+FFFD twin', { skip: noByteNames }, async (t) => {
+  async function makeNonUtf8Directory(proj) {
+    const name = Buffer.concat([Buffer.from('sub'), Buffer.from([0xff])]);
+    const dir = Buffer.concat([Buffer.from(proj + path.sep), name]);
+    await mkdir(dir);
+    const entries = await readdir(proj, { encoding: 'buffer' });
+    assert.ok(entries.some((entry) => entry.equals(name)), 'the directory name must contain byte 0xFF');
+    return dir;
+  }
+
+  test('U-SM48: both backends refuse the non-UTF-8 directory, but only native reports the missing file first', { skip: noByteNames }, async (t) => {
     const engines = await loadEngines();
     if (!requireEngines(t, engines, 'U-SM48')) return;
     await withNestedProject(async (proj) => {
-      // `sub` and the byte 0xFF, built from bytes: no string names it. `link` leads there.
-      const hostile = Buffer.concat([Buffer.from(path.join(proj, 'sub')), Buffer.from([0xff])]);
-      await mkdir(hostile);
+      const hostile = await makeNonUtf8Directory(proj);
       await writeFile(Buffer.concat([hostile, Buffer.from(`${path.sep}x.mds`)]), 'REAL\n');
       await symlink(hostile, path.join(proj, 'link'), 'dir');
       // Its twin: the name a lossy decoding of the link's target spells, with U+FFFD for
@@ -2197,6 +2202,36 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       const direct = path.join(twin, 'x.mds');
       assert.deepEqual(await compileFileOutcomes('native', [direct]), [{ output: 'TWIN\n' }]);
       assert.deepEqual(await compileFileOutcomes('wasm', [direct]), [{ output: 'TWIN\n' }]);
+
+      const missing = path.join(proj, 'missing-main.mds');
+      const missingImport = '@import "./link/missing.mds" as m';
+      await writeFile(missing, `${missingImport}\n@include m\n`);
+      assert.deepEqual(await compileFileOutcomes('native', [missing]), [{
+        code: 'mds::file_not_found',
+        message: 'file not found: ./link/missing.mds',
+        help: FILE_NOT_FOUND_HELP,
+        span: firstLineSpan(missingImport),
+      }]);
+      assert.deepEqual(await compileFileOutcomes('wasm', [missing]), [refused('./link/missing.mds')]);
+    });
+  });
+
+  test('U-SM48b: an unused lexical directory with a non-UTF-8 target does not prevent an alias', { skip: noByteNames }, async () => {
+    await withNestedProject(async (proj) => {
+      const hostile = await makeNonUtf8Directory(proj);
+      await symlink(hostile, path.join(proj, 'q'), 'dir');
+      await mkdir(path.join(proj, 'd/e'), { recursive: true });
+      await symlink(path.join(proj, 'd/e'), path.join(proj, 'sub'), 'dir');
+      await mkdir(path.join(proj, 'd/q'));
+      await writeFixture(proj, 'd/q/z.mds', 'CANONICAL\n');
+      const entry = await writeFixture(proj, 'main.mds', importLine('./sub/../q/z.mds') + '@include z\n');
+
+      const native = await compileFileOutcomes('native', [entry]);
+      assert.deepEqual(native, [{ output: 'CANONICAL\n' }]);
+      assert.deepEqual(await compileFileOutcomes('wasm', [entry]), native);
+      assert.notEqual(wasmEngine, null, 'the current WASM build is required');
+      const { aliases } = await buildModulesMapWith(entry, wasmEngine);
+      assert.deepEqual(aliases, { 'q/z.mds': 'd/q/z.mds' });
     });
   });
 
@@ -2252,6 +2287,518 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
     assert.throws(_unwrapWalkFinishedForTesting, (err) => {
       assert.ok(err instanceof Error, `an Error, not ${String(err)}`);
       assert.match(err.message, /after its scan had finished/);
+      return true;
+    });
+  });
+});
+
+const linkDotDot = './sub/../z.mds';
+const plainZ = './z.mds';
+const posixLinkOnly = process.platform === 'win32' && 'Windows resolves dot-dot before it follows a link';
+
+function conflictShape(shown, context = '') {
+  return {
+    code: 'mds::import',
+    message: `import error: two imports name different files by one module key, which the WASM backend cannot resolve: "${shown}"${context}`,
+    help: null,
+    span: null,
+  };
+}
+
+const importLine = (shown, as = 'z') => `@import "${shown}" as ${as}\n`;
+const renderPair = (first, second) => importLine(first, 'a') + importLine(second, 'b') + '@include a\n@include b\n';
+
+async function writeFixture(proj, rel, source) {
+  const file = path.join(proj, rel);
+  await writeFile(file, source);
+  return file;
+}
+
+async function linkFixture(proj, link = 'sub', base = 'deep') {
+  const target = path.join(proj, base, 'other');
+  await mkdir(target, { recursive: true });
+  await symlink(target, path.join(proj, link), 'dir');
+}
+
+test('U-S17: the alias guard refuses conflicts and allows one canonical target per key', () => {
+  const long = `${'d/'.repeat(256)}z.mds`;
+  const conflict = (shown) => conflictShape(shown);
+  const rows = [
+    ['c2 before the stop', {}, [['z.mds', 'deep/z.mds']], [], 'z.mds', 'z.mds', plainZ, conflict(plainZ)],
+    ['c2 before c1 and c3', { 'z.mds': '' }, [['deep/z.mds', 'a'], ['z.mds', 'b']], [], 'deep/z.mds', 'z.mds', plainZ, conflict(plainZ)],
+    ['c1 with empty source', { 'z.mds': '' }, [], [], 'deep/z.mds', 'z.mds', linkDotDot, conflict(linkDotDot)],
+    ['c3 later dot-dot', {}, [['z.mds', 'else/z.mds']], [], 'deep/z.mds', 'z.mds', linkDotDot, conflict(linkDotDot)],
+    ['c3 earlier dot-dot', {}, [['z.mds', 'deep/z.mds']], ['z.mds'], 'else/z.mds', 'z.mds', plainZ, conflict(plainZ)],
+    ['c3 neither', {}, [['z.mds', 'else/z.mds']], [], 'deep/z.mds', 'z.mds', '../z.mds', {
+      code: 'mds::import', message: 'import error: symlinks are not allowed in imports: ../z.mds', help: null, span: null,
+    }],
+    ['c4 alias target', {}, [], [], long, 'z.mds', linkDotDot, {
+      code: 'mds::resource_limit',
+      message: `resource limit exceeded: import path exceeds maximum segment count (256): "${linkDotDot}"`,
+      help: null,
+      span: null,
+    }],
+    ['empty alias', {}, [], [], long, '', './', undefined],
+    ['identity', {}, [], [], long, long, plainZ, undefined],
+    ['same target', { 'deep/z.mds': '' }, [['z.mds', 'deep/z.mds']], ['z.mds'], 'deep/z.mds', 'z.mds', linkDotDot, undefined],
+    ...['constructor', 'toString', '__proto__'].map((name) => [name, {}, [], [], 'deep/z.mds', name, name, undefined]),
+  ];
+  for (const [label, modules, aliases, dotDotAliases, key, aliasKey, shown, expected] of rows) {
+    const err = aliasRefusal(modules, new Map(aliases), { key, aliasKey }, shown, new Set(dotDotAliases));
+    assert.deepEqual(err === undefined ? undefined : errorShape(err), expected, label);
+  }
+});
+
+test('U-SM51: aliases refuse two targets and keep a module read error first', { skip: posixLinkOnly }, async () => {
+  await withNestedProject(async (proj) => {
+    await linkFixture(proj);
+    await linkFixture(proj, 'l1', 'one');
+    await linkFixture(proj, 'l2', 'two');
+    await mkdir(path.join(proj, 'a'));
+    await writeFixture(proj, 'z.mds', 'ROOT\n');
+    await writeFixture(proj, 'deep/z.mds', 'DEEP\n');
+    await writeFixture(proj, 'one/z.mds', 'ONE\n');
+    await writeFixture(proj, 'two/z.mds', 'TWO\n');
+    const rows = [
+      ['plain-first.mds', renderPair(plainZ, linkDotDot), 'ROOT\nDEEP\n', conflictShape(linkDotDot)],
+      ['link-first.mds', renderPair(linkDotDot, plainZ), 'DEEP\nROOT\n', conflictShape(plainZ)],
+      ['real-dir.mds', renderPair(linkDotDot, './a/../z.mds'), 'DEEP\nROOT\n', conflictShape('./a/../z.mds')],
+      ['two-links.mds', renderPair('./l1/../z.mds', './l2/../z.mds'), 'ONE\nTWO\n', conflictShape('./l2/../z.mds')],
+      ['alone.mds', importLine(linkDotDot) + '@include z\n', 'DEEP\n'],
+      ['known-target.mds', renderPair('./deep/z.mds', linkDotDot), 'DEEP\nDEEP\n'],
+      ['known-target-conflict.mds', importLine('./deep/z.mds', 'known') + renderPair(plainZ, linkDotDot),
+        'ROOT\nDEEP\n', conflictShape(linkDotDot)],
+      ['self.mds', importLine('./sub/../self.mds') + '@include z\n', 'SELF TARGET\n', conflictShape('./sub/../self.mds')],
+      ['outer.mds', importLine('./self.mds') + '@include z\n', 'SELF TARGET\n', conflictShape('./sub/../self.mds')],
+    ];
+    await writeFixture(proj, 'deep/self.mds', 'SELF TARGET\n');
+    const invalid = Buffer.from([0xff]);
+    await writeFixture(proj, 'deep/bad-link.mds', invalid);
+    await writeFixture(proj, 'bad-link.mds', 'GOOD\n');
+    await writeFixture(proj, 'deep/bad-plain.mds', 'GOOD\n');
+    await writeFixture(proj, 'bad-plain.mds', invalid);
+    for (const [entry, first, second, bad] of [
+      ['link-bad.mds', './bad-link.mds', './sub/../bad-link.mds', 'deep/bad-link.mds'],
+      ['plain-bad.mds', './sub/../bad-plain.mds', './bad-plain.mds', 'bad-plain.mds'],
+    ]) {
+      const error = { code: 'mds::io', message: `invalid UTF-8 in ${bad}: invalid utf-8 sequence of 1 bytes from index 0`, help: null, span: null };
+      rows.push([entry, renderPair(first, second), error]);
+    }
+    const files = await Promise.all(rows.map(([name, source]) => writeFixture(proj, name, source)));
+    const native = await compileFileOutcomes('native', files);
+    const wasm = await compileFileOutcomes('wasm', files);
+    for (const [i, [label, , expected, refusal]] of rows.entries()) {
+      assert.deepEqual(native[i], typeof expected === 'string' ? { output: expected } : expected, `${label} (native)`);
+      assert.deepEqual(wasm[i], refusal ?? native[i], label);
+    }
+  });
+});
+
+test('U-SM51b: a return to an active module records an alias or refuses its conflict', { skip: posixLinkOnly }, async () => {
+  await withNestedProject(async (proj) => {
+    await linkFixture(proj);
+    const loop = await writeFixture(proj, 'deep/loop.mds', importLine('../sub/../loop.mds'));
+    const shown = '../sub/../overlap.mds';
+    await writeFixture(proj, 'overlap.mds', 'ROOT\n');
+    const overlap = await writeFixture(proj, 'deep/overlap.mds', renderPair('../overlap.mds', shown));
+    const files = [loop, overlap];
+    const native = await compileFileOutcomes('native', files);
+    assert.deepEqual(native.map((outcome) => outcome.code), ['mds::circular_import', 'mds::circular_import']);
+    assert.deepEqual(await compileFileOutcomes('wasm', files), [native[0], conflictShape(shown)]);
+  });
+});
+
+test('U-SM52: dot-dot after a link keeps both containment checks', { skip: posixLinkOnly }, async () => {
+  await withNestedProject(async (proj, parent) => {
+    await linkFixture(proj);
+    await mkdir(path.join(parent, 'outside'));
+    await symlink(path.join(parent, 'outside'), path.join(proj, 'out'), 'dir');
+    await writeFixture(parent, 'z.mds', 'OUT\n');
+    await writeFixture(proj, 'z.mds', 'IN\n');
+    await writeFixture(proj, 'deep/z.mds', 'DEEP\n');
+    const missing = (shown) => ({
+      code: 'mds::file_not_found', message: `file not found: ${shown}`, help: FILE_NOT_FOUND_HELP,
+      span: firstLineSpan(importLine(shown).trimEnd()),
+    });
+    const escape = (shown) => ({
+      code: 'mds::import', message: `import error: import path escapes project directory: "${shown}"`, help: null, span: null,
+    });
+    const rows = [
+      ['./out/../z.mds', escape('./out/../z.mds')],
+      [linkDotDot, { output: 'DEEP\n' }],
+      [`${linkDotDot}/.`, { output: 'DEEP\n' }],
+      ['./out/../missing.mds', missing('./out/../missing.mds'), escape('./out/../missing.mds')],
+      ['./sub/../missing.mds', missing('./sub/../missing.mds')],
+      ['./sub/../../z.mds', { output: 'IN\n' }, escape('./sub/../../z.mds')],
+    ];
+    const files = await Promise.all(rows.map(([shown], i) => writeFixture(proj, `row-${i}.mds`, importLine(shown) + '@include z\n')));
+    const native = await compileFileOutcomes('native', files);
+    const wasm = await compileFileOutcomes('wasm', files);
+    for (const [i, [shown, expected, refusal]] of rows.entries()) {
+      assert.deepEqual(native[i], expected, `${shown} (native)`);
+      assert.deepEqual(wasm[i], refusal ?? native[i], shown);
+    }
+  });
+});
+
+test('U-SM53: the unused lexical directory does not affect the canonical target', { skip: posixLinkOnly }, async (t) => {
+  for (const kind of ['missing', 'regular file']) {
+    await t.test(kind, async () => {
+      await withNestedProject(async (proj) => {
+        await linkFixture(proj);
+        await mkdir(path.join(proj, 'deep', 'lex'));
+        await writeFixture(proj, 'deep/lex/z.mds', 'DEEP\n');
+        if (kind === 'regular file') await writeFixture(proj, 'lex', 'NOT A DIRECTORY\n');
+        const entry = await writeFixture(proj, 'main.mds', importLine('./sub/../lex/z.mds') + '@include z\n');
+        const native = await compileFileOutcomes('native', [entry]);
+        assert.deepEqual(native, [{ output: 'DEEP\n' }]);
+        assert.deepEqual(await compileFileOutcomes('wasm', [entry]), native);
+      });
+    });
+  }
+});
+
+test('U-SM54: every import kind uses the canonical alias and refuses a conflict', { skip: posixLinkOnly }, async () => {
+  await withNestedProject(async (proj) => {
+    await linkFixture(proj);
+    await writeFixture(proj, 'deep/z.mds', '@define f():\nFROM DEEP\n@end\nDEEP\n');
+    await writeFixture(proj, 'z.mds', 'ROOT\n');
+    const plain = importLine(plainZ, 'plain');
+    const kinds = [
+      ['import', importLine(linkDotDot) + '@include z\n', plain + importLine(linkDotDot) + '@include z\n', 'DEEP\n', conflictShape(linkDotDot)],
+      ['extends', `@extends "${linkDotDot}"\n`, plain + importLine('./extends.mds', 'child') + '@include child\n', 'DEEP\n', conflictShape(linkDotDot)],
+      ['frontmatter', `---\nimports:\n  - path: ${linkDotDot}\n    as: z\n---\n@include z\n`,
+        `---\nimports:\n  - path: ${plainZ}\n  - path: ${linkDotDot}\n    as: z\n---\n@include z\n`, 'DEEP\n', conflictShape(linkDotDot, ' (in frontmatter imports[1])')],
+      ['export', `@export f from "${linkDotDot}"\nBODY\n`, plain + `@export f from "${linkDotDot}"\nBODY\n`, 'BODY\n', conflictShape(linkDotDot)],
+    ];
+    const rows = kinds.flatMap(([kind, alone, collision, output, refusal]) => [
+      [`${kind}.mds`, alone, output], [`${kind}-conflict.mds`, collision, output, refusal],
+    ]);
+    const entries = await Promise.all(rows.map(([name, source]) => writeFixture(proj, name, source)));
+    const native = await compileFileOutcomes('native', entries);
+    const wasm = await compileFileOutcomes('wasm', entries);
+    for (const [i, [label, , output, refusal]] of rows.entries()) {
+      assert.deepEqual(native[i], { output }, `${label} (native)`);
+      assert.deepEqual(wasm[i], refusal ?? native[i], label);
+    }
+  });
+});
+
+test('U-SM55: check and lint use aliases and the raw engine refuses a module-key alias', { skip: posixLinkOnly }, async () => {
+  await withNestedProject(async (proj) => {
+    assert.notEqual(wasmEngine, null, 'Build the WASM engine first');
+    const { fileOpts } = await import('../dist/backend/wasm.js');
+    await linkFixture(proj);
+    const finding = '---\nunused: value\n---\n';
+    const target = await writeFixture(proj, 'deep/z.mds', `${finding}DEEP\n`);
+    const through = await writeFixture(proj, 'through.mds', finding + importLine(linkDotDot) + '@include z\n');
+    const { entryFilename, modules, aliases } = await buildModulesMapWith(through, wasmEngine);
+    assert.deepEqual(Object.keys(modules).sort(), ['deep/z.mds', 'through.mds']);
+    const rules = (outcome) => outcome.files.flatMap((file) => file.diagnostics.map((diag) => diag.rule));
+    // Lint checks the graph, but it reports findings for the entry only.
+    const [nativeTarget] = await compileFileOutcomes('native', [target], { method: 'lintFile' });
+    assert.deepEqual(rules(nativeTarget), ['unused-variable']);
+    for (const method of ['checkFile', 'lintFile']) {
+      const [native] = await compileFileOutcomes('native', [through], { method });
+      if (method === 'checkFile') assert.ok(Array.isArray(native.warnings), JSON.stringify(native));
+      else assert.deepEqual(rules(native), ['unused-variable']);
+      assert.deepEqual(await compileFileOutcomes('wasm', [through], { method }), [native], method);
+    }
+    const rootZ = await writeFixture(proj, 'z.mds', 'ROOT\n');
+    const collision = await writeFixture(proj, 'collision.mds', finding + renderPair(plainZ, linkDotDot));
+    for (const method of ['checkFile', 'lintFile']) {
+      const [native] = await compileFileOutcomes('native', [collision], { method });
+      if (method === 'checkFile') assert.ok(Array.isArray(native.warnings), JSON.stringify(native));
+      else assert.deepEqual(rules(native), ['unused-variable', 'duplicate-import']);
+      assert.deepEqual(await compileFileOutcomes('wasm', [collision], { method }), [conflictShape(linkDotDot)], method);
+    }
+    const { [entryFilename]: source, ...deps } = modules;
+    const { modules: plainModules } = await buildModulesMapWith(rootZ, wasmEngine);
+    const options = fileOpts(entryFilename, { ...deps, ...plainModules }, aliases);
+    const err = thrownBy(() => wasmEngine.compile(source, options), 'module-key alias');
+    assert.deepEqual(errorShape(err), {
+      code: 'mds::invalid_options',
+      message: 'options.moduleAliases["z.mds"]: the alias is a module key itself',
+      help: null,
+      span: null,
+    });
+  });
+});
+
+test('U-SM56: a key over 256 segments gives a scanner resource limit', { skip: process.platform === 'win32' && 'The fixture exceeds MAX_PATH' }, async () => {
+  await withNestedProject(async (proj) => {
+    assert.notEqual(wasmEngine, null, 'Build the WASM engine first');
+    const { fileOpts } = await import('../dist/backend/wasm.js');
+    const deepKey = 'd/'.repeat(255);
+    const cwd = path.join(proj, deepKey);
+    await mkdir(path.join(cwd, 'd', 'd'), { recursive: true });
+    await writeFixture(cwd, 'd/x.mds', 'OVER\n');
+    await writeFixture(cwd, 'x.mds', 'AT\n');
+    await writeFixture(cwd, 'over.mds', importLine('./d/x.mds') + '@include z\n');
+    await writeFixture(cwd, 'at.mds', importLine('./x.mds') + '@include z\n');
+    const { entryFilename } = await withCwd(cwd, () => buildModulesMapWith('at.mds', wasmEngine));
+    assert.equal(entryFilename.split('/').length, 256);
+    const limit = (shown) => ({
+      code: 'mds::resource_limit', message: `resource limit exceeded: import path exceeds maximum segment count (256): "${shown}"`,
+      help: null, span: null,
+    });
+    const files = ['over.mds', 'at.mds'];
+    const native = await compileFileOutcomes('native', files, { cwd });
+    assert.deepEqual(native, [{ output: 'OVER\n' }, { output: 'AT\n' }]);
+    assert.deepEqual(await compileFileOutcomes('wasm', files, { cwd }), [limit('./d/x.mds'), native[1]]);
+
+    const targetKey = `${deepKey}d/d/x.mds`;
+    const target = await writeFixture(proj, targetKey, 'ALIAS\n');
+    assert.equal(targetKey.split('/').length, 258);
+    assert.ok(Buffer.byteLength(target) < 1024, 'The deep fixture fits under PATH_MAX');
+    await symlink(path.dirname(target), path.join(proj, 'alias'), 'dir');
+    const shown = './alias/x.mds';
+    const source = importLine(shown) + '@include z\n';
+    const entry = await writeFixture(proj, 'alias.mds', source);
+    assert.deepEqual(await compileFileOutcomes('native', [entry]), [{ output: 'ALIAS\n' }]);
+    const [wasm] = await compileFileOutcomes('wasm', [entry]);
+    assert.deepEqual(wasm, limit(shown));
+    assert.doesNotMatch(wasm.message, /moduleAliases/);
+    const options = fileOpts('alias.mds', { [targetKey]: 'ALIAS\n' }, { 'alias/x.mds': targetKey });
+    const err = thrownBy(() => wasmEngine.compile(source, options), 'unrepresentable alias target');
+    assert.equal(err.code, 'mds::invalid_options');
+    assert.match(err.message, /options\.moduleAliases\["alias\/x\.mds"\].*exceeds maximum segment count \(256\)/);
+
+    await writeFile(target, Buffer.from([0xff]));
+    const [invalid] = await compileFileOutcomes('native', [entry]);
+    assert.equal(invalid.code, 'mds::io');
+    assert.equal(invalid.message, `invalid UTF-8 in ${targetKey}: invalid utf-8 sequence of 1 bytes from index 0`);
+    assert.deepEqual(await compileFileOutcomes('wasm', [entry]), [invalid]);
+  });
+});
+
+test('U-SM57: file handle refusals use the display path for entries and imports', async () => {
+  await withNestedProject(async (proj) => {
+    await mkdir(path.join(proj, 'sub'));
+    const file = await writeFixture(proj, 'sub/z.mds', 'OK\n');
+    const main = await writeFixture(proj, 'sub/main.mds', importLine(plainZ) + '@include z\n');
+    const target = await realpath(file);
+    const entries = [file, main];
+    const native = await compileFileOutcomes('native', entries);
+    assert.deepEqual(native, [{ output: 'OK\n' }, { output: 'OK\n' }]);
+    assert.deepEqual(await compileFileOutcomes('wasm', entries), native);
+
+    const realOpen = fs.promises.open;
+    const rawError = Object.assign(new Error(`I/O failure at ${target}`), { code: 'EIO' });
+    const mismatches = [];
+    for (const [method, reason] of [['stat', 'EIO'], ['read', 'EIO'], ['close', 'EIO'], ['stat', 'not a regular file']]) {
+      let calls = 0;
+      fs.promises.open = async function patchedOpen(name, ...args) {
+        const handle = await realOpen.call(this, name, ...args);
+        if (name === target) {
+          const realMethod = handle[method].bind(handle);
+          handle[method] = async (...params) => {
+            calls += 1;
+            if (reason === 'not a regular file') return { isFile: () => false };
+            if (method === 'close') await realMethod(...params);
+            throw rawError;
+          };
+        }
+        return handle;
+      };
+      syncBuiltinESMExports();
+      try {
+        for (const entry of entries) {
+          calls = 0;
+          const err = await rejectionOf(buildModulesMap(entry, scanImports), `U-SM57 ${method}`);
+          assert.ok(calls > 0, `${method} must reach the test fault`);
+          const expected = readIoShape('sub/z.mds', reason);
+          if (!isDeepStrictEqual(errorShape(err), expected)) {
+            mismatches.push({ method, actual: errorShape(err), expected });
+          }
+        }
+      } finally {
+        fs.promises.open = realOpen;
+        syncBuiltinESMExports();
+      }
+    }
+    assert.deepEqual(mismatches, []);
+  });
+});
+
+const windowsOnly = process.platform !== 'win32' && 'A backslash is a disk path separator only on Windows';
+const posixOnly = process.platform === 'win32' && 'A backslash is a name character only on POSIX';
+const backslashDotDot = './sub\\..\\z.mds';
+
+// Native reports absolute dependencies. Compare the paths below the project root.
+async function windowsFileOutcomes(proj, entries) {
+  const root = await realpath(proj);
+  const options = { sourceMap: true };
+  const native = (await compileFileOutcomes('native', entries, options)).map((result) =>
+    result.dependencies === undefined ? result : {
+      ...result,
+      dependencies: result.dependencies.map((dep) => path.relative(root, dep).split(path.sep).join('/')),
+    });
+  const wasm = await compileFileOutcomes('wasm', entries, options);
+  return { native, wasm };
+}
+
+const successWithDeps = (entry, output, ...dependencies) => ({
+  output, dependencies, sources: [entry, ...dependencies],
+});
+
+async function assertAliasMap(entry, expected) {
+  assert.notEqual(wasmEngine, null, 'Build the WASM engine first');
+  const { aliases } = await buildModulesMapWith(entry, wasmEngine);
+  assert.deepEqual(aliases, expected);
+}
+
+test('U-SM58: Windows mixed separators use an alias or give a conflict', { skip: windowsOnly }, async () => {
+  await withNestedProject(async (proj) => {
+    const mixed = './a\\b/../z.mds';
+    await mkdir(path.join(proj, 'a', 'b'), { recursive: true });
+    await writeFixture(proj, 'z.mds', 'ROOT\n');
+    await writeFixture(proj, 'a/z.mds', 'A\n');
+    const alone = await writeFixture(proj, 'alone.mds', importLine(mixed) + '@include z\n');
+    const first = await writeFixture(proj, 'plain-first.mds', renderPair(plainZ, mixed));
+    const last = await writeFixture(proj, 'plain-last.mds', renderPair(mixed, plainZ));
+    await assertAliasMap(alone, { 'z.mds': 'a/z.mds' });
+    const { native, wasm } = await windowsFileOutcomes(proj, [alone, first, last]);
+    assert.deepEqual(native, [
+      successWithDeps('alone.mds', 'A\n', 'a/z.mds'),
+      successWithDeps('plain-first.mds', 'ROOT\nA\n', 'z.mds', 'a/z.mds'),
+      successWithDeps('plain-last.mds', 'A\nROOT\n', 'a/z.mds', 'z.mds'),
+    ]);
+    assert.deepEqual(wasm, [native[0], conflictShape(mixed), conflictShape(plainZ)]);
+  });
+});
+
+test('U-SM59: Windows backslashes agree with slashes for disk access and containment', { skip: windowsOnly }, async () => {
+  await withNestedProject(async (proj, parent) => {
+    const outside = './sub\\..\\..\\z.mds';
+    await mkdir(path.join(proj, 'sub'));
+    await writeFixture(proj, 'z.mds', 'IN\n');
+    await writeFixture(parent, 'z.mds', 'OUT\n');
+    const alone = await writeFixture(proj, 'backslash.mds', importLine(backslashDotDot) + '@include z\n');
+    const pair = await writeFixture(proj, 'same-file.mds', renderPair(plainZ, backslashDotDot));
+    const slash = await writeFixture(proj, 'slash.mds', importLine(linkDotDot) + '@include z\n');
+    const escape = await writeFixture(proj, 'escape.mds', importLine(outside) + '@include z\n');
+    await assertAliasMap(alone, { 'sub\\..\\z.mds': 'z.mds' });
+    await assertAliasMap(pair, { 'sub\\..\\z.mds': 'z.mds' });
+    await assertAliasMap(slash, {});
+    const { native, wasm } = await windowsFileOutcomes(proj, [alone, pair, slash, escape]);
+    assert.deepEqual(native, [
+      successWithDeps('backslash.mds', 'IN\n', 'z.mds'),
+      successWithDeps('same-file.mds', 'IN\nIN\n', 'z.mds'),
+      successWithDeps('slash.mds', 'IN\n', 'z.mds'),
+      { code: 'mds::import', message: `import error: import path escapes project directory: "${outside}"`, help: null, span: null },
+    ]);
+    assert.deepEqual(wasm, native);
+  });
+});
+
+test('U-SM60: Windows applies dot-dot before it follows a junction', { skip: windowsOnly }, async (t) => {
+  await withNestedProject(async (proj) => {
+    const target = path.join(proj, 'deep', 'other');
+    await mkdir(target, { recursive: true });
+    try {
+      await symlink(target, path.join(proj, 'link'), 'junction');
+    } catch (err) {
+      if (!['EPERM', 'EACCES', 'ENOTSUP', 'ENOSYS'].includes(err.code)) throw err;
+      t.skip(`Windows could not create a junction (${err.code})`);
+      return;
+    }
+    await writeFixture(proj, 'z.mds', 'ROOT\n');
+    await writeFixture(proj, 'deep/z.mds', 'DEEP\n');
+    const shown = './link\\..\\z.mds';
+    const entry = await writeFixture(proj, 'junction.mds', importLine(shown) + '@include z\n');
+    await assertAliasMap(entry, { 'link\\..\\z.mds': 'z.mds' });
+    const { native, wasm } = await windowsFileOutcomes(proj, [entry]);
+    assert.deepEqual(native, [successWithDeps('junction.mds', 'ROOT\n', 'z.mds')]);
+    assert.deepEqual(wasm, native);
+  });
+});
+
+test('U-SM61: POSIX treats a backslash as a name character in both backends', { skip: posixOnly }, async () => {
+  await withNestedProject(async (proj) => {
+    await mkdir(path.join(proj, 'sub'));
+    await writeFixture(proj, 'z.mds', 'ROOT\n');
+    const line = importLine(backslashDotDot);
+    const entry = await writeFixture(proj, 'main.mds', line + '@include z\n');
+    const native = await compileFileOutcomes('native', [entry]);
+    assert.deepEqual(native, [{
+      code: 'mds::file_not_found', message: `file not found: ${backslashDotDot}`,
+      help: FILE_NOT_FOUND_HELP, span: firstLineSpan(line.trimEnd()),
+    }]);
+    assert.deepEqual(await compileFileOutcomes('wasm', [entry]), native);
+  });
+});
+
+test('U-SM62: POSIX read refusals keep the backend-specific display of a backslash', { skip: posixOnly }, async () => {
+  await withNestedProject(async (proj) => {
+    await mkdir(path.join(proj, 'back\\slash.mds'));
+    const entry = await writeFixture(proj, 'main.mds', importLine('./back\\slash.mds'));
+    assert.deepEqual(await compileFileOutcomes('native', [entry]), [readIoShape('back/slash.mds')]);
+    assert.deepEqual(await compileFileOutcomes('wasm', [entry]), [readIoShape('back\\slash.mds')]);
+  });
+});
+
+async function aliasLimitFixture(proj) {
+  // Each one-character link resolves to the root. Four links give 16**4 keys.
+  await Promise.all(Array.from('0123456789abcdef', (digit) => symlink('.', path.join(proj, digit), 'dir')));
+  return writeFixture(proj, 'main.mds', 'MAIN\n');
+}
+
+function aliasPaths(count, suffix) {
+  return Array.from({ length: count }, (_, i) => {
+    const prefix = i.toString(16).padStart(4, '0').split('').join('/');
+    return `./${prefix}/${suffix}`;
+  });
+}
+
+function scanAliasPaths(entry, paths) {
+  // Supply import records directly. This test measures the scanner, not the parser.
+  return buildModulesMap(entry, (source) => source === 'MAIN\n' ? paths : []);
+}
+
+function aliasLimitShape(message) {
+  return { code: 'mds::resource_limit', message, help: null, span: null };
+}
+
+test('U-SM63: the scanner caps distinct aliases and does not charge repeat visits', { skip: posixOnly }, async () => {
+  await withNestedProject(async (proj) => {
+    const entry = await aliasLimitFixture(proj);
+    await writeFixture(proj, 'z.mds', 'OK\n');
+    const paths = aliasPaths(65_536, 'z.mds');
+    paths.push(paths[0]);
+    const { aliases } = await scanAliasPaths(entry, paths);
+    assert.equal(Object.keys(aliases).length, 65_536);
+    assert.equal(aliases['f/f/f/f/z.mds'], 'z.mds');
+
+    paths.push('./0/z.mds');
+    await assert.rejects(scanAliasPaths(entry, paths), (err) => {
+      assert.deepEqual(errorShape(err), aliasLimitShape('options.moduleAliases exceeds maximum alias count of 65536 (65537 provided)'));
+      return true;
+    });
+  });
+});
+
+test('U-SM64: the scanner caps the UTF-8 bytes of alias keys and targets', { skip: posixOnly }, async () => {
+  await withNestedProject(async (proj) => {
+    const entry = await aliasLimitFixture(proj);
+    const alias = 'ß'.repeat(100);
+    const dir = `${'ß'.repeat(105)}/${'ß'.repeat(104)}x`;
+    const key = `${dir}/z.mds`;
+    await mkdir(path.join(proj, dir), { recursive: true });
+    await writeFixture(proj, key, 'OK\n');
+    await symlink(dir, path.join(proj, alias), 'dir');
+    await symlink(dir, path.join(proj, `${alias}x`), 'dir');
+
+    const paths = aliasPaths(16_384, `${alias}/z.mds`);
+    assert.equal(paths.length * Buffer.byteLength(paths[0].slice(2) + key), 10 * 1024 * 1024);
+    const { aliases } = await scanAliasPaths(entry, [...paths, paths[0]]);
+    assert.equal(Object.keys(aliases).length, paths.length);
+    assert.equal(aliases[paths.at(-1).slice(2)], key);
+
+    // Add one byte to the last key without a change to the count or target.
+    paths[paths.length - 1] = paths.at(-1).replace(alias, `${alias}x`);
+    await assert.rejects(scanAliasPaths(entry, paths), (err) => {
+      assert.deepEqual(errorShape(err), aliasLimitShape('options.moduleAliases aggregate size exceeds maximum of 10485760 bytes'));
       return true;
     });
   });
