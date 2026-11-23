@@ -125,6 +125,26 @@ describe('isTrailerCandidate', () => {
 // summarize — non-vacuity floors and success/failure shape
 // ---------------------------------------------------------------------------
 describe('summarize', () => {
+  const totals = { packageCount: 8, fileCount: 100, mapHits: [], trailerHits: [] };
+
+  // A nested notice or a backup does not replace the root NOTICE (#136).
+  for (const [paths, missing, message] of [
+    [['LICENSE', 'NOTICE'], [], 'pack-contents gate: 8 packages, 100 files, 0 maps'],
+    [['LICENSE', 'doc/NOTICE', 'NOTICE.bak'], ['NOTICE'], '@mdscript/mds-wasm: missing required file "NOTICE"'],
+    [['NOTICE'], ['LICENSE'], '@mdscript/mds-wasm: missing required file "LICENSE"'],
+  ]) {
+    test(`the WASM pack with ${paths.join(', ')} reports ${missing.join(', ') || 'no missing files'}`, async () => {
+      const { findMissingRequired } = await import('../verify-pack-contents.mjs');
+      const workspace = '@mdscript/mds-wasm';
+      const listing = { files: paths.map(path => ({ path })) };
+      assert.equal(typeof findMissingRequired, 'function', 'the pack gate must check required files');
+      assert.deepEqual(findMissingRequired(workspace, listing), missing);
+      assert.deepEqual(summarize(totals, missing.map(path => ({ workspace, path }))), {
+        ok: missing.length === 0, message,
+      });
+    });
+  }
+
   test('a clean run with real counts passes and reports 0 maps', () => {
     const result = summarize({ packageCount: 8, fileCount: 100, mapHits: [], trailerHits: [] });
     assert.equal(result.ok, true);

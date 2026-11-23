@@ -1,6 +1,5 @@
 #!/usr/bin/env node
-// Pack-contents gate — asserts no publishable npm package ships a dangling
-// source map.
+// Pack-contents gate — reject dangling source maps and missing required files.
 //
 // All six TS packages inherit sourceMap/declarationMap from tsconfig.base.json.
 // Every emitted map's "sources" entry points at ../src/*.ts, but no package's
@@ -15,6 +14,7 @@
 //   2. No packed .js/.cjs/.mjs/.d.ts/.d.cts/.d.mts file contains a
 //      `sourceMappingURL=` trailer (a map file could be pruned from "files"
 //      while the comment pointing at it ships regardless).
+//   3. The WASM package has root LICENSE and NOTICE entries (#136).
 //
 // Usage:
 //   node scripts/verify-pack-contents.mjs
@@ -58,6 +58,7 @@ const TRAILER_EXTENSIONS = ['.js', '.cjs', '.mjs', '.d.ts', '.d.cts', '.d.mts'];
 //   40 files is comfortably below the 59 trailer-candidate files the 8 packages pack today.
 const MIN_PACKAGES = 8;
 const MIN_FILES_CHECKED = 40;
+const REQUIRED_PACKED = { '@mdscript/mds-wasm': ['LICENSE', 'NOTICE'] };
 
 /**
  * True when this module is the process entry point (see verify-no-control-bytes.mjs
@@ -82,6 +83,17 @@ export function findMapEntries(listing) {
   return listing.files
     .map((f) => f.path)
     .filter((p) => p.endsWith('.map'));
+}
+
+/**
+ * @param {string} workspace
+ * @param {{ files: { path: string }[] }} listing
+ * @returns {string[]} required paths absent from the package root
+ */
+export function findMissingRequired(workspace, listing) {
+  if (!Object.hasOwn(REQUIRED_PACKED, workspace)) return [];
+  const packed = new Set(listing.files.map(file => file.path));
+  return REQUIRED_PACKED[workspace].filter(path => !packed.has(path));
 }
 
 /**
@@ -137,9 +149,10 @@ export function isTrailerCandidate(path) {
  * Build the final pass/fail summary from accumulated results.
  *
  * @param {{ packageCount: number, fileCount: number, mapHits: { workspace: string, path: string }[], trailerHits: { workspace: string, path: string }[] }} totals
+ * @param {{ workspace: string, path: string }[]} [missing]
  * @returns {{ ok: boolean, message: string }}
  */
-export function summarize(totals) {
+export function summarize(totals, missing = []) {
   const errors = [];
   if (totals.packageCount < MIN_PACKAGES) {
     errors.push(`non-vacuity floor: expected >= ${MIN_PACKAGES} packages, checked ${totals.packageCount}`);
@@ -152,6 +165,9 @@ export function summarize(totals) {
   }
   for (const hit of totals.trailerHits) {
     errors.push(`${hit.workspace}: "${hit.path}" contains a sourceMappingURL trailer${hit.reason ? ` (${hit.reason})` : ''}`);
+  }
+  for (const hit of missing) {
+    errors.push(`${hit.workspace}: missing required file "${hit.path}"`);
   }
   if (errors.length > 0) {
     return { ok: false, message: errors.join('\n') };
@@ -217,6 +233,7 @@ function main() {
   const cwd = ROOT;
   const mapHits = [];
   const trailerHits = [];
+  const missing = [];
   let fileCount = 0;
   let packageCount = 0;
   const hardErrors = [];
@@ -230,6 +247,9 @@ function main() {
     packageCount++;
     const { listing } = packed;
 
+    for (const path of findMissingRequired(workspace, listing)) {
+      missing.push({ workspace, path });
+    }
     for (const path of findMapEntries(listing)) {
       mapHits.push({ workspace, path });
     }
@@ -256,7 +276,7 @@ function main() {
     process.exit(2);
   }
 
-  const result = summarize({ packageCount, fileCount, mapHits, trailerHits });
+  const result = summarize({ packageCount, fileCount, mapHits, trailerHits }, missing);
   if (!result.ok) {
     console.error(`✖ pack-contents gate FAILED:\n${result.message}`);
     process.exit(1);
