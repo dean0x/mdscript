@@ -146,13 +146,13 @@ describe('summarize', () => {
     });
   }
 
-  test('a run without the missing-file list fails', () => {
+  test('a run without the missing-file list fails (#136)', () => {
     assert.deepEqual(summarize(totals), {
       ok: false, message: 'the list of missing required files must be an array',
     });
   });
 
-  test('a run with a non-array missing-file list fails', () => {
+  test('a run with a non-array missing-file list fails (#136)', () => {
     assert.deepEqual(summarize(totals, ''), {
       ok: false, message: 'the list of missing required files must be an array',
     });

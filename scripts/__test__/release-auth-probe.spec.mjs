@@ -1950,7 +1950,7 @@ describe('B3a: Alpine musl load tests (#340)', () => {
 /**
  * Return an ordered array of step segments from the comment-stripped job section.
  * Each entry is { index: number, body: string } where body is the full text of
- * that step segment. A bullet with six spaces starts a step.
+ * that step segment. A bullet with six spaces starts a step (#136).
  * The first key can follow the bullet on the same line or on the next line.
  */
 function jobSteps(section) {

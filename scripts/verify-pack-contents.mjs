@@ -147,6 +147,7 @@ export function isTrailerCandidate(path) {
 
 /**
  * Build the final pass/fail summary from accumulated results.
+ * The missing-file list is required, so a dropped argument fails the gate (#136).
  *
  * @param {{ packageCount: number, fileCount: number, mapHits: { workspace: string, path: string }[], trailerHits: { workspace: string, path: string }[] }} totals
  * @param {{ workspace: string, path: string }[]} missing — pass an empty array if no required files are absent

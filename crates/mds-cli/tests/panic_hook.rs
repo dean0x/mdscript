@@ -2397,6 +2397,8 @@ fn release_notice_metadata_read_does_not_count_as_a_build() {
     );
 }
 
+/// The NOTICE metadata read is exempt only in the release workflow, so every
+/// other build input must report it (#136).
 #[test]
 fn notice_metadata_read_outside_the_release_workflow_fails_the_scan() {
     for (path, _) in BUILD_FEATURE_INPUTS {
