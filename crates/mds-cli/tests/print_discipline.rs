@@ -319,8 +319,9 @@ const PRINT_MACROS: &[&str] = &[
 /// when its prints moved to the writer; lowering one is a decision made in the commit
 /// that removes the print, never a side effect.
 const SITE_FLOORS: &[(&str, usize)] = &[
-    ("build.rs", 21),
+    ("build.rs", 17),
     ("out_paths.rs", 1),
+    ("source_map.rs", 4),
     ("stdio.rs", 1),
     ("vars.rs", 4),
     ("fmt.rs", 11),
@@ -777,13 +778,13 @@ const PATH_TEXT_HELPERS: &[(&str, &str, usize, &str)] = &[
          at once through `safe_file_display`; the message lists those.",
     ),
     (
-        "build.rs",
+        "admit.rs",
         "refuse_output_over_entry",
         1,
         "Names the typed entry through `mds::escape_path_for_message` of its lossy text.",
     ),
     (
-        "build.rs",
+        "source_map.rs",
         "apply_source_map_file_label",
         1,
         "Carve-out: the source map's `file` key, the output's file name. A source map's \
@@ -791,7 +792,7 @@ const PATH_TEXT_HELPERS: &[(&str, &str, usize, &str)] = &[
          no message.",
     ),
     (
-        "build.rs",
+        "source_map.rs",
         "file_name_of",
         1,
         "Carve-out: the file name a sidecar map records as `file`, compared with the map \
