@@ -73,14 +73,14 @@ MDS_BACKEND=wasm node my-script.js
 
 WASM file APIs (`compileFile`, `checkFile`, and `lintFile`) differ from native in these cases:
 
-- WASM can report a missing import outside the project as a path outside the project. It checks the project boundary first.
-- WASM refuses an import if `..` in the path as written goes above the project root. This applies even if a link leads to a file inside the project.
+- WASM can report a missing import outside the project as a path outside the project. It checks the project boundary first, so it does not show which files exist outside the project.
+- WASM refuses an import if `..` in the path as written goes above the project root. This applies even if a link leads to a file inside the project. WASM checks the path text before it reads the file system.
 - For a project at the filesystem root, WASM also refuses `/..` as a path above the project root. A native match needs new public API, a spec change, and more WASM bytes.
 - WASM reports `mds::import` if it must use one path name for two different files.
   For example, on POSIX, if `link` points to `deep/sub`, `./link/../z.mds` refers to `deep/z.mds`.
   That import works on its own. It conflicts with an import of `./z.mds` from the same directory if that path names a different file.
   On Windows, WASM also accepts paths such as `./link\..\z.mds`. The pair `./z.mds` and `./a\b/../z.mds` can cause the same conflict.
-- WASM limits entry and import paths below the project root to 256 segments. This also applies to the resolved file path if a directory link leads to a deeper file.
+- WASM limits entry and import paths below the project root to 256 segments. This also applies to the resolved file path if a directory link leads to a deeper file. The limit keeps an explicit bound on path resolution.
 - WASM uses an errno name, such as `EACCES`, in `cannot read` messages for Node file errors.
   Node's file error message can include an absolute path. Node's system error text has no path, but differs from the Rust text.
   For example, Node gives `permission denied` and Rust gives `Permission denied (os error 13)`.

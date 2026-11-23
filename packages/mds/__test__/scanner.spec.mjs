@@ -1,6 +1,6 @@
 /**
  * Module scanner unit tests for @mdscript/mds universal package.
- * Tests: U-S*, U-SM*, U-SW*
+ * Tests: U-S*, U-SM*, U-SW*, U-PR*
  *
  * Tests the normalizeVirtualKey and buildModulesMap utilities directly
  * using the compiled JS output.
