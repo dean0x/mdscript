@@ -51,8 +51,7 @@ pythonize = "=0.29.0"
 #   - dispatch2 0.3.1 → Zlib OR Apache-2.0 OR MIT (macOS only, via ctrlc)
 # ISC and Zlib are permissive and MIT-compatible; no copyleft or contamination risk.
 # All three families are explicitly accepted here.
-# A cargo-deny license allowlist (licenses.allow = ["MIT","Apache-2.0","CC0-1.0","ISC","Zlib"])
-# would enforce this acceptance in CI (suggested follow-up, out of scope for this batch).
+# See deny.toml for the license policy that CI applies (#136).
 notify = "8"
 ctrlc = "3.5"
 # similar: pure-Rust diffing (mds-cli `fmt --diff`). Apache-2.0 (MIT-compatible, no
