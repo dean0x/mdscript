@@ -1,0 +1,13 @@
+Rust crate license notices (#136)
+
+This notice covers Rust crates resolved from Cargo.lock for the shipped targets.
+It does not cover the Rust standard library, toolchain parts, crates.io source packages, or npm dependencies.
+
+{{#each licenses}}
+=== LICENSE ===
+{{name}}
+Crates: {{#each used_by}}{{crate.name}}{{#unless @last}}, {{/unless}}{{/each}}
+
+{{{text}}}
+
+{{/each}}

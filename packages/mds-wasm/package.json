@@ -42,9 +42,10 @@
   "files": [
     "dist/",
     "LICENSE",
+    "NOTICE",
     "README.md"
   ],
   "scripts": {
-    "build": "node ../../scripts/check-wasm-tools.mjs && wasm-pack build ../../crates/mds-wasm --target nodejs --out-dir ../../packages/mds-wasm/dist/node --out-name mds_wasm -- --config profile.release.codegen-units=1 && wasm-pack build ../../crates/mds-wasm --target web --out-dir ../../packages/mds-wasm/dist/web --out-name mds_wasm -- --config profile.release.codegen-units=1 && rm -f dist/node/.gitignore dist/web/.gitignore dist/node/LICENSE dist/web/LICENSE"
+    "build": "node ../../scripts/check-wasm-tools.mjs && wasm-pack build ../../crates/mds-wasm --target nodejs --out-dir ../../packages/mds-wasm/dist/node --out-name mds_wasm -- --config profile.release.codegen-units=1 && wasm-pack build ../../crates/mds-wasm --target web --out-dir ../../packages/mds-wasm/dist/web --out-name mds_wasm -- --config profile.release.codegen-units=1 && rm -f dist/node/.gitignore dist/web/.gitignore dist/node/LICENSE dist/web/LICENSE && node -e \"require('node:fs').copyFileSync('../../NOTICE', 'NOTICE')\""
   }
 }

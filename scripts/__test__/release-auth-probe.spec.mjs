@@ -1950,14 +1950,14 @@ describe('B3a: Alpine musl load tests (#340)', () => {
 /**
  * Return an ordered array of step segments from the comment-stripped job section.
  * Each entry is { index: number, body: string } where body is the full text of
- * that step segment. Steps are segmented at /^      - / boundaries (6-space
- * bullet), matching the convention in rustCacheSteps and loadTestRunBlock.
+ * that step segment. A bullet with six spaces starts a step (#136).
+ * The first key can follow the bullet on the same line or on the next line.
  */
 function jobSteps(section) {
   const lines = stripCommentLines(section).split('\n');
   const starts = [];
   for (let i = 0; i < lines.length; i++) {
-    if (/^      - /.test(lines[i])) starts.push(i);
+    if (/^      -(?:[ \t]|$)/.test(lines[i])) starts.push(i);
   }
   return starts.map((start, n) => ({
     index: n,
@@ -2025,8 +2025,9 @@ function assertNpmRegistryOrder(section) {
   const npm = namedStep(steps, npmPublish);
   assert.ok(install && build && platform && npm && setupNode[0].index < install.index &&
     install.index < build.index && build.index < setupNode[1].index &&
-    setupNode[1].index + 1 === platform.index && platform.index + 1 === npm.index,
-    'npm install and build must run before registry setup directly precedes the publish steps');
+    setupNode[1].index + 1 === platform.index,
+    'registry setup directly precedes platform publish');
+  assert.equal(platform.index + 1, npm.index, 'no step may separate the two npm publishes');
 }
 
 test('S24: only the two Cargo publish steps bind registry values', () => {
@@ -2063,6 +2064,14 @@ test('S26: npm registry setup runs after the build and directly before publish',
   const separated = section.replace(`      - name: ${platformPublish}`,
     `      - run: npm ci\n      - name: ${platformPublish}`);
   assert.throws(() => assertNpmRegistryOrder(separated), /directly precedes/);
+  const separatedPublishes = section.replace(`      - name: ${npmPublish}`,
+    `      - run: ':'\n      - name: ${npmPublish}`);
+  assert.notEqual(separatedPublishes, section);
+  assert.throws(() => assertNpmRegistryOrder(separatedPublishes), /no step may separate/);
+  const stepOnNextLine = section.replace(`      - name: ${npmPublish}`,
+    `      -\n        run: ':'\n      - name: ${npmPublish}`);
+  assert.notEqual(stepOnNextLine, section);
+  assert.throws(() => assertNpmRegistryOrder(stepOnNextLine), /no step may separate/);
 });
 
 const nonPrGuard = "github.event_name != 'pull_request'";

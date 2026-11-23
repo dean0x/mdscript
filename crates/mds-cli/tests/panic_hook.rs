@@ -2347,32 +2347,107 @@ fn host_boundary_findings(source: &str, funnel: &str) -> Vec<String> {
     Vec::new()
 }
 
+const RELEASE_WORKFLOW: &str = "../../.github/workflows/release.yml";
+const NOTICE_METADATA_READ: &str = concat!(
+    r#""$cargo_about" about generate --frozen --workspace --all-features --fail"#,
+    " --target aarch64-apple-darwin --target x86_64-apple-darwin",
+    " --target x86_64-unknown-linux-gnu --target x86_64-unknown-linux-musl",
+    " --target aarch64-unknown-linux-gnu --target aarch64-unknown-linux-musl",
+    " --target x86_64-pc-windows-msvc --target wasm32-unknown-unknown",
+    r#" --config about.toml --output-file "$notice_raw" about.hbs"#,
+    r#" && node scripts/generate-notice.mjs < "$notice_raw" > "$notice_out""#,
+);
+const BUILD_FEATURE_INPUTS: [(&str, &str); 4] = [
+    (
+        "../mds-python/pyproject.toml",
+        "features = [\"pyo3/abi3-py311\"]",
+    ),
+    ("../mds-napi/package.json", "napi build --release --no-js"),
+    (
+        "../../packages/mds-wasm/package.json",
+        "wasm-pack build ../../crates/mds-wasm --target nodejs",
+    ),
+    (RELEASE_WORKFLOW, "napi build --platform --release"),
+];
+
+fn has_one_notice_metadata_read(release: &str) -> bool {
+    release
+        .lines()
+        .filter(|line| line.trim() == NOTICE_METADATA_READ)
+        .count()
+        == 1
+}
+
+/// A read of NOTICE metadata does not count as a release build (#136).
+#[test]
+fn release_notice_metadata_read_does_not_count_as_a_build() {
+    let release = read_source(RELEASE_WORKFLOW);
+    assert!(
+        has_one_notice_metadata_read(&release),
+        "the release workflow must contain exactly one NOTICE recipe"
+    );
+    let duplicate = format!("{release}\n  {NOTICE_METADATA_READ}\n");
+    assert!(
+        !has_one_notice_metadata_read(&duplicate),
+        "a second exact NOTICE recipe must fail the check"
+    );
+    assert_eq!(
+        build_feature_findings(RELEASE_WORKFLOW, &release),
+        Vec::<String>::new()
+    );
+}
+
+/// The NOTICE metadata read is exempt only in the release workflow, so every
+/// other build input must report it (#136).
+#[test]
+fn notice_metadata_read_outside_the_release_workflow_fails_the_scan() {
+    for (path, _) in BUILD_FEATURE_INPUTS {
+        if path == RELEASE_WORKFLOW {
+            continue;
+        }
+        assert_eq!(
+            build_feature_findings(path, NOTICE_METADATA_READ).len(),
+            1,
+            "{path}: only the release workflow permits the NOTICE recipe"
+        );
+    }
+}
+
+/// The scan rejects release builds that enable panic details (#136).
+#[test]
+fn release_builds_with_panic_details_fail_the_scan() {
+    let release = read_source(RELEASE_WORKFLOW);
+    let line = release
+        .lines()
+        .position(|line| line.trim() == NOTICE_METADATA_READ)
+        .expect("the release workflow must contain the NOTICE recipe");
+    let expected = vec![format!("line {} enables panic details", line + 1)];
+    for command in [
+        "cargo build --features debug-panics".to_string(),
+        "cargo build --all-features".to_string(),
+        format!("{NOTICE_METADATA_READ} && cargo build --all-features"),
+        format!("napi build --all-features && {NOTICE_METADATA_READ}"),
+    ] {
+        let planted = release.replacen(NOTICE_METADATA_READ, &command, 1);
+        assert_eq!(
+            build_feature_findings(RELEASE_WORKFLOW, &planted),
+            expected,
+            "{command}"
+        );
+    }
+}
+
 /// Build inputs must not select the local-only panic feature. Each input gets a
 /// planted selection in memory. Commands also get an all-features control.
 #[test]
 fn build_entry_points_leave_debug_panics_off() {
-    let inputs = [
-        (
-            "../mds-python/pyproject.toml",
-            "features = [\"pyo3/abi3-py311\"]",
-        ),
-        ("../mds-napi/package.json", "napi build --release --no-js"),
-        (
-            "../../packages/mds-wasm/package.json",
-            "wasm-pack build ../../crates/mds-wasm --target nodejs",
-        ),
-        (
-            "../../.github/workflows/release.yml",
-            "napi build --platform --release",
-        ),
-    ];
     assert!(
-        inputs
+        BUILD_FEATURE_INPUTS
             .iter()
             .any(|(path, _)| *path == "../../packages/mds-wasm/package.json"),
         "the WASM workspace build script must receive the planted feature controls"
     );
-    for (path, anchor) in inputs {
+    for (path, anchor) in BUILD_FEATURE_INPUTS {
         let source = read_source(path);
         assert!(
             source.contains(anchor),
@@ -2390,28 +2465,34 @@ fn build_entry_points_leave_debug_panics_off() {
             let planted = source.replacen(anchor, &replacement, 1);
             assert_ne!(planted, source, "{path}: the control must change the input");
             assert_eq!(
-                build_feature_findings(&planted).len(),
+                build_feature_findings(path, &planted).len(),
                 1,
                 "{path}: the planted {replacement} must fail the scan"
             );
         }
         assert_eq!(
-            build_feature_findings(&source),
+            build_feature_findings(path, &source),
             Vec::<String>::new(),
             "{path}: build entry points must not enable panic details"
         );
         assert!(
-            build_feature_findings(&format!("{source}\n# debug-panics --all-features")).is_empty()
+            build_feature_findings(path, &format!("{source}\n# debug-panics --all-features"))
+                .is_empty()
         );
     }
 }
 
-/// Conservatively refuse either spelling anywhere outside a line comment.
-fn build_feature_findings(source: &str) -> Vec<String> {
+/// Check cargo build, napi build, maturin, wasm-pack, and other build inputs.
+/// Refuse either flag outside comments. The exact cargo-about metadata read in
+/// the release workflow is the only exception. It does not build crates (#136).
+fn build_feature_findings(path: &str, source: &str) -> Vec<String> {
     source
         .lines()
         .enumerate()
         .filter(|(_, line)| {
+            if path == RELEASE_WORKFLOW && line.trim() == NOTICE_METADATA_READ {
+                return false;
+            }
             let code = toml_code(line);
             code.contains("debug-panics") || code.contains("--all-features")
         })
