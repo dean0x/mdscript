@@ -126,10 +126,8 @@ function isWithinRoot(root: string, candidate: string): boolean {
 /**
  * Open a file descriptor with O_NOFOLLOW | O_RDONLY, translating the ELOOP error
  * the kernel emits when the path is a symlink into NativeFs's symlink refusal
- * (`symlinkError`), and every other failure into the error the Rust engine reports
- * at the same step — each keyed on `shown` rather than the resolved `absolutePath`
- * (R3 / CWE-209 — the raw Node error names the resolved filesystem path in its
- * message).
+ * (`symlinkError`). A symlink or missing file uses `shown`. A read refusal uses
+ * `display`. Neither case uses the raw Node error text.
  *
  * NativeFs stats the final component (`symlink_metadata`) before it reads it and
  * maps any failure of that step to `mds::file_not_found`: so does this, when the
@@ -145,6 +143,7 @@ function isWithinRoot(root: string, candidate: string): boolean {
 async function openNoFollow(
   absolutePath: string,
   shown: string,
+  display: string,
 ): Promise<Awaited<ReturnType<typeof open>>> {
   try {
     return await open(absolutePath, constants.O_RDONLY | O_NOFOLLOW);
@@ -153,7 +152,7 @@ async function openNoFollow(
       throw symlinkError(shown);
     }
     throw await lstat(absolutePath).then(
-      () => readError(shown, err),
+      () => readError(display, err),
       () => fileNotFoundError(shown),
     );
   }
@@ -200,9 +199,9 @@ async function readAtMost(
  * Close `handle`, reporting a failure as the read failure it is (`readError`), never
  * as Node's raw error.
  */
-async function closeModule(handle: Awaited<ReturnType<typeof open>>, shown: string): Promise<void> {
+async function closeModule(handle: Awaited<ReturnType<typeof open>>, display: string): Promise<void> {
   await handle.close().catch((err: unknown) => {
-    throw readError(shown, err);
+    throw readError(display, err);
   });
 }
 
@@ -215,10 +214,8 @@ type PathErrorCode = 'mds::import' | 'mds::io' | 'mds::file_not_found' | 'mds::r
 
 /**
  * A path refusal carrying the code the Rust engine reports for the same input, and that
- * engine error's message as the native backend throws it, except where the differences
- * listed in `buildModulesMap`'s documentation say otherwise: a `cannot read` message
- * (`cannotReadError`) agrees with native on the code only, and some refusals — the
- * aggregate-size guard among them — are the WASM backend's own.
+ * engine error's message, except for the differences in `buildModulesMap`.
+ * A `cannot read` message uses the root-relative path. Its reason can differ.
  */
 type PathError = MdsError & { code: PathErrorCode };
 
@@ -321,16 +318,13 @@ function withImportContext(err: unknown, record: ImportRecord): unknown {
 }
 
 /**
- * `mds::io` for a file that resolves but cannot be read — NativeFs's `cannot read
- * …` I/O error — naming `shown`, the path as written, and `reason`: an errno name
- * (`EACCES`) or `not a regular file`, never Node's message, which names the resolved
- * absolute path. Native names its root-relative display path, and the OS error text
- * where this names an errno, so the two agree on the code, not on the message.
+ * `mds::io` for a file that resolves but cannot be read. Use its path below the root.
+ * Use an errno name instead of Node's error text, which can include an absolute path.
  */
-function cannotReadError(shown: string, reason: string): PathError {
+function cannotReadError(display: string, reason: string): PathError {
   return pathError(
     'mds::io',
-    `cannot read ${escapePathForMessage(shown)}: ${escapePathForMessage(reason)}`,
+    `cannot read ${escapePathForMessage(display)}: ${escapePathForMessage(reason)}`,
   );
 }
 
@@ -338,14 +332,14 @@ function cannotReadError(shown: string, reason: string): PathError {
  * `cannotReadError` for a module that is not a regular file — a directory, device,
  * FIFO or socket — with the reason NativeFs gives it: `not a regular file` (#428).
  */
-function notRegularFileError(shown: string): PathError {
-  return cannotReadError(shown, 'not a regular file');
+function notRegularFileError(display: string): PathError {
+  return cannotReadError(display, 'not a regular file');
 }
 
 /** `cannotReadError` for a failed Node call, with its errno name as the reason. */
-function readError(shown: string, err: unknown): PathError {
+function readError(display: string, err: unknown): PathError {
   const errno = (err as NodeJS.ErrnoException | undefined)?.code;
-  return cannotReadError(shown, typeof errno === 'string' ? errno : 'I/O error');
+  return cannotReadError(display, typeof errno === 'string' ? errno : 'I/O error');
 }
 
 /**
@@ -994,6 +988,7 @@ async function readModule(
   shown: string,
   budget?: ReadBudget,
 ): Promise<ReadModule | undefined> {
+  const display = keyOf(projectRoot, located.resolved) || '.';
   // A module that is not a regular file is refused before it is opened, as NativeFs
   // refuses it: opening a FIFO nobody writes to blocks (#428). A symlink is left to
   // the open below, which refuses it without following it.
@@ -1001,9 +996,9 @@ async function readModule(
     throw fileNotFoundError(shown);
   });
   if (!before.isFile() && !before.isSymbolicLink()) {
-    throw notRegularFileError(shown);
+    throw notRegularFileError(display);
   }
-  const handle = await openNoFollow(located.path, shown);
+  const handle = await openNoFollow(located.path, shown, display);
   try {
     // `openNoFollow` above already succeeded, so the file existed a moment ago; a
     // failure here can only come from a concurrent change (TOCTOU). It is still
@@ -1012,7 +1007,7 @@ async function readModule(
     // reading the file.
     const [stats, linkStats, resolution] = await Promise.all([
       handle.stat().catch((err: unknown) => {
-        throw readError(shown, err);
+        throw readError(display, err);
       }),
       lstat(located.path).catch(() => {
         throw fileNotFoundError(shown);
@@ -1026,13 +1021,11 @@ async function readModule(
     if (linkStats.isSymbolicLink() || resolution.kind === 'not-utf8' || resolution.path !== located.resolved) {
       throw symlinkError(shown);
     }
-    const { resolved } = located;
     // Checked again on the opened fd, as NativeFs checks its opened file: another
     // file may have taken the module's place since it was checked above.
     if (!stats.isFile()) {
-      throw notRegularFileError(shown);
+      throw notRegularFileError(display);
     }
-    const display = keyOf(projectRoot, resolved);
     // Checked on the fstat size too, before a byte is read, so a file over the cap
     // when it is opened is never read into memory; one that grows past it while it
     // is read is read to one byte past the cap and no further (#428), and refused by
@@ -1044,16 +1037,16 @@ async function readModule(
       return undefined;
     }
     const bytes = await readAtMost(handle, MAX_FILE_SIZE + 1, stats.size).catch((err: unknown) => {
-      throw readError(shown, err);
+      throw readError(display, err);
     });
     budget?.charge(bytes.length - stats.size);
     // The engine's own checks, in the native order — the per-file cap and UTF-8
     // (#414), then the file type (#417) — decode it: it refuses exactly the files the
     // native backend refuses, and a file that is not an MDS file is refused before
     // any import-like line in it is followed.
-    return { resolved, size: bytes.length, content: engine.preflightModule(bytes, display, shown) };
+    return { resolved: located.resolved, size: bytes.length, content: engine.preflightModule(bytes, display, shown) };
   } finally {
-    await closeModule(handle, shown);
+    await closeModule(handle, display);
   }
 }
 

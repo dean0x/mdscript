@@ -1091,25 +1091,26 @@ describe('buildModulesMap — a filesystem error is coded, never a raw Node erro
       await writeFile(secret, 'S\n');
       await chmod(secret, 0o000);
       try {
-        const err = await refusal(secret, 'U-SM28 entry');
-        assert.equal(err.code, 'mds::io', err.message);
-        assert.equal(err.message, `cannot read ${secret}: EACCES`);
-        assertNoHelp(err, 'U-SM28 entry');
+        const raw = await rejectionOf(open(secret), 'U-SM28 raw open');
+        assert.equal(raw.code, 'EACCES');
+        assert.ok(raw.message.includes(dir));
 
-        await writeFile(path.join(dir, 'main.mds'), '@import "./secret.mds" as s\n');
-        const imported = await refusal(path.join(dir, 'main.mds'), 'U-SM28 import');
-        assert.equal(imported.code, 'mds::io', imported.message);
-        assert.equal(imported.message, 'cannot read ./secret.mds: EACCES');
-        assertNoHelp(imported, 'U-SM28 import');
-
+        const main = path.join(dir, 'main.mds');
+        await writeFile(main, '@import "./secret.mds" as s\n');
+        const files = [secret, main];
         const engines = await loadEngines();
         if (!requireEngines(t, engines, 'U-SM28')) return;
-        const [native] = await compileFileOutcomes('native', [secret]);
-        const [wasm] = await compileFileOutcomes('wasm', [secret]);
-        // The code agrees; the message names the path as written and the errno name,
-        // where native names its root-relative display path and the OS error text.
-        assert.equal(native.code, 'mds::io', JSON.stringify(native));
-        assert.equal(wasm.code, native.code, JSON.stringify({ wasm, native }));
+        const native = await compileFileOutcomes('native', files);
+        const wasm = await compileFileOutcomes('wasm', files);
+        for (const [i, file] of files.entries()) {
+          assert.equal(native[i].code, 'mds::io', JSON.stringify(native[i]));
+          assert.ok(native[i].message.startsWith('cannot read secret.mds: '));
+          assert.deepEqual(wasm[i], readIoShape('secret.mds', 'EACCES'));
+          assert.ok(!wasm[i].message.includes(dir));
+          const err = await refusal(file, 'U-SM28 scanner');
+          assert.deepEqual(errorShape(err), wasm[i]);
+          assertNoHelp(err, 'U-SM28 scanner');
+        }
       } finally {
         await chmod(secret, 0o644);
       }
@@ -1143,9 +1144,12 @@ describe('buildModulesMap — a filesystem error is coded, never a raw Node erro
   );
 });
 
-// The refusals NativeFs makes itself — a symlinked final component, a module
-// outside the project root, a module that is not a regular file — carry its code
-// and name the path as written, never the resolved one (#408).
+function readIoShape(display, reason = 'not a regular file') {
+  return { code: 'mds::io', message: `cannot read ${display}: ${reason}`, help: null, span: null };
+}
+
+// Symlink and escape refusals name the path as written. Read refusals name the
+// file below the project root.
 describe('buildModulesMap — symlink, root-escape and non-file refusals match native (#408)', () => {
   const dirLinkType = process.platform === 'win32' ? 'junction' : 'dir';
 
@@ -1186,19 +1190,18 @@ describe('buildModulesMap — symlink, root-escape and non-file refusals match n
     });
   });
 
-  test('U-SM31: a module that is not a regular file is mds::io, naming the path as written', async () => {
+  test('U-SM31: the scanner names a non-regular file below the project root', async () => {
     await withNestedProject(async (proj) => {
-      await mkdir(path.join(proj, 'dir.mds'));
-      await writeFile(path.join(proj, 'main.mds'), '@import "./dir.mds" as d\n');
-      const imported = await rejectionOf(buildModulesMap(path.join(proj, 'main.mds'), scanImports), 'U-SM31 import');
-      const entry = await withCwd(proj, () => rejectionOf(buildModulesMap('dir.mds', scanImports), 'U-SM31 entry'));
-      const canonicalProj = await realpath(proj);
-      for (const [err, shown, label] of [[imported, './dir.mds', 'U-SM31 import'], [entry, 'dir.mds', 'U-SM31 entry']]) {
-        assert.equal(err.code, 'mds::io', `${label}: ${err.message}`);
-        assertNoHelp(err, label);
-        // Refused before it is opened, with native's reason, on every OS (#428).
-        assert.equal(err.message, `cannot read ${shown}: not a regular file`, label);
-        assert.ok(!err.message.includes(canonicalProj), `${label}: no absolute path; got: ${err.message}`);
+      const dir = path.join(proj, 'sub', 'dir.mds');
+      await mkdir(dir, { recursive: true });
+      const main = await writeFixture(proj, 'sub/main.mds', '@import "./dir.mds" as d\n');
+      const files = [dir, main];
+      const native = await compileFileOutcomes('native', files);
+      for (const [i, file] of files.entries()) {
+        assert.deepEqual(native[i], readIoShape('sub/dir.mds'));
+        const err = await rejectionOf(buildModulesMap(file, scanImports), 'U-SM31');
+        assert.deepEqual(errorShape(err), native[i]);
+        assertNoHelp(err, 'U-SM31');
       }
     });
   });
@@ -1210,31 +1213,27 @@ describe('buildModulesMap — symlink, root-escape and non-file refusals match n
       await mkdir(path.join(proj, 'dir.mds'));
       await writeFile(path.join(proj, 'imp-dir.mds'), '@import "./dir.mds" as d\nhi\n');
       await writeFile(path.join(proj, 'ok.mds'), 'OK\n');
-      // [entry, typed from the project directory; the path native names the module by,
-      // below the project root; the path the WASM backend names it by, as written].
-      // For an entry typed from the root the two are one, so the whole error is too.
       const rows = [
-        ['dir.mds', 'dir.mds', 'dir.mds'],
-        ['imp-dir.mds', 'dir.mds', './dir.mds'],
+        ['dir.mds', 'dir.mds'],
+        ['imp-dir.mds', 'dir.mds'],
       ];
       if (process.platform !== 'win32') {
         // A FIFO nobody writes to: opening it blocked both backends.
         execFileSync('mkfifo', [path.join(proj, 'fifo.mds')]);
         await writeFile(path.join(proj, 'imp-fifo.mds'), '@import "./fifo.mds" as f\nhi\n');
-        rows.push(['fifo.mds', 'fifo.mds', 'fifo.mds'], ['imp-fifo.mds', 'fifo.mds', './fifo.mds']);
+        rows.push(['fifo.mds', 'fifo.mds'], ['imp-fifo.mds', 'fifo.mds']);
       }
       const files = [...rows.map(([entry]) => entry), 'ok.mds'];
       const native = await compileFileOutcomes('native', files, { cwd: proj });
       const wasm = await compileFileOutcomes('wasm', files, { cwd: proj });
-      const refusal = (shown) => ({ code: 'mds::io', message: `cannot read ${shown}: not a regular file`, help: null, span: null });
-      // Every row is judged before anything is asserted.
+      // Compare all rows before the final assertion.
       const mismatches = [];
       const judge = (label, actual, expected) => {
         if (!isDeepStrictEqual(actual, expected)) mismatches.push({ label, actual, expected });
       };
-      for (const [i, [entry, nativeShown, wasmShown]] of rows.entries()) {
-        judge(`${entry} (native)`, native[i], refusal(nativeShown));
-        judge(`${entry} (wasm)`, wasm[i], refusal(wasmShown));
+      for (const [i, [entry, display]] of rows.entries()) {
+        judge(`${entry} (native)`, native[i], readIoShape(display));
+        judge(`${entry} (wasm)`, wasm[i], native[i]);
       }
       // Control: a regular file compiles on both.
       judge('ok.mds (native)', native[rows.length], { output: 'OK\n' });
@@ -1420,12 +1419,10 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
         path.join(proj, 'chain', 'c1.mds'),
         await write('exact.mds', 'x'.repeat(MAX_FILE_SIZE)),
       ];
-      // `./` names the importing module's own directory: NativeFs reads it and fails
-      // with `mds::io`. The message names the path differently on the two backends —
-      // every `cannot read` message does (see buildModulesMap).
-      const ownDir = await write('own.mds', '@import "./" as o\nhi\n');
+      // `./` names the importer's directory. The root has display `.`.
+      const ownDirs = await Promise.all(['own.mds', 'sub/own.mds'].map((file) => write(file, '@import "./" as o\nhi\n')));
 
-      const files = [...rows.map(([, file]) => file), ...atTheCap, ownDir];
+      const files = [...rows.map(([, file]) => file), ...atTheCap, ...ownDirs];
       const native = await compileFileOutcomes('native', files);
       const wasm = await compileFileOutcomes('wasm', files);
       // Every row is judged before anything is asserted, so a row that fails on one
@@ -1443,9 +1440,11 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
         judge(`control ${atTheCap[j]} (native)`, native[i], 'an output', typeof native[i]?.output === 'string');
         judge(`control ${atTheCap[j]}`, wasm[i], native[i]);
       }
-      const i = files.length - 1;
-      judge('import: ./ (native)', native[i], { code: 'mds::io' }, native[i]?.code === 'mds::io');
-      judge('import: ./', wasm[i], { code: 'mds::io' }, wasm[i]?.code === 'mds::io');
+      for (const [j, display] of ['.', 'sub'].entries()) {
+        const i = rows.length + atTheCap.length + j;
+        judge(`import: ./ from ${display} (native)`, native[i], readIoShape(display));
+        judge(`import: ./ from ${display} (WASM)`, wasm[i], native[i]);
+      }
       assert.deepEqual(mismatches, []);
     });
   });
@@ -2523,6 +2522,55 @@ test('U-SM56: a key over 256 segments gives a scanner resource limit', { skip: p
     const err = thrownBy(() => wasmEngine.compile(source, options), 'unrepresentable alias target');
     assert.equal(err.code, 'mds::invalid_options');
     assert.match(err.message, /options\.moduleAliases\["alias\/x\.mds"\].*exceeds maximum segment count \(256\)/);
+  });
+});
+
+test('U-SM57: file handle refusals use the display path for entries and imports', async () => {
+  await withNestedProject(async (proj) => {
+    await mkdir(path.join(proj, 'sub'));
+    const file = await writeFixture(proj, 'sub/z.mds', 'OK\n');
+    const main = await writeFixture(proj, 'sub/main.mds', importLine(plainZ) + '@include z\n');
+    const target = await realpath(file);
+    const entries = [file, main];
+    const native = await compileFileOutcomes('native', entries);
+    assert.deepEqual(native, [{ output: 'OK\n' }, { output: 'OK\n' }]);
+    assert.deepEqual(await compileFileOutcomes('wasm', entries), native);
+
+    const realOpen = fs.promises.open;
+    const rawError = Object.assign(new Error(`I/O failure at ${target}`), { code: 'EIO' });
+    const mismatches = [];
+    for (const [method, reason] of [['stat', 'EIO'], ['read', 'EIO'], ['close', 'EIO'], ['stat', 'not a regular file']]) {
+      let calls = 0;
+      fs.promises.open = async function patchedOpen(name, ...args) {
+        const handle = await realOpen.call(this, name, ...args);
+        if (name === target) {
+          const realMethod = handle[method].bind(handle);
+          handle[method] = async (...params) => {
+            calls += 1;
+            if (reason === 'not a regular file') return { isFile: () => false };
+            if (method === 'close') await realMethod(...params);
+            throw rawError;
+          };
+        }
+        return handle;
+      };
+      syncBuiltinESMExports();
+      try {
+        for (const entry of entries) {
+          calls = 0;
+          const err = await rejectionOf(buildModulesMap(entry, scanImports), `U-SM57 ${method}`);
+          assert.ok(calls > 0, `${method} must reach the test fault`);
+          const expected = readIoShape('sub/z.mds', reason);
+          if (!isDeepStrictEqual(errorShape(err), expected)) {
+            mismatches.push({ method, actual: errorShape(err), expected });
+          }
+        }
+      } finally {
+        fs.promises.open = realOpen;
+        syncBuiltinESMExports();
+      }
+    }
+    assert.deepEqual(mismatches, []);
   });
 });
 
