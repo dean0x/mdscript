@@ -1,6 +1,6 @@
 /**
  * Module scanner unit tests for @mdscript/mds universal package.
- * Tests: U-S1 through U-S10
+ * Tests: U-S*, U-SM*, U-SW*
  *
  * Tests the normalizeVirtualKey and buildModulesMap utilities directly
  * using the compiled JS output.
@@ -13,7 +13,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import fs, { existsSync, readdirSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
-import { chmod, mkdtemp, mkdir, open, realpath, symlink, writeFile, rm } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, open, readdir, realpath, symlink, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import {
   FORBIDDEN_PATH_CODEPOINTS,
@@ -849,15 +849,10 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
     });
   });
 
-  // The WASM engine resolves an import BY NAME, from the importing module's key;
-  // NativeFs resolves it ON DISK, from the importing module's canonical directory.
-  // A module's key is its canonical path (#414), so through a symlinked directory the
-  // two agree for every import except one whose own path names the link and leaves
-  // it through `..`: its key names the directory beside the link, the file NativeFs
-  // reads sits beside the link's target. That is POSIX, where the OS applies each
-  // `..` after the link before it. Windows collapses `sub\..` lexically before it
-  // follows the link (a junction here), on both backends, so there the two agree for
-  // that import too, and an entry typed that way names the file beside the link.
+  // The WASM engine resolves a name from the importer's canonical key (#414).
+  // On POSIX, NativeFs applies `..` after it follows the link. The scanner
+  // supplies an alias when that path names a file other than the lexical key.
+  // Windows collapses `sub\..` lexically on both backends.
   const lexicalDotDot = process.platform === 'win32';
 
   /** sub -> deep/other; sub/y.mds imports ../z.mds; both z.mds files exist. */
@@ -929,7 +924,7 @@ describe('buildModulesMap — case-mismatched names and symlinks (#408)', () => 
     });
   });
 
-  test('U-SM24: through a symlinked directory, the WASM backend compiles what the native backend compiles, or refuses', async (t) => {
+  test('U-SM24: both backends compile the same files through symlinked directories', async (t) => {
     const engines = await loadEngines();
     if (!requireEngines(t, engines, 'U-SM24')) return;
     await withProject(async (dir) => {
@@ -1637,7 +1632,7 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
     });
   });
 
-  test('U-SM38: an error the engine raises is identical on both backends, but a later refusal pre-empts it on WASM (difference 8)', async (t) => {
+  test('U-SM38: an error the engine raises is identical on both backends, but a later refusal pre-empts it on WASM (difference 7)', async (t) => {
     const engines = await loadEngines();
     if (!requireEngines(t, engines, 'U-SM38')) return;
     await withNestedProject(async (proj) => {
@@ -2159,13 +2154,20 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
     (process.platform === 'darwin' && 'APFS refuses a file name that is not valid UTF-8: this row runs on Linux (CI)') ||
     (process.platform === 'win32' && 'Windows file names are UTF-16, never bytes: this row runs on Linux (CI)');
 
-  test('U-SM48: a path resolved into a directory whose name is not valid UTF-8 is refused as native refuses it, never read as its U+FFFD twin', { skip: noByteNames }, async (t) => {
+  async function makeNonUtf8Directory(proj) {
+    const name = Buffer.concat([Buffer.from('sub'), Buffer.from([0xff])]);
+    const dir = Buffer.concat([Buffer.from(proj + path.sep), name]);
+    await mkdir(dir);
+    const entries = await readdir(proj, { encoding: 'buffer' });
+    assert.ok(entries.some((entry) => entry.equals(name)), 'the directory name must contain byte 0xFF');
+    return dir;
+  }
+
+  test('U-SM48: both backends refuse the non-UTF-8 directory, but only native reports the missing file first', { skip: noByteNames }, async (t) => {
     const engines = await loadEngines();
     if (!requireEngines(t, engines, 'U-SM48')) return;
     await withNestedProject(async (proj) => {
-      // `sub` and the byte 0xFF, built from bytes: no string names it. `link` leads there.
-      const hostile = Buffer.concat([Buffer.from(path.join(proj, 'sub')), Buffer.from([0xff])]);
-      await mkdir(hostile);
+      const hostile = await makeNonUtf8Directory(proj);
       await writeFile(Buffer.concat([hostile, Buffer.from(`${path.sep}x.mds`)]), 'REAL\n');
       await symlink(hostile, path.join(proj, 'link'), 'dir');
       // Its twin: the name a lossy decoding of the link's target spells, with U+FFFD for
@@ -2199,6 +2201,36 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       const direct = path.join(twin, 'x.mds');
       assert.deepEqual(await compileFileOutcomes('native', [direct]), [{ output: 'TWIN\n' }]);
       assert.deepEqual(await compileFileOutcomes('wasm', [direct]), [{ output: 'TWIN\n' }]);
+
+      const missing = path.join(proj, 'missing-main.mds');
+      const missingImport = '@import "./link/missing.mds" as m';
+      await writeFile(missing, `${missingImport}\n@include m\n`);
+      assert.deepEqual(await compileFileOutcomes('native', [missing]), [{
+        code: 'mds::file_not_found',
+        message: 'file not found: ./link/missing.mds',
+        help: FILE_NOT_FOUND_HELP,
+        span: firstLineSpan(missingImport),
+      }]);
+      assert.deepEqual(await compileFileOutcomes('wasm', [missing]), [refused('./link/missing.mds')]);
+    });
+  });
+
+  test('U-SM48b: an unused lexical directory with a non-UTF-8 target does not prevent an alias', { skip: noByteNames }, async () => {
+    await withNestedProject(async (proj) => {
+      const hostile = await makeNonUtf8Directory(proj);
+      await symlink(hostile, path.join(proj, 'q'), 'dir');
+      await mkdir(path.join(proj, 'd/e'), { recursive: true });
+      await symlink(path.join(proj, 'd/e'), path.join(proj, 'sub'), 'dir');
+      await mkdir(path.join(proj, 'd/q'));
+      await writeFixture(proj, 'd/q/z.mds', 'CANONICAL\n');
+      const entry = await writeFixture(proj, 'main.mds', importLine('./sub/../q/z.mds') + '@include z\n');
+
+      const native = await compileFileOutcomes('native', [entry]);
+      assert.deepEqual(native, [{ output: 'CANONICAL\n' }]);
+      assert.deepEqual(await compileFileOutcomes('wasm', [entry]), native);
+      assert.notEqual(wasmEngine, null, 'the current WASM build is required');
+      const { aliases } = await buildModulesMapWith(entry, wasmEngine);
+      assert.deepEqual(aliases, { 'q/z.mds': 'd/q/z.mds' });
     });
   });
 
@@ -2394,20 +2426,13 @@ test('U-SM52: dot-dot after a link keeps both containment checks', { skip: posix
 });
 
 test('U-SM53: the unused lexical directory does not affect the canonical target', { skip: posixLinkOnly }, async (t) => {
-  for (const kind of ['missing', 'regular file', 'non-UTF-8']) {
-    await t.test(kind, { skip: kind === 'non-UTF-8' && process.platform !== 'linux' && 'This row needs Linux byte names' }, async () => {
+  for (const kind of ['missing', 'regular file']) {
+    await t.test(kind, async () => {
       await withNestedProject(async (proj) => {
         await linkFixture(proj);
         await mkdir(path.join(proj, 'deep', 'lex'));
         await writeFixture(proj, 'deep/lex/z.mds', 'DEEP\n');
         if (kind === 'regular file') await writeFixture(proj, 'lex', 'NOT A DIRECTORY\n');
-        if (kind === 'non-UTF-8') {
-          const name = Buffer.from([0xff]);
-          const target = Buffer.concat([Buffer.from(`${proj}/`), name]);
-          await mkdir(target);
-          await symlink(target, path.join(proj, 'lex'), 'dir');
-          assert.ok(readdirSync(proj, { encoding: 'buffer' }).some((entry) => entry.equals(name)));
-        }
         const entry = await writeFixture(proj, 'main.mds', importLine('./sub/../lex/z.mds') + '@include z\n');
         const native = await compileFileOutcomes('native', [entry]);
         assert.deepEqual(native, [{ output: 'DEEP\n' }]);
