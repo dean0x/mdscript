@@ -74,13 +74,20 @@ MDS_BACKEND=wasm node my-script.js
 WASM file APIs (`compileFile`, `checkFile`, and `lintFile`) differ from native in these cases:
 
 - WASM can report a missing import outside the project as a path outside the project. It checks the project boundary first.
-- WASM refuses `..` above the key root because it checks the written path before it resolves links.
-- For a project at the filesystem root, WASM also refuses `/..` as a path above the key root. A native match needs new public API, a spec change, and more WASM bytes.
-- On POSIX, `link/..` can use an alias. On Windows, both backends apply `..` lexically for disk access. WASM can use aliases for paths such as `./link\..\z.mds` or `./a\b/../z.mds`. On either platform, WASM refuses to use one module key for two files.
-- WASM limits the root-relative entry key, resolved import key, and alias target to 256 segments. This bounds key resolution.
-- WASM uses an errno name for Node file errors in `cannot read` messages. Node's error message can include an absolute path. For a POSIX name with a backslash, native displays `/` and WASM keeps `\`.
+- WASM refuses an import if `..` in the path as written goes above the project root. This applies even if a link leads to a file inside the project.
+- For a project at the filesystem root, WASM also refuses `/..` as a path above the project root. A native match needs new public API, a spec change, and more WASM bytes.
+- WASM reports `mds::import` if it must use one path name for two different files.
+  For example, on POSIX, if `link` points to `deep/sub`, `./link/../z.mds` refers to `deep/z.mds`.
+  That import works on its own. It conflicts with an import of `./z.mds` from the same directory if that path names a different file.
+  On Windows, WASM also accepts paths such as `./link\..\z.mds`. The pair `./z.mds` and `./a\b/../z.mds` can cause the same conflict.
+- WASM limits entry and import paths below the project root to 256 segments. This also applies to the resolved file path if a directory link leads to a deeper file.
+- WASM uses an errno name, such as `EACCES`, in `cannot read` messages for Node file errors.
+  Node's file error message can include an absolute path. Node's system error text has no path, but differs from the Rust text.
+  For example, Node gives `permission denied` and Rust gives `Permission denied (os error 13)`.
+  For a POSIX name with a backslash, native displays `/` and WASM keeps `\`.
 - A later file error can precede an earlier compile error or cycle. WASM reads the modules before it evaluates them. To match native error order, the engine would need to evaluate each module before the scanner reads the next. This difference changes which error WASM reports, not the compiled output.
-- WASM limits total module bytes. Its scanner refuses any new alias that would exceed 65,536 distinct aliases or 10 MiB of UTF-8 keys plus targets. The WASM engine checks the same alias limits. Native does not use those limits.
+- WASM limits total module bytes. It also keeps a table for import paths that differ from their resolved file paths below the project root.
+  The scanner and the WASM engine limit the table to 65,536 entries and 10 MiB of path text in UTF-8. Native does not use this table.
 - WASM refuses a non-UTF-8 directory before it checks the file. Native checks the file first. To match native order, each path check would need both string and byte forms.
 
 ## Error handling

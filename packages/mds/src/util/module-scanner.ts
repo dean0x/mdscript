@@ -1135,8 +1135,10 @@ async function readModule(
  *    target at 256 segments (`mds::resource_limit`). Native caps paths as written.
  *    The alias-target check never pre-empts a refusal of that module itself.
  *    Deliberate: keep an explicit bound on key resolution (U-S16, U-SM56).
- * 6. A `cannot read` reason can be an errno name instead of native OS error text.
- *    Node's error message can include an absolute path (U-SM28, U-SM57).
+ * 6. A `cannot read` reason can be an errno name instead of Rust's system error text.
+ *    Node's file error message can include an absolute path (U-SM28, U-SM57).
+ *    Node's `util.getSystemErrorMessage` gives libuv text without a path, but this
+ *    text differs from Rust's text.
  *    For a POSIX name with a backslash, native shows `/` and WASM keeps `\` (U-SM62).
  * 7. The scanner reads modules before the engine evaluates them. A later import
  *    refusal can precede an earlier compile error or cycle that native reports.
