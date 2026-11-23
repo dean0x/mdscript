@@ -9,7 +9,7 @@ use super::config::compile_inputs;
 use super::config::{load_config, run_reads, source_inputs};
 use super::flags::{effective_build_flags, warn_build_flags};
 use super::single::BuildRun;
-use super::source_map::{apply_source_map_file_label, embed_carrier, map_path_for};
+use super::source_map::{apply_source_map_file_label, embed_map_in_content, write_sidecar_map};
 use super::vars::RuntimeVars;
 use super::{run_build_directory, CompileOutput};
 use crate::output::{
@@ -244,11 +244,7 @@ pub(super) fn write_file(
     }
 
     let final_content = if source_map && inline {
-        if let Some(ref sm) = compiled.source_map {
-            embed_carrier(compiled.content, &sm.to_json())
-        } else {
-            compiled.content
-        }
+        embed_map_in_content(compiled.content, compiled.source_map.as_ref())
     } else {
         compiled.content
     };
@@ -272,17 +268,9 @@ pub(super) fn write_file(
 
             if source_map && !inline {
                 if let Some(ref sm) = compiled.source_map {
-                    let map = target.sibling(map_path_for);
-                    let map_json = sm.to_json();
-                    if let Err(e) = write_compiled(&map, &map_json, &inputs) {
+                    if let Err(e) = write_sidecar_map(&target, sm, &inputs, quiet) {
                         crate::output::eprint_io_failure(e);
                         return WriteOutcome::Failed;
-                    }
-                    if !quiet {
-                        crate::output::ewriteln!(
-                            "Source map written to {}",
-                            crate::output::safe_path(&map.shown)
-                        );
                     }
                 }
             }

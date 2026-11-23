@@ -1,4 +1,4 @@
-//! Set source map paths and labels, embed maps, and check stale sidecars.
+//! Set source map paths and labels, embed maps, and write or check sidecars.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use super::config::ProjectConfig;
 #[cfg(doc)]
 use super::out_paths::resolve_output_path_for_kind;
+use super::stdio::write_output;
 use crate::output::WriteTarget;
-use crate::write::{NotRemoved, Removal};
-use mds::{effective_parent, MdsError, STRING_SOURCE_MAP_LABEL};
+use crate::write::{write_compiled, Inputs, NotRemoved, Removal};
+use mds::{effective_parent, MdsError, SourceMap, STRING_SOURCE_MAP_LABEL};
 use miette::Result;
 
 /// Return the sidecar map path: append `.map` to the full output name.
@@ -93,6 +94,68 @@ pub(crate) fn embed_carrier(content: String, map_json: &str) -> String {
     // Ensure there is exactly one newline before the carrier.
     let sep = if base.ends_with('\n') { "" } else { "\n" };
     format!("{base}{sep}{}\n", carrier_line(map_json))
+}
+
+/// Embed a map if one exists. Otherwise, return the content unchanged.
+#[must_use]
+pub(super) fn embed_map_in_content(content: String, map: Option<&SourceMap>) -> String {
+    match map {
+        Some(sm) => embed_carrier(content, &sm.to_json()),
+        None => content,
+    }
+}
+
+/// Write a source map beside the compiled output.
+pub(super) fn write_sidecar_map(
+    out: &WriteTarget,
+    sm: &SourceMap,
+    inputs: &Inputs,
+    quiet: bool,
+) -> Result<(), MdsError> {
+    let map = out.sibling(map_path_for);
+    // Write the sidecar's `file`, `sources` and `sourcesContent` verbatim (spec §7.5).
+    // Consumers need the exact paths for file references. Escape the status line only.
+    write_compiled(&map, &sm.to_json(), inputs)?;
+    if !quiet {
+        crate::output::ewriteln!(
+            "Source map written to {}",
+            crate::output::safe_path(&map.shown)
+        );
+    }
+    Ok(())
+}
+
+/// Resolve a sidecar request when the destination is stdout.
+pub(super) fn write_stdout_ladder(
+    map_present: bool,
+    flag_source_map: bool,
+    cfg: Option<&ProjectConfig>,
+    content: String,
+    inputs: &Inputs,
+    quiet: bool,
+) -> Result<()> {
+    if map_present {
+        if flag_source_map {
+            return Err(miette::miette!(
+                "--source-map (sidecar) requires an output file; use -o <file> or \
+                 --out-dir, --inline to embed the map for stdout, or --no-source-map \
+                 to skip it"
+            ));
+        }
+        // Name the config as the input reached it, as a config error does (#390).
+        if !quiet {
+            let cfg_path = cfg
+                .map(ProjectConfig::shown_file)
+                .unwrap_or_else(|| PathBuf::from("mds.json"));
+            crate::output::ewriteln!(
+                "warning: source_map in {} has no effect when writing to \
+                 stdout (sidecar requires -o <file> or --out-dir); use --inline to \
+                 embed the map, or --no-source-map to silence this warning",
+                crate::output::safe_path(&cfg_path)
+            );
+        }
+    }
+    write_output(None, &content, inputs, quiet, true)
 }
 
 /// Compute the directory to use as `source_map_base` in [`mds::CompileOptions`].

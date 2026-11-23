@@ -9,14 +9,14 @@ use super::config::{compile_inputs, load_config, run_reads, ProjectConfig};
 use super::flags::{effective_build_flags, warn_build_flags};
 use super::out_paths::{resolve_output_path_for_kind, warn_output_extension_mismatch, OutputKind};
 use super::source_map::{
-    apply_source_map_file_label, compute_source_map_base, embed_carrier, file_name_of,
-    map_path_for, verify_then_delete_map,
+    apply_source_map_file_label, compute_source_map_base, embed_map_in_content, file_name_of,
+    map_path_for, verify_then_delete_map, write_sidecar_map, write_stdout_ladder,
 };
 use super::stdio::{read_stdin, write_output};
 use super::vars::RuntimeVars;
 use super::{compile_to_content, serialize_output};
 use crate::output::WriteTarget;
-use crate::write::{write_compiled, Inputs};
+use crate::write::Inputs;
 
 pub(super) struct BuildRun {
     pub(super) output: Option<String>,
@@ -106,59 +106,24 @@ fn finish_stdin_output(
         apply_source_map_file_label(sm, output_path.as_ref().map(|t| t.path.as_path()), true);
     }
 
-    if use_source_map {
-        if inline {
-            // Inline: embed carrier into the output content, then write.
-            let map_json = source_map.as_ref().map(|sm| sm.to_json());
-            let final_content = if let Some(ref json) = map_json {
-                embed_carrier(content, json)
-            } else {
-                content
-            };
-            return write_output(output_path.as_ref(), &final_content, &inputs, quiet, true);
-        } else {
-            // Sidecar: write output first (byte-identical to no-flag; ADR-002).
-            match &output_path {
-                None => {
-                    // Sidecar + stdout: three-case ladder (stdin has no config, so cases 1–2).
-                    if source_map.is_none() {
-                        // Case 1 — messages mode: compiler produced no map; write to stdout.
-                        return write_output(None, &content, &inputs, quiet, true);
-                    }
-                    // Case 2 — explicit --source-map flag: hard error.
-                    return Err(miette::miette!(
-                        "--source-map (sidecar) requires an output file; use -o <file> or \
-                         --out-dir, --inline to embed the map for stdout, or --no-source-map \
-                         to skip it"
-                    ));
-                }
-                Some(out) => {
-                    write_output(Some(out), &content, &inputs, quiet, true)?;
-                    if let Some(ref sm) = source_map {
-                        let map = out.sibling(map_path_for);
-                        // The sidecar's `file` / `sources` / `sourcesContent` are
-                        // written VERBATIM, by decision — spec §7.5 "Carve-out:
-                        // functional path references". They are resolved against the
-                        // filesystem by devtools and bundlers, so a `\uXXXX`-escaped
-                        // path would not exist. Consumers must treat them as
-                        // untrusted; see the `mds::SourceMap` rustdoc. The status
-                        // line below is a diagnostic surface and IS escaped.
-                        let map_json = sm.to_json();
-                        write_compiled(&map, &map_json, &inputs)?;
-                        if !quiet {
-                            crate::output::ewriteln!(
-                                "Source map written to {}",
-                                crate::output::safe_path(&map.shown)
-                            );
-                        }
-                    }
-                    return Ok(());
-                }
-            }
-        }
+    if !use_source_map {
+        return write_output(output_path.as_ref(), &content, &inputs, quiet, true);
+    }
+    if inline {
+        let final_content = embed_map_in_content(content, source_map.as_ref());
+        return write_output(output_path.as_ref(), &final_content, &inputs, quiet, true);
     }
 
-    write_output(output_path.as_ref(), &content, &inputs, quiet, true)
+    let Some(out) = &output_path else {
+        // Stdin has no config. Only the explicit flag can request a map.
+        return write_stdout_ladder(source_map.is_some(), true, None, content, &inputs, quiet);
+    };
+    // Write the output first, with the same bytes as a build without a map.
+    write_output(Some(out), &content, &inputs, quiet, true)?;
+    if let Some(ref sm) = source_map {
+        write_sidecar_map(out, sm, &inputs, quiet)?;
+    }
+    Ok(())
 }
 
 // ── File input path ──────────────────────────────────────────────────────────
@@ -215,7 +180,7 @@ pub(super) fn run_build_file(input: PathBuf, vars: RuntimeVars, run: &BuildRun) 
     write_file_output(
         run,
         flags.use_source_map,
-        config,
+        config.as_ref(),
         output_path,
         inputs,
         compiled.content,
@@ -226,7 +191,7 @@ pub(super) fn run_build_file(input: PathBuf, vars: RuntimeVars, run: &BuildRun) 
 fn write_file_output(
     run: &BuildRun,
     use_source_map: bool,
-    config: Option<ProjectConfig>,
+    config: Option<&ProjectConfig>,
     output_path: Option<WriteTarget>,
     inputs: Inputs,
     content: String,
@@ -242,12 +207,7 @@ fn write_file_output(
         if inline {
             // Inline: embed carrier into the output, then write (ADR-002 not applicable:
             // inline mode intentionally modifies the output file).
-            let map_json = source_map.as_ref().map(|sm| sm.to_json());
-            let final_content = if let Some(ref json) = map_json {
-                embed_carrier(content, json)
-            } else {
-                content
-            };
+            let final_content = embed_map_in_content(content, source_map.as_ref());
             write_output(output_path.as_ref(), &final_content, &inputs, quiet, true)?;
 
             // Stale sidecar reconciliation: if there is an existing .map file from
@@ -256,53 +216,20 @@ fn write_file_output(
                 verify_then_delete_map(&out.sibling(map_path_for), &file_name_of(out), quiet)?;
             }
         } else {
-            // Sidecar: write output byte-identical to no-flag build (ADR-002).
-            match &output_path {
-                None => {
-                    // Sidecar + stdout: three-case ladder.
-                    if source_map.is_none() {
-                        // Case 1 — messages mode: compiler produced no map; write to stdout.
-                        return write_output(None, &content, &inputs, quiet, true);
-                    }
-                    if flag_source_map {
-                        // Case 2 — explicit --source-map flag: hard error.
-                        return Err(miette::miette!(
-                            "--source-map (sidecar) requires an output file; use -o <file> or \
-                             --out-dir, --inline to embed the map for stdout, or --no-source-map \
-                             to skip it"
-                        ));
-                    }
-                    // Case 3 — config-sourced source_map: degrade gracefully. The warning
-                    // names `mds.json` as the input reached it, as a config error does
-                    // (#390).
-                    if !quiet {
-                        let cfg_path = config
-                            .as_ref()
-                            .map(ProjectConfig::shown_file)
-                            .unwrap_or_else(|| PathBuf::from("mds.json"));
-                        crate::output::ewriteln!(
-                            "warning: source_map in {} has no effect when writing to \
-                             stdout (sidecar requires -o <file> or --out-dir); use --inline to \
-                             embed the map, or --no-source-map to silence this warning",
-                            crate::output::safe_path(&cfg_path)
-                        );
-                    }
-                    return write_output(None, &content, &inputs, quiet, true);
-                }
-                Some(out) => {
-                    write_output(Some(out), &content, &inputs, quiet, true)?;
-                    if let Some(ref sm) = source_map {
-                        let map = out.sibling(map_path_for);
-                        let map_json = sm.to_json();
-                        write_compiled(&map, &map_json, &inputs)?;
-                        if !quiet {
-                            crate::output::ewriteln!(
-                                "Source map written to {}",
-                                crate::output::safe_path(&map.shown)
-                            );
-                        }
-                    }
-                }
+            let Some(out) = &output_path else {
+                return write_stdout_ladder(
+                    source_map.is_some(),
+                    flag_source_map,
+                    config,
+                    content,
+                    &inputs,
+                    quiet,
+                );
+            };
+            // Write the output first, with the same bytes as a build without a map.
+            write_output(Some(out), &content, &inputs, quiet, true)?;
+            if let Some(ref sm) = source_map {
+                write_sidecar_map(out, sm, &inputs, quiet)?;
             }
         }
     } else {
