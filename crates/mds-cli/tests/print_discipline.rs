@@ -319,8 +319,8 @@ const PRINT_MACROS: &[&str] = &[
 /// when its prints moved to the writer; lowering one is a decision made in the commit
 /// that removes the print, never a side effect.
 const SITE_FLOORS: &[(&str, usize)] = &[
-    ("build.rs", 8),
-    ("directory.rs", 1),
+    ("build.rs", 3),
+    ("directory.rs", 6),
     ("single.rs", 8),
     ("out_paths.rs", 1),
     ("source_map.rs", 4),
@@ -464,7 +464,7 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
     ),
     // ── Integer counters — a `usize`/`u128` cannot carry a control byte ───────
     (
-        "build.rs",
+        "directory.rs",
         "walk.excluded_by_default",
         "`usize` count of `.mds` files the default-exclusion walker skipped \
          (hidden dirs, node_modules); produced by `collect_mds_files_detailed`.",
@@ -487,7 +487,7 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
          cannot carry a control byte.",
     ),
     (
-        "build.rs",
+        "directory.rs",
         "partials_only_count",
         "`usize` count of `.mds` files found in a partials-only tree, bound from \
          `output::partials_only`'s `Some(n)` in the #387 nothing-to-build diagnostic. \
