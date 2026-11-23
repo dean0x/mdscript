@@ -70,6 +70,10 @@ const ABOUT = {
     'ignore-build-dependencies': false,
   },
   private: { ignore: false },
+  'miniz_oxide.clarify': {
+    license: 'MIT',
+    files: [{ path: 'LICENSE-MIT.md', checksum: '799e9ca9d179295ef372f25d3769cdda7d25bb2668add6a6a1e22d1e4c678b8d' }],
+  },
 };
 
 const BARE = /^[A-Za-z0-9_-]+$/;
@@ -144,7 +148,7 @@ function readPolicy(text, schema = POLICY) {
   for (let i = 0; i < tokens.length && pos < tokens.length; i++) {
     const { part: start, line } = take();
     if (start === '[') {
-      const name = /^\s*\[([A-Za-z-]+(?:\.[A-Za-z-]+)?)\]\s*(?:#.*)?$/.exec(lines[line])?.[1];
+      const name = /^\s*\[([A-Za-z_-]+(?:\.[A-Za-z_-]+)?)\]\s*(?:#.*)?$/.exec(lines[line])?.[1];
       assert.ok(Object.hasOwn(schema, name), `unknown or invalid table: ${lines[line]}`);
       assert.ok(!tables.has(name), `duplicate table ${name}`);
       table = new Map();
@@ -508,6 +512,7 @@ for (const [name, from, to, message] of [
   ['a missing accepted license', '"CC0-1.0", ', '', /^about\.toml accepted licenses/],
   ['a quoted key', 'accepted =', '"accepted" =', /^expected a bare key$/],
   ['a missing target', '    "wasm32-unknown-unknown",\n', '', /^about\.toml targets/],
+  ['the alternate miniz license file', 'path = "LICENSE-MIT.md"', 'path = "LICENSE"', /^about\.toml files/],
 ]) {
   test(`the notice config rejects ${name} (#136)`, () => {
     const baseline = read('about.toml');

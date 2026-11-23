@@ -16,3 +16,8 @@ ignore-build-dependencies = false
 
 [private]
 ignore = false
+
+# The miniz_oxide MIT files differ by one blank line. Use the same file on all hosts (#136).
+[miniz_oxide.clarify]
+license = "MIT"
+files = [{ path = "LICENSE-MIT.md", checksum = "799e9ca9d179295ef372f25d3769cdda7d25bb2668add6a6a1e22d1e4c678b8d" }]
