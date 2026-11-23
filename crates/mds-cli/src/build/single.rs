@@ -6,6 +6,7 @@ use miette::Result;
 
 use super::admit::{admit_output, EntryPaths};
 use super::config::{compile_inputs, load_config, run_reads, ProjectConfig};
+use super::flags::{effective_build_flags, warn_build_flags};
 use super::out_paths::{resolve_output_path_for_kind, warn_output_extension_mismatch, OutputKind};
 use super::source_map::{
     apply_source_map_file_label, compute_source_map_base, embed_carrier, file_name_of,
@@ -39,33 +40,16 @@ pub(super) fn run_build_stdin(input: PathBuf, vars: RuntimeVars, run: &BuildRun)
         inline,
         flag_embed_sources,
     } = *run;
-    // Stdin: no project config; effective flags from CLI only.
-    let use_source_map = flag_source_map && !no_source_map;
-    let use_embed_sources = flag_embed_sources;
+    let flags = effective_build_flags(None, flag_source_map, no_source_map, flag_embed_sources);
+    warn_build_flags(&flags, inline, quiet);
 
-    // C3/D6: embed_sources without source_map is a no-op; warn so users don't wonder
-    // why their output contains no sourcesContent (applies PF-004 — both paths checked).
-    if use_embed_sources && !use_source_map && !quiet {
-        crate::output::ewriteln!(
-            "warning: embed_sources has no effect without source maps; \
-             set build.source_map=true or pass --source-map"
-        );
-    }
-
-    // AC-SEC-02: warn when shipping full source text in a distributable artifact.
-    if use_embed_sources && inline && !quiet {
-        crate::output::ewriteln!(
-            "warning: --embed-sources with --inline ships full source text in the output \
-             (AC-SEC-02)"
-        );
-    }
-
-    let source_map_base = use_source_map
+    let source_map_base = flags
+        .use_source_map
         .then(|| compute_source_map_base(Path::new("-"), output, out_dir, &None))
         .transpose()?;
     let opts = mds::CompileOptions::default()
-        .with_source_map(use_source_map)
-        .with_include_sources_content(use_embed_sources)
+        .with_source_map(flags.use_source_map)
+        .with_include_sources_content(flags.use_embed_sources)
         .with_source_map_base(source_map_base);
 
     let source = read_stdin()?;
@@ -100,7 +84,7 @@ pub(super) fn run_build_stdin(input: PathBuf, vars: RuntimeVars, run: &BuildRun)
     warn_output_extension_mismatch(output, kind, quiet);
     finish_stdin_output(
         run,
-        use_source_map,
+        flags.use_source_map,
         source_map,
         content,
         output_path,
@@ -189,43 +173,22 @@ pub(super) fn run_build_file(input: PathBuf, vars: RuntimeVars, run: &BuildRun) 
         inline,
         flag_embed_sources,
     } = *run;
-    // File input: load project config and compute effective flags.
     let config = load_config(&input)?;
-    let cfg_source_map = config
-        .as_ref()
-        .map(|c| c.config.build.source_map)
-        .unwrap_or(false);
-    let cfg_embed_sources = config
-        .as_ref()
-        .map(|c| c.config.build.embed_sources)
-        .unwrap_or(false);
+    let flags = effective_build_flags(
+        config.as_ref(),
+        flag_source_map,
+        no_source_map,
+        flag_embed_sources,
+    );
+    warn_build_flags(&flags, inline, quiet);
 
-    let use_source_map = (flag_source_map || cfg_source_map) && !no_source_map;
-    let use_embed_sources = flag_embed_sources || cfg_embed_sources;
-
-    // C3/D6: embed_sources without source_map is a no-op; warn so users don't wonder
-    // why their output contains no sourcesContent (applies PF-004 — both paths checked).
-    if use_embed_sources && !use_source_map && !quiet {
-        crate::output::ewriteln!(
-            "warning: embed_sources has no effect without source maps; \
-             set build.source_map=true or pass --source-map"
-        );
-    }
-
-    // AC-SEC-02: warn when shipping full source text in a distributable artifact.
-    if use_embed_sources && inline && !quiet {
-        crate::output::ewriteln!(
-            "warning: --embed-sources with --inline ships full source text in the output \
-             (AC-SEC-02)"
-        );
-    }
-
-    let source_map_base = use_source_map
+    let source_map_base = flags
+        .use_source_map
         .then(|| compute_source_map_base(&input, output, out_dir, &config))
         .transpose()?;
     let opts = mds::CompileOptions::default()
-        .with_source_map(use_source_map)
-        .with_include_sources_content(use_embed_sources)
+        .with_source_map(flags.use_source_map)
+        .with_include_sources_content(flags.use_embed_sources)
         .with_source_map_base(source_map_base);
 
     let compiled = compile_to_content(&input, vars.vars, quiet, opts)?;
@@ -251,7 +214,7 @@ pub(super) fn run_build_file(input: PathBuf, vars: RuntimeVars, run: &BuildRun) 
 
     write_file_output(
         run,
-        use_source_map,
+        flags.use_source_map,
         config,
         output_path,
         inputs,

@@ -7,6 +7,7 @@ use miette::Result;
 #[cfg(doc)]
 use super::config::compile_inputs;
 use super::config::{load_config, run_reads, source_inputs};
+use super::flags::{effective_build_flags, warn_build_flags};
 use super::single::BuildRun;
 use super::source_map::{apply_source_map_file_label, embed_carrier, map_path_for};
 use super::vars::RuntimeVars;
@@ -42,34 +43,22 @@ pub(super) fn build_directory_mode(
     // (a symlink, the filesystem root, a forbidden character — all `mds::io`).
     crate::input::resolve_directory_argument(&input).map_err(miette::Error::from)?;
 
-    // Load project config to determine effective flags for directory mode.
     let dir_config = load_config(&input)?;
-    let cfg_source_map = dir_config
-        .as_ref()
-        .map(|c| c.config.build.source_map)
-        .unwrap_or(false);
-    let cfg_embed_sources = dir_config
-        .as_ref()
-        .map(|c| c.config.build.embed_sources)
-        .unwrap_or(false);
-    let use_source_map = (flag_source_map || cfg_source_map) && !no_source_map;
-    let use_embed_sources = flag_embed_sources || cfg_embed_sources;
-
-    // C3/D6: embed_sources without source_map is a no-op (applies PF-004 — all paths).
-    if use_embed_sources && !use_source_map && !quiet {
-        crate::output::ewriteln!(
-            "warning: embed_sources has no effect without source maps; \
-             set build.source_map=true or pass --source-map"
-        );
-    }
+    let flags = effective_build_flags(
+        dir_config.as_ref(),
+        flag_source_map,
+        no_source_map,
+        flag_embed_sources,
+    );
+    warn_build_flags(&flags, false, quiet);
 
     run_build_directory(
         &input,
         out_dir,
         resolved,
         quiet,
-        use_source_map,
-        use_embed_sources,
+        flags.use_source_map,
+        flags.use_embed_sources,
         inline,
     )
 }

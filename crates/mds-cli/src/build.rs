@@ -6,6 +6,7 @@ mod admit;
 mod config;
 mod directory;
 mod entry;
+mod flags;
 mod out_paths;
 mod single;
 mod source_map;

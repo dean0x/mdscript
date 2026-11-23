@@ -320,8 +320,9 @@ const PRINT_MACROS: &[&str] = &[
 /// that removes the print, never a side effect.
 const SITE_FLOORS: &[(&str, usize)] = &[
     ("build.rs", 3),
-    ("directory.rs", 6),
-    ("single.rs", 8),
+    ("directory.rs", 5),
+    ("flags.rs", 2),
+    ("single.rs", 4),
     ("out_paths.rs", 1),
     ("source_map.rs", 4),
     ("stdio.rs", 1),
