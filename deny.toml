@@ -13,7 +13,8 @@ db-path = "$CARGO_HOME/advisory-dbs"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 git-fetch-with-cli = false
 disable-yank-checking = false
-# The daily check has a one-week limit on the age of the database.
+# cargo-deny checks this limit only if you disable database fetch.
+# The CI checks fetch the database.
 maximum-db-staleness = "P7D"
 unsound = "all"
 yanked = "deny"

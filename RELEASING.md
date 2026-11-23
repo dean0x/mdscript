@@ -587,18 +587,35 @@ The local pre-flight command runs all four checks.
   must pass for the release. The separate advisories run does not block a release tag.
   Run the full local check before you tag.
 
+**Absent advisories run.**
+
+1. For a branch in this repository, run `gh workflow run deny-advisories.yml --ref <branch>`.
+   Manual dispatch requires the workflow on the default branch.
+   If a fork PR needs approval, use the [workflow approval procedure](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/approve-runs-from-forks).
+2. Get the run head SHA with `gh run view <run-id> --json headSha`.
+   Get the PR head SHA with `gh pr view <pr-number> --json headRefOid`.
+   Confirm that the two SHAs match.
+3. Wait for the run to complete successfully.
+4. Run `node scripts/verify-pr-checks.mjs <pr-number>` again.
+
+Do not waive the check or roll back protection for an absent run.
+
 **Advisory triage.** The maintainer who last changed the cron line receives scheduled
 failure notices. That maintainer checks each notice. If a new advisory applies,
 open a pull request with the dependency fix.
 
-If the fix must wait, open an issue and add an ignore in `deny.toml`.
+If the fix must wait, open an issue.
+Add an ignore in `deny.toml`.
+Set `id` to the advisory ID.
 Set the reason to `#NNN until YYYY-MM-DD: text` with that issue number.
 Set the date no later than the end of the soak window for the release with the fix.
 The governance spec rejects expired ignores. Remove the entry when the fix lands.
 
+The advisory ID and issue number in `deny.toml` are public.
+CI diagnostics are also public.
 In the public issue, state only the effect, for example, "update crate X."
-Do not name an advisory against this project in public text.
-Use only the private report process in [SECURITY.md](SECURITY.md) for an advisory reference.
+Use only the private report process in [SECURITY.md](SECURITY.md) for new reports
+about this project and their details.
 
 **Break-glass procedure.** If the tool or database fails, use a reviewed pull request
 that updates the tool pin. If the pinned tool cannot read a new database record format,
