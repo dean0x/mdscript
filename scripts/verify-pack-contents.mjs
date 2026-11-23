@@ -149,10 +149,13 @@ export function isTrailerCandidate(path) {
  * Build the final pass/fail summary from accumulated results.
  *
  * @param {{ packageCount: number, fileCount: number, mapHits: { workspace: string, path: string }[], trailerHits: { workspace: string, path: string }[] }} totals
- * @param {{ workspace: string, path: string }[]} [missing]
+ * @param {{ workspace: string, path: string }[]} missing — pass an empty array if no required files are absent
  * @returns {{ ok: boolean, message: string }}
  */
-export function summarize(totals, missing = []) {
+export function summarize(totals, missing) {
+  if (!Array.isArray(missing)) {
+    return { ok: false, message: 'the list of missing required files must be an array' };
+  }
   const errors = [];
   if (totals.packageCount < MIN_PACKAGES) {
     errors.push(`non-vacuity floor: expected >= ${MIN_PACKAGES} packages, checked ${totals.packageCount}`);

@@ -146,8 +146,20 @@ describe('summarize', () => {
     });
   }
 
+  test('a run without the missing-file list fails', () => {
+    assert.deepEqual(summarize(totals), {
+      ok: false, message: 'the list of missing required files must be an array',
+    });
+  });
+
+  test('a run with a non-array missing-file list fails', () => {
+    assert.deepEqual(summarize(totals, ''), {
+      ok: false, message: 'the list of missing required files must be an array',
+    });
+  });
+
   test('a clean run with real counts passes and reports 0 maps', () => {
-    const result = summarize({ packageCount: 8, fileCount: 100, mapHits: [], trailerHits: [] });
+    const result = summarize(totals, []);
     assert.equal(result.ok, true);
     assert.match(result.message, /^pack-contents gate: 8 packages, 100 files, 0 maps$/);
   });
@@ -158,7 +170,7 @@ describe('summarize', () => {
       fileCount: 100,
       mapHits: [{ workspace: '@mdscript/mds', path: 'dist/index.js.map' }],
       trailerHits: [],
-    });
+    }, []);
     assert.equal(result.ok, false);
     assert.match(result.message, /@mdscript\/mds: ships dangling source map "dist\/index\.js\.map"/);
   });
@@ -169,19 +181,19 @@ describe('summarize', () => {
       fileCount: 100,
       mapHits: [],
       trailerHits: [{ workspace: '@mdscript/mds', path: 'dist/index.js' }],
-    });
+    }, []);
     assert.equal(result.ok, false);
     assert.match(result.message, /@mdscript\/mds: "dist\/index\.js" contains a sourceMappingURL trailer/);
   });
 
   test('the package-count floor trips on too few packages', () => {
-    const result = summarize({ packageCount: 3, fileCount: 100, mapHits: [], trailerHits: [] });
+    const result = summarize({ packageCount: 3, fileCount: 100, mapHits: [], trailerHits: [] }, []);
     assert.equal(result.ok, false);
     assert.match(result.message, /non-vacuity floor: expected >= 8 packages, checked 3/);
   });
 
   test('the file-count floor trips on too few files', () => {
-    const result = summarize({ packageCount: 8, fileCount: 2, mapHits: [], trailerHits: [] });
+    const result = summarize({ packageCount: 8, fileCount: 2, mapHits: [], trailerHits: [] }, []);
     assert.equal(result.ok, false);
     assert.match(result.message, /non-vacuity floor: expected >= \d+ files, checked 2/);
   });
