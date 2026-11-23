@@ -3,7 +3,12 @@ import { readFileSync, realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
 const PIN_FILE = '.github/actions/setup-wasm/action.yml';
-const VERSION_TIMEOUT_MS = 3000;
+/**
+ * Bound for one `--version` call. The limit stops a hung tool only. On an arm64
+ * macOS runner, the first start of an x86_64 binary under Rosetta can take more
+ * than 3 s (#519).
+ */
+export const VERSION_TIMEOUT_MS = 60_000;
 const VERSION_MAX_BYTES = 16 * 1024;
 /** @type {readonly ['wasm-pack', 'wasm-opt']} */
 const TOOLS = ['wasm-pack', 'wasm-opt'];
@@ -79,13 +84,21 @@ function loadToolPins() {
   }
 }
 
-/** @param {Tool} tool @returns {Result<string>} */
-function probeToolVersion(tool) {
+/**
+ * @param {Tool} tool
+ * @param {{timeoutMs?: number, env?: NodeJS.ProcessEnv}} [options]
+ * @returns {Result<string>}
+ */
+export function probeToolVersion(tool, { timeoutMs = VERSION_TIMEOUT_MS, env = process.env } = {}) {
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+    return { ok: false, error: `invalid ${tool} --version time limit` };
+  }
   try {
     const output = execFileSync(tool, ['--version'], {
       encoding: 'utf8',
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: VERSION_TIMEOUT_MS,
+      timeout: timeoutMs,
       maxBuffer: VERSION_MAX_BYTES,
       killSignal: 'SIGKILL',
     });
