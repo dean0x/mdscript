@@ -216,7 +216,7 @@ Each import walked starts a `readAhead()` for it via `startReadAhead`, tracked i
 1. WASM can report an escape for a missing module outside the project. It checks containment before it checks the file (U-SM30, U-SM32).
 2. Only WASM has an aggregate-size guard (`maxAggregateSize`). The guard never pre-empts a refusal of the same module (U-SM39).
 3. WASM refuses each lexical `..` above the key root before disk resolution. This includes `/..`, which native resolves to `/` (#424; U-S16, U-SM34). It also includes `link/..` above the project root as written (U-SM52).
-4. On POSIX, a `link/..` import can use an alias. WASM refuses when a plain path, real-directory path, existing module key, or other link conflicts with that alias. The map applies to all imports, so one key cannot name two files (#432; U-SM51 to U-SM55). Windows collapses `link\..` lexically on both backends.
+4. On POSIX, a `link/..` import can use an alias. WASM refuses when a plain path, real-directory path, existing module key, or other link conflicts with that alias. The map applies to all imports, so one key cannot name two files (#432; U-SM51 to U-SM55). On Windows, both backends collapse `link\..` lexically for disk access. The WASM scanner does not apply this rule to its virtual key.
 5. WASM limits the entry key, resolved import key, and canonical alias target to 256 segments (`mds::resource_limit`). The alias-target check never pre-empts a refusal of that module itself (U-S16, U-SM56).
 6. A `cannot read` message can use an errno name instead of OS text, which can show an absolute path. Both backends show the path below the project root, or `.` for the root (U-SM28, U-SM31, U-SM33, U-SM57). For a POSIX file name with a backslash, native displays `/` and the scanner keeps the backslash.
 7. The scanner reads modules before the engine evaluates them. A later import refusal can precede an earlier compile error or cycle (U-SM38).
@@ -301,7 +301,7 @@ export const WASM_EXPORTS = [
 - **`cannot read` names the path below the project root.** Compare the display path and the code across backends. The reason for a Node error can differ (difference 6).
 - **`U-SM34` needs a root container.** A non-root local run does not test that case.
 - **`U-SM48` and `U-SM48b` use Linux byte names.** macOS and Windows skip these fixtures because their filesystems cannot create such a name.
-- **Only the POSIX after-the-link semantics make a `link/..` alias.** Windows collapses `link\..` lexically on both backends (difference 4).
+- **A path with `..` can give an alias on POSIX or Windows.** On POSIX, for a path with `/` separators such as `./link/../z.mds`, disk resolution follows the link before it applies `..`. On Windows, the scanner can also record an alias for a backslash path such as `./link\..\z.mds`. The scanner splits the path at `/` only, so the backslashes stay in its virtual key (difference 4).
 - **An alias can name a file other than its lexical key.** Safety therefore depends on the walk seeing every import that the engine resolves. A new import form must update `scan_import_records` and the walk together.
 - **A directory, FIFO, device, or socket gets `not a regular file`.** Both backends use `mds::io` for this case (#428).
 
