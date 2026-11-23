@@ -69,12 +69,10 @@ use crate::value::Value;
 use context::{
     fragment_map_from, is_visible_export, CollectedDefs, ExtendsComponents, ImportSite, ModuleCtx,
 };
-use frontmatter::{
-    build_scope_from_merged_mapping, deep_merge_yaml, parse_frontmatter_yaml_with, Allowance,
-};
+use frontmatter::{build_scope_from_merged_mapping, deep_merge_yaml};
 pub(crate) use frontmatter::{
     parse_frontmatter_imports, parse_frontmatter_imports_from_yaml, parse_frontmatter_yaml,
-    FrontmatterImport,
+    parse_frontmatter_yaml_with, Allowance, FrontmatterImport,
 };
 #[cfg(test)]
 use import_paths::ImportPathViolation;

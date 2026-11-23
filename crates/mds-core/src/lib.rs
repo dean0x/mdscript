@@ -107,8 +107,12 @@ impl From<evaluator::EvalMessage> for Message {
     }
 }
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
+
+use evaluator::budget::{MemBudget, Part};
+use resolver::{parse_frontmatter_yaml_with, Allowance};
 
 pub use error::{module_count_exceeded, MdsError, SerializedError, SerializedSpan};
 pub use value::Value;
@@ -877,108 +881,223 @@ pub fn check_str_collecting_warnings(
     Ok(((), warnings))
 }
 
-/// Output-side reserved frontmatter keys: stripped from raw YAML before re-emitting frontmatter.
-///
-/// `extends` is intentionally absent — it is a directive consumed during template inheritance,
-/// never emitted as output FM. Contrast with `RESERVED_MERGE_KEYS` in `resolver/frontmatter.rs`
-/// which includes `extends` (the merge gate sees it as a directive to consume, not a value key).
+#[derive(Clone, Copy)]
+pub(crate) struct ReservedOutputKey {
+    pub(crate) name: &'static str,
+    // None reserves any value. Some reserves only the given YAML string.
+    only_value: Option<&'static str>,
+    form_message: &'static str,
+    split_at_yaml_break: bool,
+}
+
+/// Keys to remove from standalone output. Order sets form-message priority.
 ///
 /// SYNC POINT: also audit `RESERVED_MERGE_KEYS` in `resolver/frontmatter.rs`,
 /// `build_scope_from_frontmatter` in `resolver/module_scope.rs`, and `RESERVED` in `lint/facts.rs`.
-/// Each site reserves keys for its own purpose.
-const RESERVED_OUTPUT_KEYS: &[&str] = &["type", "imports", lexer::INDENTED_DIRECTIVES];
+/// The stripper and its proof share this table. The merge also reserves `extends`.
+pub(crate) const RESERVED_OUTPUT_KEYS: &[ReservedOutputKey] = &[
+    ReservedOutputKey {
+        name: "type",
+        only_value: Some("mds"),
+        form_message: "write `type:` at the start of a line",
+        split_at_yaml_break: false,
+    },
+    ReservedOutputKey {
+        name: "imports",
+        only_value: None,
+        form_message: "write `imports:` at the start of a line",
+        split_at_yaml_break: false,
+    },
+    ReservedOutputKey {
+        name: lexer::INDENTED_DIRECTIVES,
+        only_value: None,
+        form_message: "write `indented-directives:` at the start of a line",
+        split_at_yaml_break: true,
+    },
+];
+const RESERVED_KEY_FORM: &str = "write reserved frontmatter keys at the start of a line";
+const YAML_COMMENT_BREAKS: [char; 3] = ['\u{85}', '\u{2028}', '\u{2029}'];
 
-/// Remove reserved keys from raw frontmatter content.
-///
-/// Returns `Some(remaining)` if any non-whitespace content survives after filtering,
-/// or `None` if the frontmatter would be empty (nothing worth emitting).
-///
-/// Strips the keys named in `RESERVED_OUTPUT_KEYS`:
-/// - Top-level `type: mds` lines (all three YAML quoting styles; `type` with any other value
-///   is not a reserved directive and is left in place).
-/// - Top-level `imports:` key and its continuation lines (indented child lines).
-/// - Top-level `indented-directives:` line.
-fn strip_reserved_keys(raw: &str) -> Option<String> {
-    // Verify this function's bespoke stripping logic covers the keys listed in
-    // RESERVED_OUTPUT_KEYS. Zero cost in release; surfaces drift in debug/test builds.
-    debug_assert!(
-        RESERVED_OUTPUT_KEYS.contains(&"type")
-            && RESERVED_OUTPUT_KEYS.contains(&"imports")
-            && RESERVED_OUTPUT_KEYS.contains(&lexer::INDENTED_DIRECTIVES),
-        "RESERVED_OUTPUT_KEYS must match the keys handled by strip_reserved_keys"
-    );
-    let mut filtered = String::with_capacity(raw.len());
-    let mut in_imports_block = false;
+impl ReservedOutputKey {
+    fn reserves(self, value: &serde_yaml_ng::Value) -> bool {
+        self.only_value.is_none_or(
+            |expected| matches!(value, serde_yaml_ng::Value::String(text) if text == expected),
+        )
+    }
 
-    for line in raw.lines() {
-        let line = if line
-            .strip_prefix(lexer::INDENTED_DIRECTIVES)
-            .is_some_and(|tail| tail.starts_with(':'))
-        {
-            in_imports_block = false;
-            // YAML can end the key's comment before the next LF. Keep the next field.
-            let Some((_, rest)) = line.split_once(['\u{85}', '\u{2028}', '\u{2029}']) else {
-                continue;
-            };
-            rest
-        } else {
-            line
+    fn matches_line(self, line: &str) -> bool {
+        let Some(value) = line
+            .strip_prefix(self.name)
+            .and_then(|tail| tail.strip_prefix(':'))
+        else {
+            return false;
         };
-        // Blank lines are not YAML keys — preserve them outside an imports block
-        // and skip them (without resetting state) inside one.
-        if line.is_empty() {
-            if !in_imports_block {
-                filtered.push('\n');
+        let Some(expected) = self.only_value else {
+            return true;
+        };
+        let comment = value
+            .as_bytes()
+            .windows(2)
+            .position(|pair| matches!(pair, [b' ' | b'\t', b'#']));
+        let value = value[..comment.unwrap_or(value.len())].trim();
+        value == expected
+            || ['\'', '"'].into_iter().any(|quote| {
+                value
+                    .strip_prefix(quote)
+                    .and_then(|tail| tail.strip_suffix(quote))
+                    == Some(expected)
+            })
+    }
+}
+
+/// Yield the raw slices to keep. Keep each slice's bytes, including its line end.
+fn strip_reserved_keys<'a>(
+    raw: &'a str,
+    keys: &'a [ReservedOutputKey],
+) -> impl Iterator<Item = &'a str> + Clone {
+    let line_key = move |line| keys.iter().find(|key| key.matches_line(line));
+    raw.split_inclusive('\n')
+        .scan(false, move |in_block, mut line| {
+            let mut key = line_key(line);
+            // YAML can end the file key's comment before the next LF.
+            if let Some((_, rest)) = key
+                .filter(|key| key.split_at_yaml_break)
+                .and_then(|_| line.split_once(YAML_COMMENT_BREAKS))
+            {
+                *in_block = false;
+                line = rest;
+                key = line_key(line);
             }
-            continue;
-        }
-
-        // Only inspect top-level (no leading whitespace) keys.
-        let is_top_level = !line.starts_with(' ') && !line.starts_with('\t');
-
-        if is_top_level {
-            // Reset imports block tracking whenever we see a new top-level key.
-            if line.starts_with("imports:") {
-                in_imports_block = true;
-                // Drop this line (the `imports:` key itself).
-                continue;
+            if key.is_some() {
+                *in_block = true;
+                Some("")
+            } else if line.starts_with('#') {
+                Some(line)
+            } else if line.starts_with([' ', '\t', '\r', '\n']) {
+                Some(if *in_block { "" } else { line })
+            } else {
+                *in_block = false;
+                Some(line)
             }
-            in_imports_block = false;
+        })
+}
 
-            // Strip the `type: mds` line (plain, double-quoted, and single-quoted).
-            let is_type_mds = line.strip_prefix("type:").is_some_and(|v| {
-                let v = v.trim();
-                v == "mds" || v == "\"mds\"" || v == "'mds'"
-            });
-            if is_type_mds {
-                continue;
-            }
-        } else if in_imports_block {
-            // Continuation lines of the `imports:` block — drop them too.
-            continue;
-        }
-
-        filtered.push_str(line);
-        filtered.push('\n');
+/// Verify that the strip removes only the reserved keys from the parsed mapping.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the parse-site gate follows this phase")
+)]
+#[must_use = "the caller must propagate a reserved-key proof error"]
+pub(crate) fn prove_reserved_strip(
+    raw: &str,
+    original: Option<&serde_yaml_ng::Mapping>,
+    mem: &mut MemBudget,
+) -> Result<(), MdsError> {
+    let kept = strip_reserved_keys(raw, RESERVED_OUTPUT_KEYS);
+    // The slices do not overlap, so their total length is at most raw.len().
+    let kept_len: usize = kept.clone().map(str::len).sum();
+    let first_reserved = RESERVED_OUTPUT_KEYS.iter().find(|key| {
+        original
+            .and_then(|map| map.get(key.name))
+            .is_some_and(|value| key.reserves(value))
+    });
+    if kept_len == raw.len() && first_reserved.is_none() {
+        return Ok(());
     }
 
-    filtered.truncate(filtered.trim_end().len());
-    if filtered.is_empty() {
-        return None;
-    }
-    let leading = filtered.len() - filtered.trim_start().len();
-    filtered.drain(..leading);
-    filtered.push('\n');
-    Some(filtered)
+    let form_error =
+        || MdsError::yaml_error(first_reserved.map_or(RESERVED_KEY_FORM, |key| key.form_message));
+    let mark = mem.mark();
+    let result = (|| {
+        let stripped = if kept_len == raw.len() {
+            Cow::Borrowed(raw)
+        } else {
+            mem.charge(Part::Temp, Some(kept_len))?;
+            let mut text = String::with_capacity(kept_len);
+            text.extend(kept);
+            Cow::Owned(text)
+        };
+        let (proof, spent) = parse_frontmatter_yaml_with(&stripped, Allowance::in_compile(mem))
+            .map_err(|err| match err {
+                MdsError::YamlError { .. } => form_error(),
+                other => other,
+            })?;
+        mem.charge(Part::Temp, Some(spent))?;
+
+        let Some(original) = original else {
+            return Err(form_error());
+        };
+        let proof = match proof {
+            serde_yaml_ng::Value::Mapping(map) => map,
+            // A document with only white space and comments has no YAML value.
+            serde_yaml_ng::Value::Null
+                if stripped
+                    .split([
+                        '\r',
+                        '\n',
+                        YAML_COMMENT_BREAKS[0],
+                        YAML_COMMENT_BREAKS[1],
+                        YAML_COMMENT_BREAKS[2],
+                    ])
+                    .all(|line| {
+                        let line = line.trim_start_matches([' ', '\t']);
+                        line.is_empty() || line.starts_with('#')
+                    }) =>
+            {
+                serde_yaml_ng::Mapping::new()
+            }
+            _ => return Err(form_error()),
+        };
+
+        let mut expected_len = original.len();
+        for key in RESERVED_OUTPUT_KEYS {
+            let before = original.get(key.name);
+            let expected = before.filter(|value| !key.reserves(value));
+            if proof.get(key.name) != expected {
+                return Err(MdsError::yaml_error(key.form_message));
+            }
+            expected_len -= usize::from(before.is_some() && expected.is_none());
+        }
+        if proof.len() != expected_len
+            || proof
+                .iter()
+                .any(|(key, value)| original.get(key) != Some(value))
+        {
+            return Err(MdsError::yaml_error(RESERVED_KEY_FORM));
+        }
+        Ok(())
+    })();
+    mem.release_to(mark);
+    result
+}
+
+/// Identify the fixed YAML form messages, not other YAML errors.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the formatter consumer follows this phase")
+)]
+#[must_use]
+pub(crate) fn is_frontmatter_form_message(message: &str) -> bool {
+    message == lexer::FILE_KEY_FORM
+        || message == RESERVED_KEY_FORM
+        || RESERVED_OUTPUT_KEYS
+            .iter()
+            .any(|key| message == key.form_message)
 }
 
 /// Return fenced frontmatter if non-whitespace content remains after key removal.
 pub(crate) fn frontmatter_prefix(raw: Option<&str>) -> Option<String> {
     const FENCE: &str = "---\n";
-    let cleaned = strip_reserved_keys(raw?)?;
-    let mut prefix = String::with_capacity(cleaned.len() + 2 * FENCE.len());
+    let raw = raw?;
+    let mut prefix = String::with_capacity(raw.len() + 2 * FENCE.len() + 1);
     prefix.push_str(FENCE);
-    prefix.push_str(&cleaned);
+    prefix.extend(strip_reserved_keys(raw, RESERVED_OUTPUT_KEYS));
+    if prefix[FENCE.len()..].trim().is_empty() {
+        return None;
+    }
+    if !prefix.ends_with('\n') {
+        prefix.push('\n');
+    }
     prefix.push_str(FENCE);
     Some(prefix)
 }
@@ -2316,13 +2435,18 @@ mod tests {
         );
     }
 
+    fn stripped_for_test(raw: &str) -> Option<String> {
+        let stripped: String = strip_reserved_keys(raw, RESERVED_OUTPUT_KEYS).collect();
+        (!stripped.trim().is_empty()).then_some(stripped)
+    }
+
     // ── strip_reserved_keys: type: mds variants ───────────────────────────────
 
     #[test]
     fn strip_reserved_keys_plain_value() {
         // Baseline: unquoted `type: mds` is stripped.
         let raw = "type: mds\nname: Alice\n";
-        let result = strip_reserved_keys(raw);
+        let result = stripped_for_test(raw);
         assert_eq!(result, Some("name: Alice\n".to_string()));
     }
 
@@ -2330,7 +2454,7 @@ mod tests {
     fn strip_reserved_keys_double_quoted() {
         // `type: "mds"` — double-quoted YAML string — must also be stripped.
         let raw = "type: \"mds\"\nname: Alice\n";
-        let result = strip_reserved_keys(raw);
+        let result = stripped_for_test(raw);
         assert_eq!(
             result,
             Some("name: Alice\n".to_string()),
@@ -2342,7 +2466,7 @@ mod tests {
     fn strip_reserved_keys_single_quoted() {
         // `type: 'mds'` — single-quoted YAML string — must also be stripped.
         let raw = "type: 'mds'\nname: Alice\n";
-        let result = strip_reserved_keys(raw);
+        let result = stripped_for_test(raw);
         assert_eq!(
             result,
             Some("name: Alice\n".to_string()),
@@ -2354,7 +2478,7 @@ mod tests {
     fn strip_reserved_keys_no_space_after_colon() {
         // `type:mds` — no space after colon — must also be stripped.
         let raw = "type:mds\nname: Alice\n";
-        let result = strip_reserved_keys(raw);
+        let result = stripped_for_test(raw);
         assert_eq!(
             result,
             Some("name: Alice\n".to_string()),
@@ -2366,7 +2490,7 @@ mod tests {
     fn strip_reserved_keys_quoted_only_returns_none() {
         // Frontmatter with only a quoted `type: "mds"` should return None (empty after strip).
         let raw = "type: \"mds\"\n";
-        let result = strip_reserved_keys(raw);
+        let result = stripped_for_test(raw);
         assert_eq!(
             result, None,
             "frontmatter with only quoted type:mds should be None, got: {result:?}"
@@ -2377,7 +2501,7 @@ mod tests {
     fn strip_reserved_keys_indented_quoted_not_stripped() {
         // Indented `  type: "mds"` inside a nested mapping must NOT be stripped.
         let raw = "type: mds\nconfig:\n  type: \"mds\"\n  theme: dark\n";
-        let result = strip_reserved_keys(raw);
+        let result = stripped_for_test(raw);
         assert_eq!(
             result,
             Some("config:\n  type: \"mds\"\n  theme: dark\n".to_string()),
@@ -2387,14 +2511,16 @@ mod tests {
 
     #[test]
     fn indented_directives_is_a_reserved_output_key() {
-        assert!(RESERVED_OUTPUT_KEYS.contains(&"indented-directives"));
+        assert!(RESERVED_OUTPUT_KEYS
+            .iter()
+            .any(|key| key.name == "indented-directives"));
     }
 
     #[test]
     fn indented_directives_is_stripped_only_at_top_level() {
         let raw = "indented-directives: false # off\nconfig:\n  indented-directives: custom\n";
         assert_eq!(
-            strip_reserved_keys(raw).as_deref(),
+            stripped_for_test(raw).as_deref(),
             Some("config:\n  indented-directives: custom\n"),
         );
     }
@@ -2405,7 +2531,7 @@ mod tests {
     fn strip_imports_block() {
         // Multi-line `imports:` block with indented entries is fully stripped.
         let raw = "name: Alice\nimports:\n  - path: ./lib.mds\n    as: lib\ngreeting: hello\n";
-        let result = strip_reserved_keys(raw);
+        let result = stripped_for_test(raw);
         assert_eq!(
             result,
             Some("name: Alice\ngreeting: hello\n".to_string()),
@@ -2417,7 +2543,7 @@ mod tests {
     fn strip_imports_and_type_returns_none_when_empty() {
         // Only `type: mds` and `imports:` — nothing left after stripping → None.
         let raw = "type: mds\nimports:\n  - path: ./lib.mds\n";
-        let result = strip_reserved_keys(raw);
+        let result = stripped_for_test(raw);
         assert_eq!(
             result, None,
             "only reserved keys, should be None, got: {result:?}"
@@ -2429,7 +2555,7 @@ mod tests {
         // Inline (flow-style) `imports:` key on a single line with no children.
         // The key line itself is dropped; the next top-level key continues normally.
         let raw = "imports: []\nname: Bob\n";
-        let result = strip_reserved_keys(raw);
+        let result = stripped_for_test(raw);
         assert_eq!(
             result,
             Some("name: Bob\n".to_string()),
@@ -2441,7 +2567,7 @@ mod tests {
     fn strip_preserves_nested_imports_key() {
         // An indented `imports:` key inside a nested mapping must NOT be stripped.
         let raw = "name: Alice\nconfig:\n  imports: true\n  theme: dark\n";
-        let result = strip_reserved_keys(raw);
+        let result = stripped_for_test(raw);
         assert_eq!(
             result,
             Some("name: Alice\nconfig:\n  imports: true\n  theme: dark\n".to_string()),
@@ -2456,12 +2582,166 @@ mod tests {
         // it would reset `in_imports_block` and allow the trailing `greeting:` to
         // be emitted — but only after the blank-line guard was added.
         let raw = "imports:\n  - path: ./a.mds\n\n  - path: ./b.mds\ngreeting: hello\n";
-        let result = strip_reserved_keys(raw);
+        let result = stripped_for_test(raw);
         assert_eq!(
             result,
             Some("greeting: hello\n".to_string()),
             "blank lines inside imports block must not leak; got: {result:?}"
         );
+    }
+
+    #[test]
+    fn reserved_strip_keeps_comment_and_drops_the_rest_of_the_block() {
+        let raw = "imports:\n  - ./a.mds\n# keep this\n \t\n  - ./b.mds\nname: World\n";
+        assert_eq!(
+            frontmatter_prefix(Some(raw)).as_deref(),
+            Some("---\n# keep this\nname: World\n---\n"),
+        );
+    }
+
+    #[test]
+    fn reserved_strip_accepts_type_with_a_trailing_comment() {
+        for value in ["mds # marker", "\"mds\"\t# marker", "'mds' # marker"] {
+            let raw = format!("type: {value}\nname: World\n");
+            assert_eq!(
+                frontmatter_prefix(Some(&raw)).as_deref(),
+                Some("---\nname: World\n---\n"),
+                "value: {value}",
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_strip_preserves_kept_line_bytes() {
+        let raw = "\n# keep  \nimports: []\nname: World  \n\n";
+        assert_eq!(
+            frontmatter_prefix(Some(raw)).as_deref(),
+            Some("---\n\n# keep  \nname: World  \n\n---\n"),
+        );
+    }
+
+    #[test]
+    fn reserved_strip_keeps_field_after_yaml_line_break() {
+        for separator in [char::from(0x85), '\u{2028}', '\u{2029}'] {
+            let raw = format!("indented-directives: false # marker{separator}name: World\n");
+            assert_eq!(
+                frontmatter_prefix(Some(&raw)).as_deref(),
+                Some("---\nname: World\n---\n"),
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_strip_accepts_a_test_only_table_entry() {
+        let raw = "extra:\n  note: hidden\nname: World\n";
+        let mut keys = RESERVED_OUTPUT_KEYS.to_vec();
+        keys.push(ReservedOutputKey {
+            name: "extra",
+            only_value: None,
+            form_message: "write `extra:` at the start of a line",
+            split_at_yaml_break: false,
+        });
+        assert_eq!(
+            strip_reserved_keys(raw, &keys).collect::<String>(),
+            "name: World\n"
+        );
+    }
+
+    mod reserved_strip_proof {
+        use super::*;
+
+        #[test]
+        fn reserved_strip_form_predicate_matches_only_fixed_messages() {
+            for message in [
+                lexer::FILE_KEY_FORM,
+                "write `type:` at the start of a line",
+                "write `imports:` at the start of a line",
+                "write `indented-directives:` at the start of a line",
+                "write reserved frontmatter keys at the start of a line",
+            ] {
+                assert!(is_frontmatter_form_message(message), "message: {message}");
+            }
+            assert!(!is_frontmatter_form_message("invalid YAML"));
+        }
+
+        fn prove(raw: &str, mem: &mut MemBudget) -> Result<(), MdsError> {
+            let original = resolver::parse_frontmatter_yaml(raw).expect("valid original YAML");
+            prove_reserved_strip(raw, original.as_mapping(), mem)
+        }
+
+        #[test]
+        fn reserved_strip_proof_accepts_a_comment_as_the_only_kept_line() {
+            let mut mem = MemBudget::default();
+            mem.charge(Part::Temp, Some(1)).unwrap();
+            let before = mem;
+            let raw = "imports:\n# keep\n  - ./a.mds\n";
+            assert!(prove(raw, &mut mem).is_ok());
+            assert_eq!(mem, before);
+        }
+
+        #[test]
+        fn reserved_strip_proof_skips_parse_without_reserved_keys_or_dropped_lines() {
+            let mut mem = MemBudget::default();
+            mem.headroom = 0;
+            assert!(prove("{type: post, note: ok}\n", &mut mem).is_ok());
+        }
+
+        #[test]
+        fn reserved_strip_proof_reports_first_listed_key_that_differs() {
+            let raw = "'imports': [private-marker]\n\"type\": mds\n";
+            let error = prove(raw, &mut MemBudget::default())
+                .expect_err("reserved keys remain after the strip")
+                .serialize();
+            assert_eq!(error.code, "mds::yaml");
+            assert_eq!(
+                error.message,
+                "YAML parse error: write `type:` at the start of a line",
+            );
+        }
+
+        #[test]
+        fn reserved_strip_proof_uses_form_message_for_a_yaml_parse_error() {
+            let raw = "imports: &shared [private-marker]\nnote: *shared\n";
+            let mut mem = MemBudget::default();
+            mem.charge(Part::Temp, Some(1)).unwrap();
+            let before = mem;
+            let error = prove(raw, &mut mem)
+                .expect_err("kept alias has no anchor")
+                .serialize();
+            assert_eq!(error.code, "mds::yaml");
+            assert_eq!(
+                error.message,
+                "YAML parse error: write `imports:` at the start of a line",
+            );
+            assert_eq!(mem, before);
+        }
+
+        #[test]
+        fn reserved_strip_proof_uses_generic_message_if_no_listed_key_differs() {
+            for raw in ["type:mds\n", "note: 'before\nimports: []\nafter'\n"] {
+                let error = prove(raw, &mut MemBudget::default())
+                    .expect_err("the strip drops text that is not a reserved key")
+                    .serialize();
+                assert_eq!(error.code, "mds::yaml");
+                assert_eq!(
+                    error.message,
+                    "YAML parse error: write reserved frontmatter keys at the start of a line",
+                );
+            }
+        }
+
+        #[test]
+        fn reserved_strip_proof_preserves_the_resource_limit_and_temp_mark() {
+            let raw = "imports: []\nnote: retained value\n";
+            let mut mem = MemBudget::default();
+            mem.charge(Part::Temp, Some(1)).unwrap();
+            // There is room for the stripped text, but not for its parsed tree.
+            mem.headroom = 1 + "note: retained value\n".len();
+            let before = mem;
+            let error = prove(raw, &mut mem).expect_err("proof parse exceeds available memory");
+            assert_eq!(error.serialize().code, "mds::resource_limit");
+            assert_eq!(mem, before);
+        }
     }
 
     // ── scan_imports: frontmatter imports paths ───────────────────────────────

@@ -261,7 +261,7 @@ fn collect_frontmatter_vars(
     ctx: &mut AnalysisContext,
 ) -> Result<(), MdsError> {
     // Reserved keys per Appendix A (unused-variable skip-set).
-    // SYNC POINT: audit `strip_reserved_keys` and `RESERVED_OUTPUT_KEYS` in lib.rs,
+    // SYNC POINT: audit `RESERVED_OUTPUT_KEYS` in lib.rs (stripper and proof),
     // `RESERVED_MERGE_KEYS` in resolver/frontmatter.rs, and `build_scope_from_frontmatter` in resolver/module_scope.rs.
     const RESERVED: &[&str] = &[
         "imports",

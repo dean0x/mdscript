@@ -76,7 +76,7 @@ pub(super) fn deep_merge_yaml(
     // recursive calls (depth > 0).  A nested key like `config.type` is not a
     // top-level directive; filtering it would silently discard user data.
     //
-    // SYNC POINT: also audit `RESERVED_OUTPUT_KEYS` and `strip_reserved_keys` in lib.rs,
+    // SYNC POINT: also audit `RESERVED_OUTPUT_KEYS` in lib.rs (stripper and proof),
     // `build_scope_from_frontmatter` in resolver/module_scope.rs, and `RESERVED` in lint/facts.rs.
     // Each site reserves keys for its own purpose. Only the merge sees `extends`.
     const RESERVED_MERGE_KEYS: &[&str] = &[
