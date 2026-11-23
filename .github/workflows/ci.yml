@@ -540,8 +540,34 @@ jobs:
         run: python -m pip install --upgrade pip "maturin==1.13.3" pytest
       - name: Build wheel
         run: maturin build -m crates/mds-python/Cargo.toml --out dist
-      - name: Assert wheel is cp311-abi3
-        run: ls dist/ && ls dist/ | grep -q 'cp311-abi3' || (echo "expected a cp311-abi3 wheel" && exit 1)
+      # Use the built archive from the local maturin wheel command (#136).
+      - name: Assert wheel is cp311-abi3 and contains NOTICE
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(dist/*-cp311-abi3-*.whl)
+          if [[ "${#wheels[@]}" -ne 1 ]]; then
+            printf 'Expected one cp311-abi3 wheel; found %s\n' "${#wheels[@]}" >&2
+            exit 1
+          fi
+
+          wheel=${wheels[0]##*/}
+          notice="${wheel%-cp311-abi3-*}.dist-info/licenses/NOTICE"
+          listings=$(mktemp -d "$RUNNER_TEMP/wheel-notice.XXXXXX")
+          unzip -Z1 "${wheels[0]}" > "$listings/wheel.txt"
+          if ! grep -Fx -- "$notice" "$listings/wheel.txt"; then
+            printf 'Expected a NOTICE entry in the wheel license directory\n' >&2
+            exit 1
+          fi
+
+          grep -Fvx -- "$notice" "$listings/wheel.txt" > "$listings/control.txt"
+          rc=0
+          grep -Fx -- "$notice" "$listings/control.txt" > "$listings/control-match.txt" || rc=$?
+          if [[ "$rc" -ne 1 || -s "$listings/control-match.txt" ]]; then
+            printf 'Wheel NOTICE control: expected exit 1 and no match; got exit %s\n' "$rc" >&2
+            exit 1
+          fi
+          printf 'Wheel NOTICE control: exit %s, no match\n' "$rc"
       - name: Install the built wheel (not editable) + import smoke
         run: |
           python -m pip install --find-links dist --no-index markdown-script
