@@ -1,0 +1,23 @@
+# List the policy allow list first, then exception licenses in deny.toml order (#136).
+accepted = ["MIT", "Apache-2.0", "ISC", "CC0-1.0", "Unicode-3.0", "Zlib", "Apache-2.0 WITH LLVM-exception"]
+# Include the native addon targets and the WASM target (#136).
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc",
+    "wasm32-unknown-unknown",
+]
+ignore-dev-dependencies = false
+ignore-build-dependencies = false
+
+[private]
+ignore = false
+
+# The miniz_oxide MIT files differ by one blank line. Use the same file on all hosts (#136).
+[miniz_oxide.clarify]
+license = "MIT"
+files = [{ path = "LICENSE-MIT.md", checksum = "799e9ca9d179295ef372f25d3769cdda7d25bb2668add6a6a1e22d1e4c678b8d" }]

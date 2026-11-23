@@ -1,0 +1,4 @@
+# Keep NOTICE bytes unchanged in platform packages and local freshness checks (#136).
+/NOTICE text eol=lf
+/crates/mds-python/NOTICE text eol=lf
+/about.hbs text eol=lf
