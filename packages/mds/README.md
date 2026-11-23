@@ -79,7 +79,7 @@ WASM file APIs (`compileFile`, `checkFile`, and `lintFile`) differ from native i
 - On POSIX, `link/..` can use an alias. A conflict fails because one alias key cannot name two files. Windows resolves `link\..` lexically on both backends.
 - WASM limits the root-relative entry key, resolved import key, and alias target to 256 segments. This bounds key resolution.
 - WASM uses an errno name for Node file errors in `cannot read` messages. The OS text can include an absolute path.
-- A later file error can precede an earlier compile error or cycle. WASM reads the modules before it evaluates them.
+- A later file error can precede an earlier compile error or cycle. WASM reads the modules before it evaluates them. To match native error order, the engine would need to evaluate each module before the scanner reads the next. This difference changes which error WASM reports, not the compiled output.
 - WASM limits total module bytes and limits aliases to 65,536 entries and 10 MiB of keys and targets. Native does not use those limits.
 - WASM refuses a non-UTF-8 directory before it checks the file. Native checks the file first. To match native order, each path check would need both string and byte forms.
 
