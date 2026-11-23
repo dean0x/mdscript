@@ -319,7 +319,9 @@ const PRINT_MACROS: &[&str] = &[
 /// when its prints moved to the writer; lowering one is a decision made in the commit
 /// that removes the print, never a side effect.
 const SITE_FLOORS: &[(&str, usize)] = &[
-    ("build.rs", 17),
+    ("build.rs", 8),
+    ("directory.rs", 1),
+    ("single.rs", 8),
     ("out_paths.rs", 1),
     ("source_map.rs", 4),
     ("stdio.rs", 1),
@@ -633,6 +635,22 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
 const ALLOWED_UNTRACED_HELPER_ARGS: &[(&str, &str, &str)] = &[
     (
         "build.rs",
+        "w",
+        "`for w in &result.warnings` — `w` is a whole warning string produced by \
+         `mds-core`, not a value this crate interpolates. HUMAN mode is the correct mode \
+         for it: it is prose, legitimately multi-line. What makes it safe is that \
+         `mds-core`'s three untrusted-value warning producers WIRE-escape at construction: \
+         `resolver.rs`'s imported-module filename, and `evaluator.rs`'s two `@include` \
+         alias warnings — see the boundary table in \
+         `crates/mds-core/src/lint/diagnostic.rs`. That is PRODUCER DISCIPLINE, which this \
+         lexical guard cannot follow across a crate boundary to confirm. It is upheld by \
+         review, plus one test on the only producer whose input can carry a hostile \
+         character: `producer_discipline.rs` in this crate. The two alias sites are upheld \
+         by review alone — the parser restricts an alias to `[A-Za-z_][A-Za-z0-9_]*`, so \
+         testing them would be vacuous (PF-013). See this file's module doc.",
+    ),
+    (
+        "single.rs",
         "w",
         "`for w in &result.warnings` — `w` is a whole warning string produced by \
          `mds-core`, not a value this crate interpolates. HUMAN mode is the correct mode \

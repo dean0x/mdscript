@@ -4,8 +4,10 @@
 //! Build children use `super::child::item` to refer to items in sibling modules.
 mod admit;
 mod config;
+mod directory;
 mod entry;
 mod out_paths;
+mod single;
 mod source_map;
 mod stdio;
 mod vars;
@@ -24,15 +26,11 @@ pub(crate) use config::{compile_inputs, load_config, run_reads, source_inputs, P
 #[cfg(test)]
 pub(crate) use config::{BuildConfig, MdsConfig};
 pub(crate) use entry::{auto_detect_mds_file, resolve_input};
-use out_paths::warn_output_extension_mismatch;
 pub(crate) use out_paths::{
     reject_forbidden_output_flags, resolve_output_path_for_kind, OutputKind,
 };
 pub(crate) use source_map::map_path_for;
-use source_map::{
-    apply_source_map_file_label, compute_source_map_base, embed_carrier, file_name_of,
-    verify_then_delete_map,
-};
+use source_map::{apply_source_map_file_label, embed_carrier};
 pub(crate) use stdio::{read_stdin, write_output};
 pub(crate) use vars::{
     build_runtime_vars, build_runtime_vars_logged, emit_duplicate_var_warnings,
@@ -259,8 +257,6 @@ pub(crate) struct BuildArgs {
     pub(crate) embed_sources: bool,
 }
 
-// ── Source-map helpers ────────────────────────────────────────────────────────
-
 pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     let BuildArgs {
         input,
@@ -291,329 +287,28 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         crate::output::ewriteln!("Building {}", crate::output::safe_path(&input));
     }
 
+    let run = single::BuildRun {
+        output,
+        out_dir,
+        quiet,
+        flag_source_map,
+        no_source_map,
+        inline,
+        flag_embed_sources,
+    };
+
     // Directory mode: compile every non-partial .mds file in the tree.
     if input != Path::new("-") && input.is_dir() {
-        // Reject -o/--output in directory mode: output goes to files, not a single destination.
-        if output.is_some() {
-            return Err(miette::miette!(
-                "build directory mode does not support -o/--output; \
-                 use --out-dir to specify an output directory"
-            ));
-        }
-        // #413: the one directory-argument check every directory-mode subcommand makes
-        // (a symlink, the filesystem root, a forbidden character — all `mds::io`).
-        crate::input::resolve_directory_argument(&input).map_err(miette::Error::from)?;
-
-        // Load project config to determine effective flags for directory mode.
-        let dir_config = load_config(&input)?;
-        let cfg_source_map = dir_config
-            .as_ref()
-            .map(|c| c.config.build.source_map)
-            .unwrap_or(false);
-        let cfg_embed_sources = dir_config
-            .as_ref()
-            .map(|c| c.config.build.embed_sources)
-            .unwrap_or(false);
-        let use_source_map = (flag_source_map || cfg_source_map) && !no_source_map;
-        let use_embed_sources = flag_embed_sources || cfg_embed_sources;
-
-        // C3/D6: embed_sources without source_map is a no-op (applies PF-004 — all paths).
-        if use_embed_sources && !use_source_map && !quiet {
-            crate::output::ewriteln!(
-                "warning: embed_sources has no effect without source maps; \
-                 set build.source_map=true or pass --source-map"
-            );
-        }
-
-        return run_build_directory(
-            &input,
-            out_dir,
-            resolved,
-            quiet,
-            use_source_map,
-            use_embed_sources,
-            inline,
-        );
+        return directory::build_directory_mode(input, resolved, run);
     }
 
     // The vars, and the `--vars` file they came from, which no output is written over
     // (#425).
-    let RuntimeVars {
-        vars: runtime_vars,
-        vars_file,
-        ..
-    } = resolved;
-
-    // ── Stdin path ───────────────────────────────────────────────────────────────
-
     if input == Path::new("-") {
-        // Stdin: no project config; effective flags from CLI only.
-        let use_source_map = flag_source_map && !no_source_map;
-        let use_embed_sources = flag_embed_sources;
-
-        // C3/D6: embed_sources without source_map is a no-op; warn so users don't wonder
-        // why their output contains no sourcesContent (applies PF-004 — both paths checked).
-        if use_embed_sources && !use_source_map && !quiet {
-            crate::output::ewriteln!(
-                "warning: embed_sources has no effect without source maps; \
-                 set build.source_map=true or pass --source-map"
-            );
-        }
-
-        // AC-SEC-02: warn when shipping full source text in a distributable artifact.
-        if use_embed_sources && inline && !quiet {
-            crate::output::ewriteln!(
-                "warning: --embed-sources with --inline ships full source text in the output \
-                 (AC-SEC-02)"
-            );
-        }
-
-        let source_map_base = use_source_map
-            .then(|| compute_source_map_base(Path::new("-"), &output, &out_dir, &None))
-            .transpose()?;
-        let opts = mds::CompileOptions::default()
-            .with_source_map(use_source_map)
-            .with_include_sources_content(use_embed_sources)
-            .with_source_map_base(source_map_base);
-
-        let source = read_stdin()?;
-        // AD-211-1 / AD-211-5: same stdin relabel as `compile_to_content`; `None` is the
-        // working directory, shown as "." (see `read_stdin`).
-        let result = mds::compile_str_with_deps_opts(&source, None, runtime_vars, opts)
-            .map_err(|e| crate::output::relabel_stdin_error(&e, &source))?;
-        if !quiet {
-            for w in &result.warnings {
-                crate::output::eprint_warning(w);
-            }
-        }
-
-        let mut source_map = result.source_map;
-        let kind = OutputKind::from(&result.output);
-        let content = serialize_output(result.output)?;
-        let inputs = compile_inputs(
-            None,
-            &result.dependencies,
-            &run_reads(vars_file.as_deref(), None),
-        );
-
-        // Stdin: no project config; output path follows -o flag or defaults to stdout.
-        // There is no entry file to refuse (#425), so the `-o` warning is printed now.
-        let output_path = resolve_output_path_for_kind(
-            Some(EntryPaths::as_typed(&input)),
-            &output,
-            &out_dir,
-            &None,
-            kind,
-        )?;
-        warn_output_extension_mismatch(&output, kind, quiet);
-
-        if let Some(ref mut sm) = source_map {
-            // Set `file` field and relabel source entry for stdin builds (AC-FUNC-12).
-            apply_source_map_file_label(sm, output_path.as_ref().map(|t| t.path.as_path()), true);
-        }
-
-        if use_source_map {
-            if inline {
-                // Inline: embed carrier into the output content, then write.
-                let map_json = source_map.as_ref().map(|sm| sm.to_json());
-                let final_content = if let Some(ref json) = map_json {
-                    embed_carrier(content, json)
-                } else {
-                    content
-                };
-                return write_output(output_path.as_ref(), &final_content, &inputs, quiet, true);
-            } else {
-                // Sidecar: write output first (byte-identical to no-flag; ADR-002).
-                match &output_path {
-                    None => {
-                        // Sidecar + stdout: three-case ladder (stdin has no config, so cases 1–2).
-                        if source_map.is_none() {
-                            // Case 1 — messages mode: compiler produced no map; write to stdout.
-                            return write_output(None, &content, &inputs, quiet, true);
-                        }
-                        // Case 2 — explicit --source-map flag: hard error.
-                        return Err(miette::miette!(
-                            "--source-map (sidecar) requires an output file; use -o <file> or \
-                             --out-dir, --inline to embed the map for stdout, or --no-source-map \
-                             to skip it"
-                        ));
-                    }
-                    Some(out) => {
-                        write_output(Some(out), &content, &inputs, quiet, true)?;
-                        if let Some(ref sm) = source_map {
-                            let map = out.sibling(map_path_for);
-                            // The sidecar's `file` / `sources` / `sourcesContent` are
-                            // written VERBATIM, by decision — spec §7.5 "Carve-out:
-                            // functional path references". They are resolved against the
-                            // filesystem by devtools and bundlers, so a `\uXXXX`-escaped
-                            // path would not exist. Consumers must treat them as
-                            // untrusted; see the `mds::SourceMap` rustdoc. The status
-                            // line below is a diagnostic surface and IS escaped.
-                            let map_json = sm.to_json();
-                            write_compiled(&map, &map_json, &inputs)?;
-                            if !quiet {
-                                crate::output::ewriteln!(
-                                    "Source map written to {}",
-                                    crate::output::safe_path(&map.shown)
-                                );
-                            }
-                        }
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
-        return write_output(output_path.as_ref(), &content, &inputs, quiet, true);
+        return single::run_build_stdin(input, resolved, &run);
     }
 
-    // ── File input path ──────────────────────────────────────────────────────────
-
-    // File input: load project config and compute effective flags.
-    let config = load_config(&input)?;
-    let cfg_source_map = config
-        .as_ref()
-        .map(|c| c.config.build.source_map)
-        .unwrap_or(false);
-    let cfg_embed_sources = config
-        .as_ref()
-        .map(|c| c.config.build.embed_sources)
-        .unwrap_or(false);
-
-    let use_source_map = (flag_source_map || cfg_source_map) && !no_source_map;
-    let use_embed_sources = flag_embed_sources || cfg_embed_sources;
-
-    // C3/D6: embed_sources without source_map is a no-op; warn so users don't wonder
-    // why their output contains no sourcesContent (applies PF-004 — both paths checked).
-    if use_embed_sources && !use_source_map && !quiet {
-        crate::output::ewriteln!(
-            "warning: embed_sources has no effect without source maps; \
-             set build.source_map=true or pass --source-map"
-        );
-    }
-
-    // AC-SEC-02: warn when shipping full source text in a distributable artifact.
-    if use_embed_sources && inline && !quiet {
-        crate::output::ewriteln!(
-            "warning: --embed-sources with --inline ships full source text in the output \
-             (AC-SEC-02)"
-        );
-    }
-
-    let source_map_base = use_source_map
-        .then(|| compute_source_map_base(&input, &output, &out_dir, &config))
-        .transpose()?;
-    let opts = mds::CompileOptions::default()
-        .with_source_map(use_source_map)
-        .with_include_sources_content(use_embed_sources)
-        .with_source_map_base(source_map_base);
-
-    let compiled = compile_to_content(&input, runtime_vars, quiet, opts)?;
-    let inputs = compile_inputs(
-        Some(&input),
-        &compiled.dependencies,
-        &run_reads(vars_file.as_deref(), config.as_ref()),
-    );
-    // `mds build` holds only the typed path: the output is resolved from it, and
-    // `admit_output` canonicalizes both sides itself.
-    let entry = EntryPaths::as_typed(&input);
-    let output_path =
-        resolve_output_path_for_kind(Some(entry), &output, &out_dir, &config, compiled.kind)?;
-    // #425: nothing — output or sidecar map — is written once the output is the entry,
-    // and no warning announces that write.
-    let written_path = output_path.as_ref().map(|t| t.path.as_path());
-    admit_output(written_path, entry, &output, compiled.kind, quiet)
-        .map_err(miette::Error::from)?;
-
-    let mut source_map = compiled.source_map;
-    if let Some(ref mut sm) = source_map {
-        apply_source_map_file_label(sm, written_path, false);
-    }
-
-    if use_source_map {
-        if inline {
-            // Inline: embed carrier into the output, then write (ADR-002 not applicable:
-            // inline mode intentionally modifies the output file).
-            let map_json = source_map.as_ref().map(|sm| sm.to_json());
-            let final_content = if let Some(ref json) = map_json {
-                embed_carrier(compiled.content, json)
-            } else {
-                compiled.content
-            };
-            write_output(output_path.as_ref(), &final_content, &inputs, quiet, true)?;
-
-            // Stale sidecar reconciliation: if there is an existing .map file from
-            // a prior sidecar build, remove it (AC-FUNC-10).
-            if let Some(ref out) = output_path {
-                verify_then_delete_map(&out.sibling(map_path_for), &file_name_of(out), quiet)?;
-            }
-        } else {
-            // Sidecar: write output byte-identical to no-flag build (ADR-002).
-            match &output_path {
-                None => {
-                    // Sidecar + stdout: three-case ladder.
-                    if source_map.is_none() {
-                        // Case 1 — messages mode: compiler produced no map; write to stdout.
-                        return write_output(None, &compiled.content, &inputs, quiet, true);
-                    }
-                    if flag_source_map {
-                        // Case 2 — explicit --source-map flag: hard error.
-                        return Err(miette::miette!(
-                            "--source-map (sidecar) requires an output file; use -o <file> or \
-                             --out-dir, --inline to embed the map for stdout, or --no-source-map \
-                             to skip it"
-                        ));
-                    }
-                    // Case 3 — config-sourced source_map: degrade gracefully. The warning
-                    // names `mds.json` as the input reached it, as a config error does
-                    // (#390).
-                    if !quiet {
-                        let cfg_path = config
-                            .as_ref()
-                            .map(ProjectConfig::shown_file)
-                            .unwrap_or_else(|| PathBuf::from("mds.json"));
-                        crate::output::ewriteln!(
-                            "warning: source_map in {} has no effect when writing to \
-                             stdout (sidecar requires -o <file> or --out-dir); use --inline to \
-                             embed the map, or --no-source-map to silence this warning",
-                            crate::output::safe_path(&cfg_path)
-                        );
-                    }
-                    return write_output(None, &compiled.content, &inputs, quiet, true);
-                }
-                Some(out) => {
-                    write_output(Some(out), &compiled.content, &inputs, quiet, true)?;
-                    if let Some(ref sm) = source_map {
-                        let map = out.sibling(map_path_for);
-                        let map_json = sm.to_json();
-                        write_compiled(&map, &map_json, &inputs)?;
-                        if !quiet {
-                            crate::output::ewriteln!(
-                                "Source map written to {}",
-                                crate::output::safe_path(&map.shown)
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        write_output(
-            output_path.as_ref(),
-            &compiled.content,
-            &inputs,
-            quiet,
-            true,
-        )?;
-
-        // No-source-map build: if a stale sidecar exists from a prior source-map build,
-        // remove it (AC-FUNC-10).
-        if let Some(ref out) = output_path {
-            verify_then_delete_map(&out.sibling(map_path_for), &file_name_of(out), quiet)?;
-        }
-    }
-
-    Ok(())
+    single::run_build_file(input, resolved, &run)
 }
 
 /// Compile every non-partial `.mds` file under `dir`, streaming one at a time
