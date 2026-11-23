@@ -44,7 +44,8 @@ publishes nothing.
 10. Packaging spot-check: `npm pack --dry-run -w @mdscript/mds && npm pack --dry-run -w @mdscript/mds-wasm && npm pack --dry-run -w @mdscript/mds-napi`
 11. Tag does not already exist
 12. Branch dry-run (mandatory when `release.yml` changes): `gh workflow run release.yml` — runs
-    version-gate, 7-target build, A3 gate, and credential probe; all publish jobs are skipped.
+    `Credential probe`, `Version gate`, the 7-target build, and the A3 gate.
+    All publish jobs skip this run.
     **Limitation**: ref-guarded steps (tag-only publish gates) are structurally un-exercisable
     from a branch dispatch — four clean dry-runs still let a tag-only gate fail on the first
     real tag. For musl artifact verification: download `bindings-*-linux-musl` artifacts and
@@ -75,20 +76,19 @@ publishes nothing.
   while CI is still running. Then:
   `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`.
   The tag fires `release.yml`; build+publish run from the tag.
-- **Dry run**: `gh workflow run release.yml` (no version input) — runs version-gate (including
-  the PyPI OIDC trusted-publisher probe), 7-target napi build, 7-target + sdist Python wheel
-  matrix, A3 gate, and credential probe; publishes nothing. **Limitation**: ref-guarded steps
-  (tag-only publish gates) are structurally un-exercisable from a branch dispatch — four clean
-  dry-runs still let a tag-only gate fail on the first real tag.
+- **Dry run**: `gh workflow run release.yml` takes no version input and publishes nothing.
+  `Credential probe` checks the registries, including the PyPI trusted publisher.
+  `Version gate` then runs before the 7-target napi build and the Python wheel and sdist builds.
+  The run also includes the A3 gate. **Limitation**: A branch dispatch does not run tag-only steps.
 - **Recovery**: Publishes are idempotent (crates.io matches "already uploaded/exists"; npm
   pre-checks `npm view <pkg>@<ver>` and tolerates E403 on `napi prepublish`). A partial failure
   is recoverable with `gh run rerun --failed <run-id>`. Never re-tag.
-- **Known gap (crates.io token)**: The version-gate credential probe runs `npm whoami` for npm
-  (authentication only, not publish rights) but only checks `CARGO_REGISTRY_TOKEN` for
-  non-emptiness: the crates.io API has no read route that accepts a scoped token, so this is
-  the strongest check it allows. A dead crates.io token is only discovered at `Publish
-  mds-core`, after the builds (fail-before-write; recover with `gh run rerun --failed`).
-  #345 is closed; Trusted Publishing for crates.io is tracked in #368.
+- **Known gap (crates.io token)**: `Credential probe` runs `npm whoami` for npm.
+  It verifies the npm account, not publish rights. For crates.io, it only checks
+  that `CARGO_REGISTRY_TOKEN` is not empty. The crates.io API has no read route
+  that accepts a scoped token. `Publish mds-core` detects an invalid token after
+  the builds and before any upload. Recover with `gh run rerun --failed`.
+  #345 is closed. #368 tracks Trusted Publishing for crates.io.
 - **Flow (tag-push)**: version-gate → build-napi (7 targets) + build-python (7 wheels + sdist,
   parallel) → stage+verify (A3 gate, then the x64 Alpine load test) → load-test-musl-arm64
   (arm64 Alpine load test). rehearse-publish-python (pin, GHCR manifest, pull, `twine check`;

@@ -49,7 +49,9 @@ wasm-opt = [
   # NOTE: --gufa was measured and REGRESSES size by ~+700 bytes — do not add it.
   "-Oz", "--flatten", "--rereloop", "-Oz", "--converge", "--strip-producers",
   # Rust 1.88+ emits post-MVP WASM features; each must be explicitly enabled.
-  # Requires Binaryen: CI uses phi-ag/setup-binaryen v129; locally `brew install binaryen`.
+  # CI uses the Binaryen version in .github/actions/setup-wasm/action.yml.
+  # Put that version of wasm-opt on PATH to match CI. The local build warns on a mismatch.
+  # If PATH has no wasm-opt, wasm-pack uses its bundled version instead.
   "--enable-bulk-memory", "--enable-sign-ext", "--enable-nontrapping-float-to-int",
   "--enable-mutable-globals",
 ]

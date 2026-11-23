@@ -32,6 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Both `@mdscript/mds` entry points use the shared export list in `public-types.ts`. `export-surface.spec.mjs` checks the export names (#312).
 - The `cjs-compat` specs fail in CI if the CommonJS build is absent (#364).
 - Remove the TypeScript major version ignore entry from Dependabot (#364).
+- The release version check covers workspace member versions in both lockfiles. CI runs it on every PR, and the version bump updates both lockfiles.
+- npm and crates.io publish steps receive only the registry inputs that they use. Registry checks run on tag push and manual dispatch.
+- CI pins the Rust setup and cache action revisions (#163). The stable channel still selects the current stable compiler.
+- The release runbook explains the separate Rust caches for each Python wheel target and container flavor (#351).
+- Local WASM builds warn if the tools differ from the CI pins. CI stops on a difference (#206).
+- The WASM size limit stays at 821,000 B. Changes that leave less than 18,851 B of room must state their size cost in the PR (#128).
 
 ## [0.6.0] — 2026-11-21
 

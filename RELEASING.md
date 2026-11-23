@@ -12,7 +12,9 @@ The [version-consistency gate](scripts/verify-versions.mjs) (run in CI and local
 asserts these are all equal before anything publishes:
 
 - Workspace crate version — `Cargo.toml` `[workspace.package] version` (covers
-  `mds-core`, `mds-cli`, `mds-wasm`, `mds-napi`)
+  `mds-core`, `mds-cli`, `mds-wasm`, `mds-napi`, and `mds-python`)
+- Workspace member versions in `Cargo.lock` and `package-lock.json`. The gate
+  checks the members in `scripts/release-manifest.mjs`, not transitive versions.
 - Every publishable `package.json`: `@mdscript/mds-napi`, `@mdscript/mds`,
   `@mdscript/mds-wasm`, `@mdscript/bundler-utils`, `@mdscript/vite-plugin`,
   `@mdscript/rollup-plugin`, `@mdscript/webpack-loader`, `@mdscript/rspack-loader`
@@ -54,16 +56,10 @@ These are **not** automated and must be done before the first release:
    lands (ADR-012 amendment). Only the first `pypa/gh-action-pypi-publish` run
    on a real tag push secures the name.
 
-   **PyPI OIDC probe:** The `version-gate` job also probes the PyPI trusted
-   publisher by performing the OIDC mint-token exchange (`pypi.org/_/oidc/mint-token`)
-   before any irreversible publish. A missing, expired, or mismatched trusted-publisher
-   record causes version-gate to fail, aborting the release before any crates.io or
-   npm publish runs. The minted token expires unused — the probe is free and safe.
-   This step is NOT tag-guarded so it runs in the `workflow_dispatch` dry run too,
-   exercising the PyPI trust chain before the real tag push (PF-039). It is
-   run on `pull_request` events too — the version-gate step fails closed on
-   fork and Dependabot PRs (they receive no `id-token: write` and no
-   repository secrets), and no PR run can reach a publish in any case.
+   **PyPI OIDC probe:** `Credential probe` checks the PyPI trusted publisher
+   before any publish. It calls `pypi.org/_/oidc/mint-token` on tag push and
+   manual dispatch. A missing, expired, or mismatched record stops the release.
+   The probe does not use the token it receives. A PR run skips this step.
 
 6. **Configure TestPyPI trusted publisher** (optional, needed for `testpypi: true`
    dispatch runs) at [test.pypi.org/manage/account/publishing](https://test.pypi.org/manage/account/publishing/):
@@ -97,6 +93,7 @@ Run the local dry-runs and gates:
 
 ```bash
 # Rust
+cargo metadata --locked --format-version 1 >/dev/null
 cargo test --workspace
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
@@ -110,13 +107,14 @@ cargo publish -p mds-core --dry-run
 # publishes mds-core first (and waits for the index), then mds-cli.
 
 # JS
+node scripts/check-wasm-tools.mjs --strict  # Match the WASM tool pins in CI
 npm ci
 npm run build -w @mdscript/mds-wasm
 npm run build --workspaces --if-present
 npm test --workspaces --if-present
 node scripts/verify-versions.mjs
 # Verify #[deprecated(since = ...)] attributes match the release version.
-# bump-version.mjs rewrites manifests and CHANGELOG only -- never .rs files.
+# bump-version.mjs updates manifests, lockfiles, and CHANGELOG, not Rust source.
 # Every hit's version must be <= X.Y.Z. A deprecation introduced in THIS release
 # must equal X.Y.Z; pre-existing ones keep their original version.
 # PF-018: REQUIRED while the grep returns no hits (none since #304): plant a temporary
@@ -161,8 +159,8 @@ gh workflow run release.yml          # workflow_dispatch — builds the 7-target
                                      # step. Publishes NOTHING.
 ```
 
-The dry-run workflow runs `version-gate` in full, which includes the
-**credential probe** (security-08). What each registry check proves:
+The dry-run workflow runs **Credential probe** before `Version gate`.
+What each registry check proves:
 
 - **npm** (`npm whoami`): proves the token is accepted by the npm registry
   (authentication). Does NOT prove publish rights to the `@mdscript` scope —
@@ -192,13 +190,15 @@ The dry-run workflow runs `version-gate` in full, which includes the
   completed it; see PF-023). A durable fix — Trusted Publishing for crates.io —
   is tracked in #368; #345 is closed as won't-fix-as-filed with this finding.
 
-All three checks **run on every event, including `pull_request`**. On fork and
-Dependabot PRs — which receive no repository secrets and no `id-token: write` —
-they fail closed with an actionable error: maintainers must supersede with a
-first-party branch PR or dispatch `gh workflow run release.yml --ref <branch>`.
-On release-surface PRs a fail-closed `Version gate` **blocks the merge** because
-D-PR7 requires it (by design, not advisory) — supersede with a first-party branch
-PR or dispatch by hand.
+The registry checks run on tag push and manual dispatch. On PR runs,
+`Credential probe` reports a notice and passes. The npm and crates.io publish
+steps receive only the registry inputs that they use.
+
+`Version gate` rejects a PR that touches the release surface when the actor or
+the PR author is `dependabot[bot]`, when the head repository is a fork, or when
+the head repository is missing or is not this repository. A maintainer push to a
+Dependabot PR is also rejected. Replace such a PR with a maintainer PR. A PR outside the release surface does not
+require release checks.
 
 Even though release-surface PRs now trigger `release.yml` automatically, a
 manual `gh workflow run release.yml --ref <branch>` is still required in four
@@ -212,10 +212,9 @@ cases (the six release-surface paths are `.github/workflows/release.yml`,
 2. **Changes outside the release surface** — dependency sweeps,
    `crates/mds-core/**`, `Cargo.toml`, and `package.json` are not in the six
    paths above and do not trigger a `pull_request` run on `release.yml`.
-3. **Dependabot and fork PRs** — no repository secrets and no `id-token: write`;
-   `Version gate` fails closed with the "No Actions secrets on this run" error.
-   Do not merge on those checks; supersede with a maintainer-authored PR or
-   dispatch by hand.
+3. **Dependabot and fork PRs on the release surface** — `Version gate` reports
+   "Release checks require a maintainer PR." Open a maintainer PR to replace it.
+   Dispatch a dry run on the maintainer branch.
 4. **TestPyPI handshake** — `gh workflow run release.yml --ref <branch> -f testpypi=true`
    (once per version; `skip-existing: true` makes repeats no-ops).
 
@@ -257,9 +256,8 @@ control (PF-013 — a gate never observed rejecting anything is not evidence):
 
 The rehearsal proves everything listed above; it cannot prove the upload handshake
 and trusted-publisher exchange at publish time — the action has no dry-run mode.
-The credential half is covered by `version-gate`'s OIDC probe (which runs on
-every event including PRs); the upload half is closed by the opt-in TestPyPI leg
-(`-f testpypi=true`), which exercises the full exchange once per version.
+`Credential probe` checks the exchange on tag push and manual dispatch. The
+opt-in TestPyPI leg (`-f testpypi=true`) tests the full upload once per version.
 
 `publish-crates` needs this job, so a broken pin aborts the release before the
 irreversible crates.io write. It is intentionally unguarded, so it runs on
@@ -323,8 +321,9 @@ branch-protection required context (branch protection covers `ci.yml` jobs only;
 
 The release is driven by pushing a `vX.Y.Z` tag. This is how all versions have shipped.
 
-1. **Bump versions:** `node scripts/bump-version.mjs X.Y.Z` (updates all
-   manifests and stamps the CHANGELOG, opening a fresh `[Unreleased]`).
+1. **Bump versions:** Run `node scripts/bump-version.mjs X.Y.Z`. The script
+   updates the release manifests and workspace member versions in both lockfiles.
+   It stamps the CHANGELOG and opens a fresh `[Unreleased]` section.
 2. **Land the bump on `main`:** open a PR (CI-gated). Once CI is green, run the
    pre-merge check verifier before merging — a cancelled run reads as green under
    `--admin` (PF-017):
@@ -352,9 +351,10 @@ The release is driven by pushing a `vX.Y.Z` tag. This is how all versions have s
 
 ### What happens after tagging
 
-The `release.yml` workflow runs, in order:
-   1. **version-gate** — synchronized-version check, credential probe, PyPI OIDC
-      probe, source-hygiene gate, and CI-history gate (fails fast).
+The `credential-probe` job checks the registry inputs first. After it passes,
+`release.yml` runs these jobs:
+   1. **version-gate** — checks release manifests, workspace member versions in both
+      lockfiles, source hygiene, and CI history.
    2. **build-napi** (parallel with build-python) — cross-compiles the addon for
       all 7 targets.
    3. **build-python** (parallel with build-napi) — builds `cp311-abi3` wheels
@@ -401,7 +401,8 @@ the failed job tells you what has already happened: nothing publishes before
 
 | Failed job | Already irreversible | Recovery |
 |---|---|---|
-| `Version gate` — version mismatch, CI-history gate on a still-running CI run, credential or OIDC probe, source hygiene | Nothing | Fix the cause. CI still running or just finished: wait for it, then `gh run rerun <run-id> --failed`. Wrong commit tagged (version mismatch, hygiene): delete the tag (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`), land the fix via PR, wait for its CI, re-tag. |
+| `Credential probe` — a registry check failed | Nothing | Correct the registry setup. Run `gh run rerun <run-id> --failed`. |
+| `Version gate` — version mismatch, CI-history gate on a still-running CI run, source hygiene | Nothing | Fix the cause. CI still running or just finished: wait for it, then `gh run rerun <run-id> --failed`. Wrong commit tagged (version mismatch, hygiene): delete the tag (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`), land the fix via PR, wait for its CI, re-tag. |
 | `build-napi`, `build-python`, `Stage + verify platform packages`, `Alpine load test (linux-arm64-musl)`, `Rehearse PyPI publish (no upload)` | Nothing | Transient (runner, Docker Hub pull, registry outage): `gh run rerun <run-id> --failed` — re-runs the failed jobs and their dependents; upstream artifacts are reused. Genuine defect: land the fix, bump to the next patch version, tag that. Do not move a tag that a defect was found on. |
 | `Publish to crates.io` at `Publish mds-core` — the v0.4.0 case: HTTP 403 from a revoked token, run 33569514359 | Nothing | Fix the secret or cause, then `gh run rerun <run-id> --failed`. |
 | `Publish to crates.io` after `mds-core` is live — index poll timeout, `Publish mds-cli` failure | `mds-core@X.Y.Z` on crates.io (cannot be deleted; `cargo yank` only hides it from new resolutions) | Transient: `gh run rerun <run-id> --failed` — the `mds-core` step treats "already uploaded" as success and proceeds to `mds-cli`. Defect in `mds-cli`: the version is consumed for the whole workspace (one coordinated version); land the fix, bump to the next patch, optionally `cargo yank --version X.Y.Z mds-core`, and say so in the GitHub Release body. |
@@ -509,7 +510,19 @@ the new `main` before its head runs the new job; Dependabot rebases its own PRs 
 
 - The 7 native napi targets: aarch64-apple-darwin, x86_64-apple-darwin, x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl, aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl, x86_64-pc-windows-msvc. x86_64-gnu passes napi's --use-napi-cross; aarch64-gnu links with the apt cross gcc; both musl legs cross-compile with `napi build … -x` (cargo-zigbuild 0.23.0) — the `-x` flag makes `@napi-rs/cli` 3.8.6 run `cargo zigbuild` instead of `cargo build`; cargo-zigbuild 0.23.0 is installed by the SHA-pinned `taiki-e/install-action` (v2.86.3) with `fallback: none` placed BEFORE `Swatinem/rust-cache` (rust-cache deletes `~/.cargo/bin` binaries on save, so installing after cache would be wiped on a warm hit) and asserted after rust-cache and re-asserted after the build (napi's detector is presence-only — `cargo help zigbuild` — and silently runs an unpinned `cargo install cargo-zigbuild` when zigbuild is absent, reverting the pin); zig 0.16.0 via the SHA-pinned `mlugg/setup-zig`; cargo-zigbuild 0.23.0 owns the full linker-arg filter (`--fix-cortex-a53-843419`, `--no-undefined-version`, `-lgcc_s` to `-lunwind`, self-contained musl CRT skip, response files), its CI tests zig 0.16.0, and nothing in 0.23.2–0.23.4 touches x86_64/aarch64 musl — bumping zig OR cargo-zigbuild is a deliberate, paired decision; never set a musl linker export (`CARGO_TARGET_*_MUSL_LINKER`) — cargo-zigbuild's `add_env_if_missing` yields to a pre-set value and a leftover export would silently revert the migration; the version-keyed wrapper cache (`~/.cache/cargo-zigbuild/0.23.0/…`) is always fresh per version and is deliberately NOT cached (post-build presence proves cargo-zigbuild 0.23.0 ran in that job, not a prior version from cache); the readelf gate uses `ALLOWED_NEEDED='libc\.so|libgcc_s\.so\.1'` with a planted `libunwind.so.1` positive control, and the Alpine load tests are the acceptance instrument for any linkage delta (a NEEDED soname Alpine does not ship is invisible to readelf — only a real `docker run node:22-alpine` catches it). Both musl addons are load-tested on `node:22-alpine` before anything publishes: the x64 load test is the last step of `stage-and-verify-napi` (placed after the staged artifact upload so the artifact is preserved even when the x64 test fails), and the arm64 load test runs in the separate unguarded `load-test-musl-arm64` job on a native `ubuntu-24.04-arm` runner using the `napi-staged` artifact. The fixture is `index.js` + `scripts/musl-load-probe.cjs` + only the musl platform package under `node_modules/@mdscript/`, so a pass is proof the loader's `isMusl()` returned true; a control fixture without the package must fail first (PF-013). `publish-crates` blocks on both via its `needs:` list AND its `if:` conjunct (PF-047). The readelf gate proves ELF metadata (no glibc soname) but not that the addon dlopens on Alpine — a NEEDED entry that Alpine does not ship (e.g. `libunwind.so.1`) is invisible to it; only a real load on `node:22-alpine` catches that (PF-038 shape). When the x64 load test fails, the arm64 job is skipped (its `if:` requires `stage-and-verify-napi` to succeed) and both tests are re-run together after the fix. The container runs with `-w /w`: `node:22-alpine` has no `WORKDIR`, and its default cwd of `/` made every mds-core string compile fail until #371 was fixed (surfaced by this gate's first run on PR #370). The flag is kept as a regression tripwire — `musl-load-probe.cjs` asserts `process.cwd() === '/w'`, so a dropped flag fails loudly.
 - The 8 Python artifacts (7 `cp311-abi3` wheels + 1 sdist): manylinux x86_64 and aarch64, musllinux_1_2 x86_64 and aarch64, macOS x86_64 and arm64, Windows x86_64, plus one source distribution. Built by `PyO3/maturin-action@v1.51.0` (maturin 1.13.3). The musl and manylinux legs run inside Docker containers that maturin-action manages; the readelf linkage gate asserts the `.so` inside each Linux wheel links the correct libc (musl or glibc), with a positive control and a non-vacuity guard (PF-038). Platform wheels cannot be built or validated locally — use the branch dry-run workflow instead.
-- wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-sign-ext", ...] is enabled in crates/mds-wasm/Cargo.toml; CI installs wasm-pack and Binaryen v129 via the composite action at .github/actions/setup-wasm/ (version pins live there). Local builds do not need system Binaryen — wasm-pack auto-downloads wasm-opt (v117) on first use; install Binaryen v129+ (brew install binaryen / apt install binaryen) only for offline builds, to override a stale wasm-opt on PATH, or to reproduce CI's exact release optimizer.
+- Keep the host Rust install guard and per-leg cache keys in `build-python` (#351).
+  Linux wheel containers supply Rust. In `maturin-action` v1.51.0, the cache purge
+  checks `debugBuildDir` instead of `releaseBuildDir`. It misses proc-macro files
+  in `target/release/deps` ([upstream issue](https://github.com/PyO3/maturin-action/issues/476)).
+  Revisit the workaround only after an upstream fix ships and a release rehearsal
+  with that fix passes.
+- `crates/mds-wasm/Cargo.toml` enables `wasm-opt`. The
+  [WASM setup action](.github/actions/setup-wasm/action.yml) installs `wasm-pack`
+  and Binaryen `wasm-opt`. CI stops before the build if either tool differs from
+  its pin. The local WASM build scripts warn but continue. If `wasm-opt` is absent
+  from `PATH`, `wasm-pack` uses its bundled `wasm-opt` instead of the CI version.
+  To match CI, put the exact versions from the setup action on `PATH`.
+  A local size result does not replace the CI size check.
 - Platform packages are generated in CI only — they cannot be validated with a local npm pack; use the dry-run workflow instead.
 - `atomic_write_file` (`crates/mds-cli/src/write.rs`, the write funnel) is replace-by-rename: it does not preserve hard links, ACLs, extended attributes (xattrs), or owner/group of the original file (permission bits are restored on Unix). This applies to `mds fmt`, `mds lint --fix`, `mds init --force`'s starter file (without `--force`, `create_new` writes a starter that never replaces a file) and — since #227 — `mds build`/`mds watch` compiled outputs and `.map` sidecars (source rewrites fsync before the rename; compiled outputs, sidecars and the starter file rely on the rename alone). The user-facing contract lives in spec §7.2 ("Output writing") and `SECURITY.md`; hard-link preservation is won't-fix by construction, the rest is not planned (#226).
 - `Swatinem/rust-cache` computes its key as `v0-rust[-<key>]-<job>-<runner.os>-<runner.arch>-<envhash>-<lockhash>`; the env hash covers `rustc -vV` (the HOST triple) plus `CARGO*`/`CC*`/`CFLAGS` env. The cross TARGET is not in it, so without `key:` all four ubuntu legs in `build-napi` and both macOS legs share one blob. Both matrix jobs carry per-leg keys: `build-napi` uses `key: ${{ matrix.settings.target }}` (#352, PF-041); `build-python` uses `key: ${{ matrix.target }}-${{ matrix.manylinux }}` (#347) so a containerised Linux leg never restores host-built build scripts or proc-macro `.so` files written by another leg. `publish-crates` and `publish-npm` are single-leg and use the automatic key. Spec S20 in `scripts/__test__/release-auth-probe.spec.mjs` pins this — dropping `with: key:` from a matrix job's rust-cache step causes S20 to fail `Version gate`. Validation: two runs in the SAME cache scope — first run shows `No cache found.`; second shows `Restored from cache key "v0-rust-<target>-build-napi-…" full match: true.` for every leg with the readelf gates green. `pull_request` caches live under `refs/pull/N/merge` and are invisible to a branch dispatch, so warm evidence comes from a second dispatch on the same branch (or a PR-run rerun), never from a dispatch that follows a PR run.

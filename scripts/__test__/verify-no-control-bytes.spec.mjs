@@ -388,8 +388,10 @@ describe('AC-11: git ls-files discovery path', () => {
 describe('AC-5 AC-6: full-tree scan and non-vacuity', () => {
 
   test('AC-5 AC-30: scanner exits 0 on real repo tree with >= 500 files and >= 4MB in under 5 s', () => {
-    // AC-30 (clause a): full tracked-tree scan must complete in under 5 seconds wall-clock.
-    // A generous CI-safe bound of 5 s is used; local runs are typically < 1 s.
+    // AC-30 (clause a): the full tracked-tree scan must take less than 5,000 ms.
+    // On 2026-11-22, 10 main Source hygiene runs (44444298037–45055089420)
+    // gave a TAP duration_ms median of 472.86 ms and a maximum of 512.75 ms.
+    // Retune the bound only if this check fails on a runner class.
     const start = Date.now();
     const r = runScanner([], { cwd: ROOT });
     const elapsed = Date.now() - start;
@@ -718,8 +720,10 @@ describe('AC-15: scanner source is self-clean', () => {
 //        buffer — hazardHits never retains file buffers; verified by code shape.
 //
 // AC-30 has three clauses:
-//   (a) Wall-clock full-tree scan < 5 s — asserted with Date.now() in the
-//       AC-5 test above (generous CI-safe bound).
+//   (a) The AC-5 test above uses Date.now() to check the 5,000 ms bound.
+//       On 2026-11-22, 10 main Source hygiene runs (44444298037–45055089420)
+//       gave a TAP duration_ms median of 472.86 ms and a maximum of 512.75 ms.
+//       Retune the bound only if this check fails on a runner class.
 //   (b) --staged mode < 2 s for a 20-file commit — not directly timed here.
 //       NOTE: readAllIndexBlobs() collapses N per-file `git cat-file blob`
 //       spawns into ONE `git cat-file --batch` call. The entire staged set is
