@@ -7,11 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-11-23
+
 ### Changed
 
 - Optional input fields in `@mdscript/mds` and optional `vars` fields in `@mdscript/bundler-utils` accept explicit `undefined` with `exactOptionalPropertyTypes` (#312).
   File and virtual options still require callers to omit `basePath` in this mode.
   **Type-only compatibility note:** With `exactOptionalPropertyTypes` on, TypeScript can reject assignments of these options to types that disallow explicit `undefined`, with no runtime effect.
+- A `NOTICE` file now ships in `@mdscript/mds-wasm`, in the seven `@mdscript/mds-napi` platform packages, and in the `markdown-script` wheels and sdist. It lists the licenses of the Rust crates that each binary contains (#136, #521).
+- The `mds-core` and `mds-cli` crates on crates.io now include the `LICENSE` file.
 
 ### Removed
 
@@ -20,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The `@mdscript/mds` README and the JavaScript example in `examples/README.md` now call `await init()` before the Node.js entry compiles. The README said that Node.js needs no initialization.
+- The `@mdscript/mds` README and the JavaScript example in `examples/README.md` now call `await init()` before the Node.js entry compiles. The README said that Node.js needs no initialization (#502).
 - On POSIX, WASM file APIs can resolve `./link/../z.mds` to the same file as native (#432).
   If `./z.mds` and `./link/../z.mds` refer to different files, WASM reports a path conflict with `mds::import`.
 - WASM file APIs now use the same parent and file name as native for an import with a final `/.`, such as `./x.mds/.` (#432).
@@ -28,8 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - WASM file API `cannot read` messages show the path below the project root (#432).
 - WASM file APIs report `mds::resource_limit` if a short import path resolves through a link to more than 256 segments below the project root (#432).
 
+### Known limits
+
+- For a project at the filesystem root, WASM file APIs refuse `/..` as a path above the project root. Native resolves it to `/`. The `@mdscript/mds` README lists this limit with the other WASM path differences (#424).
+
 ### Internal
 
+- CI checks the licenses, bans and sources of the locked Rust dependency graph with cargo-deny on every PR. A separate workflow checks advisories each day and on PRs that change Rust dependencies (#136, #517).
 - **Split `resolver.rs` and `build.rs` into child modules (#223, #229).** Build modes share flag and warning logic, sidecar writes, and stdout output. Behaviour does not change.
 - Enable `exactOptionalPropertyTypes` in the base TypeScript config. Check the `@mdscript/mds` type fixtures with this flag on and off (#312).
 - The lockfile gives each of the six workspaces its own TypeScript 7.0.2 copy. The root copy stays at 6.0.3 because `@napi-rs/cli` requires `^6.0.3` (#364).
@@ -2212,7 +2221,8 @@ First public release of the MDS (Markdown Script) compiler.
 
 - 590 Rust tests (integration, unit, and doc-tests across the workspace) plus the JavaScript package suites
 
-[Unreleased]: https://github.com/dean0x/mdscript/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/dean0x/mdscript/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/dean0x/mdscript/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/dean0x/mdscript/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/dean0x/mdscript/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/dean0x/mdscript/compare/v0.4.4...v0.5.0
