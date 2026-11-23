@@ -978,7 +978,7 @@ fn fm_import_same_path_diff_alias() {
 fn fm_import_collision_merge_within_fm() {
     // Two merge imports that export the same function name → collision error.
     // Exercises the scope.get_function() check in the merge-import path
-    // (resolver.rs build_scope_from_frontmatter, FrontmatterImport::Merge branch).
+    // (`resolver/module_scope.rs`, `build_scope_from_frontmatter`, `FrontmatterImport::Merge`).
     let mut modules = HashMap::new();
     modules.insert(
         "lib_a.mds".to_string(),

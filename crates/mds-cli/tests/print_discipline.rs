@@ -319,7 +319,14 @@ const PRINT_MACROS: &[&str] = &[
 /// when its prints moved to the writer; lowering one is a decision made in the commit
 /// that removes the print, never a side effect.
 const SITE_FLOORS: &[(&str, usize)] = &[
-    ("build.rs", 27),
+    ("build.rs", 3),
+    ("directory.rs", 4),
+    ("flags.rs", 2),
+    ("single.rs", 1),
+    ("out_paths.rs", 1),
+    ("source_map.rs", 6),
+    ("stdio.rs", 1),
+    ("vars.rs", 4),
     ("fmt.rs", 11),
     ("lint.rs", 1),
     ("lint_sink.rs", 12),
@@ -451,14 +458,14 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
     ),
     // ── `&'static str` labels — no runtime data reaches these ────────────────
     (
-        "build.rs",
+        "out_paths.rs",
         "kind_label(kind)",
         "Returns one of exactly two `&'static str` literals (`build.rs::kind_label`); \
          it is a compile-time label for an `OutputKind`, not user data.",
     ),
     // ── Integer counters — a `usize`/`u128` cannot carry a control byte ───────
     (
-        "build.rs",
+        "directory.rs",
         "walk.excluded_by_default",
         "`usize` count of `.mds` files the default-exclusion walker skipped \
          (hidden dirs, node_modules); produced by `collect_mds_files_detailed`.",
@@ -481,7 +488,7 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
          cannot carry a control byte.",
     ),
     (
-        "build.rs",
+        "directory.rs",
         "partials_only_count",
         "`usize` count of `.mds` files found in a partials-only tree, bound from \
          `output::partials_only`'s `Some(n)` in the #387 nothing-to-build diagnostic. \
@@ -644,6 +651,22 @@ const ALLOWED_UNTRACED_HELPER_ARGS: &[(&str, &str, &str)] = &[
          testing them would be vacuous (PF-013). See this file's module doc.",
     ),
     (
+        "single.rs",
+        "w",
+        "`for w in &result.warnings` — `w` is a whole warning string produced by \
+         `mds-core`, not a value this crate interpolates. HUMAN mode is the correct mode \
+         for it: it is prose, legitimately multi-line. What makes it safe is that \
+         `mds-core`'s three untrusted-value warning producers WIRE-escape at construction: \
+         `resolver.rs`'s imported-module filename, and `evaluator.rs`'s two `@include` \
+         alias warnings — see the boundary table in \
+         `crates/mds-core/src/lint/diagnostic.rs`. That is PRODUCER DISCIPLINE, which this \
+         lexical guard cannot follow across a crate boundary to confirm. It is upheld by \
+         review, plus one test on the only producer whose input can carry a hostile \
+         character: `producer_discipline.rs` in this crate. The two alias sites are upheld \
+         by review alone — the parser restricts an alias to `[A-Za-z_][A-Za-z0-9_]*`, so \
+         testing them would be vacuous (PF-013). See this file's module doc.",
+    ),
+    (
         "main.rs",
         "w",
         "`for w in &warnings` on the `mds check` file, stdin and directory paths — same \
@@ -745,7 +768,7 @@ const PATH_TEXT_HELPERS: &[(&str, &str, usize, &str)] = &[
         "Checks whether a file name starts with `_`; the name reaches no message.",
     ),
     (
-        "build.rs",
+        "out_paths.rs",
         "warn_output_extension_mismatch",
         1,
         "Takes the extension of the `-o` value, which the warning shows through \
@@ -760,27 +783,27 @@ const PATH_TEXT_HELPERS: &[(&str, &str, usize, &str)] = &[
          `to_str` compares the extension with `mds`.",
     ),
     (
-        "build.rs",
+        "entry.rs",
         "auto_detect_mds_file",
         1,
         "Compares the extension of each entry of the working directory with `mds`; the \
          extension reaches no message.",
     ),
     (
-        "build.rs",
+        "entry.rs",
         "several_mds_files",
         1,
         "Takes the file name of each `.mds` file in the working directory and escapes it \
          at once through `safe_file_display`; the message lists those.",
     ),
     (
-        "build.rs",
+        "admit.rs",
         "refuse_output_over_entry",
         1,
         "Names the typed entry through `mds::escape_path_for_message` of its lossy text.",
     ),
     (
-        "build.rs",
+        "source_map.rs",
         "apply_source_map_file_label",
         1,
         "Carve-out: the source map's `file` key, the output's file name. A source map's \
@@ -788,14 +811,14 @@ const PATH_TEXT_HELPERS: &[(&str, &str, usize, &str)] = &[
          no message.",
     ),
     (
-        "build.rs",
+        "source_map.rs",
         "file_name_of",
         1,
         "Carve-out: the file name a sidecar map records as `file`, compared with the map \
          on disk before it is replaced; no message shows it.",
     ),
     (
-        "build.rs",
+        "vars.rs",
         "vars_file_error",
         1,
         "Names the typed `--vars` path through `mds::escape_path_for_message` of its \
@@ -897,7 +920,15 @@ const PATH_FREE_ERRORS: &[(&str, &str, usize, &str)] = &[
     (
         "build.rs",
         "crate::output::safe_inline(&e)",
-        3,
+        1,
+        "Escaped, and none names a path: a `FromUtf8Error` reading `mds.json` (a byte \
+         count and an offset), a `serde_json` error parsing it (a message, a line and a \
+         column), and one serializing `messages` output (fixed text).",
+    ),
+    (
+        "config.rs",
+        "crate::output::safe_inline(&e)",
+        2,
         "Escaped, and none names a path: a `FromUtf8Error` reading `mds.json` (a byte \
          count and an offset), a `serde_json` error parsing it (a message, a line and a \
          column), and one serializing `messages` output (fixed text).",
@@ -2523,6 +2554,35 @@ fn file_key(path: &Path) -> String {
         .to_string()
 }
 
+fn duplicate_basenames(paths: &[PathBuf]) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut duplicates = std::collections::BTreeSet::new();
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("source file names are UTF-8");
+        if !seen.insert(name) {
+            duplicates.insert(name);
+        }
+    }
+    duplicates.into_iter().map(str::to_owned).collect()
+}
+
+#[test]
+#[should_panic(expected = "duplicate Rust source basenames: [\"x.rs\"]")]
+fn rust_files_refuses_duplicate_basenames() {
+    let dir = tempfile::tempdir().unwrap();
+    for file in ["a/x.rs", "b/y.rs"] {
+        let path = dir.path().join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "").unwrap();
+    }
+    assert_eq!(rust_files(dir.path()).len(), 2);
+    std::fs::rename(dir.path().join("b/y.rs"), dir.path().join("b/x.rs")).unwrap();
+    rust_files(dir.path());
+}
+
 fn rust_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -2543,6 +2603,11 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
         }
     }
     out.sort();
+    let duplicates = duplicate_basenames(&out);
+    assert!(
+        duplicates.is_empty(),
+        "duplicate Rust source basenames: {duplicates:?}"
+    );
     out
 }
 

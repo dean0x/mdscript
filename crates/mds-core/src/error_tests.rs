@@ -152,7 +152,19 @@ fn serialize_undefined_var_with_span() {
 
 #[test]
 fn serialize_arity_code() {
-    let e = MdsError::arity_at("greet", 1, 1, 3, "f.mds", "source text", 0, 6, None);
+    let e = MdsError::arity_at(
+        "greet",
+        1,
+        1,
+        3,
+        SourceLoc {
+            file: "f.mds",
+            source: "source text",
+            offset: 0,
+            len: 6,
+        },
+        None,
+    );
     let s = e.serialize();
     assert_eq!(s.code, "mds::arity");
     assert!(

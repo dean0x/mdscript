@@ -179,6 +179,14 @@ fn format_arity(min: usize, max: usize) -> String {
     }
 }
 
+/// Location of a diagnostic within its source file.
+pub(crate) struct SourceLoc<'a> {
+    pub(crate) file: &'a str,
+    pub(crate) source: &'a str,
+    pub(crate) offset: usize,
+    pub(crate) len: usize,
+}
+
 /// Build the `(span, src)` pair shared by all `_at` constructors.
 ///
 /// Defense-in-depth guard: if `offset` or `offset + len` is out of bounds for
@@ -680,22 +688,18 @@ impl MdsError {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn arity_at(
         name: impl Into<String>,
         expected_min: usize,
         expected_max: usize,
         got: usize,
-        file: &str,
-        source: &str,
-        offset: usize,
-        len: usize,
+        loc: SourceLoc<'_>,
         signature: Option<String>,
     ) -> Self {
         let signature_note = signature
             .map(|s| format!("\nexpected: {s}"))
             .unwrap_or_default();
-        let (span, src) = at(file, source, offset, len);
+        let (span, src) = at(loc.file, loc.source, loc.offset, loc.len);
         MdsError::ArityMismatch {
             name: name.into(),
             expected_min,

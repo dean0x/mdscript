@@ -363,7 +363,7 @@ fn run_fmt_directory(dir: &Path, canonical_dir: &Path, flags: FmtFlags) -> Resul
             );
             crate::output::exit(1);
         }
-        // #204: an empty tree is "nothing to format", not success (mirrors build.rs).
+        // #204: an empty tree is "nothing to format", not success (mirrors `build/directory.rs`).
         // Emitted even under --quiet and exit 1.  This arm sits BEFORE the `read_only`
         // split below, so `--check` and `--diff` behave identically on an empty tree.
         crate::output::ewriteln!(

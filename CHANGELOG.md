@@ -21,9 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - The `@mdscript/mds` README and the JavaScript example in `examples/README.md` now call `await init()` before the Node.js entry compiles. The README said that Node.js needs no initialization.
+- On POSIX, WASM file APIs can resolve `./link/../z.mds` to the same file as native (#432).
+  If `./z.mds` and `./link/../z.mds` refer to different files, WASM reports a path conflict with `mds::import`.
+- WASM file APIs now use the same parent and file name as native for an import with a final `/.`, such as `./x.mds/.` (#432).
+  If the path refers to a directory, such as `./dir.mds/.`, WASM reports `not a regular file` as native does.
+- WASM file API `cannot read` messages show the path below the project root (#432).
+- WASM file APIs report `mds::resource_limit` if a short import path resolves through a link to more than 256 segments below the project root (#432).
 
 ### Internal
 
+- **Split `resolver.rs` and `build.rs` into child modules (#223, #229).** Build modes share flag and warning logic, sidecar writes, and stdout output. Behaviour does not change.
 - Enable `exactOptionalPropertyTypes` in the base TypeScript config. Check the `@mdscript/mds` type fixtures with this flag on and off (#312).
 - The lockfile gives each of the six workspaces its own TypeScript 7.0.2 copy. The root copy stays at 6.0.3 because `@napi-rs/cli` requires `^6.0.3` (#364).
 - Use `bundler` module resolution for the CommonJS builds of `bundler-utils`, `webpack-loader` and `rspack-loader`. Their CommonJS output does not change (#364).
@@ -36,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI pins the Rust setup and cache action revisions (#163). The stable channel still selects the current stable compiler.
 - The release runbook explains the separate Rust caches for each Python wheel target and container flavor (#351).
 - Local WASM builds warn if the tools differ from the CI pins. CI stops on a difference (#206).
+- The WASM tool check gives each `--version` call 60 s. The macOS CI job no longer fails at random on a slow first start of `wasm-pack` (#519).
 - The WASM size limit stays at 821,000 B. Changes that leave less than 18,851 B of room must state their size cost in the PR (#128).
 
 ## [0.6.0] — 2026-11-21
