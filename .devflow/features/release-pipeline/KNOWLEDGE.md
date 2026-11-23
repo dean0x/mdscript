@@ -52,9 +52,10 @@ state between `cargo publish` and `npm publish`).
 
 ```
 credential-probe → version-gate
-  ├─→ build-napi (7 legs)  ─→ stage-and-verify-napi ─→ load-test-musl-arm64 ─┐
-  └─→ build-python (8 legs) ─→ rehearse-publish-python ──────────────────────┤
-                                └─→ publish-testpypi     │ (dispatch+input only)
+  ├─→ build-napi (7 legs) ───┐
+  └─→ build-python (8 legs) ─┴─→ stage-and-verify-napi ─→ load-test-musl-arm64 ─┐
+       └─→ rehearse-publish-python ────────────────────────────────────────────┤
+             └─→ publish-testpypi (dispatch+input only)                       │
                                                           ↓
                                               publish-crates  (tag only)
                                                 ↓           ↓
@@ -71,7 +72,7 @@ Job details:
 | `credential-probe` | Credential probe | no job guard; PR notice only | — |
 | `version-gate` | Version gate | no job guard | credential-probe |
 | `build-napi` | Build napi (...) | nothing | version-gate |
-| `stage-and-verify-napi` | Stage + verify platform packages | nothing | build-napi |
+| `stage-and-verify-napi` | Stage + verify platform packages | Both build jobs must pass | build-napi, build-python |
 | `load-test-musl-arm64` | Alpine load test (linux-arm64-musl) | unguarded, not-cancelled + `needs.stage-and-verify-napi.result == 'success'` | stage-and-verify-napi |
 | `build-python` | Build Python (...) | nothing | version-gate |
 | `rehearse-publish-python` | Rehearse PyPI publish (no upload) | nothing | build-python |
@@ -89,6 +90,11 @@ an x64 failure never suppresses the artifact; `load-test-musl-arm64` is skipped 
 x64 fails (both are re-run together after the fix).
 
 Key ordering constraints:
+- `version-gate` checks both NOTICE files in a read-only job on all release events (#136).
+  The CI-history floor is 17 required contexts.
+- `stage-and-verify-napi` waits for the sdist check in `build-python`.
+  It adds `LICENSE` and `NOTICE` to seven platform packages and checks their pack lists before A3 (#136).
+  `publish-npm` repeats the list check before the restored A3 and after `napi prepublish`.
 - `publish-crates` blocks on `rehearse-publish-python`: a failed OIDC exchange aborts before the irreversible crates.io write (PF-039).
 - `publish-crates` blocks on `build-python`: a Python wheel build failure aborts before ANY registry write (PF-023).
 - `publish-python` blocks on `publish-crates` AND `publish-npm`: PyPI is last because it is the only surface with OIDC revocability; losing npm is less recoverable than losing PyPI.
@@ -343,7 +349,7 @@ entire workflow invalid with "An expression was expected", producing a zero-job 
 completes in the same second. `js-yaml`, `actionlint`, and `@action-validator/cli` all pass
 such a file. Never write `${{` in comments; describe it in words.
 
-### pack-contents gate — no dangling source maps (ci.yml `js` job, not release.yml)
+### Pack contents gate — source maps and WASM license files
 
 `scripts/verify-pack-contents.mjs` + `scripts/__test__/verify-pack-contents.spec.mjs`
 (added in PR #402, commit d3646a4) assert that no publishable npm package ships a
@@ -355,16 +361,15 @@ roughly 27% of unpacked tarball size was unusable dead weight. PR #402 set both
 absence durable so a future tsconfig edit (or a package-specific override) cannot
 silently reintroduce the maps.
 
-Two checks per publishable workspace, against the `WORKSPACES` export (8 entries —
-`@mdscript/mds`, `mds-wasm`, `bundler-utils`, `vite-plugin`, `rollup-plugin`,
-`webpack-loader`, `rspack-loader`, `mds-napi`; mirrors `PKG_PATHS` in
-`verify-versions.mjs`, expressed as workspace identifiers):
+The first two checks apply to all eight publishable workspaces in `WORKSPACES`.
+The third check applies only to the WASM workspace.
 
 1. No packed file entry (`npm pack --dry-run --json -w <workspace>`, via `spawnSync`
    with an argv array — no shell) ends in `.map`.
 2. No packed `.js`/`.cjs`/`.mjs`/`.d.ts`/`.d.cts`/`.d.mts` file contains a
    `sourceMappingURL=` trailer — a map file can be pruned from `files` while the
    comment pointing at it still ships, so this check is independent of check 1.
+3. The WASM package must include root `LICENSE` and `NOTICE` entries (#136).
 
 Each workspace's on-disk directory is resolved via `npm exec -w <workspace> -- node -e
 "process.stdout.write(process.cwd())"` (avoids re-deriving the workspaces glob), and
@@ -384,10 +389,11 @@ output, not platform-specific binaries, so it is host-independent — running it
 three OSes would be redundant), placed AFTER the native addon build, the WASM build, and
 `Build TS packages`, so every one of the 8 workspaces is actually built and packable by
 the time the gate runs.
+The `publish-npm` job also runs this gate after the build and before any npm upload (#136).
 
 **Hermetic-spec rule**: `verify-pack-contents.spec.mjs` unit-tests only the exported pure
-helpers (`findMapEntries`, `resolveSafePath`, `findTrailerHits`, `isTrailerCandidate`,
-`summarize`, `WORKSPACES`) against fake listings and a fake file reader — it never shells
+helpers (`findMapEntries`, `findMissingRequired`, `resolveSafePath`, `findTrailerHits`,
+`isTrailerCandidate`, `summarize`, `WORKSPACES`) against fake listings and a fake file reader — it never shells
 out to `npm pack`. This is required, not incidental: `npm run test:gates` runs inside
 `version-gate`'s "Source hygiene" step with NO prior build step, so a spec under
 `scripts/__test__/*.spec.mjs` that depends on `dist/` or a built package would fail there
@@ -590,10 +596,9 @@ belongs in a built CI job (here, `ci.yml`'s `js` job), never in `test:gates`.
 - `scripts/musl-load-probe.cjs` — Alpine container smoke-test for musl napi addons; accepts
   `linux-x64-musl` or `linux-arm64-musl` as argv[2]; run inside `node:22-alpine` via
   `docker run --rm --network none --pull=never -w /w -v <staged-dir>:/w:ro <image> node /w/probe.cjs <platform>`.
-- `scripts/verify-pack-contents.mjs` — pack-contents gate; no dangling `.map` files or
-  `sourceMappingURL` trailers in any of the 8 publishable npm packages.
-- `scripts/__test__/verify-pack-contents.spec.mjs` — hermetic unit tests for the gate's
-  pure helpers; the real-tree check runs separately in `ci.yml`'s `js` job.
+- `scripts/verify-pack-contents.mjs` — reject dangling source maps and require WASM license files (#136).
+- `scripts/__test__/verify-pack-contents.spec.mjs` — tests for the pack gate's pure helpers.
+- `scripts/__test__/notice.spec.mjs` — tests for NOTICE content, package settings, and release checks (#136).
 - `tsconfig.base.json` — `sourceMap`/`declarationMap` both `false`; all six TS packages
   inherit this, which is why the pack-contents gate can assert their absence globally.
 - `scripts/__test__/verify-pr-checks.spec.mjs` — specs for the verifier (M10c, S13, S18 rules;

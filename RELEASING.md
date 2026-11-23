@@ -145,7 +145,80 @@ fi
 The first `PATH` entry is the private directory that this block creates.
 The explicit Cargo home `bin` entry stops Cargo from putting it first.
 If you set `CARGO_HOME` in Git Bash, use a path in Git Bash format.
-Run the local dry-runs and gates from the repository root:
+### Check NOTICE freshness (#136)
+
+Install `cargo-about 0.9.1` from the pinned manifest.
+Run this block in Bash. Use Git Bash on Windows.
+If the manifest has no archive for your host, use a supported host.
+If the install fails, stop.
+
+```bash
+if cargo_about_tmp=$(mktemp -d) && bash -s -- "$cargo_about_tmp" <<'INSTALL_CARGO_ABOUT'
+set -euo pipefail
+work=$1
+version=0.9.1
+action_sha=5b4d68e2e660441203ab128a23676f1e4faf1532
+binary=cargo-about
+case "$(uname -s):$(uname -m)" in
+  Darwin:arm64)       platform=aarch64_macos;      target=aarch64-apple-darwin ;;
+  Linux:aarch64)      platform=aarch64_linux_musl; target=aarch64-unknown-linux-musl ;;
+  Linux:x86_64)       platform=x86_64_linux_musl;  target=x86_64-unknown-linux-musl ;;
+  MINGW*:x86_64|MSYS*:x86_64)
+    platform=x86_64_windows; target=x86_64-pc-windows-msvc; binary=cargo-about.exe ;;
+  MINGW*:aarch64|MSYS*:aarch64|MINGW*:arm64|MSYS*:arm64)
+    platform=aarch64_windows; target=aarch64-pc-windows-msvc; binary=cargo-about.exe ;;
+  *) printf 'No pinned cargo-about archive for this host\n' >&2; exit 1 ;;
+esac
+bundle="cargo-about-$version-$target"
+mkdir "$work/download" "$work/bin"
+archive="$work/download/$bundle.tar.gz"
+manifest="https://raw.githubusercontent.com/taiki-e/install-action/$action_sha/manifests/cargo-about.json"
+expected=$(curl -fsSL --proto '=https' --proto-redir '=https' "$manifest" |
+  jq -er --arg v "$version" --arg p "$platform" \
+    '.[$v][$p].hash | strings | select(test("^[0-9a-f]{64}$"))')
+curl -fsSL --proto '=https' --proto-redir '=https' -o "$archive" \
+  "https://github.com/EmbarkStudios/cargo-about/releases/download/$version/$bundle.tar.gz"
+if command -v sha256sum >/dev/null; then
+  actual=$(sha256sum < "$archive")
+else
+  actual=$(shasum -a 256 < "$archive")
+fi
+if [ "${actual%% *}" != "$expected" ]; then
+  printf 'cargo-about archive SHA-256 mismatch\n' >&2
+  exit 1
+fi
+tar -xzf "$archive" -C "$work/bin" --strip-components=1 "$bundle/$binary"
+"$work/bin/$binary" --version > "$work/version"
+if ! cmp -s "$work/version" <(printf 'cargo-about 0.9.1\n'); then
+  printf 'Expected cargo-about 0.9.1\n' >&2
+  exit 1
+fi
+INSTALL_CARGO_ABOUT
+then
+  cargo_about="$cargo_about_tmp/bin/cargo-about"
+  if [ ! -x "$cargo_about" ]; then cargo_about="$cargo_about.exe"; fi
+else
+  printf 'Stop: cargo-about install failed\n' >&2
+  false
+fi
+```
+
+In the same Bash shell, define `refresh_notice` from the repository root.
+The command writes a temporary NOTICE from the locked graph.
+Compare it with both copies before you tag.
+If a copy differs, update both copies in the version bump pull request.
+
+```bash
+notice_raw="$cargo_about_tmp/notice.raw"
+notice_out="$cargo_about_tmp/NOTICE"
+refresh_notice() {
+  cargo fetch --locked || return $?
+  "$cargo_about" about generate --frozen --workspace --all-features --fail --target aarch64-apple-darwin --target x86_64-apple-darwin --target x86_64-unknown-linux-gnu --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-gnu --target aarch64-unknown-linux-musl --target x86_64-pc-windows-msvc --target wasm32-unknown-unknown --config about.toml --output-file "$notice_raw" about.hbs && node scripts/generate-notice.mjs < "$notice_raw" > "$notice_out"
+}
+refresh_notice && cmp NOTICE "$notice_out" && cmp crates/mds-python/NOTICE "$notice_out"
+```
+
+Run the remaining local gates from the repository root:
 
 ```bash
 # Rust
@@ -187,6 +260,8 @@ node scripts/verify-pr-checks.mjs "$PR_NUMBER"
 # Note: a branch dry-run's skipped publish jobs are tolerated by the verifier.
 
 # Packaging spot-check (inspect tarball contents)
+# The pack gate requires root LICENSE and NOTICE in @mdscript/mds-wasm (#136).
+node scripts/verify-pack-contents.mjs
 npm pack -w @mdscript/mds --dry-run
 npm pack -w @mdscript/mds-wasm --dry-run
 npm pack -w @mdscript/mds-napi --dry-run
@@ -381,6 +456,13 @@ The release is driven by pushing a `vX.Y.Z` tag. This is how all versions have s
 1. **Bump versions:** Run `node scripts/bump-version.mjs X.Y.Z`. The script
    updates the release manifests and workspace member versions in both lockfiles.
    It stamps the CHANGELOG and opens a fresh `[Unreleased]` section.
+   - **Refresh NOTICE:** Run the install block under [Check NOTICE freshness](#check-notice-freshness-136).
+     Define `refresh_notice` as shown there. Run this block from the repository root.
+     Include any changes to both NOTICE copies in the version bump pull request.
+
+     ```bash
+     refresh_notice && cp "$notice_out" NOTICE && cp "$notice_out" crates/mds-python/NOTICE
+     ```
 2. **Land the bump on `main`:** open a PR (CI-gated). Once CI is green, run the
    pre-merge check verifier before merging — a cancelled run reads as green under
    `--admin` (PF-017):
@@ -410,15 +492,16 @@ The release is driven by pushing a `vX.Y.Z` tag. This is how all versions have s
 
 The `credential-probe` job checks the registry inputs first. After it passes,
 `release.yml` runs these jobs:
-   1. **version-gate** — checks release manifests, workspace member versions in both
-      lockfiles, source hygiene, and CI history.
+   1. **version-gate** — checks release manifests, lockfile versions, source hygiene, and CI history.
+      A read-only job regenerates NOTICE and compares both copies (#136).
    2. **build-napi** (parallel with build-python) — cross-compiles the addon for
       all 7 targets.
-   3. **build-python** (parallel with build-napi) — builds `cp311-abi3` wheels
-      for 7 platforms + sdist, runs the readelf linkage gate on Linux legs.
-   4. **stage-and-verify-napi** — `napi create-npm-dirs` + `artifacts`, copies
-      LICENSE into each platform dir, runs the **A3 name-gate**. The last step
-      runs the x64 Alpine load test (`linux-x64-musl`) inside `node:22-alpine`
+   3. **build-python** (parallel with build-napi) — builds `cp311-abi3` wheels for seven platforms and one sdist.
+      It checks the Linux wheel linkage and the NOTICE entries in the sdist (#136).
+   4. **stage-and-verify-napi** — waits for both build jobs.
+      It stages the seven platform packages with `LICENSE` and `NOTICE`.
+      It checks each packed file list for `NOTICE` before the **A3 name-gate** (#136).
+      The last step runs the x64 Alpine load test (`linux-x64-musl`) inside `node:22-alpine`
       after the staged artifact upload, so the artifact is preserved even when
       the x64 test fails; if x64 fails, the arm64 job is skipped and both are
       re-run together after the fix.
@@ -439,10 +522,10 @@ The `credential-probe` job checks the registry inputs first. After it passes,
       `load-test-musl-arm64`, `build-python`, AND `rehearse-publish-python`
       succeed. `cargo publish` `mds-core`, polls the crates.io index for up to
       5 min (bounded, max 20 × 15 s), then `mds-cli`.
-   8. **publish-npm**, then **publish-python** (`publish-python` `needs`
-      `publish-npm`) — publish npm packages (with provenance) and PyPI
-      `markdown-script` (OIDC trusted publishing + PEP 740 attestations,
-      `skip-existing: true`).
+   8. **publish-npm**, then **publish-python** (`publish-python` `needs` `publish-npm`).
+      The npm job checks NOTICE before the A3 re-run and again after `napi prepublish` (#136).
+      It checks the workspace pack lists before the first npm publish.
+      The Python job publishes `markdown-script` with OIDC, PEP 740 attestations, and `skip-existing: true`.
    9. **github-release** — `gh release create` with generated notes; runs only
       after all three publish jobs succeed.
 
@@ -460,6 +543,8 @@ the failed job tells you what has already happened: nothing publishes before
 |---|---|---|
 | `Credential probe` — a registry check failed | Nothing | Correct the registry setup. Run `gh run rerun <run-id> --failed`. |
 | `Version gate` — version mismatch, CI-history gate on a still-running CI run, source hygiene | Nothing | Fix the cause. CI still running or just finished: wait for it, then `gh run rerun <run-id> --failed`. Wrong commit tagged (version mismatch, hygiene): delete the tag (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`), land the fix via PR, wait for its CI, re-tag. |
+| `Version gate` — stale NOTICE (#136) | Nothing | Run `refresh_notice` from [Check NOTICE freshness](#check-notice-freshness-136). Copy the result to both NOTICE paths in a pull request. If no registry has the version, move the tag to the corrected commit after CI passes. |
+| `Version gate` — cargo-about install or version check fails (#136) | Nothing | If the archive host failed temporarily, run `gh run rerun <run-id> --failed`. If the pin or archive is wrong, fix it in a pull request. Verify the local install and the release dry run. If no registry has the version, move the tag to the corrected commit after CI passes. |
 | `build-napi`, `build-python`, `Stage + verify platform packages`, `Alpine load test (linux-arm64-musl)`, `Rehearse PyPI publish (no upload)` | Nothing | Transient (runner, Docker Hub pull, registry outage): `gh run rerun <run-id> --failed` — re-runs the failed jobs and their dependents; upstream artifacts are reused. Genuine defect: land the fix, bump to the next patch version, tag that. Do not move a tag that a defect was found on. |
 | `Publish to crates.io` at `Publish mds-core` — the v0.4.0 case: HTTP 403 from a revoked token, run 33569514359 | Nothing | Fix the secret or cause, then `gh run rerun <run-id> --failed`. |
 | `Publish to crates.io` after `mds-core` is live — index poll timeout, `Publish mds-cli` failure | `mds-core@X.Y.Z` on crates.io (cannot be deleted; `cargo yank` only hides it from new resolutions) | Transient: `gh run rerun <run-id> --failed` — the `mds-core` step treats "already uploaded" as success and proceeds to `mds-cli`. Defect in `mds-cli`: the version is consumed for the whole workspace (one coordinated version); land the fix, bump to the next patch, optionally `cargo yank --version X.Y.Z mds-core`, and say so in the GitHub Release body. |
