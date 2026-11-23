@@ -214,7 +214,7 @@ notice_raw="$cargo_about_tmp/notice.raw"
 notice_out="$cargo_about_tmp/NOTICE"
 refresh_notice() {
   cargo fetch --locked || return $?
-  bash scripts/refresh-notice.sh "$cargo_about" "$notice_raw" > "$notice_out"
+  "$cargo_about" about generate --frozen --workspace --all-features --fail --target aarch64-apple-darwin --target x86_64-apple-darwin --target x86_64-unknown-linux-gnu --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-gnu --target aarch64-unknown-linux-musl --target x86_64-pc-windows-msvc --target wasm32-unknown-unknown --config about.toml --output-file "$notice_raw" about.hbs && node scripts/generate-notice.mjs < "$notice_raw" > "$notice_out"
 }
 refresh_notice && cmp NOTICE "$notice_out" && cmp crates/mds-python/NOTICE "$notice_out"
 ```
