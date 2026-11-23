@@ -642,10 +642,10 @@ export interface BuildModulesMapResult {
    */
   modules: Record<string, string>;
   /**
-   * The keys an import resolves to by name that are not the key of the module it reads
-   * — an import spelling a file in another case than its on-disk name, or reaching it
-   * through a symbolically linked directory — each mapped to that module's key: the
-   * WASM engine's `moduleAliases` option (#414).
+   * The WASM engine's `moduleAliases` option. An alias can name a file other than
+   * its lexical key. Safety depends on the walk: it must see every import that the
+   * engine resolves. For a new import form, update `scan_import_records` and the walk
+   * together.
    */
   aliases: Record<string, string>;
 }
@@ -851,43 +851,57 @@ async function locateEntry(entryPath: string): Promise<{ path: string; dir: stri
   return { path, dir, resolved };
 }
 
-/**
- * Refuse an import whose module key names another directory than the one the
- * native backend reads it from, in a project rooted at `projectRoot`.
- *
- * The WASM engine resolves an import by name, from the importing module's key.
- * NativeFs resolves it on disk, from the importing module's canonical directory,
- * where on POSIX the OS applies each `..` after the symbolic links before it. A
- * module's key is its canonical path, so the two agree for every import except one
- * that names a symlinked directory and leaves it through `..` (`./link/../x.mds`):
- * its key names the directory beside the link, while the file on disk sits beside
- * the link's target. Whichever file were stored under that key, the engine would
- * compile a module the native backend never reads (#408). On Windows the OS applies
- * each `..` lexically, before any link is followed, so the two always agree there.
- *
- * Returns that directory, canonical: the one the key names and NativeFs reads from.
- */
-async function assertKeyMatchesDisk(
-  projectRoot: string,
-  importerDir: string,
-  importPath: string,
-  childKey: string,
-): Promise<string> {
-  // realpath() resolves each `..` as the OS does for NativeFs — after the links
-  // before it on POSIX, lexically on Windows — so this is the directory NativeFs
-  // reads from. A missing directory is file-not-found there, and one that is not
-  // valid UTF-8 is refused.
-  const onDisk = await realpathParent(importerDir + sep + importPath, importPath);
-  // The directory the engine's key names. If it cannot be resolved at all, or only to
-  // a path that is not valid UTF-8, it is not the directory above, and the import is
-  // refused below.
-  const byName = await resolvePath(dirname(join(projectRoot, ...childKey.split('/'))));
-  if (byName.kind !== 'resolved' || byName.path !== onDisk) {
-    throw importError(
-      `import path leaves a symlinked directory through '..', which the WASM backend cannot resolve: "${escapePathForMessage(importPath)}"`,
-    );
+function hasDotDotAfterName(shown: string): boolean {
+  let seenName = false;
+  for (const part of shown.split(PATH_SEPARATORS)) {
+    if (part === '..' && seenName) {
+      return true;
+    }
+    if (part !== '' && part !== '.' && part !== '..') {
+      seenName = true;
+    }
   }
-  return onDisk;
+  return false;
+}
+
+function aliasConflictError(shown: string): PathError {
+  return importError(
+    `two imports name different files by one module key, one of them through a symlinked directory and '..', which the WASM backend cannot resolve: "${escapePathForMessage(shown)}"`,
+  );
+}
+
+/**
+ * Refuse a key that names two files or an alias target beyond the segment cap.
+ * An alias can name a file other than its lexical key. Safety depends on the walk:
+ * it must see every import that the engine resolves. For a new import form, update
+ * `scan_import_records` and the walk together.
+ *
+ * @internal
+ */
+export function aliasRefusal(
+  modules: Readonly<Record<string, string>>,
+  aliases: ReadonlyMap<string, string>,
+  { key, aliasKey }: Pick<Located, 'key' | 'aliasKey'>,
+  shown: string,
+  dotDotAliases: ReadonlySet<string>,
+): PathError | undefined {
+  if (aliases.has(key)) {
+    return aliasConflictError(shown);
+  }
+  if (aliasKey === '' || aliasKey === key) {
+    return undefined;
+  }
+  if (Object.hasOwn(modules, aliasKey)) {
+    return aliasConflictError(shown);
+  }
+  const known = aliases.get(aliasKey);
+  if (known !== undefined && known !== key) {
+    return dotDotAliases.has(aliasKey) || hasDotDotAfterName(shown)
+      ? aliasConflictError(shown)
+      : symlinkError(shown);
+  }
+  // The walk checks the module itself before this cap.
+  return key.split('/').length > MAX_PATH_SEGMENTS ? segmentCapError(shown) : undefined;
 }
 
 /**
@@ -915,15 +929,13 @@ async function locateImport(projectRoot: string, importer: Located, importPath: 
   if (!isWithinRoot(projectRoot, childAbsolute)) {
     throw escapesProjectError(importPath);
   }
-  // The parent directory canonicalized (its symlinks followed) — once, by the check
-  // that the key names it — and the final component joined as written: the pattern of
-  // NativeFs::check_symlink_named. An import of `./` names the importing module's own
-  // directory, which NativeFs opens and fails to read (`mds::io`); the engine has no
-  // key for it.
+  // `./` names the importer's directory. The engine has no key for it.
   const aliasKey = name === undefined ? '' : normalizeVirtualKey(importer.key, importPath);
+  // Pass the path as written to the OS. POSIX applies `..` after it follows links.
+  // Windows applies `..` before it follows links.
   const dir = name === undefined
     ? await realpathParent(childAbsolute, importPath)
-    : await assertKeyMatchesDisk(projectRoot, importer.dir, importPath, aliasKey);
+    : await realpathParent(importer.dir + sep + importPath, importPath);
   const path = join(dir, basename(childAbsolute));
   // Security: containment on the canonical path, so a symlinked directory cannot
   // lead outside the project root.
@@ -1179,8 +1191,10 @@ export async function buildModulesMap(
   const entryFilename = keyOf(projectRoot, entry.resolved);
 
   const modules: Record<string, string> = {};
-  /** The key an import resolves to by name → the key of the module it reads. */
+  /** The lexical key of each alias and its canonical target. */
   const aliases = new Map<string, string>();
+  /** Alias keys whose first import has a `..` segment after a name. */
+  const dotDotAliases = new Set<string>();
   /** Keys of modules walked to the end: the native resolver's module cache. */
   const completed = new Set<string>();
   /** Keys of modules being walked: the native resolver's stack of modules resolving. */
@@ -1269,21 +1283,19 @@ export async function buildModulesMap(
     return read?.ok === true ? read.value : undefined;
   }
 
-  /**
-   * Record that the engine resolves the import `shown` of a walked module, by name, to
-   * `located.aliasKey`, so its alias names the module read: `located.key`. A key names
-   * one file on disk; should it name another later in the scan, the file was replaced
-   * meanwhile, refused as `readModule` refuses a replaced component.
-   */
-  function recordAlias(located: Located, shown: string): void {
-    if (located.aliasKey === '' || located.aliasKey === located.key) {
-      return;
+  /** Check the alias before the engine can use it for any import. */
+  function checkAndRecordAlias(located: Located, shown: string): void {
+    const refusal = aliasRefusal(modules, aliases, located, shown, dotDotAliases);
+    if (refusal !== undefined) {
+      throw refusal;
     }
-    const known = aliases.get(located.aliasKey);
-    if (known !== undefined && known !== located.key) {
-      throw symlinkError(shown);
+    const { key, aliasKey } = located;
+    if (aliasKey !== '' && aliasKey !== key && !aliases.has(aliasKey)) {
+      aliases.set(aliasKey, key);
+      if (hasDotDotAfterName(shown)) {
+        dotDotAliases.add(aliasKey);
+      }
     }
-    aliases.set(located.aliasKey, located.key);
   }
 
   /**
@@ -1320,6 +1332,7 @@ export async function buildModulesMap(
   ): Promise<void> {
     const { key } = located;
     if (completed.has(key) || walking.has(key)) {
+      checkAndRecordAlias(located, shown);
       return;
     }
     admit(depth);
@@ -1337,6 +1350,7 @@ export async function buildModulesMap(
     if (aggregateSize > maxAggregateSize) {
       throw resourceLimitError(`aggregate module size exceeds maximum of ${maxAggregateSize} bytes`);
     }
+    checkAndRecordAlias(located, shown);
     modules[key] = read.content;
 
     const records = engine.scanImportRecords(read.content, asBase);
@@ -1349,9 +1363,7 @@ export async function buildModulesMap(
     for (const [record, ahead] of imports) {
       const { located: child, read: childRead } = await ahead;
       try {
-        const next = unwrap(child);
-        recordAlias(next, record.path);
-        await walk(next, record.path, depth + 1, childRead, record.kind === 'extends');
+        await walk(unwrap(child), record.path, depth + 1, childRead, record.kind === 'extends');
       } catch (err) {
         throw withImportContext(err, record);
       }
