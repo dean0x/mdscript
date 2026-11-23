@@ -1950,14 +1950,14 @@ describe('B3a: Alpine musl load tests (#340)', () => {
 /**
  * Return an ordered array of step segments from the comment-stripped job section.
  * Each entry is { index: number, body: string } where body is the full text of
- * that step segment. Steps are segmented at /^      - / boundaries (6-space
- * bullet), matching the convention in rustCacheSteps and loadTestRunBlock.
+ * that step segment. A bullet with six spaces starts a step.
+ * The first key can follow the bullet on the same line or on the next line.
  */
 function jobSteps(section) {
   const lines = stripCommentLines(section).split('\n');
   const starts = [];
   for (let i = 0; i < lines.length; i++) {
-    if (/^      - /.test(lines[i])) starts.push(i);
+    if (/^      -(?:[ \t]|$)/.test(lines[i])) starts.push(i);
   }
   return starts.map((start, n) => ({
     index: n,
@@ -2022,14 +2022,12 @@ function assertNpmRegistryOrder(section) {
   const install = stepMatching(steps, /^      - run: npm ci$/m);
   const build = namedStep(steps, 'Build WASM + TS packages');
   const platform = namedStep(steps, platformPublish);
-  const notice = namedStep(steps, 'Assert platform NOTICE after napi prepublish');
   const npm = namedStep(steps, npmPublish);
-  // Check the platform pack lists once more after napi prepublish (#136).
-  assert.ok(install && build && platform && notice && npm && setupNode[0].index < install.index &&
+  assert.ok(install && build && platform && npm && setupNode[0].index < install.index &&
     install.index < build.index && build.index < setupNode[1].index &&
-    setupNode[1].index + 1 === platform.index && platform.index + 1 === notice.index &&
-    notice.index + 1 === npm.index && /^        run: \*assert-platform-notice$/m.test(notice.body),
-    'registry setup directly precedes platform publish; only the NOTICE check may separate the publish steps');
+    setupNode[1].index + 1 === platform.index,
+    'registry setup directly precedes platform publish');
+  assert.equal(platform.index + 1, npm.index, 'no step may separate the two npm publishes');
 }
 
 test('S24: only the two Cargo publish steps bind registry values', () => {
@@ -2066,10 +2064,14 @@ test('S26: npm registry setup runs after the build and directly before publish',
   const separated = section.replace(`      - name: ${platformPublish}`,
     `      - run: npm ci\n      - name: ${platformPublish}`);
   assert.throws(() => assertNpmRegistryOrder(separated), /directly precedes/);
-  const postNotice = namedStep(jobSteps(section), 'Assert platform NOTICE after napi prepublish');
-  const otherCheck = section.replace(postNotice.body, postNotice.body.replace('run: *assert-platform-notice', 'run: npm ci'));
-  assert.notEqual(otherCheck, section);
-  assert.throws(() => assertNpmRegistryOrder(otherCheck), /only the NOTICE check/);
+  const separatedPublishes = section.replace(`      - name: ${npmPublish}`,
+    `      - run: ':'\n      - name: ${npmPublish}`);
+  assert.notEqual(separatedPublishes, section);
+  assert.throws(() => assertNpmRegistryOrder(separatedPublishes), /no step may separate/);
+  const stepOnNextLine = section.replace(`      - name: ${npmPublish}`,
+    `      -\n        run: ':'\n      - name: ${npmPublish}`);
+  assert.notEqual(stepOnNextLine, section);
+  assert.throws(() => assertNpmRegistryOrder(stepOnNextLine), /no step may separate/);
 });
 
 const nonPrGuard = "github.event_name != 'pull_request'";

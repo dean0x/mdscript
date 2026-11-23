@@ -93,7 +93,7 @@ Key ordering constraints:
   The CI-history floor is 17 required contexts.
 - `build-python` checks the sdist NOTICE before it uploads the archive (#136).
 - `stage-and-verify-napi` adds `LICENSE` and `NOTICE` to seven platform packages and checks their pack lists before A3 (#136).
-  `publish-npm` repeats the list check before the restored A3 and after `napi prepublish`.
+  `publish-npm` repeats the list check before the A3 re-run. No step separates the two npm publishes.
 - `publish-crates` blocks on `rehearse-publish-python`: a failed OIDC exchange aborts before the irreversible crates.io write (PF-039).
 - `publish-crates` blocks on `build-python`: a Python wheel build failure aborts before ANY registry write (PF-023).
 - `publish-python` blocks on `publish-crates` AND `publish-npm`: PyPI is last because it is the only surface with OIDC revocability; losing npm is less recoverable than losing PyPI.

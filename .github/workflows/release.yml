@@ -1591,9 +1591,6 @@ jobs:
             echo "::notice::All platform packages already published (E403) — idempotent re-run, skipping"
             echo "$OUTPUT"
           fi
-      - name: Assert platform NOTICE after napi prepublish
-        shell: bash
-        run: *assert-platform-notice
       - name: Publish npm packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

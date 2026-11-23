@@ -116,8 +116,10 @@ const stripComments = text => text.replace(/^ *#.*$/gm, '');
 const jobBlocks = text => new Map(Array.from(stripComments(text).matchAll(/^  ([\w-]+):\n([\s\S]*?)(?=^  [\w-]+:\n|(?![\s\S]))/gm),
   match => [match[1], match[2]]));
 
+const stepHeaders = job => Array.from(job.matchAll(/^      -(?:[ \t].*)?$/gm));
+
 function namedStep(job, name) {
-  const starts = Array.from(job.matchAll(/^      - (?:name|uses|run): .*/gm));
+  const starts = stepHeaders(job);
   const i = starts.findIndex(match => match[0] === `      - name: ${name}`);
   if (i < 0) return '';
   return job.slice(starts[i].index, starts[i + 1]?.index);
@@ -181,6 +183,41 @@ function freshnessProblems(workflow, ciWorkflow) {
   return problems;
 }
 
+function cargoAboutPinProblems(block, workflow) {
+  const gate = jobBlocks(workflow.split(/^jobs:\s*$/m)[1]).get('version-gate');
+  const install = namedStep(gate, 'Install cargo-about (pinned)');
+  const version = /^          tool: cargo-about@(\d+\.\d+\.\d+)$/m.exec(install)?.[1];
+  const sha = /^        uses: taiki-e\/install-action@([a-f0-9]{40})(?: +#.*)?$/m.exec(install)?.[1];
+  const docVersion = /^version=(.+)$/m.exec(block)?.[1];
+  const docCmp = /^if ! cmp -s "\$work\/version" <\(printf '([^'\n]+)\\n'\); then$/m.exec(block)?.[1];
+  const docSha = /^action_sha=(.+)$/m.exec(block)?.[1];
+  const problems = [];
+  if (!version || docVersion !== version) problems.push('version');
+  if (!version || docCmp !== `cargo-about ${version}`) problems.push('cmp');
+  if (!sha || docSha !== sha) problems.push('action_sha');
+  return problems;
+}
+
+const cargoAboutInstall = /<<'INSTALL_CARGO_ABOUT'\n([\s\S]*?)^INSTALL_CARGO_ABOUT$/m
+  .exec(read('RELEASING.md'))?.[1];
+
+test('The cargo-about install guide matches the release pin (#136)', () => {
+  assert.ok(cargoAboutInstall, 'Find the INSTALL_CARGO_ABOUT block');
+  assert.deepEqual(cargoAboutPinProblems(cargoAboutInstall, release), []);
+});
+
+for (const [field, before, after] of [
+  ['version', /^version=.+$/m, 'version=9.9.9'],
+  ['cmp', /^(if ! cmp .*?printf ')cargo-about \d+\.\d+\.\d+/m, '$1cargo-about 9.9.9'],
+  ['action_sha', /^action_sha=[a-f0-9]{40}$/m, `action_sha=${'0'.repeat(40)}`],
+]) {
+  test(`The cargo-about install guide rejects a different ${field} (#136)`, () => {
+    const control = cargoAboutInstall.replace(before, after);
+    assert.notEqual(control, cargoAboutInstall);
+    assert.deepEqual(cargoAboutPinProblems(control, release), [field]);
+  });
+}
+
 test('Local and release generation use all configured targets (#136)', () => {
   const recipe = recipeLine(release);
   assert.ok(recipe, 'release generation command');
@@ -232,27 +269,85 @@ function platformOrderIsValid(workflow) {
   const jobs = jobBlocks(workflow.split(/^jobs:\s*$/m)[1]);
   const stage = jobs.get('stage-and-verify-napi');
   const publish = jobs.get('publish-npm');
-  const inOrder = (job, ...names) => {
-    const steps = names.map(name => namedStep(job, name));
-    return steps.every((step, i) => step && (i === 0 || job.indexOf(step) > job.indexOf(steps[i - 1])));
+  const indexes = (job, ...names) => {
+    const headers = stepHeaders(job).map(match => match[0]);
+    return names.map(name => headers.indexOf(`      - name: ${name}`));
   };
+  const inOrder = steps => steps.every((index, i) => index >= 0 && (i === 0 || index > steps[i - 1]));
+  const [restored, a3, platforms, workspace] = indexes(publish, 'Assert restored platform packages contain NOTICE',
+    'Re-run A3 gate against the restored tree', 'Publish platform packages (napi prepublish)', 'Publish npm packages');
   return stage.includes('needs: [build-napi]')
     && stage.includes("needs.build-napi.result == 'success'")
-    && inOrder(stage, 'Add LICENSE and NOTICE to each platform package', 'Assert platform packages contain NOTICE',
-      'A3 — name <-> loader verification gate', 'Upload staged napi tree')
-    && inOrder(publish, 'Assert restored platform packages contain NOTICE', 'Re-run A3 gate against the restored tree',
-      'Publish platform packages (napi prepublish)', 'Assert platform NOTICE after napi prepublish', 'Publish npm packages')
+    && inOrder(indexes(stage, 'Add LICENSE and NOTICE to each platform package', 'Assert platform packages contain NOTICE',
+      'A3 — name <-> loader verification gate', 'Upload staged napi tree'))
+    && inOrder([restored, a3, platforms, workspace])
+    && platforms + 1 === workspace
     && namedStep(stage, 'Assert platform packages contain NOTICE').includes('run: &assert-platform-notice |')
-    && ['Assert restored platform packages contain NOTICE', 'Assert platform NOTICE after napi prepublish']
-      .every(name => namedStep(publish, name).includes('run: *assert-platform-notice'));
+    && namedStep(publish, 'Assert restored platform packages contain NOTICE').includes('run: *assert-platform-notice');
 }
 
-test('The platform list checks run before A3 and after napi prepublish (#136)', () => {
+test('The platform list checks precede A3 and the npm publishes are adjacent (#136)', () => {
   assert.equal(platformOrderIsValid(release), true);
   assert.equal(platformOrderIsValid(release.replace('needs: [build-napi]', 'needs: [build-napi, build-python]')), false);
   assert.equal(platformOrderIsValid(release.replace('name: Assert restored platform packages contain NOTICE', 'name: Removed')), false);
-  assert.equal(platformOrderIsValid(release.replace('name: Assert platform NOTICE after napi prepublish', 'name: Removed')), false);
+  const publish = '      - name: Publish npm packages\n';
+  for (const step of ['      - if: always()\n        run: \':\'\n', '      -\n        run: \':\'\n']) {
+    const separated = release.replace(publish, step + publish);
+    assert.notEqual(separated, release);
+    assert.equal(platformOrderIsValid(separated), false);
+  }
 });
+
+const packLine = 'npm pack --dry-run --json --ignore-scripts "$1" > "$2.json" &&';
+
+function platformNoticeProblems(workflow) {
+  const body = /^        run: &assert-platform-notice \|\n((?: {10}[^\n]*\n?|\n)*)/m.exec(workflow)?.[1];
+  if (!body) return ['anchor body'];
+  const commands = stripComments(body).split('\n').map(line => line.trim());
+  const problems = [];
+  if (/\bsecrets\s*(?:\.|\[)|\$\{\{\s*secrets\b/i.test(body)
+      || /\b(?:[A-Z0-9]+_)*TOKEN(?:_[A-Z0-9]+)*\b/.test(body)) problems.push('registry value');
+  const networkCommand = /\b(?:curl|wget|gh)\b|\bnpm\s+(?:publish|view)\b/;
+  if (commands.some(line => networkCommand.test(line))) problems.push('network command');
+  const packs = commands.filter(line => /\bnpm\b(?!\/)/.test(line) && !networkCommand.test(line));
+  const helper = 'list_paths() {';
+  const helperIndex = commands.indexOf(helper);
+  if (packs.length !== 1 || helperIndex < 0 || commands[helperIndex + 1] !== packLine) problems.push('pack');
+  const paths = commands.filter(line => /\blist_paths\b/.test(line));
+  const localPaths = [helper, 'list_paths "$work/control" "$work/control"',
+    'list_paths "./$platform" "$work/${platform##*/}"'];
+  const workDirs = commands.filter(line => /^work=/.test(line));
+  if (paths.length !== localPaths.length || localPaths.some(line => !paths.includes(line))
+      || workDirs.length !== 1 || workDirs[0] !== 'work=$(mktemp -d "$RUNNER_TEMP/napi-notice.XXXXXX")') problems.push('path');
+  return problems;
+}
+
+test('The platform NOTICE check only packs local directories in dry-run mode (#136)', () => {
+  assert.deepEqual(platformNoticeProblems(release), []);
+});
+
+const beforeControl = '          mkdir "$work/control"';
+for (const [name, before, after, problem] of [
+  ['pack without --ignore-scripts', packLine, packLine.replace(' --ignore-scripts', ''), 'pack'],
+  ['pack without --dry-run', packLine, packLine.replace(' --dry-run', ''), 'pack'],
+  ['pack with a registry target', packLine, packLine.replace('"$1"', 'registry-fixture'), 'pack'],
+  ['second pack without flags', beforeControl, `          npm pack registry-fixture\n${beforeControl}`, 'pack'],
+  ['no npm pack', packLine, 'true &&', 'pack'],
+  ['non-local helper argument', 'list_paths "./$platform"', 'list_paths "registry-fixture"', 'path'],
+  ['non-local control path', 'work=$(mktemp -d "$RUNNER_TEMP/napi-notice.XXXXXX")', 'work=@registry-fixture', 'path'],
+  ...[
+    ['secrets reference', ': secrets.FIXTURE', 'registry value'],
+    ['secrets expression', '# ${{ secrets ["FIXTURE"] }}', 'registry value'],
+    ['token environment variable', ': "$ACTIONS_ID_TOKEN_REQUEST_URL"', 'registry value'],
+    ...['curl', 'wget', 'gh', 'npm publish', 'npm view'].map(command => [command, command, 'network command']),
+  ].map(([name, command, problem]) => [name, beforeControl, `          ${command}\n${beforeControl}`, problem]),
+]) {
+  test(`The platform NOTICE check rejects ${name} (#136)`, () => {
+    const control = release.replace(before, after);
+    assert.notEqual(control, release);
+    assert.deepEqual(platformNoticeProblems(control), [problem]);
+  });
+}
 
 test('The wheel, sdist and platform checks use saved archive lists (#136)', () => {
   const jobs = jobBlocks(release.split(/^jobs:\s*$/m)[1]);
