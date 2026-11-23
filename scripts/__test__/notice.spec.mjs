@@ -123,7 +123,8 @@ function namedStep(job, name) {
   return job.slice(starts[i].index, starts[i + 1]?.index);
 }
 
-const generator = /\bgenerate-notice\.mjs\b|(?:\bcargo(?:-about)?|\$cargo_about")\s+about\s+generate\b/;
+const refreshCommand = 'bash scripts/refresh-notice.sh "$cargo_about" "$notice_raw" > "$notice_out"';
+const generator = /\b(?:refresh-notice\.sh|generate-notice\.mjs)\b|(?:\bcargo(?:-about)?|\$cargo_about")\s+about\s+generate\b/;
 
 test('Only the release workflow can generate NOTICE (#136)', () => {
   const workflows = readdirSync(file('.github/workflows')).filter(name => /\.ya?ml$/.test(name));
@@ -133,6 +134,7 @@ test('Only the release workflow can generate NOTICE (#136)', () => {
     assert.equal(generator.test(stripComments(read(`.github/workflows/${name}`))), false, name);
   }
   assert.equal(generator.test('run: cargo about generate --frozen'), true);
+  assert.equal(generator.test(`run: ${refreshCommand}`), true);
 });
 
 function freshnessProblems(workflow, ciWorkflow) {
@@ -163,7 +165,7 @@ function freshnessProblems(workflow, ciWorkflow) {
   if (!version.includes('cargo-about 0.9.1') || !version.includes('cargo-about 9.9.9')) {
     problems.push('Check the binary version with a wrong-version control');
   }
-  if (!freshness.includes('cargo fetch --locked') || !freshness.includes('about generate --frozen --workspace --all-features --fail')
+  if (!freshness.includes('cargo fetch --locked') || !freshness.includes(refreshCommand)
       || !freshness.includes('for checked in NOTICE crates/mds-python/NOTICE')
       || !freshness.includes('cmp -s "$checked" "$notice_out" || rc=$?')) {
     problems.push('Regenerate from the locked graph and compare both copies');
@@ -177,10 +179,12 @@ function freshnessProblems(workflow, ciWorkflow) {
 }
 
 test('Local and release generation use all configured targets (#136)', () => {
-  const line = text => text.split('\n').find(row => row.trimStart().startsWith('"$cargo_about" about generate '))?.trim();
-  const recipe = line(release);
-  assert.ok(recipe, 'release generation command');
-  assert.equal(line(read('RELEASING.md')), recipe);
+  assert.ok(stripComments(release).includes(refreshCommand));
+  assert.ok(read('RELEASING.md').includes(refreshCommand));
+  const recipe = stripComments(read('scripts/refresh-notice.sh'));
+  const generatesLockedGraph = text => /"\$cargo_about" about generate --frozen --workspace --all-features --fail\b/.test(text);
+  assert.equal(generatesLockedGraph(recipe), true);
+  assert.equal(generatesLockedGraph(recipe.replace(' --all-features', '')), false);
   const config = /^targets = \[([^\]]+)\]/m.exec(read('about.toml'))[1];
   const targets = [...config.matchAll(/"([\w-]+)"/g)].map(match => match[1]).sort();
   const cliTargets = command => [...command.matchAll(/ --target ([\w-]+)/g)].map(match => match[1]).sort();
@@ -201,7 +205,7 @@ test('Release freshness checks the locked NOTICE in a read-only job (#136)', () 
     ['      checks: read', '      checks: read\n    env:\n      NPM_TOKEN: $' + '{{ secrets.NPM_TOKEN }}', 'The NOTICE job must not hold publish grants'],
     ['tool: cargo-about@0.9.1', 'tool: cargo-about@0.9.2', 'Install the pinned cargo-about before any Rust cache'],
     ['cargo-about 9.9.9', 'cargo-about 0.9.1', 'Check the binary version with a wrong-version control'],
-    ['about generate --frozen', 'about generate --locked', 'Regenerate from the locked graph and compare both copies'],
+    ['cargo fetch --locked', 'cargo fetch', 'Regenerate from the locked graph and compare both copies'],
     ['for checked in NOTICE crates/mds-python/NOTICE', 'for checked in NOTICE', 'Regenerate from the locked graph and compare both copies'],
     ['cmp -s "$checked" "$notice_out" || rc=$?', 'rc=0', 'Regenerate from the locked graph and compare both copies'],
     ['diff_rc=$?', 'diff_rc=0', 'Print the refresh command before the bounded diff and retain its status'],
