@@ -176,7 +176,7 @@ fn a_module_read_holds_at_most_the_cap_plus_one_byte() {
     ] {
         let path = sized("data.json", size);
         let (outcome, peak) = peak_growth(|| {
-            let key = fs.normalize_data_in_dir(&base, "./data.json").unwrap();
+            let key = fs.normalize_in_dir(&base, "./data.json").unwrap();
             fs.read_data(&key)
                 .map(|text| text.len())
                 .map_err(|e| e.to_string())
@@ -208,7 +208,7 @@ fn a_module_read_holds_at_most_the_cap_plus_one_byte() {
         measured.push(("vars FIFO fed cap + 2 MiB", outcome, peak));
 
         let data_path = sized("swap.json", 4);
-        let key = fs.normalize_data_in_dir(&base, "./swap.json").unwrap();
+        let key = fs.normalize_in_dir(&base, "./swap.json").unwrap();
         assert_eq!(fs.read_data(&key).unwrap().len(), 4);
         std::fs::rename(&data_path, dir.path().join("saved.json")).unwrap();
         assert!(std::process::Command::new("mkfifo")

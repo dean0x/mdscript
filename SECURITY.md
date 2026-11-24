@@ -68,7 +68,8 @@ input. The compiler enforces several defense-in-depth controls:
   or be `node_modules`, in any ASCII case. MDS checks these segment rules again on the
   resolved path below the project root. The native read does not wait on a named pipe, and
   it reads only the regular file that resolution found, at most 10 MiB of UTF-8
-  (`crates/mds-core/src/data/path.rs`; tests in `crates/mds-core/tests/data_paths.rs`).
+  (`crates/mds-core/src/data/path.rs`; tests in `crates/mds-core/src/data/path_tests.rs`
+  and `crates/mds-core/tests/data_paths.rs`).
   `mds check`, `mds lint`, `mds fmt` and the check and lint calls of the Rust API, the Python
   binding, the napi binding and the WASM binding read no data file (tests: `D-6` in
   `crates/mds-napi/__test__/index.spec.mjs`, `check_and_lint_read_no_data_file` in

@@ -58,8 +58,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rust API: `mds::is_data_path`, `mds::MAX_DATA_FILES`, `mds::MAX_DATA_BYTES`, the
   `ImportKind::Data` kind of `scan_import_records` (data records come last; `scan_imports` stays
   modules-only), the `MdsError::Data` and `MdsError::NetworkDenied` variants with the
-  constructors `MdsError::data` and `MdsError::network_denied`, and the `FileSystem` methods
-  `normalize_data_in_dir` and `read_data`. The default `read_data` fails with `mds::io`.
+  constructors `MdsError::data` and `MdsError::network_denied`, and the `FileSystem` method
+  `read_data`. The default `read_data` fails with `mds::io`. The `VirtualFs` and `NativeFs`
+  `read_data` refuse a key that does not end in exactly `.json`, `.yaml` or `.yml`
+  (`mds::import`).
 - Bindings: the virtual module maps of the Python `compile_virtual`, `check_virtual` and
   `lint_virtual`, of the WASM `options.modules` and `lintVirtual`, and of the napi `lintVirtual`
   hold data files. A key that ends in exactly `.json`, `.yaml` or `.yml` is a data file. Data

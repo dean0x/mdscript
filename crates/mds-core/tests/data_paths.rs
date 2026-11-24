@@ -4,28 +4,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use mds::{FileSystem, MdsError, NativeFs, ReadLog, VirtualFs, MAX_FILE_SIZE};
-use serde::Deserialize;
 
-#[derive(Deserialize)]
-struct Vectors {
-    portable: Vec<Vector>,
-    #[cfg(windows)]
-    windows: Vec<Vector>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Vector {
-    path: String,
-    code: Option<String>,
-    reason: Option<String>,
-    code_point: Option<u32>,
-    #[serde(default)]
-    from: String,
-}
-
+/// Resolve `path` with the module resolver, then read the key with the data read. The
+/// data read checks the key rules itself, so these tests do not depend on the checks of
+/// the path as written.
 fn read_data(fs: &dyn FileSystem, dir: &str, path: &str) -> Result<String, MdsError> {
-    fs.read_data(&fs.normalize_data_in_dir(dir, path)?)
+    fs.read_data(&fs.normalize_in_dir(dir, path)?)
 }
 
 fn anchor(fs: &NativeFs, root: &Path) -> String {
@@ -45,62 +29,6 @@ fn assert_error(error: &MdsError, code: &str, reason: &str) {
         error.to_string().contains(reason),
         "{error}; expected {reason}"
     );
-}
-
-fn vectors() -> Vectors {
-    serde_json::from_str(include_str!("fixtures/data-path-vectors.json")).unwrap()
-}
-
-#[test]
-fn native_paths_follow_the_shared_portable_table() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("project");
-    for path in [
-        "modules/a.json",
-        "modules/a.yaml",
-        "modules/a.yml",
-        "modules/a.JSON",
-        "a.json",
-        "modules/a.txt",
-        "modules/{{name}}.json",
-        ".env/a.json",
-        "node_modules/a.json",
-        "NoDe_MoDuLeS/a.json",
-    ] {
-        put(&root, path, b"true");
-    }
-    put(temp.path(), "a.json", b"false");
-    let fs = NativeFs::new();
-    let dir = anchor(&fs, &root);
-
-    for vector in vectors().portable {
-        let path = match vector.code_point {
-            Some(point) => vector
-                .path
-                .replace("@CODEPOINT@", &char::from_u32(point).unwrap().to_string()),
-            None => vector.path,
-        };
-        let from = if vector.from.is_empty() {
-            dir.clone()
-        } else {
-            Path::new(&dir)
-                .join(vector.from)
-                .to_str()
-                .unwrap()
-                .to_owned()
-        };
-        let outcome = read_data(&fs, &from, &path);
-        if let Some(code) = vector.code {
-            let error = outcome.expect_err(&path);
-            assert_error(&error, &code, &vector.reason.unwrap());
-            assert!(error
-                .to_string()
-                .chars()
-                .all(|ch| !mds::is_forbidden_path_char(ch)));
-        } else {
-            assert_eq!(outcome.unwrap(), "true", "{path}");
-        }
-    }
 }
 
 #[cfg(unix)]
@@ -153,38 +81,6 @@ fn native_data_checks_the_canonical_directory_but_not_root_ancestors() {
     }
 }
 
-#[cfg(windows)]
-#[test]
-fn windows_data_refuses_trailing_dot_and_short_name_forms() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
-    put(root, "modules/a.json", b"true");
-    put(root, "node_modules/a.json", b"false");
-    let fs = NativeFs::new();
-    let dir = anchor(&fs, root);
-    assert_eq!(read_data(&fs, &dir, "./modules/a.json").unwrap(), "true");
-
-    // If this volume has no 8.3 alias, give the same spelling a directory junction.
-    // Either form must resolve to the blocked parent before the segment check.
-    let short = root.join("NODE_M~1");
-    if !short.exists() {
-        let status = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(&short)
-            .arg(root.join("node_modules"))
-            .status()
-            .unwrap();
-        assert!(status.success());
-    }
-    let short_key = fs.normalize_in_dir(&dir, "./NODE_M~1/a.json").unwrap();
-    let long_key = fs.normalize_in_dir(&dir, "./node_modules/a.json").unwrap();
-    assert_eq!(short_key, long_key);
-    for vector in vectors().windows {
-        let error = read_data(&fs, &dir, &vector.path).unwrap_err();
-        assert_error(&error, &vector.code.unwrap(), &vector.reason.unwrap());
-    }
-}
-
 #[test]
 fn native_data_caps_bytes_and_checks_utf8_before_parse() {
     let temp = tempfile::tempdir().unwrap();
@@ -215,7 +111,7 @@ fn native_data_requires_the_resolved_file_identity() {
     let fs = NativeFs::new();
     let dir = anchor(&fs, root);
     put(root, "data.json", b"true");
-    let key = fs.normalize_data_in_dir(&dir, "./data.json").unwrap();
+    let key = fs.normalize_in_dir(&dir, "./data.json").unwrap();
     assert_eq!(fs.read_data(&key).unwrap(), "true");
 
     fs::rename(root.join("data.json"), root.join("saved.json")).unwrap();
@@ -295,8 +191,11 @@ fn virtual_aliases_must_not_hide_a_blocked_key() {
 }
 
 /// `read_data` applies the segment rule to the key it gets. The module normalizer
-/// does not apply that rule, so its key reaches the read-time check. Control: a key
-/// of a permitted directory from the same normalizer reads.
+/// does not apply that rule, so its key reaches the read-time check. The data path
+/// rules refuse the same paths as written
+/// (`data_path_rules_refuse_the_paths_that_the_read_check_gets` in
+/// `crates/mds-core/src/data/path_tests.rs`). Control: a key of a permitted directory
+/// from the same normalizer reads.
 #[test]
 fn read_data_checks_a_key_that_skipped_the_data_path_rule() {
     let temp = tempfile::tempdir().unwrap();
@@ -312,7 +211,6 @@ fn read_data_checks_a_key_that_skipped_the_data_path_rule() {
         ("./.hidden/a.json", "dot-prefixed"),
         ("./NoDe_MoDuLeS/a.json", "node_modules"),
     ] {
-        assert!(fs.normalize_data_in_dir(&dir, path).is_err(), "{path}");
         let key = fs.normalize_in_dir(&dir, path).unwrap();
         let error = fs.read_data(&key).unwrap_err();
         assert_error(&error, "mds::import", reason);
@@ -331,6 +229,61 @@ fn read_data_checks_a_key_that_skipped_the_data_path_rule() {
     ] {
         let error = virtual_fs.read_data(key).unwrap_err();
         assert_error(&error, "mds::import", reason);
+    }
+}
+
+const EXTENSION_REASON: &str = "expected the .json, .yaml or .yml extension";
+
+/// A direct `read_data` call refuses a map key without a data extension, compared byte
+/// for byte as a compile compares it, so `.JSON` is refused too. The module read serves
+/// each refused key, so only the extension rule refuses it. Control: the same content
+/// under a `.json` key reads.
+#[test]
+fn virtual_read_data_refuses_a_key_without_a_data_extension() {
+    let fs = VirtualFs::new(HashMap::from([
+        ("main.mds".into(), "true".into()),
+        ("note.txt".into(), "true".into()),
+        ("upper.JSON".into(), "true".into()),
+        ("control.json".into(), "true".into()),
+    ]));
+    assert_eq!(fs.read_data("control.json").unwrap(), "true");
+    for key in ["main.mds", "note.txt", "upper.JSON"] {
+        assert_eq!(fs.read(key).unwrap(), "true", "{key}");
+        let error = fs.read_data(key).unwrap_err();
+        assert_error(&error, "mds::import", EXTENSION_REASON);
+        assert!(
+            error.to_string().contains(&format!("data path \"{key}\"")),
+            "{error}"
+        );
+    }
+}
+
+/// A direct `read_data` call refuses a key that the module resolver registered below
+/// the project root when the key has no data extension. The module read serves each
+/// refused key, so only the extension rule refuses it, and the message names the file
+/// relative to the project root. Control: the same content under a `.json` key reads.
+#[test]
+fn native_read_data_refuses_a_resolved_key_without_a_data_extension() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let fs = NativeFs::new();
+    let dir = anchor(&fs, root);
+    for name in ["note.txt", "upper.JSON", "control.json"] {
+        put(root, name, b"true");
+    }
+    let control = fs.normalize_in_dir(&dir, "./control.json").unwrap();
+    assert_eq!(fs.read_data(&control).unwrap(), "true");
+    for name in ["note.txt", "upper.JSON"] {
+        let key = fs.normalize_in_dir(&dir, &format!("./{name}")).unwrap();
+        assert_eq!(fs.read(&key).unwrap(), "true", "{name}");
+        let error = fs.read_data(&key).unwrap_err();
+        assert_error(&error, "mds::import", EXTENSION_REASON);
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("data path \"{name}\"")),
+            "{message}"
+        );
+        assert!(!message.contains(&dir), "{message}");
     }
 }
 

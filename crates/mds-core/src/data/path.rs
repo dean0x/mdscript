@@ -17,12 +17,7 @@ pub(crate) fn normalize(
     if relative.contains("{{") {
         return Err(refused(relative, "references are not allowed"));
     }
-    if !crate::is_data_path(relative) {
-        return Err(refused(
-            relative,
-            "expected the .json, .yaml or .yml extension",
-        ));
-    }
+    check_extension(relative, relative)?;
     check_segments(relative, relative, true)?;
 
     let key = fs.normalize_in_dir(dir, relative)?;
@@ -30,8 +25,27 @@ pub(crate) fn normalize(
     Ok(key)
 }
 
+/// Inspect the key of a data read: the key rules of [`check_key`], then the data
+/// extension. Each built-in `read_data` calls this, so a caller that gives a key
+/// directly gets the same rules as a compile.
+pub(crate) fn check_data_key(key: &str, root: Option<&Path>, shown: &str) -> Result<(), MdsError> {
+    check_key(key, root, shown)?;
+    check_extension(key, shown)
+}
+
+fn check_extension(path: &str, shown: &str) -> Result<(), MdsError> {
+    if crate::is_data_path(path) {
+        Ok(())
+    } else {
+        Err(refused(
+            shown,
+            "expected the .json, .yaml or .yml extension",
+        ))
+    }
+}
+
 /// Inspect the exact key that the backend uses for the read, not a display path.
-pub(crate) fn check_key(key: &str, root: Option<&Path>, shown: &str) -> Result<(), MdsError> {
+fn check_key(key: &str, root: Option<&Path>, shown: &str) -> Result<(), MdsError> {
     let path = Path::new(key);
     reject_forbidden_in_path(path, shown)?;
     let relative = match root {
@@ -72,3 +86,7 @@ fn refused(shown: &str, reason: &str) -> MdsError {
         escape_path_for_message(shown)
     ))
 }
+
+#[cfg(test)]
+#[path = "path_tests.rs"]
+mod tests;

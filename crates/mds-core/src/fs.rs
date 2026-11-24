@@ -142,33 +142,25 @@ pub trait FileSystem: Send + Sync {
     /// Read the content of a normalized key.
     fn read(&self, normalized: &str) -> Result<String, MdsError>;
 
-    /// Resolve a local data path without a content read.
-    ///
-    /// This checks the path as written before [`FileSystem::normalize_in_dir`].
-    /// It checks the resolved key relative to [`FileSystem::source_root`] before
-    /// it returns that key. Backends with absolute keys must report their root.
-    ///
-    /// A compile applies the same rules itself, through
-    /// [`FileSystem::normalize_in_dir`], and does not call this method. So an
-    /// override does not change which data paths a compile accepts.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the path fails the data path rules or cannot resolve.
-    fn normalize_data_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError> {
-        crate::data::path::normalize(self, dir, relative)
-    }
-
-    /// Read UTF-8 data from a key returned by [`FileSystem::normalize_data_in_dir`].
+    /// Read UTF-8 data from a data file key that the compile resolved through
+    /// [`FileSystem::normalize_in_dir`] and the data path rules.
     ///
     /// The default never uses [`FileSystem::read`]. A backend that supports data
     /// must enforce the data path rules and the 10 MiB file cap before it returns
     /// content. For host files, it must check that the open file is the regular
     /// file that resolution accepted, before the first byte read.
     ///
+    /// [`VirtualFs`] and [`NativeFs`] check the key itself before the read, also
+    /// when a caller gives the key directly. The key must end in exactly `.json`,
+    /// `.yaml` or `.yml`, and no segment of it may start with `.` or be
+    /// `node_modules`. A [`NativeFs`] key must stay inside the project root, and a
+    /// [`VirtualFs`] key must be relative.
+    ///
     /// # Errors
     ///
     /// The default returns `mds::io`: `this file system does not read data files`.
+    /// [`VirtualFs`] and [`NativeFs`] return `mds::import` for a key that fails the
+    /// rules above.
     fn read_data(&self, _normalized: &str) -> Result<String, MdsError> {
         Err(MdsError::io("this file system does not read data files"))
     }
@@ -1121,7 +1113,7 @@ impl FileSystem for VirtualFs {
     }
 
     fn read_data(&self, normalized: &str) -> Result<String, MdsError> {
-        crate::data::path::check_key(normalized, None, normalized)?;
+        crate::data::path::check_data_key(normalized, None, normalized)?;
         let content = self
             .module(normalized)
             .ok_or_else(|| MdsError::data_file_not_found(normalized))?;
@@ -1643,7 +1635,7 @@ impl NativeFs {
         let display = self.display_of(path);
         if matches!(rule, ReadRule::Data) {
             let root = self.root_dir.get().ok_or_else(|| not_resolved(&display))?;
-            crate::data::path::check_key(normalized, Some(root), &display)?;
+            crate::data::path::check_data_key(normalized, Some(root), &display)?;
         }
         let id = self
             .ids
