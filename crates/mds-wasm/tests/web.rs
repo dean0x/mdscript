@@ -1380,6 +1380,113 @@ fn non_plain_data_key_forms_return_the_fixed_form_error() {
     }
 }
 
+/// Text that no data parser accepts: a read of it fails with `mds::yaml`.
+const BAD_DATA: &str = "[";
+
+/// Assert that `result` is an `mds::yaml` error whose message holds `needle`.
+fn assert_data_read_fails(result: Result<JsValue, JsValue>, needle: &str) {
+    let err = result.expect_err("the data read must fail");
+    let message = get_str(&err, "message");
+    assert_eq!(get_str(&err, "code"), "mds::yaml", "{message}");
+    assert!(message.contains(needle), "{message}");
+}
+
+/// A runtime var with an entry's name replays the entry, and its data file is not read
+/// (#405). Control: with no replay, the compile reads the file and fails with `mds::yaml`.
+#[wasm_bindgen_test]
+fn runtime_vars_replay_an_entry_and_read_no_file() {
+    let source = "---\ndata:\n  title: ./title.json\n---\nTitle: {{title}}\n";
+    let modules = serde_json::json!({ "title.json": BAD_DATA });
+    let replay = to_js_object(&serde_json::json!({
+        "modules": modules,
+        "vars": { "title": "Replayed" },
+    }));
+    let result = mds_wasm::compile(source, replay).unwrap();
+    assert_eq!(get_str(&result, "output"), "Title: Replayed\n");
+    assert_eq!(
+        js_sys::Array::from(&get_prop(&result, "dependencies")).length(),
+        0
+    );
+    assert_data_read_fails(
+        mds_wasm::compile(source, modules_opts(&modules)),
+        "data file \"title.json\", entry \"title\"",
+    );
+}
+
+/// A runtime var named `data` is an ordinary variable: it defines no entry and reads no
+/// file (#405). Control: the same entry in frontmatter reads the file and fails.
+#[wasm_bindgen_test]
+fn a_runtime_data_variable_defines_no_entry() {
+    let modules = serde_json::json!({ "bad.json": BAD_DATA });
+    let runtime = to_js_object(&serde_json::json!({
+        "modules": modules,
+        "vars": { "data": { "cfg": "./bad.json" } },
+    }));
+    let result = mds_wasm::compile("{{data.cfg}}\n", runtime).unwrap();
+    assert_eq!(get_str(&result, "output"), "./bad.json\n");
+    assert_eq!(
+        js_sys::Array::from(&get_prop(&result, "dependencies")).length(),
+        0
+    );
+    assert_data_read_fails(
+        mds_wasm::compile(
+            "---\ndata:\n  cfg: ./bad.json\n---\n{{cfg}}\n",
+            modules_opts(&modules),
+        ),
+        "data file \"bad.json\"",
+    );
+}
+
+/// `check`, `lint` and `lintVirtual` read no data file (#405): a data file that does not
+/// parse and one that does not exist fail none of them. `check` returns one warning that
+/// names the pending entries. Controls: `compile` reads the files and fails with
+/// `mds::yaml`, and a misspelled name that is not an entry still fails `check`.
+#[wasm_bindgen_test]
+fn check_and_lint_read_no_data_file() {
+    let source = concat!(
+        "---\ndata:\n  rows: ./bad.yml\n  other: ./absent.json\n---\n",
+        "@for row in rows:\n{{row.name}}\n@end\n{{other}}\n",
+    );
+    let opts = || {
+        to_js_object(&serde_json::json!({
+            "filename": "main.mds",
+            "modules": { "bad.yml": BAD_DATA },
+        }))
+    };
+
+    let result = mds_wasm::check(source, opts()).unwrap();
+    let warnings: Vec<String> = js_sys::Array::from(&get_prop(&result, "warnings"))
+        .iter()
+        .filter_map(|w| w.as_string())
+        .collect();
+    assert_eq!(
+        warnings,
+        ["data pending; output was not evaluated: \"main.mds\", entry \"rows\"; \"main.mds\", entry \"other\""]
+    );
+
+    let map = to_js_object(&serde_json::json!({ "main.mds": source, "bad.yml": BAD_DATA }));
+    for result in [
+        mds_wasm::lint(source, opts()),
+        mds_wasm::lint_virtual(map, "main.mds", JsValue::NULL),
+    ] {
+        let result = result.unwrap();
+        let files = js_sys::Array::from(&get_prop(&result, "files"));
+        let diagnostics: u32 = files
+            .iter()
+            .map(|f| js_sys::Array::from(&get_prop(&f, "diagnostics")).length())
+            .sum();
+        assert_eq!(diagnostics, 0);
+    }
+
+    assert_data_read_fails(
+        mds_wasm::compile(source, opts()),
+        "data file \"bad.yml\", entry \"rows\"",
+    );
+    let typo = source.replace("{{other}}", "{{typo}}");
+    let err = mds_wasm::check(&typo, opts()).unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::undefined_var");
+}
+
 #[wasm_bindgen_test]
 fn scan_imports_returns_error_for_malformed_source() {
     // Unclosed double-brace interpolation — should produce a syntax error.
