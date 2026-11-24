@@ -34,8 +34,8 @@ export const NODE_METHODS = ['compileFile', 'checkFile', 'lintFile'] as const;
 
 /**
  * WASM module exports @mdscript/mds calls — BASE_METHODS, lintVirtual for
- * multi-module lint, and the two calls the JS-side file pre-scanner makes
- * (scanImportRecords, preflightModule). The module may export more (the
+ * multi-module lint, and the three calls the JS-side file pre-scanner makes
+ * (scanImportRecords, preflightModule, preflightData). The module may export more (the
  * @mdscript/mds-wasm package also exports scanImports); only these are required.
  */
 export const WASM_EXPORTS = [
@@ -43,6 +43,7 @@ export const WASM_EXPORTS = [
   'lintVirtual',
   'scanImportRecords',
   'preflightModule',
+  'preflightData',
 ] as const;
 
 export type BaseMethodName = (typeof BASE_METHODS)[number];

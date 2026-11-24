@@ -361,7 +361,7 @@ describe('wasm backend — browser shape validation', () => {
     _resetForTesting(0);
   });
 
-  test('U-WB17: validateWasmShape accepts a well-formed module (compile, check, lint, lintVirtual, scanImportRecords, preflightModule)', () => {
+  test('U-WB17: validateWasmShape accepts a well-formed module (compile, check, lint, lintVirtual, scanImportRecords, preflightModule, preflightData)', () => {
     const validMod = {
       compile: () => {},
       check: () => {},
@@ -369,6 +369,7 @@ describe('wasm backend — browser shape validation', () => {
       lintVirtual: () => {},
       scanImportRecords: () => [],
       preflightModule: () => '',
+      preflightData: () => '',
     };
     assert.doesNotThrow(
       () => validateWasmShape(validMod),

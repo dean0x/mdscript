@@ -66,9 +66,12 @@ function importRecordsOf(scan) {
   return (source) => scan(source).map((p) => ({ path: p, kind: 'import', frontmatterIndex: null, span: null }));
 }
 
-/** buildModulesMap with `scan` as the engine's import scanner (see `importRecordsOf`). */
+/**
+ * buildModulesMap with `scan` as the engine's import scanner (see `importRecordsOf`). Its
+ * records are imports only, so the scan reads no data file.
+ */
 function buildModulesMap(entryPath, scan, options) {
-  return buildModulesMapWith(entryPath, { scanImportRecords: importRecordsOf(scan), preflightModule }, options);
+  return buildModulesMapWith(entryPath, { scanImportRecords: importRecordsOf(scan), preflightModule }, false, options);
 }
 
 /** Reach the core graph guard without exceeding the separate 257-entry map guard. */
@@ -2264,7 +2267,7 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       for (const [i, [label, source, options, code, fields]] of rows.entries()) {
         const entry = path.join(proj, `e${i}.mds`);
         await writeFile(entry, source);
-        const err = await rejectionOf(buildModulesMapWith(entry, engine, options), label);
+        const err = await rejectionOf(buildModulesMapWith(entry, engine, false, options), label);
         assert.equal(err.code, code, `${label}: ${err.message}`);
         assert.deepEqual(Object.keys(err).sort(), fields, label);
         assert.equal(Object.hasOwn(err, 'help'), fields.includes('help'), label);

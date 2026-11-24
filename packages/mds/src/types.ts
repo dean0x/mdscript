@@ -54,11 +54,13 @@ export interface MarkdownResult {
   /** Non-fatal diagnostic messages produced during compilation. */
   warnings: string[];
   /**
-   * Paths of every file transitively imported by the source. The native
-   * backend emits absolute canonical paths; the WASM backend emits
-   * project-root-relative POSIX paths. Entries are untrusted functional
-   * references (spec.md "Carve-out: functional path references") — resolve
-   * relative entries against the project root before filesystem use.
+   * Paths of every file transitively imported by the source, in first-resolution
+   * order, then of the local data files that the compile read, in first-read order.
+   * The entry is not listed, and each file occurs once. A data entry that a runtime
+   * variable replaces reads no file. The native backend emits absolute canonical
+   * paths; the WASM backend emits project-root-relative POSIX paths. Entries are
+   * untrusted functional references (spec.md "Carve-out: functional path references")
+   * — resolve relative entries against the project root before filesystem use.
    */
   dependencies: string[];
   /**
@@ -79,11 +81,13 @@ export interface MessagesResult {
   /** Non-fatal diagnostic messages produced during compilation. */
   warnings: string[];
   /**
-   * Paths of every file transitively imported by the source. The native
-   * backend emits absolute canonical paths; the WASM backend emits
-   * project-root-relative POSIX paths. Entries are untrusted functional
-   * references (spec.md "Carve-out: functional path references") — resolve
-   * relative entries against the project root before filesystem use.
+   * Paths of every file transitively imported by the source, in first-resolution
+   * order, then of the local data files that the compile read, in first-read order.
+   * The entry is not listed, and each file occurs once. A data entry that a runtime
+   * variable replaces reads no file. The native backend emits absolute canonical
+   * paths; the WASM backend emits project-root-relative POSIX paths. Entries are
+   * untrusted functional references (spec.md "Carve-out: functional path references")
+   * — resolve relative entries against the project root before filesystem use.
    */
   dependencies: string[];
 }

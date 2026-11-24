@@ -489,8 +489,8 @@ describe('backend contract — method manifest', () => {
     );
   });
 
-  test('U-BC3: WASM_EXPORTS contains BASE_METHODS plus lintVirtual, scanImportRecords and preflightModule', () => {
-    const expected = [...BASE_METHODS, 'lintVirtual', 'scanImportRecords', 'preflightModule'].sort();
+  test('U-BC3: WASM_EXPORTS contains BASE_METHODS plus lintVirtual, scanImportRecords, preflightModule and preflightData', () => {
+    const expected = [...BASE_METHODS, 'lintVirtual', 'scanImportRecords', 'preflightModule', 'preflightData'].sort();
     assert.deepEqual([...WASM_EXPORTS].sort(), expected);
   });
 
