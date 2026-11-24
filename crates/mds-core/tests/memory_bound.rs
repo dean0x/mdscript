@@ -765,6 +765,44 @@ fn assert_extends_chain_trees_share_one_limit() {
     );
 }
 
+/// `files` JSON data files of `items` small objects each. The entry declares them
+/// and renders none, so the compile reads, parses and keeps each file.
+fn data_items_peak(files: usize, items: usize) -> (Result<CompileResult, MdsError>, usize) {
+    let item = r#"{"a":0}"#;
+    let text = format!("[{}{item}]", format!("{item},").repeat(items - 1));
+    let mut main = String::from("---\ndata:\n");
+    let mut modules = HashMap::new();
+    for i in 0..files {
+        main.push_str(&format!("  d{i}: ./d{i}.json\n"));
+        modules.insert(format!("d{i}.json"), text.clone());
+    }
+    modules.insert("main.mds".to_owned(), main + "---\nok\n");
+    peak_growth(|| mds::compile_virtual(modules, "main.mds", None))
+}
+
+/// Many small data items reach the compile memory budget before any data cap: each
+/// file is below the node cap and the file byte cap, and all files are far below the
+/// 32 MiB aggregate. The budget is charged before each allocation, so the refused
+/// compile stays within the budget plus the slack.
+fn assert_data_items_share_one_limit() {
+    const FILES: usize = 8;
+    const ITEMS: usize = 66_000;
+    // The root array, and an object, a key and a value for each item, fit the
+    // 200,000-node cap. All files fit the 32 MiB aggregate.
+    const { assert!(3 * ITEMS < 200_000) };
+    const { assert!(FILES * (8 * ITEMS + 1) < 32 * MIB) };
+    let (control, control_peak) = data_items_peak(FILES, ITEMS / 2);
+    assert!(control.unwrap().into_markdown().unwrap().ends_with("ok\n"));
+
+    let (result, peak) = data_items_peak(FILES, ITEMS);
+    eprintln!("data items heap (B): half items={control_peak}, all items={peak}");
+    assert_compile_memory_error(result, "data items");
+    let limit = 200 * MIB + SLACK;
+    assert!(peak <= limit, "data items grow {peak} B (limit: {limit} B)");
+    // Non-vacuity: the refused compile holds more than the control.
+    assert!(peak > control_peak, "{peak} B, control {control_peak} B");
+}
+
 const MAPPED_CORNER_TYPE: &str = "type: mds\n";
 
 fn mapped_corner(extra: usize) -> (Result<CompileResult, MdsError>, usize) {
@@ -1299,6 +1337,7 @@ fn compile_peak_heap_stays_within_each_bound() {
     assert_imported_prompts_share_one_limit();
     assert_alias_frontmatter_shares_one_limit();
     assert_extends_chain_trees_share_one_limit();
+    assert_data_items_share_one_limit();
     assert_refused_tree_is_never_built();
     assert_cached_trees_share_one_limit();
     assert_syntax_tree_peaks();

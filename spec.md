@@ -130,9 +130,12 @@ than 64 levels. The frontmatter bounds are pinned by the `parse_frontmatter_yaml
 | `MAX_DATA_BYTES_PER_COMPILE` | 32 MiB of source text across distinct data files, at input admission |
 
 A dense data file can reach the node cap at about 1 to 2 MiB, before the file byte cap.
-Dense data can also reach the compile memory budget before the 32 MiB aggregate.
+Dense data can also reach the compile memory budget before the 32 MiB aggregate
+(`assert_data_items_share_one_limit` in `crates/mds-core/tests/memory_bound.rs`).
 Sparse data, such as a few long strings, can reach a byte cap before the node cap.
-Many small files can reach the file count first.
+Each file read needs an entry, and the entry cap counts entries before reads. Thus many
+small files reach the entry cap first, at the same count as the file cap
+(`crates/mds-core/tests/data_limits.rs`).
 The entry and level caps depend on declarations, not on data density.
 
 ---

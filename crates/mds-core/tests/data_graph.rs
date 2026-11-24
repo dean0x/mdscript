@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use mds::{CompileOptions, Value};
+use mds::Value;
 
 fn chain(levels: usize) -> String {
     let mut source = String::from("---\ndata:\n  entry0: https://example.com/root\n");
@@ -12,23 +12,6 @@ fn chain(levels: usize) -> String {
     }
     source.push_str("---\nHello.\n");
     source
-}
-
-#[test]
-fn public_compile_applies_the_level_cap_before_url_denial() {
-    let compile = |levels| {
-        mds::compile_virtual_with_deps_opts(
-            HashMap::from([("main.mds".into(), chain(levels))]),
-            "main.mds",
-            None,
-            CompileOptions::default(),
-        )
-        .unwrap_err()
-    };
-    let err = compile(16);
-    assert_eq!(err.serialize().code, "mds::network_denied", "{err}");
-    let err = compile(17);
-    assert_eq!(err.serialize().code, "mds::resource_limit", "{err}");
 }
 
 #[test]

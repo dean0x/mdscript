@@ -281,8 +281,10 @@ pub(crate) const MAX_DATA_FILE_BYTES: u64 = MAX_FILE_SIZE;
 pub(crate) const MAX_DATA_NODES_PER_FILE: usize = 200_000;
 
 /// Maximum distinct data files admitted in one compile, apart from modules.
-/// Many small files can reach this cap first. Dense files can reach a node or
-/// memory cap first. Large sparse files can reach a byte cap first.
+/// Each file read needs an entry, and `MAX_DATA_ENTRIES_PER_COMPILE` counts the
+/// entries before the reads, so many small files reach the entry cap first. Dense
+/// files can reach a node or memory cap first. Large sparse files can reach a byte
+/// cap first.
 pub(crate) const MAX_DATA_FILES: usize = 256;
 
 /// Maximum data entries admitted during declaration analysis in one module.

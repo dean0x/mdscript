@@ -493,4 +493,37 @@ mod tests {
         assert_eq!(module_reads.load(Ordering::Relaxed), 3);
         assert_eq!(cache.data.bytes, 2);
     }
+
+    /// The entry cap binds first in a real compile, so the memo starts with files
+    /// that earlier reads would have left. A file it already holds needs no new slot.
+    #[test]
+    fn data_file_cap_refuses_a_new_file_past_the_cap() {
+        let source = "---\ndata:\n  held: ./held.json\n  a: ./a.json\n  b: ./b.json\n---\n{{held}}{{a}}{{b}}\n";
+        let compile = |held: usize| {
+            let fs = VirtualFs::new(HashMap::from([
+                ("main.mds".into(), source.into()),
+                ("held.json".into(), "0".into()),
+                ("a.json".into(), "1".into()),
+                ("b.json".into(), "2".into()),
+            ]));
+            let mut cache = ModuleCache::compiling(Box::new(fs));
+            cache
+                .data
+                .files
+                .insert("held.json".into(), Arc::new(Value::Number(9.0)));
+            for i in 1..held {
+                let value = Arc::new(Value::Null);
+                cache.data.files.insert(format!("seed{i}.json"), value);
+            }
+            cache.resolve_virtual_intrinsic("main.mds", &HashMap::new(), &mut vec![])
+        };
+        let cap = crate::limits::MAX_DATA_FILES;
+        let out = compile(cap - 2).unwrap();
+        assert!(matches!(out, crate::CompiledOutput::Markdown(text) if text.ends_with("912\n")));
+        let err = compile(cap - 1).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("resource limit exceeded: too many data files (max {cap} per compile)")
+        );
+    }
 }
