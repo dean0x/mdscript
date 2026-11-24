@@ -66,6 +66,19 @@ def test_e3_core_error_codes(code: str, src: str) -> None:
     assert ei.value.code == code, ei.value.message
 
 
+def test_compile_check_and_lint_report_the_same_quoted_imports_error() -> None:
+    plain = "---\nimports: []\n---\nBody\n"
+    quoted = plain.replace("imports:", "'imports':")
+    assert m.compile(plain).output == "Body\n"
+    for run in (m.compile, m.check, m.lint):
+        with pytest.raises(m.MdsError) as error:
+            run(quoted)
+        assert error.value.code == "mds::yaml", run.__name__
+        assert error.value.message == (
+            "YAML parse error: write `imports:` at the start of a line"
+        ), run.__name__
+
+
 def test_e3_file_not_found() -> None:
     with pytest.raises(m.MdsError) as ei:
         m.compile_file("/no/such/mds/file.mds")

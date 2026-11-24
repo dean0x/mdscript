@@ -87,7 +87,7 @@ use crate::lint::named_source_for_render;
 ///
 /// # Errors
 ///
-/// Returns `Err` if `source` has a syntax error (never a garbled string), or if
+/// Returns `Err` if `source` has a syntax or frontmatter form error, or if
 /// the rewritten source fails the internal compile-equivalence safety gate
 /// (`MdsError::FormatterInvariant` — signals a formatter bug; callers must not
 /// write the file when this occurs).
@@ -442,7 +442,7 @@ fn rewrite_body(
 ///   error is surfaced verbatim — matching `mds build` / `mds check` — instead
 ///   of silently emitting a still-broken file or a misleading
 ///   `FormatterInvariant` for what is ordinary author error.
-/// - A file-key YAML disagreement is an author error and is returned unchanged.
+/// - A frontmatter form error is an author error and is returned unchanged.
 /// - Any OTHER compile error (a minority case — typically an undefined runtime
 ///   variable or function; imports still resolve via `base_dir`) means the
 ///   source parsed into a well-formed token stream and only failed later during
@@ -487,7 +487,7 @@ fn assert_equivalent(
             // neutralization (PF-014) plus WIRE-mode filename escaping.
             src: Some(Arc::new(named_source_for_render(file_name, source))),
         }),
-        Err(MdsError::YamlError { message }) if message == lexer::FILE_KEY_FORM => {
+        Err(MdsError::YamlError { message }) if crate::is_frontmatter_form_message(&message) => {
             Err(MdsError::YamlError { message })
         }
         // Any other compile failure (undefined var/fn, unresolved import, …)
@@ -634,6 +634,26 @@ fn structural_equivalent(source: &str, formatted: &str, raw_content: &[Range<usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_str_returns_the_same_frontmatter_form_error_as_compile() {
+        let plain = "---\nimports: []\n---\nBody\n";
+        assert_eq!(format_str(plain).unwrap(), plain);
+
+        for raw in [
+            "'imports': []",
+            "{type: mds}",
+            "'indented-directives': true",
+            "note: 'a\nimports: []\nb'",
+        ] {
+            let source = format!("---\n{raw}\n---\nBody\n");
+            let compile_error = crate::compile_str(&source).unwrap_err().serialize();
+            assert_eq!(compile_error.code, "mds::yaml", "{raw}");
+            let format_error = format_str(&source).expect_err(raw).serialize();
+            assert_eq!(format_error.code, compile_error.code, "{raw}");
+            assert_eq!(format_error.message, compile_error.message, "{raw}");
+        }
+    }
 
     #[test]
     fn directive_line_offsets_finds_at_directives_only() {

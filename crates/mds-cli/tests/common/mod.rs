@@ -25,6 +25,55 @@ pub fn mds_bin() -> std::process::Command {
     cmd
 }
 
+#[allow(dead_code)]
+pub const IMPORTS_FORM_MESSAGE: &str = "YAML parse error: write `imports:` at the start of a line";
+
+/// Exercise plain and quoted imports in the entry, an import, and an extends base.
+#[allow(dead_code)]
+pub fn with_imports_form_cases(test: impl Fn(&Path, bool, &str)) {
+    let dir = tempfile::tempdir().unwrap();
+    let entry_path = dir.path().join("entry.mds");
+    let target_path = dir.path().join("target.mds");
+    for (case, entry_body, target_body) in [
+        ("entry", "Body\n", ""),
+        (
+            "imported module",
+            "@import \"./target.mds\" as target\n{{target.word()}}\n",
+            "@define word():\nBody\n@end\n",
+        ),
+        (
+            "extends base",
+            "@extends \"./target.mds\"\n",
+            "@block content:\nBody\n@end\n",
+        ),
+    ] {
+        for key in ["imports", "'imports'"] {
+            let rejected = key != "imports";
+            let frontmatter = format!("---\n{key}: []\n---\n");
+            let (entry, target) = if target_body.is_empty() {
+                (format!("{frontmatter}{entry_body}"), String::new())
+            } else {
+                (entry_body.to_owned(), format!("{frontmatter}{target_body}"))
+            };
+            std::fs::write(&entry_path, &entry).unwrap();
+            std::fs::write(&target_path, &target).unwrap();
+            test(&entry_path, rejected, case);
+            if rejected {
+                assert_eq!(
+                    std::fs::read(&entry_path).unwrap(),
+                    entry.as_bytes(),
+                    "{case}"
+                );
+                assert_eq!(
+                    std::fs::read(&target_path).unwrap(),
+                    target.as_bytes(),
+                    "{case}"
+                );
+            }
+        }
+    }
+}
+
 /// The write end of a pipe whose read end has already been dropped.
 ///
 /// Handing this to a child as one of its standard streams makes every write the child

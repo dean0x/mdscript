@@ -1068,10 +1068,6 @@ pub(crate) fn prove_reserved_strip(
 }
 
 /// Identify the fixed YAML form messages, not other YAML errors.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the formatter consumer follows this phase")
-)]
 #[must_use]
 pub(crate) fn is_frontmatter_form_message(message: &str) -> bool {
     message == lexer::FILE_KEY_FORM

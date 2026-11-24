@@ -69,6 +69,36 @@ fn check_invalid_exits_nonzero() {
 }
 
 #[test]
+fn build_and_check_refuse_quoted_imports_in_every_module_kind() {
+    common::with_imports_form_cases(|entry, rejected, case| {
+        for (command, args) in [("build", ["-o", "-"].as_slice()), ("check", &[])] {
+            let output = mds_bin()
+                .arg(command)
+                .arg(entry)
+                .args(args)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(i32::from(rejected)),
+                "{command}: {case}: {stderr}"
+            );
+            if rejected {
+                assert!(stderr.contains("mds::yaml"), "{command}: {case}: {stderr}");
+                assert!(
+                    stderr
+                        .lines()
+                        .any(|line| line.ends_with(common::IMPORTS_FORM_MESSAGE)),
+                    "{command}: {case}: {stderr}"
+                );
+                assert!(output.stdout.is_empty(), "{command}: {case}");
+            }
+        }
+    });
+}
+
+#[test]
 fn check_auto_detects_single_mds_file_in_directory() {
     let dir = tempfile::tempdir().expect("create temp dir");
     let mds_path = dir.path().join("valid.mds");
