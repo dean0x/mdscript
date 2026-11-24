@@ -95,7 +95,10 @@ function runLeg(backend, entry, changed) {
 
 describe('bundler adapters watch local data files (#405)', () => {
   test('TP-64: vite, rollup, webpack and rspack watch the data file after the modules, on both backends', () => {
-    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'mds-tp64-')));
+    // Resolve the directory as the OS resolves it, as both backends do. On Windows the
+    // temp path can hold an 8.3 short name (RUNNER~1) that the JS realpathSync keeps;
+    // the OS resolver, and so the native and WASM backends, give the long name.
+    const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'mds-tp64-')));
     try {
       writeFileSync(join(dir, '.mdsroot'), '');
       mkdirSync(join(dir, 'conf'));
