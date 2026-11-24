@@ -70,11 +70,13 @@ const MAX_SOURCE_SIZE: usize = mds::MAX_FILE_SIZE as usize;
 ///
 /// Mirrors the WASM and Python bindings: the entry plus 256 other modules.
 /// This input-size bound counts unused entries too. The core separately bounds
-/// the resolved graph, including modules still being resolved.
+/// the resolved graph, including modules still being resolved. Data file keys
+/// ([`mds::is_data_path`]) are counted apart, against [`mds::MAX_DATA_FILES`].
 const MAX_MODULE_COUNT: usize = 256 + 1;
 
 /// Maximum aggregate byte size of all `lintVirtual` module values combined
-/// (same ceiling as a single source input).
+/// (same ceiling as a single source input). Data file values are counted apart,
+/// against [`mds::MAX_DATA_BYTES`].
 const MAX_MODULES_AGGREGATE_SIZE: usize = MAX_SOURCE_SIZE;
 
 // ── Return types ──────────────────────────────────────────────────────────────
@@ -791,7 +793,9 @@ fn build_canonical_result(result: mds::CompileResult) -> serde_json::Value {
 /// - Markdown: `{ kind: "markdown", output: string, warnings: string[], dependencies: string[], sourceMap?: object }`
 /// - Messages: `{ kind: "messages", messages: [{role:string,content:string},...], warnings: string[], dependencies: string[] }`
 ///
-/// The inactive payload field is absent from the returned object.
+/// The inactive payload field is absent from the returned object. `dependencies` lists
+/// the absolute paths of the imported modules, then of the local data files that the
+/// compile read.
 ///
 /// On failure, throws a JS `Error` with additional properties:
 /// - `code`: diagnostic code (e.g. `"mds::syntax"`)
@@ -1147,7 +1151,10 @@ pub fn lint_file(env: Env, path: String, opts: Option<Object>) -> napi::Result<s
 ///
 /// ## Arguments
 ///
-/// - `modules`: `Record<string, string>` mapping module key → source string.
+/// - `modules`: `Record<string, string>` mapping module key → source string. At most
+///   257 modules and 10 MiB of module text, and apart from them 256 data files (keys
+///   ending in `.json`, `.yaml` or `.yml`) and 32 MiB of data text; past a bound is
+///   `mds::resource_limit`.
 /// - `entry`: the key within `modules` to use as the lint entry point.
 /// - `opts`: optional configuration object:
 ///   - `vars` (`Record<string, any>`): runtime variable overrides.
@@ -1174,20 +1181,32 @@ pub fn lint_virtual(
         ));
     };
 
-    // Convert and validate, enforcing the same module-count and size caps the WASM
-    // and Python bindings apply — the virtual-FS path bypasses the file layer's own
+    // Convert and validate, enforcing the same count and size caps the WASM and
+    // Python bindings apply — the virtual-FS path bypasses the file layer's own
     // size guard, so it must be re-enforced here (defense-in-depth, cross-binding parity).
-    if mods_map.len() > MAX_MODULE_COUNT {
+    // Data file keys have their own count and byte aggregate (#405).
+    let data_count = mods_map.keys().filter(|key| mds::is_data_path(key)).count();
+    let module_count = mods_map.len() - data_count;
+    if module_count > MAX_MODULE_COUNT {
         return Err(throw_resource_limit(
             &env,
             &format!(
-                "modules exceeds maximum module count of {MAX_MODULE_COUNT} ({} provided)",
-                mods_map.len()
+                "modules exceeds maximum module count of {MAX_MODULE_COUNT} ({module_count} provided)"
+            ),
+        ));
+    }
+    if data_count > mds::MAX_DATA_FILES {
+        return Err(throw_resource_limit(
+            &env,
+            &format!(
+                "modules exceeds maximum data file count of {} ({data_count} provided)",
+                mds::MAX_DATA_FILES
             ),
         ));
     }
     let mut mods: HashMap<String, String> = HashMap::with_capacity(mods_map.len());
-    let mut aggregate: usize = 0;
+    let mut module_bytes: usize = 0;
+    let mut data_bytes: usize = 0;
     for (key, val) in mods_map {
         // A key is caller input, escaped wherever a message names it (#265).
         let shown = mds::escape_path_for_message(&key);
@@ -1206,13 +1225,16 @@ pub fn lint_virtual(
                 ),
             ));
         }
-        aggregate = aggregate.saturating_add(s.len());
-        if aggregate > MAX_MODULES_AGGREGATE_SIZE {
+        let (total, cap, kind) = if mds::is_data_path(&key) {
+            (&mut data_bytes, mds::MAX_DATA_BYTES, " data")
+        } else {
+            (&mut module_bytes, MAX_MODULES_AGGREGATE_SIZE, "")
+        };
+        *total = total.saturating_add(s.len());
+        if *total > cap {
             return Err(throw_resource_limit(
                 &env,
-                &format!(
-                    "modules aggregate size exceeds maximum of {MAX_MODULES_AGGREGATE_SIZE} bytes"
-                ),
+                &format!("modules{kind} aggregate size exceeds maximum of {cap} bytes"),
             ));
         }
         mods.insert(key, s);

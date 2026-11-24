@@ -2198,6 +2198,118 @@ describe('virtual map entry limit', () => {
       });
     });
   }
+
+  /** Assert that lintVirtual refuses `modules` with `mds::resource_limit` and `message`. */
+  const assertMapRefused = (modules, message) => {
+    assert.throws(() => lintVirtual(modules, 'm0.mds'), (err) => {
+      assert.equal(err.code, 'mds::resource_limit');
+      assert.equal(err.message, message);
+      return true;
+    });
+  };
+
+  // #405: the entry and 256 modules, and apart from them 256 data files — keys with the
+  // exact extension .json, .yaml or .yml. The messages are the WASM and Python ones.
+  test('lintVirtual counts modules and data files apart (#405)', () => {
+    const modules = Object.fromEntries(
+      Array.from({ length: 257 }, (_, i) => [`m${i}.mds`, 'Body\n']),
+    );
+    for (let i = 0; i < 256; i++) modules[`d${i}.${['json', 'yaml', 'yml'][i % 3]}`] = '1';
+    assert.ok(Array.isArray(lintVirtual(modules, 'm0.mds').files));
+    assertMapRefused(
+      { ...modules, 'd256.json': '1' },
+      'modules exceeds maximum data file count of 256 (257 provided)',
+    );
+    const moduleCount = 'modules exceeds maximum module count of 257 (258 provided)';
+    assertMapRefused({ ...modules, 'unused.mds': 'Body\n' }, moduleCount);
+    // The extension is compared exactly: a .JSON key is a module key.
+    assertMapRefused({ ...modules, 'D.JSON': '1' }, moduleCount);
+  });
+
+  test('lintVirtual bounds module and data bytes apart (#405)', () => {
+    const MIB = 1024 * 1024;
+    const modules = { 'm0.mds': 'OK\n', 'big.mds': 'x'.repeat(10 * MIB - 3) };
+    for (let i = 0; i < 4; i++) modules[`d${i}.json`] = 'x'.repeat(8 * MIB);
+    assert.ok(Array.isArray(lintVirtual(modules, 'm0.mds').files));
+    assertMapRefused(
+      { ...modules, 'd0.json': 'x'.repeat(8 * MIB + 1) },
+      'modules data aggregate size exceeds maximum of 33554432 bytes',
+    );
+    assertMapRefused(
+      { ...modules, 'big.mds': 'x'.repeat(10 * MIB - 2) },
+      'modules aggregate size exceeds maximum of 10485760 bytes',
+    );
+  });
+});
+
+// ── Local data (#405) ─────────────────────────────────────────────────────────
+
+describe('local data (#405)', () => {
+  /** Write `files` into a new project directory, run `fn(dir)`, then remove the directory. */
+  const inProject = (files, fn) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-napi-data-'));
+    try {
+      fs.writeFileSync(path.join(dir, '.mdsroot'), '');
+      for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), text);
+      return fn(dir);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  // The fixture of the WASM test `compile_binds_json_and_yaml_data_from_the_modules_map`.
+  const DATA_FIXTURE =
+    '---\ndata:\n  cfg: ./cfg.json\n  list: ./list.yaml\n  more: ./more.yml\n---\n' +
+    '{{cfg.name}}: {{list.count}} {{more.unit}}\n';
+  const MARKER = './fixture-marker.yml';
+
+  test('D-1: compile and compileFile bind .json, .yaml and .yml data to the same output', () => {
+    const files = {
+      'main.mds': DATA_FIXTURE,
+      'cfg.json': '{"name": "Ada"}\n',
+      'list.yaml': 'count: 3\n',
+      'more.yml': 'unit: items\n',
+    };
+    inProject(files, (dir) => {
+      const fromString = compile(DATA_FIXTURE, { basePath: dir });
+      const fromFile = compileFile(path.join(dir, 'main.mds'));
+      assert.equal(fromString.output, 'Ada: 3 items\n');
+      assert.equal(fromFile.output, fromString.output);
+      const names = (result) => result.dependencies.map((d) => path.basename(d));
+      assert.deepEqual(names(fromFile), ['cfg.json', 'list.yaml', 'more.yml']);
+      assert.deepEqual(names(fromString), names(fromFile));
+    });
+  });
+
+  test('D-2: a data header is absent from output in every plain form', () => {
+    const info = `info: ${MARKER}`;
+    const forms = [
+      [`data:\n  local: ${MARKER}`, ''],
+      [`data:\n# Data comment\n  local: ${MARKER}`, '# Data comment\n'],
+      [`data: {local: ${MARKER}}`, ''],
+    ];
+    inProject({ 'fixture-marker.yml': 'Local' }, (dir) => {
+      for (const [header, kept] of forms) {
+        const source = `---\n${header}\n${info}\n---\n{{local}}\n`;
+        // Control: the marker under the key `info` stays.
+        assert.equal(compile(source, { basePath: dir }).output, `---\n${kept}${info}\n---\nLocal\n`, header);
+      }
+    });
+  });
+
+  test('D-3: a quoted or flow data key fails with the fixed form message', () => {
+    inProject({ 'fixture-marker.yml': 'Local' }, (dir) => {
+      // Control: a quoted `info` key compiles and stays.
+      const control = `---\n'info': {local: ${MARKER}}\n---\nBody\n`;
+      assert.equal(compile(control, { basePath: dir }).output, control);
+      for (const header of [`'data': {local: ${MARKER}}`, `{data: {local: ${MARKER}}}`]) {
+        assert.throws(() => compile(`---\n${header}\n---\nBody\n`, { basePath: dir }), (err) => {
+          assert.equal(err.code, 'mds::yaml', header);
+          assert.equal(err.message, 'YAML parse error: write `data:` at the start of a line', header);
+          return true;
+        });
+      }
+    });
+  });
 });
 
 describe('resource limits', () => {
