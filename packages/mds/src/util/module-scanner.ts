@@ -1116,7 +1116,11 @@ function dataAliasKey(importerKey: string, path: string): string | undefined {
   }
   try {
     return normalizeVirtualKey(importerKey, path);
-  } catch {
+  } catch (err) {
+    // Only a refusal means that the engine has no key. Any other error is a defect.
+    if (!isMdsError(err)) {
+      throw err;
+    }
     return undefined;
   }
 }
@@ -1312,7 +1316,10 @@ async function readFile(
  * native's error when the compile binds the entry. Every other refusal is kept in
  * `dataRefusals` with the context the resolver adds to it, and the file stays out of
  * `modules`. So a compile fails for a data file only where native fails for it, and with
- * native's error, except as difference 10 lists.
+ * native's error, except as difference 10 lists. One more exception: a path whose key is
+ * already in the map must name the file of that key. Else the scan throws the alias
+ * refusal of a module import, or the path's own refusal, because the engine reads the
+ * file of that key for both paths.
  *
  * The scanner uses `scanImportRecords` for import context (#414, #423).
  * A missing target of `@import`, `@extends` or `@export … from` gets the directive's
@@ -1653,9 +1660,10 @@ export async function buildModulesMap(
   /**
    * Put the data file of the `data` record `record` of `importer` in `modules`, as a
    * leaf: in walk order, once per canonical key, within the data bounds, with an alias
-   * for another spelling of its key. A refusal is never thrown: it is kept in
+   * for another spelling of its key. A refusal of a new key is not thrown: it is kept in
    * `dataRefusals`, with the context the resolver adds to it, and the file stays out of
-   * `modules` (`restoreDataRefusal`).
+   * `modules` (`restoreDataRefusal`). A refusal of a path whose key is already in the map
+   * is thrown, as for a module import.
    */
   async function walkData(
     importer: Located,
@@ -1664,14 +1672,18 @@ export async function buildModulesMap(
     context: ImportContext,
   ): Promise<void> {
     const aliasKey = dataAliasKey(importer.key, record.path);
-    // The engine refuses a path it cannot key itself, with native's error. A key met
-    // before names the same file and needs nothing more.
-    if (
-      aliasKey === undefined ||
-      dataKeys.has(aliasKey) ||
-      aliases.has(aliasKey) ||
-      dataRefusals.has(dataFileNotFoundMessage(aliasKey))
-    ) {
+    // The engine refuses a path it cannot key itself, with native's error. A key refused
+    // before stays out of `modules`, so the engine gives back that first refusal.
+    if (aliasKey === undefined || dataRefusals.has(dataFileNotFoundMessage(aliasKey))) {
+      return;
+    }
+    if (dataKeys.has(aliasKey) || aliases.has(aliasKey)) {
+      // A key met before: the engine reads the file that the first path of the key named.
+      // On POSIX, `./sub/../a.json` and `./a.json` have one key but can name two files,
+      // as for a module import. So the path must name that same file (`aliasRefusal`).
+      // The key is in the map, so the engine cannot report a refusal of this path:
+      // the refusal is thrown.
+      checkAndRecordAlias(unwrap(ahead.located), record.path);
       return;
     }
     try {

@@ -1383,7 +1383,8 @@ module, a base entry that a child entry replaces, and a `node_modules` segment r
 symbolic link (U-WCF15 in `packages/mds/__test__/wasm-compileFile.spec.mjs`). They are also equal
 for each row of the shared data path vector table, a symbolic link as the final component, a linked
 directory outside the project root, a named pipe, a file over 10 MiB, an entry with more than 256
-references and, on a case-insensitive volume, a resolved key with no data extension
+references, more than 256 data entries in one compile, more than 32 MiB of data text in one
+compile and, on a case-insensitive volume, a resolved key with no data extension
 (`packages/mds/__test__/data-scanner.spec.mjs`). The napi `compile` and `compileFile`, and the WASM
 `compile` with an `options.modules` map, bind data
 ('D-1: compile and compileFile bind .json, .yaml and .yml data to the same output' in
@@ -1401,6 +1402,11 @@ references and, on a case-insensitive volume, a resolved key with no data extens
   compile starts. This includes the file of an entry that a runtime variable or a child entry
   replaces, which the native backend does not read. Such a file counts toward the 256-file and
   32 MiB data limits.
+- On POSIX, two data paths with one key can name two files, for example `./a.json` and
+  `./sub/../a.json` through a linked `sub`. The WASM backend of `@mdscript/mds` refuses the second
+  path with `mds::import`, as it refuses two such module imports. The native backend reads both
+  files ('two data paths with one key that name two files are refused on the WASM backend, never
+  bound to one file' in `packages/mds/__test__/data-scanner.spec.mjs`).
 
 ---
 

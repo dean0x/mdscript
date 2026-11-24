@@ -1,6 +1,7 @@
 /**
  * Data-file pre-scanner tests for @mdscript/mds (#405).
- * Tests: TP-20, TP-21, TP-23, TP-26, TP-27, TP-56, TP-112, and the case-variant data key.
+ * Tests: TP-20, TP-21, TP-23, TP-26, TP-27, TP-56, TP-112, the data key conflict, the data
+ * file count and byte bounds, and the case-variant data key.
  *
  * The WASM backend's file pre-scanner reads the local data files of a compile with the
  * data path rules of the native backend. Each rule test compares the WASM backend with
@@ -554,6 +555,124 @@ describe('WASM backend data pre-scanner (#405)', () => {
         [], [], [], [], [],
         ['outside.json'], ['sub/a.json'], ['sub/link.json'], ['sub/big.json'], ['sub/a.json'],
       ]);
+    });
+  });
+
+  test('two data paths with one key that name two files are refused on the WASM backend, never bound to one file', async (t) => {
+    if (!requireEngines(t, engines, 'data key conflict')) return;
+    await withTemp('mds-dkey-', async (tmp) => {
+      const root = await project(tmp, 'p');
+      await put(root, 'z.json', '"ROOT"');
+      await put(root, 'deep/z.json', '"DEEP"');
+      await mkdir(path.join(root, 'deep', 'other'));
+      if (!(await symlinkOrSkip(t, path.join('deep', 'other'), path.join(root, 'sub'), 'dir'))) return;
+      // `./sub/../z.json` and `./z.json` have the one key `z.json`. On POSIX the OS applies
+      // the `..` after it follows the link, so the first path names deep/z.json. Windows
+      // removes `sub\..` first, so there both paths name the root z.json.
+      const files = [
+        await put(root, 'link-first.mds', dataModule({ a: './sub/../z.json', b: './z.json' }, '{{a}} {{b}}\n')),
+        await put(root, 'link-last.mds', dataModule({ a: './z.json', b: './sub/../z.json' }, '{{a}} {{b}}\n')),
+        // Control: the second path names the file of the first path by its own key.
+        await put(root, 'control.mds', dataModule({ a: './sub/../z.json', b: './deep/z.json' }, '{{a}} {{b}}\n')),
+      ];
+      const native = await compileFileOutcomes('native', files);
+      const wasm = await compileFileOutcomes('wasm', files);
+      if (process.platform === 'win32') {
+        assert.deepEqual(native.slice(0, 2), [{ output: 'ROOT ROOT\n' }, { output: 'ROOT ROOT\n' }]);
+        assert.deepEqual(wasm, native);
+        return;
+      }
+      // Native reads two files. The WASM engine has one file for the key, so the scan
+      // refuses the second path and never gives the first file for it.
+      assert.deepEqual(native, [{ output: 'DEEP ROOT\n' }, { output: 'ROOT DEEP\n' }, { output: 'DEEP DEEP\n' }]);
+      const conflict = (shown) => ({
+        code: 'mds::import',
+        message: `import error: two imports name different files by one module key, which the WASM backend cannot resolve: "${shown}"`,
+        help: null,
+        span: null,
+      });
+      assert.deepEqual(wasm, [conflict('./z.json'), conflict('./sub/../z.json'), { output: 'DEEP DEEP\n' }]);
+    });
+  });
+
+  test('the scan puts at most 256 data files in the map; past that, both backends give the native refusal', async (t) => {
+    if (!requireEngines(t, engines, 'data file count')) return;
+    await withTemp('mds-dcount-', async (tmp) => {
+      const root = await project(tmp, 'p');
+      // Four modules of 64 entries each, the cap per module, name 256 distinct files.
+      const imports = [];
+      for (let m = 0; m < 4; m += 1) {
+        const entries = {};
+        for (let i = 0; i < 64; i += 1) {
+          const n = m * 64 + i;
+          entries[`e${i}`] = `./d/f${n}.json`;
+          await put(root, `d/f${n}.json`, `${n}`);
+        }
+        await put(root, `m${m}.mds`, dataModule(entries, '{{e0}}\n'));
+        imports.push(`@import "./m${m}.mds" as m${m}\n`);
+      }
+      await put(root, 'd/f256.json', '256');
+      const body = `${imports.join('')}@include m0\n`;
+      // The entry module names a 257th file, after the files of its imports.
+      const over = await put(root, 'over.mds', dataModule({ x: './d/f256.json' }, body));
+      // Control: the same imports, with no data entry in the entry module.
+      const control = await put(root, 'control.mds', body);
+      const native = await nativeEqualsWasm([over, control]);
+      assert.deepEqual(native, [
+        {
+          code: 'mds::resource_limit',
+          message: 'resource limit exceeded: too many data entries (max 256 per compile)',
+          help: null,
+          span: null,
+        },
+        { output: '0\n' },
+      ]);
+      const dataKeysOf = (scan) => Object.keys(scan.modules).filter((key) => key.endsWith('.json'));
+      const scan = await scanData(over);
+      assert.equal(dataKeysOf(scan).length, 256);
+      assert.equal(Object.hasOwn(scan.modules, 'd/f256.json'), false);
+      assert.deepEqual([...scan.dataRefusals.values()].map(errorShape), [
+        {
+          code: 'mds::resource_limit',
+          message: 'resource limit exceeded: too many data files (max 256 per compile)',
+          help: null,
+          span: null,
+        },
+      ]);
+      const controlScan = await scanData(control);
+      assert.equal(dataKeysOf(controlScan).length, 256);
+      assert.equal(controlScan.dataRefusals.size, 0);
+    });
+  });
+
+  test('data text over 32 MiB in one compile gets the native refusal on both backends; no file is admitted after it', async (t) => {
+    if (!requireEngines(t, engines, 'data bytes')) return;
+    await withTemp('mds-dbytes-', async (tmp) => {
+      const root = await project(tmp, 'p');
+      // Four files of 8.5 MiB each: three fit in the 32 MiB bound, the fourth does not.
+      const size = 8.5 * 1024 * 1024;
+      for (const name of ['a', 'b', 'c', 'd']) await put(root, `${name}.json`, `"${'x'.repeat(size - 2)}"`);
+      await put(root, 'small.json', 'true');
+      const three = { a: './a.json', b: './b.json', c: './c.json' };
+      const over = await put(root, 'over.mds', dataModule({ ...three, d: './d.json', e: './small.json' }, 'ok\n'));
+      // Control: the fourth entry names a small file.
+      const control = await put(root, 'control.mds', dataModule({ ...three, d: './small.json' }, 'ok\n'));
+      const native = await nativeEqualsWasm([over, control]);
+      const bound = {
+        code: 'mds::resource_limit',
+        message: `resource limit exceeded: data files exceed ${32 * 1024 * 1024} bytes per compile`,
+        help: null,
+        span: null,
+      };
+      assert.deepEqual(native, [bound, { output: 'ok\n' }]);
+      // The fourth file and every file after it stay out of the map, with the bound kept.
+      const scan = await scanData(over);
+      const dataKeysOf = (result) => Object.keys(result.modules).filter((key) => key.endsWith('.json'));
+      assert.deepEqual(dataKeysOf(scan), ['a.json', 'b.json', 'c.json']);
+      assert.deepEqual([...scan.dataRefusals.values()].map(errorShape), [bound, bound]);
+      const controlScan = await scanData(control);
+      assert.deepEqual(dataKeysOf(controlScan), ['a.json', 'b.json', 'c.json', 'small.json']);
+      assert.equal(controlScan.dataRefusals.size, 0);
     });
   });
 

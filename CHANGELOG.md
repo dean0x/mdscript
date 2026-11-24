@@ -71,10 +71,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its text. `scanImportRecords` lists the local data file of each `data:` entry with the kind
   `data`, after the module records.
 - `@mdscript/mds`: the WASM backend of `compileFile` reads local data files with the data path
-  rules of the native backend, and gives the same output and the same errors. The TypeScript
+  rules of the native backend. For the cases that spec §4.12 lists, it gives the same output and
+  the same errors as the native backend. The TypeScript
   `kind` of an import record gets `'data'`. The WASM backend reads each data file that a module
   lists, also the file of an entry that a runtime variable or a child entry replaces. Such a file
-  counts toward the 256-file and 32 MiB data limits.
+  counts toward the 256-file and 32 MiB data limits. On POSIX, two data paths with one key can
+  name two files, for example `./a.json` and `./sub/../a.json` through a linked `sub`. Then the
+  WASM backend refuses the second path, as it refuses two such module imports.
 
 ### Changed
 
