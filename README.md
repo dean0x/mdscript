@@ -208,7 +208,7 @@ output over an MDS module a template can import — a `.mds` file, or a `.md` fi
 frontmatter declares `type: mds` — nor over a file the run reads: the entry, a module it imports, a data file it reads, the `--vars` file or the
 `mds.json` in force (`mds build chat.mds --vars chat.json`, a messages template whose output is
 `chat.json`) — in directory mode also the `mds.json` nearest each source, which `mds build
-<source>` would hold in force. In directory mode, this input rule applies per source: its own compile's entry and imported modules.
+<source>` would hold in force. In directory mode, this input rule applies per source: its own compile's entry, imported modules and data files.
 The `--vars` file and the `mds.json` files named above count too. It is refused (`mds::io`, `cannot write <file>: refusing to replace an MDS module (an output that declares type: mds is a generated module, and is rebuilt from its source)`
 or `… refusing to replace a file this run reads`) and left as it is: `mds build <file>` exits 2,
 `mds build <dir>` goes on with the other files and exits 2, and `mds watch` reports it and

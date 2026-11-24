@@ -148,6 +148,10 @@ pub trait FileSystem: Send + Sync {
     /// It checks the resolved key relative to [`FileSystem::source_root`] before
     /// it returns that key. Backends with absolute keys must report their root.
     ///
+    /// A compile applies the same rules itself, through
+    /// [`FileSystem::normalize_in_dir`], and does not call this method. So an
+    /// override does not change which data paths a compile accepts.
+    ///
     /// # Errors
     ///
     /// Returns an error if the path fails the data path rules or cannot resolve.
