@@ -9,7 +9,7 @@ use crate::lint::{
     sanitize_control_chars_wire,
 };
 
-fn data_location(module: &str, entry: Option<&str>, field: Option<&str>) -> String {
+pub(crate) fn data_location(module: &str, entry: Option<&str>, field: Option<&str>) -> String {
     let mut location = format!("\"{}\"", escape_path_for_message(module));
     if let Some(entry) = entry {
         location.push_str(", entry \"");

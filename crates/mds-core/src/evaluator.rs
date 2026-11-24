@@ -496,7 +496,13 @@ fn resolve_var(name: &str, scope: &Scope) -> Result<Slot, MdsError> {
         .get_slot(name)
         .filter(|slot| slot.get().is_some())
         .cloned()
-        .ok_or_else(|| MdsError::undefined_var(name))
+        .ok_or_else(|| {
+            if scope.is_pending_data(name) {
+                MdsError::internal()
+            } else {
+                MdsError::undefined_var(name)
+            }
+        })
 }
 
 fn invalid_projection() -> MdsError {
@@ -2522,6 +2528,19 @@ mod tests {
         assert_eq!(
             evaluate(&nodes, &mut scope, &mut warnings, "", "").unwrap(),
             "Hello Alice!"
+        );
+    }
+
+    #[test]
+    fn evaluator_refuses_pending_variable_reads() {
+        let mut scope = Scope::new();
+        scope.set_pending_data(["item".to_owned()].into_iter().collect());
+        let err = resolve_var("item", &scope).unwrap_err();
+        assert_eq!(err.serialize().code, "mds::internal");
+        scope.set_var("item", Value::from("known"));
+        assert_eq!(
+            resolve_var("item", &scope).unwrap().get(),
+            Some(&Value::from("known"))
         );
     }
 

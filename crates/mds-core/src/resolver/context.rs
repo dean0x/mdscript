@@ -55,9 +55,9 @@ pub(super) struct ExtendsComponents {
 
 /// The immediate directive that requests a module's type check.
 pub(super) struct ImportSite<'a> {
-    file_str: &'a str,
-    source: &'a str,
-    offset: usize,
+    pub(super) file_str: &'a str,
+    pub(super) source: &'a str,
+    pub(super) offset: usize,
 }
 
 impl ImportSite<'_> {

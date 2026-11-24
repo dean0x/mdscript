@@ -17,6 +17,7 @@ pub struct CapturedScope {
     own_vars: Option<Arc<HashMap<String, Slot>>>,
     pub(crate) runtime: Option<Arc<VarLayer>>,
     frontmatter: Option<Arc<VarLayer>>,
+    pending_data: Option<Arc<HashSet<String>>>,
     head: Option<Arc<CaptureLink>>,
 }
 
@@ -378,6 +379,8 @@ pub struct Scope {
     frames: Vec<Frame>,
     runtime: Option<Arc<VarLayer>>,
     frontmatter: Option<Arc<VarLayer>>,
+    pending_data: Option<Arc<HashSet<String>>>,
+    pending_prompt: bool,
     vars_generation: u64,
     own_vars_snapshot: Option<OwnVarsSnapshot>,
     pending_functions: HashMap<String, Arc<FunctionDef>>,
@@ -478,6 +481,8 @@ impl Scope {
             frames: vec![Frame::default()],
             runtime: None,
             frontmatter: None,
+            pending_data: None,
+            pending_prompt: false,
             vars_generation: 0,
             own_vars_snapshot: None,
             pending_functions: HashMap::new(),
@@ -545,6 +550,37 @@ impl Scope {
             .expect("BUG: scope has no frames")
             .vars
             .insert(name.to_string(), slot);
+    }
+
+    pub(crate) fn set_pending_data(&mut self, names: HashSet<String>) {
+        self.pending_data = (!names.is_empty()).then(|| Arc::new(names));
+    }
+
+    pub(crate) fn mark_pending_prompt(&mut self) {
+        self.pending_prompt = true;
+    }
+
+    pub(crate) fn is_pending_data(&self, name: &str) -> bool {
+        if self.pending_prompt && name == "prompt" {
+            return true;
+        }
+        self.frames
+            .iter()
+            .rev()
+            .find_map(|frame| {
+                let captured = frame.capture()?;
+                Some(
+                    captured
+                        .pending_data
+                        .as_ref()
+                        .is_some_and(|names| names.contains(name)),
+                )
+            })
+            .unwrap_or_else(|| {
+                self.pending_data
+                    .as_ref()
+                    .is_some_and(|names| names.contains(name))
+            })
     }
 
     /// Look up a variable by walking the scope chain (innermost first).
@@ -694,6 +730,7 @@ impl Scope {
             own_vars,
             runtime: self.runtime.clone(),
             frontmatter: self.frontmatter.clone(),
+            pending_data: self.pending_data.clone(),
             head: self.head.clone(),
         })
     }

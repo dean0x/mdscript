@@ -170,6 +170,8 @@ pub struct ModuleCache {
     /// for sub-modules (AC-PERF-01).
     source_map_mode: bool,
     data: crate::data::resolve::State,
+    analyze_data: bool,
+    source_snapshot: Option<process::SourceSnapshot>,
     budget: EvalBudget,
     retained: usize,
     kept: usize,
@@ -237,6 +239,8 @@ impl ModuleCache {
             resolving: IndexSet::new(),
             source_map_mode: false,
             data: crate::data::resolve::State::default(),
+            analyze_data: false,
+            source_snapshot: None,
             budget: EvalBudget::default(),
             retained: 0,
             kept: 0,
@@ -251,11 +255,42 @@ impl ModuleCache {
         }
     }
 
-    /// Opt in only on the virtual compile path, where both passes see the same sources.
-    pub(crate) fn compiling_virtual(fs: VirtualFs) -> Self {
-        let mut cache = Self::with_fs(Box::new(fs));
-        cache.data.mode = crate::data::resolve::Mode::Collect;
+    /// Only compile entry points may opt in to local data reads.
+    pub(crate) fn compiling(fs: Box<dyn FileSystem>) -> Self {
+        let mut cache = Self::tooling(fs);
+        cache.data.compile = true;
         cache
+    }
+
+    /// The check gate can validate without returning a rendered artifact.
+    pub(crate) fn tooling(fs: Box<dyn FileSystem>) -> Self {
+        let mut cache = Self::with_fs(fs);
+        cache.analyze_data = true;
+        cache
+    }
+
+    pub(crate) fn has_pending_data(&self) -> bool {
+        self.data.pending
+    }
+
+    fn read_module(&self, key: &str) -> Result<(Arc<String>, usize), MdsError> {
+        if let Some(snapshot) = &self.source_snapshot {
+            let source = snapshot.source(key).ok_or_else(MdsError::internal)?;
+            return Ok((Arc::clone(source), 0));
+        }
+        let source = self.fs.read(key)?;
+        let capacity = source.capacity();
+        Ok((Arc::new(source), capacity))
+    }
+
+    fn normalize_module_edge(&self, ctx: &ModuleCtx<'_>, path: &str) -> Result<String, MdsError> {
+        if let Some(snapshot) = &self.source_snapshot {
+            return snapshot
+                .edge(ctx.key, path)
+                .map(str::to_owned)
+                .ok_or_else(MdsError::internal);
+        }
+        self.fs.normalize_in_dir(ctx.base_dir, path)
     }
 
     /// Returns normalized keys of all modules resolved during compilation,
@@ -394,7 +429,7 @@ impl ModuleCache {
         self.check_module_count(key)?;
 
         // Step 4: read the file only on a cache miss.
-        let source = self.fs.read(key)?;
+        let (source, read_bytes) = self.read_module(key)?;
 
         // Step 5: determine if markdown (for frontmatter type-key handling).
         let is_md = self.fs.is_markdown(key);
@@ -409,7 +444,7 @@ impl ModuleCache {
         // Mark as resolving before recursing into process_module.
         // IndexSet preserves insertion order, so it serves as both the set (O(1) lookup)
         // and the ordered stack (for cycle path reconstruction).
-        let (mark, read) = self.begin_module(key, runtime_vars, source.capacity());
+        let (mark, read) = self.begin_module(key, runtime_vars, read_bytes);
         let resolved = read.and_then(|()| {
             let base_dir_owned = self.fs.parent_dir(key);
             let display_owned = crate::source_path::display_path_for(&*self.fs, key);
@@ -421,6 +456,7 @@ impl ModuleCache {
                 runtime_vars,
                 origin: OnceCell::new(),
             };
+            self.prepare_data(&ctx, warnings)?;
             self.process_module(&ctx, is_md, upgrade, warnings)
         });
         #[cfg(test)]
@@ -516,7 +552,10 @@ impl ModuleCache {
             runtime_vars: &runtime,
             origin: OnceCell::new(),
         };
-        let resolved = read.and_then(|()| self.process_module(&ctx, false, false, warnings));
+        let resolved = read.and_then(|()| {
+            self.prepare_data(&ctx, warnings)?;
+            self.process_module(&ctx, false, false, warnings)
+        });
         self.close_module(mark);
 
         let popped = self.pop_resolving(SOURCE_LABEL);
@@ -629,6 +668,7 @@ impl ModuleCache {
                 runtime_vars,
                 origin: OnceCell::new(),
             };
+            self.prepare_data(&ctx, warnings)?;
             self.process_module_intrinsic_opts(&ctx, is_md, opts, warnings)
         });
         self.close_module(mark);
@@ -665,7 +705,10 @@ impl ModuleCache {
             runtime_vars: &runtime,
             origin: OnceCell::new(),
         };
-        let result = read.and_then(|()| self.process_module_intrinsic(&ctx, false, warnings));
+        let result = read.and_then(|()| {
+            self.prepare_data(&ctx, warnings)?;
+            self.process_module_intrinsic(&ctx, false, warnings)
+        });
         self.close_module(mark);
         let popped = self.pop_resolving(SOURCE_LABEL);
         let result = result?;
@@ -698,8 +741,10 @@ impl ModuleCache {
             runtime_vars: &runtime,
             origin: OnceCell::new(),
         };
-        let result =
-            read.and_then(|()| self.process_module_intrinsic_opts(&ctx, false, opts, warnings));
+        let result = read.and_then(|()| {
+            self.prepare_data(&ctx, warnings)?;
+            self.process_module_intrinsic_opts(&ctx, false, opts, warnings)
+        });
         self.close_module(mark);
         let popped = self.pop_resolving(SOURCE_LABEL);
         let result = result?;
@@ -774,7 +819,13 @@ impl ModuleCache {
 
     // Call even on error. Only propagate the pop error if the module result is Ok.
     fn pop_resolving(&mut self, key: &str) -> Result<(), MdsError> {
-        Self::check_lifo_pop(self.resolving.pop(), key)
+        let result = Self::check_lifo_pop(self.resolving.pop(), key);
+        if self.resolving.is_empty() {
+            if let Some(snapshot) = self.source_snapshot.take() {
+                self.budget.mem.release_buffers(snapshot.charge);
+            }
+        }
+        result
     }
 
     fn check_lifo_pop(popped: Option<String>, expected: &str) -> Result<(), MdsError> {

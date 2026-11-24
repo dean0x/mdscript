@@ -169,7 +169,7 @@ impl ResolvedModule {
     ///
     /// When no explicit `@export` list is present every name is visible.
     /// When an explicit list exists only the listed names are visible.
-    fn is_exported(&self, name: &str) -> bool {
+    pub(super) fn is_exported(&self, name: &str) -> bool {
         is_visible_export(self.has_explicit_exports, &self.explicit_exports, name)
     }
 

@@ -127,15 +127,11 @@ fn validate_for_node(
     // Validate the iterable expression.
     match &block.iterable {
         Expr::Var(root) => {
-            let iterable_val = scope.get_var(root).ok_or_else(|| {
-                MdsError::undefined_var_at(root, file, source, block.offset, root.len())
-            })?;
-            // Only perform static type checks for simple identifier iterables when
-            // there is no key_var (single-var iteration should be an array or object).
-            //
-            // ACCEPTED LIMITATION: same as before — for object fields, dot-paths, and
-            // expression iterables, type mismatches surface at evaluation time.
-            if block.key_var.is_none() && !matches!(iterable_val, Value::Array(_)) {
+            let value = validate_var(root, scope, file, source, block.offset)?;
+            // Only check known types on single-variable loops.
+            if let Some(iterable_val) =
+                value.filter(|v| block.key_var.is_none() && !matches!(v, Value::Array(_)))
+            {
                 if matches!(iterable_val, Value::Object(_)) {
                     return Err(MdsError::syntax_at(
                         format!(
@@ -159,9 +155,7 @@ fn validate_for_node(
         }
         Expr::MemberAccess { object, .. } => {
             // Validate that the root object exists; field type is checked at runtime.
-            scope.get_var(object).ok_or_else(|| {
-                MdsError::undefined_var_at(object, file, source, block.offset, object.len())
-            })?;
+            validate_var(object, scope, file, source, block.offset)?;
         }
         Expr::Call { name, .. } | Expr::QualifiedCall { name, .. } => {
             validate_expr(
@@ -316,6 +310,28 @@ fn validate_call_arity(
     }
 }
 
+/// Return `None` for a defined name whose value is pending.
+fn validate_var<'a>(
+    name: &str,
+    scope: &'a Scope,
+    file: &str,
+    source: &str,
+    offset: usize,
+) -> Result<Option<&'a Value>, MdsError> {
+    let value = scope.get_var(name);
+    if value.is_some() || scope.is_pending_data(name) {
+        Ok(value)
+    } else {
+        Err(MdsError::undefined_var_at(
+            name,
+            file,
+            source,
+            offset,
+            name.len(),
+        ))
+    }
+}
+
 fn validate_expr(
     expr: &Expr,
     scope: &Scope,
@@ -325,19 +341,8 @@ fn validate_expr(
     len: usize,
 ) -> Result<(), MdsError> {
     match expr {
-        Expr::Var(name) => scope
-            .get_var(name)
-            .ok_or_else(|| MdsError::undefined_var_at(name, file, source, offset, name.len()))
-            .map(|_| ()),
-        Expr::MemberAccess { object, .. } => {
-            // Validate that the root object is defined in scope.
-            // Field existence is checked at runtime since objects may vary.
-            scope
-                .get_var(object)
-                .ok_or_else(|| {
-                    MdsError::undefined_var_at(object, file, source, offset, object.len())
-                })
-                .map(|_| ())
+        Expr::Var(name) | Expr::MemberAccess { object: name, .. } => {
+            validate_var(name, scope, file, source, offset).map(|_| ())
         }
         Expr::Call { name, args } => {
             validate_call_arity(name, args.len(), scope, file, source, offset, len)?;
@@ -403,17 +408,8 @@ fn validate_var_args(
             | Arg::NumberLiteral(_)
             | Arg::BooleanLiteral(_)
             | Arg::NullLiteral => {}
-            Arg::Var(var_name) => {
-                scope.get_var(var_name).ok_or_else(|| {
-                    MdsError::undefined_var_at(var_name, file, source, offset, var_name.len())
-                })?;
-            }
-            Arg::MemberAccess { object, .. } => {
-                // Validate that the root object is defined in scope.
-                // Field existence is checked at runtime.
-                scope.get_var(object).ok_or_else(|| {
-                    MdsError::undefined_var_at(object, file, source, offset, object.len())
-                })?;
+            Arg::Var(name) | Arg::MemberAccess { object: name, .. } => {
+                validate_var(name, scope, file, source, offset)?;
             }
             Arg::Call {
                 name,

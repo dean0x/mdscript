@@ -126,24 +126,30 @@ fn invalid_later_inheritance_graph_precedes_a_data_read_in_an_earlier_import() {
         "@import \"./first.mds\" as first\n@import \"./later.mds\" as later\n@include first\n";
     let first = "---\ndata:\n  item: ./bad.json\n---\n{{item}}\n";
     let later = "@extends \"./base.mds\"\n";
-    let run = |reference| {
+    let run = |reference, replay| {
         let base = format!("---\ndata:\n  remote: 'https://example.com/{{{{{reference}}}}}'\nname: ok\n---\nBase.\n");
-        compile(&[
-            ("main.mds", main),
-            ("first.mds", first),
-            ("later.mds", later),
-            ("base.mds", &base),
-            ("bad.json", "["),
-        ])
+        compile_with_replay(
+            &[
+                ("main.mds", main),
+                ("first.mds", first),
+                ("later.mds", later),
+                ("base.mds", &base),
+                ("bad.json", "["),
+            ],
+            replay,
+        )
         .unwrap_err()
     };
-    let err = run("unknown");
+    let err = run("unknown", None);
     assert_eq!(err.serialize().code, "mds::data");
     assert!(
         err.to_string().contains("unknown data reference name"),
         "{err}"
     );
-    let err = run("name");
+    let err = run("name", None);
+    assert_eq!(err.serialize().code, "mds::network_denied", "{err}");
+    assert!(err.to_string().contains("remote"), "{err}");
+    let err = run("name", Some("remote"));
     assert_eq!(err.serialize().code, "mds::yaml", "{err}");
     assert!(err.to_string().contains("bad.json"), "{err}");
 }

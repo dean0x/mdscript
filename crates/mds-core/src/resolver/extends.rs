@@ -143,7 +143,7 @@ impl ModuleCache {
             &child_fm_imports,
             &[],
         )?;
-        self.bind_data(
+        let pending = self.bind_data(
             &data_chain,
             Some(&merged_mapping),
             false,
@@ -151,6 +151,7 @@ impl ModuleCache {
             &mut vars,
         )?;
         let mut scope = Scope::with_layers(Arc::clone(ctx.runtime_vars), Arc::new(vars));
+        scope.set_pending_data(pending);
 
         // 3d-iv: Resolve base frontmatter imports against base_key (frontmatter-first ordering,
         // PF-004 safe via resolve_frontmatter_imports → resolve_import_from).
@@ -328,8 +329,7 @@ impl ModuleCache {
             .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
 
         let base_key = self
-            .fs
-            .normalize_in_dir(ctx.base_dir, &ext.path)
+            .normalize_module_edge(ctx, &ext.path)
             .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
 
         // PF-004 (avoids PF-004): resolve through resolve_by_key_skeleton so cycle
@@ -505,15 +505,18 @@ impl ModuleCache {
         let prompt_exported = is_visible_export(has_explicit_exports, &explicit_exports, "prompt");
         let regions = spliced_regions(&effective_skeleton, &effective_blocks, &skeleton_origin);
         let seed = (self.source_map_mode && prompt_exported).then_some(&skeleton_origin);
-        let (body_raw, builder) = Self::evaluate_extends_regions(
-            &regions,
-            seed,
-            &mut scope,
-            warnings,
-            self.budget.start_module(),
-        )?;
-        let (prompt_body, prompt_map) =
-            self.prompt_body_and_map(body_raw, builder, ctx.file_str, warnings);
+        let (prompt_body, prompt_map) = if self.data.pending {
+            (None, None)
+        } else {
+            let (body_raw, builder) = Self::evaluate_extends_regions(
+                &regions,
+                seed,
+                &mut scope,
+                warnings,
+                self.budget.start_module(),
+            )?;
+            self.prompt_body_and_map(body_raw, builder, ctx.file_str, warnings)
+        };
 
         let namespace = ResolvedModule::build_namespace(
             &functions,
@@ -577,11 +580,11 @@ impl ModuleCache {
         self.check_module_count(key)?;
 
         // PF-004: read via FileSystem trait — NEVER std::fs.
-        let source = self.fs.read(key)?;
+        let (source, read_bytes) = self.read_module(key)?;
         let is_md = self.fs.is_markdown(key);
         check_module_type(module, &source).map_err(|err| import_site.attach_type_error(err))?;
 
-        let (mark, read) = self.begin_module(key, runtime_vars, source.capacity());
+        let (mark, read) = self.begin_module(key, runtime_vars, read_bytes);
         let resolved = read.and_then(|()| {
             let base_dir_owned = self.fs.parent_dir(key);
             let display_owned = crate::source_path::display_path_for(&*self.fs, key);
@@ -652,8 +655,7 @@ impl ModuleCache {
         validate_import_path(&ext.path)
             .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
         let grandparent_key = self
-            .fs
-            .normalize_in_dir(ctx.base_dir, &ext.path)
+            .normalize_module_edge(ctx, &ext.path)
             .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
         let grandparent_ref = ModuleRef {
             key: &grandparent_key,

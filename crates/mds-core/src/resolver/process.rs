@@ -13,18 +13,74 @@ use crate::ast::{ExportDirective, ImportDirective};
 use crate::data::resolve::{Chain, DeclarationSite, Declarations, FrontmatterNames};
 use crate::MarkdownFrontmatter;
 
-/// Check the static graph before the first data read. This pass uses the same
-/// immutable virtual sources as the compile pass and does not evaluate them.
+/// Module bytes and import keys that the graph check used. The compile pass
+/// takes modules from here, so both passes see the same bytes and edges.
+#[derive(Default)]
+pub(super) struct SourceSnapshot {
+    sources: super::HashMap<String, Arc<String>>,
+    edges: super::HashMap<String, super::HashMap<String, String>>,
+    pub(super) charge: usize,
+}
+
+impl SourceSnapshot {
+    /// The bytes that the graph check read for `key`.
+    pub(super) fn source(&self, key: &str) -> Option<&Arc<String>> {
+        self.sources.get(key)
+    }
+
+    /// The module key that `path`, written in module `from`, resolved to.
+    pub(super) fn edge(&self, from: &str, path: &str) -> Option<&str> {
+        self.edges.get(from)?.get(path).map(String::as_str)
+    }
+}
+
+/// One winning entry that no replay satisfies.
+pub(super) struct Unreplayed {
+    pub(super) module: String,
+    pub(super) entry: String,
+    pub(super) url: bool,
+    key: String,
+    ordinal: usize,
+}
+
+/// The result of the graph check, taken before any module evaluates.
+pub(super) struct DataPreflight {
+    pub(super) snapshot: SourceSnapshot,
+    /// Unreplayed entries in module first-resolution order, then declaration
+    /// order. Each `(module, entry)` pair occurs once.
+    pub(super) unreplayed: Vec<Unreplayed>,
+}
+
+impl DataPreflight {
+    /// The URL entries that no replay satisfies: the compile-wide frontier.
+    pub(super) fn frontier(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.unreplayed
+            .iter()
+            .filter(|item| item.url)
+            .map(|item| (item.module.as_str(), item.entry.as_str()))
+    }
+
+    /// True when an entry has no value before evaluation (tooling mode).
+    pub(super) fn has_pending(&self) -> bool {
+        !self.unreplayed.is_empty()
+    }
+}
+
 struct DataGraphWalk<'a> {
     fs: &'a dyn super::FileSystem,
     runtime: &'a super::VarLayer,
-    seen: super::HashMap<String, Option<SeenDataScope>>,
+    /// Insertion order is module first-resolution order.
+    seen: indexmap::IndexMap<String, Option<SeenDataScope>>,
+    snapshot: SourceSnapshot,
+    /// Bytes that stay charged to buffers after the walk (snapshot and labels).
+    kept: usize,
     entries: usize,
 }
 
 struct SeenDataScope {
     chain: Chain,
-    checked: bool,
+    /// `None` until a full use of the module checks its scope.
+    labels: Option<Vec<Unreplayed>>,
     merged: bool,
 }
 
@@ -34,13 +90,15 @@ impl DataGraphWalk<'_> {
         module_ref: super::ModuleRef<'_>,
         is_base: bool,
         depth: usize,
+        supplied: Option<&ModuleCtx<'_>>,
+        import_site: Option<super::ImportSite<'_>>,
         mem: &mut MemBudget,
     ) -> Result<Chain, MdsError> {
         let key = module_ref.key;
         if let Some(stored) = self.seen.get_mut(key) {
             let Some(SeenDataScope {
                 chain,
-                checked,
+                labels,
                 merged,
             }) = stored
             else {
@@ -53,9 +111,15 @@ impl DataGraphWalk<'_> {
                 }
                 return Ok(None);
             };
-            if !is_base && !*checked {
-                Self::check_scope(chain, *merged, self.runtime, &mut self.entries, mem)?;
-                *checked = true;
+            if !is_base && labels.is_none() {
+                *labels = Some(Self::check_scope(
+                    chain,
+                    *merged,
+                    self.runtime,
+                    &mut self.entries,
+                    &mut self.kept,
+                    mem,
+                )?);
             }
             return Ok(chain.clone());
         }
@@ -75,32 +139,54 @@ impl DataGraphWalk<'_> {
         )?;
         self.seen.insert(key.to_owned(), None);
         let mark = mem.mark();
-        let result = self.check_module(module_ref, is_base, depth, mem);
+        let result = self.check_module(module_ref, is_base, depth, supplied, import_site, mem);
         mem.release_to(mark);
-        let (chain, merged) = result?;
+        let (chain, merged, labels) = result?;
         *self.seen.get_mut(key).ok_or_else(MdsError::internal)? = Some(SeenDataScope {
             chain: chain.clone(),
-            checked: !is_base,
+            labels,
             merged,
         });
         Ok(chain)
     }
 
+    /// Check one full scope and return its unreplayed winners in declaration order.
     fn check_scope(
         chain: &Chain,
         merged: bool,
         runtime: &super::VarLayer,
         entries: &mut usize,
+        kept: &mut usize,
         mem: &mut MemBudget,
-    ) -> Result<(), MdsError> {
+    ) -> Result<Vec<Unreplayed>, MdsError> {
         Declarations::with_graph(
             chain,
             FrontmatterNames::Preflight { merged },
             runtime,
             mem,
-            |count, _, _| count_data_entries(entries, count),
+            |count, graph, mem| {
+                count_data_entries(entries, count)?;
+                let mut labels = Vec::new();
+                for node in graph.unreplayed() {
+                    let bytes = node
+                        .module
+                        .len()
+                        .checked_add(node.entry.name.len())
+                        .and_then(|n| n.checked_add(node.position.0.len()))
+                        .and_then(|n| n.checked_add(2 * size_of::<Unreplayed>()));
+                    *kept += mem.charge(Part::Buffers, bytes)?;
+                    labels.push(Unreplayed {
+                        module: node.module.to_owned(),
+                        entry: node.entry.name.clone(),
+                        url: matches!(node.entry.source, crate::data::decl::Source::Url(_)),
+                        key: node.position.0.to_owned(),
+                        ordinal: node.position.1,
+                    });
+                }
+                Ok(labels)
+            },
         )
-        .map(drop)
+        .map(Option::unwrap_or_default)
     }
 
     fn check_module(
@@ -108,16 +194,37 @@ impl DataGraphWalk<'_> {
         module_ref: super::ModuleRef<'_>,
         is_base: bool,
         depth: usize,
+        supplied: Option<&ModuleCtx<'_>>,
+        import_site: Option<super::ImportSite<'_>>,
         mem: &mut MemBudget,
-    ) -> Result<(Chain, bool), MdsError> {
+    ) -> Result<(Chain, bool, Option<Vec<Unreplayed>>), MdsError> {
         let key = module_ref.key;
-        let source = self.fs.read(key)?;
-        mem.charge(Part::Temp, Some(source.capacity()))?;
-        check_module_type(module_ref, &source)?;
+        // A string-source root comes from the caller. Every other module is
+        // read once here and kept, so the compile pass sees the same bytes.
+        let read;
+        let source = if let Some(ctx) = supplied {
+            ctx.source
+        } else {
+            let text = self.fs.read(key)?;
+            let bytes = text
+                .capacity()
+                .checked_add(key.len())
+                .and_then(|n| n.checked_add(2 * size_of::<(String, Arc<String>)>()));
+            self.kept += mem.charge(Part::Buffers, bytes)?;
+            read = Arc::new(text);
+            self.snapshot
+                .sources
+                .insert(key.to_owned(), Arc::clone(&read));
+            check_module_type(module_ref, &read).map_err(|err| match import_site {
+                Some(site) => site.attach_type_error(err),
+                None => err,
+            })?;
+            read.as_str()
+        };
         let display = crate::source_path::display_path_for(self.fs, key);
-        let tokens = super::tokenize(&source, &display)?;
+        let tokens = super::tokenize(source, &display)?;
         mem.charge(Part::Temp, super::tree_estimate(&tokens, source.len()))?;
-        let module = super::parse_with_ctx(&tokens, &display, &source)?;
+        let module = super::parse_with_ctx(&tokens, &display, source)?;
         drop(tokens);
         let (mapping, _) = parse_frontmatter_mapping(module.frontmatter.as_ref(), mem)?;
         let imports = mapping
@@ -126,48 +233,91 @@ impl DataGraphWalk<'_> {
             .map(parse_frontmatter_imports_from_yaml)
             .transpose()?
             .unwrap_or_default();
-        let dir = self.fs.parent_dir(key);
-        let mut follow = |path: &str, base| {
-            validate_import_path(path)?;
-            let key = self.fs.normalize_in_dir(&dir, path)?;
-            self.visit(
-                super::ModuleRef::keyed(&key).typed(path),
-                base,
-                depth + 1,
-                mem,
-            )
+        let owned_dir;
+        let dir = if let Some(ctx) = supplied {
+            ctx.base_dir
+        } else {
+            owned_dir = self.fs.parent_dir(key);
+            &owned_dir
+        };
+        let mut follow = |path: &str, base, offset: Option<usize>| {
+            let from = key;
+            let site = offset.map(|offset| super::ImportSite {
+                file_str: &display,
+                source,
+                offset,
+            });
+            let result = (|| {
+                validate_import_path(path)?;
+                let target =
+                    if let Some(target) = self.snapshot.edge(from, path) {
+                        target.to_owned()
+                    } else {
+                        let target = self.fs.normalize_in_dir(dir, path)?;
+                        let bytes =
+                            path.len()
+                                .checked_add(target.len())
+                                .and_then(|n| n.checked_add(from.len()))
+                                .and_then(|n| {
+                                    n.checked_add(2 * size_of::<(String, String)>()
+                            + 2 * size_of::<(String, super::HashMap<String, String>)>())
+                                });
+                        self.kept += mem.charge(Part::Buffers, bytes)?;
+                        self.snapshot
+                            .edges
+                            .entry(from.to_owned())
+                            .or_default()
+                            .insert(path.to_owned(), target.clone());
+                        target
+                    };
+                self.visit(
+                    super::ModuleRef::keyed(&target).typed(path),
+                    base,
+                    depth + 1,
+                    None,
+                    site,
+                    mem,
+                )
+            })();
+            if let Some(offset) = offset {
+                result.map_err(|err| super::attach_import_span(err, path, &display, source, offset))
+            } else {
+                result
+            }
         };
         let merged = module.extends.is_some();
         let base = if !is_base {
             module
                 .extends
                 .as_ref()
-                .map(|ext| follow(&ext.path, true))
+                .map(|ext| follow(&ext.path, true, Some(ext.offset)))
                 .transpose()?
                 .flatten()
         } else {
             None
         };
-        for import in &imports {
-            follow(import.path(), false)?;
+        for (index, import) in imports.iter().enumerate() {
+            follow(import.path(), false, None)
+                .map_err(|err| super::attach_frontmatter_index(err, index))?;
         }
         for node in &module.body {
             match node {
                 Node::Import(
-                    ImportDirective::Alias { path, .. }
-                    | ImportDirective::Merge { path, .. }
-                    | ImportDirective::Selective { path, .. },
+                    ImportDirective::Alias { path, offset, .. }
+                    | ImportDirective::Merge { path, offset }
+                    | ImportDirective::Selective { path, offset, .. },
                 )
                 | Node::Export(
-                    ExportDirective::ReExport { path, .. } | ExportDirective::Wildcard { path, .. },
+                    ExportDirective::ReExport { path, offset, .. }
+                    | ExportDirective::Wildcard { path, offset },
                 ) => {
-                    follow(path, false)?;
+                    follow(path, false, Some(*offset))?;
                 }
                 _ => {}
             }
         }
         let base = if let Some(ext) = module.extends.as_ref().filter(|_| is_base) {
-            follow(&ext.path, true)?
+            follow(&ext.path, true, Some(ext.offset))?
         } else {
             base
         };
@@ -177,7 +327,7 @@ impl DataGraphWalk<'_> {
             DeclarationSite {
                 key,
                 module: &display,
-                dir: &dir,
+                dir,
                 is_md: self.fs.is_markdown(key),
                 preflight: true,
             },
@@ -187,10 +337,36 @@ impl DataGraphWalk<'_> {
             mem,
         )?;
         mem.transfer(Part::Temp, Part::Buffers, mem.mark() - mark);
-        if !is_base {
-            Self::check_scope(&chain, merged, self.runtime, &mut self.entries, mem)?;
+        let labels = if is_base {
+            None
+        } else {
+            Some(Self::check_scope(
+                &chain,
+                merged,
+                self.runtime,
+                &mut self.entries,
+                &mut self.kept,
+                mem,
+            )?)
+        };
+        Ok((chain, merged, labels))
+    }
+
+    /// Sort by the declaring module (not the merged scope) and deduplicate.
+    fn finish(mut self) -> DataPreflight {
+        let mut unreplayed: Vec<_> = self
+            .seen
+            .values_mut()
+            .flatten()
+            .filter_map(|scope| scope.labels.take())
+            .flatten()
+            .collect();
+        unreplayed.sort_unstable_by_key(|item| (self.seen.get_index_of(&item.key), item.ordinal));
+        unreplayed.dedup_by(|a, b| a.key == b.key && a.ordinal == b.ordinal);
+        DataPreflight {
+            snapshot: self.snapshot,
+            unreplayed,
         }
-        Ok((chain, merged))
     }
 }
 
@@ -210,22 +386,73 @@ type StandalonePrompt<'ctx> = (
 );
 
 impl ModuleCache {
-    pub(super) fn collect_compile_data_graphs(
-        &mut self,
-        runtime: &super::VarLayer,
-    ) -> Result<(), MdsError> {
-        let key = self.resolving.first().ok_or_else(MdsError::internal)?;
+    /// Check the static data graph of the whole compile before any module
+    /// evaluates. The walk reads module sources only, never a data file.
+    /// `root` supplies the entry bytes and its anchored directory.
+    fn collect_data_preflight(&mut self, root: &ModuleCtx<'_>) -> Result<DataPreflight, MdsError> {
+        if self.resolving.first().map(String::as_str) != Some(root.key) {
+            return Err(MdsError::internal());
+        }
         let mem = &mut self.budget.mem;
         let before = mem.buffers;
         let mut walk = DataGraphWalk {
             fs: &*self.fs,
-            runtime,
-            seen: super::HashMap::new(),
+            runtime: root.runtime_vars,
+            seen: indexmap::IndexMap::new(),
+            snapshot: SourceSnapshot::default(),
+            kept: 0,
             entries: 0,
         };
-        let result = walk.visit(super::ModuleRef::keyed(key).typed(key), false, 0, mem);
-        mem.release_buffers(mem.buffers - before);
-        result.map(drop)
+        let result = walk.visit(
+            super::ModuleRef::keyed(root.key).typed(root.file_str),
+            false,
+            0,
+            Some(root),
+            None,
+            mem,
+        );
+        // The walk bookkeeping goes. The snapshot and the labels stay charged.
+        let spent = mem.buffers - before;
+        let kept = if result.is_ok() { walk.kept } else { 0 };
+        let Some(release) = spent.checked_sub(kept) else {
+            mem.release_buffers(spent);
+            return Err(MdsError::internal());
+        };
+        mem.release_buffers(release);
+        result.map(|_| {
+            let mut preflight = walk.finish();
+            preflight.snapshot.charge = kept;
+            preflight
+        })
+    }
+
+    pub(super) fn prepare_data(
+        &mut self,
+        root: &ModuleCtx<'_>,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), MdsError> {
+        if !self.analyze_data || self.resolving.len() != 1 {
+            return Ok(());
+        }
+        let preflight = self.collect_data_preflight(root)?;
+        if self.data.compile {
+            let frontier: Vec<_> = preflight.frontier().collect();
+            if !frontier.is_empty() {
+                self.budget.mem.release_buffers(preflight.snapshot.charge);
+                return Err(MdsError::network_denied(&frontier));
+            }
+        } else if preflight.has_pending() {
+            self.data.pending = true;
+            let entries = preflight
+                .unreplayed
+                .iter()
+                .map(|item| crate::error::data_location(&item.module, Some(&item.entry), None))
+                .collect::<Vec<_>>()
+                .join("; ");
+            warnings.push(format!("data pending; output was not evaluated: {entries}"));
+        }
+        self.source_snapshot = Some(preflight.snapshot);
+        Ok(())
     }
 
     /// Common intrinsic processing: tokenize, parse, build scope, then dispatch on
@@ -318,6 +545,9 @@ impl ModuleCache {
             let mut scope = components.scope.clone();
             Self::validate_extends_components(&components, &mut scope)?;
         }
+        if self.data.pending {
+            return Ok((crate::CompiledOutput::Markdown(String::new()), None));
+        }
 
         let ExtendsComponents {
             mut scope,
@@ -405,6 +635,9 @@ impl ModuleCache {
 
         validator::validate(&module.body, &mut scope, ctx.file_str, ctx.source)?;
 
+        if self.data.pending {
+            return Ok((crate::CompiledOutput::Markdown(String::new()), None));
+        }
         if has_message_block(&module.body) {
             // AC-FUNC-07: source_map=true is incompatible with messages-mode templates.
             if opts.source_map {
@@ -715,6 +948,9 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<StandalonePrompt<'ctx>, MdsError> {
         let origin = ctx.origin(self)?;
+        if self.data.pending {
+            return Ok((None, None, origin));
+        }
 
         // Evaluate the body to get prompt text (and optionally a FragmentMap).
         //

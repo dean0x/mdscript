@@ -672,9 +672,9 @@ impl<'a> ReverifyGate<'a> {
             .all(|e| mds::fix::is_output_neutral(&e.rule));
         let original_output = all_output_neutral
             .then(|| {
-                mds::compile_str_collecting_warnings(source, Some(base_dir), runtime_vars.clone())
+                mds::lint_fix_output(source, base_dir, runtime_vars.as_ref())
                     .ok()
-                    .map(|r| r.output)
+                    .flatten()
             })
             .flatten();
         Self {
@@ -698,12 +698,9 @@ impl<'a> ReverifyGate<'a> {
             self.name,
         )?;
         if let Some(original_output) = &self.original_output {
-            match mds::compile_str_collecting_warnings(
-                candidate,
-                Some(self.base_dir),
-                self.runtime_vars.clone(),
-            ) {
-                Ok(compiled) if compiled.output != *original_output => {
+            match mds::lint_fix_output(candidate, self.base_dir, self.runtime_vars.as_ref()) {
+                Ok(Some(compiled)) if compiled == *original_output => {}
+                Ok(_) => {
                     return Err(MdsError::Io {
                         message: "lint --fix would change compiled output; \
                                   edit reverted to preserve template semantics"

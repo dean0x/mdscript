@@ -9046,6 +9046,46 @@ fn stdin_under_fix_in_json_is_refused_with_one_error_document() {
     );
 }
 
+#[test]
+fn tooling_checks_and_fixes_without_evaluation_until_data_is_replayed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let source = "---\ndata:\n  pending: ./bad.yml\nobject: {}\n---\n@if 1 == 1:\n{{object.missing}}\n@else:\n{{pending}}\n@end\n";
+    fs::write(root.join("main.mds"), source).unwrap();
+    fs::write(root.join("bad.yml"), "[").unwrap();
+    for args in [vec!["check", "main.mds"], vec!["fmt", "main.mds"]] {
+        let out = mds_bin().current_dir(root).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let lint = lint_with_stdin(root, &["main.mds"], b"");
+    let stderr = String::from_utf8_lossy(&lint.stderr);
+    assert!(stderr.contains("unreachable-branch"), "{stderr}");
+    let fixed = lint_with_stdin(root, &["--fix", "-"], source.as_bytes());
+    let output = String::from_utf8(fixed.stdout).unwrap();
+    assert!(output.contains("{{object.missing}}"), "{output}");
+    assert!(!output.contains("@else"), "{output}");
+
+    let replay = lint_with_stdin(root, &["--set", "pending=replay", "main.mds"], b"");
+    assert_eq!(replay.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&replay.stderr);
+    assert!(stderr.contains("field 'missing' not found"), "{stderr}");
+    let build = mds_bin()
+        .current_dir(root)
+        .args(["build", "main.mds"])
+        .output()
+        .unwrap();
+    assert!(!build.status.success());
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("invalid YAML data") && stderr.contains("bad.yml"),
+        "{stderr}"
+    );
+}
+
 /// `--fix --diff --format json` is the one exception to the one document: stdout holds the
 /// diffs first, one per file with a pending fix, then exactly one document — for a file
 /// argument and for a directory.

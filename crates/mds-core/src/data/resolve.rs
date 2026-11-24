@@ -13,17 +13,10 @@ use crate::resolver::FrontmatterImport;
 use crate::scope::VarLayer;
 use crate::{FileSystem, MdsError, Value};
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum Mode {
-    #[default]
-    NoReads,
-    Collect,
-    Read,
-}
-
 #[derive(Default)]
 pub(crate) struct State {
-    pub(crate) mode: Mode,
+    pub(crate) compile: bool,
+    pub(crate) pending: bool,
     pub(crate) files: IndexMap<String, Arc<Value>>,
     pub(crate) entries: usize,
     pub(crate) bytes: usize,
@@ -172,9 +165,10 @@ impl Declarations {
         let result = (|| {
             let mut entries = IndexMap::new();
             for source in sources.iter().rev().flatten() {
-                for entry in &source.entries {
+                for (ordinal, entry) in source.entries.iter().enumerate() {
                     let node = graph::Node {
                         entry,
+                        position: (&source.key, ordinal),
                         module: &source.module,
                         dir: &source.dir,
                     };

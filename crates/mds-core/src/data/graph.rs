@@ -8,6 +8,8 @@ use crate::{sanitize_control_chars_wire, MdsError};
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Node<'a> {
     pub(crate) entry: &'a Entry,
+    /// The declaring key and the entry's position in that declaration.
+    pub(crate) position: (&'a str, usize),
     /// Project-relative label of the module that declares the entry.
     pub(crate) module: &'a str,
     pub(crate) dir: &'a str,

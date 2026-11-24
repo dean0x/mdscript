@@ -505,7 +505,7 @@ pub fn check(
     let path = path.as_ref();
     let path_str = path_to_str(path)?;
     let vars = runtime_vars.unwrap_or_default();
-    let mut cache = ModuleCache::new();
+    let mut cache = ModuleCache::tooling(Box::new(NativeFs::new()));
     let mut warnings = vec![];
     cache.resolve_path_intrinsic(path_str, &vars, &mut warnings)?;
     emit_warnings(&warnings);
@@ -624,7 +624,7 @@ pub fn check_str_with(
 ) -> Result<(), MdsError> {
     let vars = runtime_vars.unwrap_or_default();
     let dir = resolve_base_dir(base_dir)?;
-    let mut cache = ModuleCache::new();
+    let mut cache = ModuleCache::tooling(Box::new(NativeFs::new()));
     let mut warnings = vec![];
     cache.resolve_source_intrinsic(source, &dir, &vars, &mut warnings)?;
     emit_warnings(&warnings);
@@ -744,7 +744,7 @@ pub fn compile_collecting_warnings(
     let path = path.as_ref();
     let path_str = path_to_str(path)?;
     let vars = runtime_vars.unwrap_or_default();
-    let mut cache = ModuleCache::new();
+    let mut cache = ModuleCache::compiling(Box::new(NativeFs::new()));
     let mut warnings = vec![];
     let output = cache.resolve_path_intrinsic(path_str, &vars, &mut warnings)?;
     // The intrinsic resolver does NOT insert the entry module into the cache (only
@@ -783,19 +783,14 @@ pub fn compile_str_collecting_warnings(
     compile_source_in_dir(source, &dir, runtime_vars)
 }
 
-/// [`compile_str_collecting_warnings`] against a base directory that
-/// [`resolve_base_dir`] has already resolved.
-///
-/// The formatter's safety gate resolves the base directory once, up front, so a
-/// refused or unresolvable one is reported as the error it is rather than taken
-/// for a template that does not compile standalone.
-pub(crate) fn compile_source_in_dir(
+/// Compile against a base directory that `resolve_base_dir` resolved.
+fn compile_source_in_dir(
     source: &str,
     dir: &str,
     runtime_vars: Option<HashMap<String, Value>>,
 ) -> Result<CompileResult, MdsError> {
     let vars = runtime_vars.unwrap_or_default();
-    let mut cache = ModuleCache::new();
+    let mut cache = ModuleCache::compiling(Box::new(NativeFs::new()));
     let mut warnings = vec![];
     let output = cache.resolve_source_intrinsic(source, dir, &vars, &mut warnings)?;
     // resolve_source_intrinsic does not insert the inline source into the modules cache,
@@ -807,6 +802,34 @@ pub(crate) fn compile_source_in_dir(
         dependencies,
         source_map: None,
     })
+}
+
+/// The formatter and lint fix can compare only output that tooling can evaluate.
+fn tooling_output_in_dir(
+    source: &str,
+    dir: &str,
+    vars: &HashMap<String, Value>,
+) -> Result<Option<CompiledOutput>, MdsError> {
+    let mut cache = ModuleCache::tooling(Box::new(NativeFs::new()));
+    let output = cache.resolve_source_intrinsic(source, dir, vars, &mut Vec::new())?;
+    Ok((!cache.has_pending_data()).then_some(output))
+}
+
+/// Verify the output of a lint edit without access to data files.
+/// Returns `None` when data entries have no replay values.
+#[doc(hidden)]
+#[must_use = "lint fix must handle pending output and errors"]
+pub fn lint_fix_output(
+    source: &str,
+    base_dir: &Path,
+    vars: Option<&HashMap<String, Value>>,
+) -> Result<Option<CompiledOutput>, MdsError> {
+    let dir = resolve_base_dir(Some(base_dir))?;
+    if let Some(vars) = vars {
+        tooling_output_in_dir(source, &dir, vars)
+    } else {
+        tooling_output_in_dir(source, &dir, &HashMap::new())
+    }
 }
 
 /// Check (validate) an MDS file and return any collected warnings without rendering output.
@@ -844,7 +867,7 @@ pub fn check_native_fs(
     let path = entry.as_ref();
     let path_str = path_to_str(path)?;
     let vars = runtime_vars.unwrap_or_default();
-    let mut cache = ModuleCache::with_fs(Box::new(fs));
+    let mut cache = ModuleCache::tooling(Box::new(fs));
     let mut warnings = vec![];
     // Dispatch on output shape so a messages template's mixed-content check runs
     // during validation; the CompiledOutput itself is discarded.
@@ -876,7 +899,7 @@ pub fn check_str_collecting_warnings(
 ) -> Result<((), Vec<String>), MdsError> {
     let vars = runtime_vars.unwrap_or_default();
     let dir = resolve_base_dir(base_dir)?;
-    let mut cache = ModuleCache::new();
+    let mut cache = ModuleCache::tooling(Box::new(NativeFs::new()));
     let mut warnings = vec![];
     cache.resolve_source_intrinsic(source, &dir, &vars, &mut warnings)?;
     Ok(((), warnings))
@@ -1381,7 +1404,7 @@ pub fn compile_virtual_collecting_warnings(
     runtime_vars: Option<HashMap<String, Value>>,
 ) -> Result<CompileResult, MdsError> {
     let vars = runtime_vars.unwrap_or_default();
-    let mut cache = ModuleCache::virtual_fs(modules);
+    let mut cache = ModuleCache::compiling(Box::new(VirtualFs::new(modules)));
     let mut warnings = vec![];
     let output = cache.resolve_virtual_intrinsic(entry, &vars, &mut warnings)?;
     let dependencies = cache
@@ -1526,7 +1549,7 @@ pub fn compile_native_fs(
     let path = entry.as_ref();
     let path_str = path_to_str(path)?;
     let vars = runtime_vars.unwrap_or_default();
-    let mut cache = ModuleCache::with_fs(Box::new(fs));
+    let mut cache = ModuleCache::compiling(Box::new(fs));
     let mut warnings = vec![];
     let (output, source_map) =
         cache.resolve_path_intrinsic_opts(path_str, &vars, &opts, &mut warnings)?;
@@ -1572,7 +1595,7 @@ pub fn compile_str_with_deps_opts(
 ) -> Result<CompileResult, MdsError> {
     let vars = runtime_vars.unwrap_or_default();
     let dir = resolve_base_dir(base_dir)?;
-    let mut cache = ModuleCache::new();
+    let mut cache = ModuleCache::compiling(Box::new(NativeFs::new()));
     let mut warnings = vec![];
     let (output, source_map) =
         cache.resolve_source_intrinsic_opts(source, &dir, &vars, &opts, &mut warnings)?;
@@ -1641,7 +1664,7 @@ pub fn compile_virtual_fs(
     opts: CompileOptions,
 ) -> Result<CompileResult, MdsError> {
     let vars = runtime_vars.unwrap_or_default();
-    let mut cache = ModuleCache::compiling_virtual(fs);
+    let mut cache = ModuleCache::compiling(Box::new(fs));
     let mut warnings = vec![];
     let (output, source_map) =
         cache.resolve_virtual_intrinsic_opts(entry, &vars, &opts, &mut warnings)?;
@@ -1743,7 +1766,7 @@ pub fn check_virtual_fs(
     runtime_vars: Option<HashMap<String, Value>>,
 ) -> Result<Vec<String>, MdsError> {
     let vars = runtime_vars.unwrap_or_default();
-    let mut cache = ModuleCache::with_fs(Box::new(fs));
+    let mut cache = ModuleCache::tooling(Box::new(fs));
     let mut warnings = vec![];
     // Dispatch on output shape so a messages template's mixed-content check runs
     // during validation; the CompiledOutput itself is discarded.
@@ -1865,7 +1888,7 @@ pub fn lint_str_named(
     let vars = runtime_vars.unwrap_or_default();
     // Step 1: check gate — resolve+validate ONCE (AC-PERF-01).
     {
-        let mut cache = ModuleCache::new();
+        let mut cache = ModuleCache::tooling(Box::new(NativeFs::new()));
         let mut warnings = vec![];
         cache.resolve_source_intrinsic(source, &dir, &vars, &mut warnings)?;
     }
@@ -1910,7 +1933,7 @@ pub fn lint_native_fs(
     let path = entry.as_ref();
     let path_str = path_to_str(path)?;
     let vars = runtime_vars.unwrap_or_default();
-    let mut cache = ModuleCache::with_fs(Box::new(fs));
+    let mut cache = ModuleCache::tooling(Box::new(fs));
     let mut warnings = vec![];
     let (_, source) = cache.resolve_path_intrinsic_source(path_str, &vars, &mut warnings)?;
     let filename = path
@@ -1975,7 +1998,7 @@ pub fn lint_virtual_fs(
     let source = fs.module(entry).map(str::to_owned);
     // Step 1: check gate — resolve+validate ONCE (AC-PERF-01).
     {
-        let mut cache = ModuleCache::with_fs(Box::new(fs));
+        let mut cache = ModuleCache::tooling(Box::new(fs));
         let mut warnings = vec![];
         cache.resolve_virtual_intrinsic(entry, &vars, &mut warnings)?;
     }

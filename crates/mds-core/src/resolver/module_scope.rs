@@ -252,12 +252,10 @@ impl ModuleCache {
         } else {
             None
         };
-        self.bind_data(&data, mapping, is_md, ctx.runtime_vars, &mut vars)?;
-        Ok((
-            Scope::with_layers(Arc::clone(ctx.runtime_vars), Arc::new(vars)),
-            imports,
-            data,
-        ))
+        let pending = self.bind_data(&data, mapping, is_md, ctx.runtime_vars, &mut vars)?;
+        let mut scope = Scope::with_layers(Arc::clone(ctx.runtime_vars), Arc::new(vars));
+        scope.set_pending_data(pending);
+        Ok((scope, imports, data))
     }
 
     /// Keep the declaring location even when a cached module becomes a base.
@@ -297,17 +295,14 @@ impl ModuleCache {
         is_md: bool,
         runtime: &VarLayer,
         vars: &mut VarLayer,
-    ) -> Result<(), MdsError> {
+    ) -> Result<std::collections::HashSet<String>, MdsError> {
         if !resolve::Declarations::contains_data(chain) {
-            return Ok(());
-        }
-        if self.data.mode == resolve::Mode::Collect {
-            self.collect_compile_data_graphs(runtime)?;
-            self.data.mode = resolve::Mode::Read;
+            return Ok(Default::default());
         }
         let before = self.budget.mem.buffers;
         let fs = &*self.fs;
         let data = &mut self.data;
+        let analyze_data = self.analyze_data;
         let result = resolve::Declarations::with_graph(
             chain,
             resolve::FrontmatterNames::Parsed { mapping, is_md },
@@ -315,17 +310,30 @@ impl ModuleCache {
             &mut self.budget.mem,
             |count, graph, mem| {
                 count_data_entries(&mut data.entries, count)?;
-                if data.mode != resolve::Mode::Read {
-                    return Ok(());
+                let mut pending = std::collections::HashSet::new();
+                if !data.compile {
+                    for node in graph.unreplayed() {
+                        if !analyze_data {
+                            return Err(MdsError::undefined_var(&node.entry.name));
+                        }
+                        if !data.pending {
+                            return Err(MdsError::internal());
+                        }
+                        let name = &node.entry.name;
+                        mem.charge(
+                            Part::Buffers,
+                            name.len().checked_add(2 * size_of::<String>()),
+                        )?;
+                        pending.insert(name.clone());
+                    }
+                    return Ok(pending);
                 }
                 if graph.frontier().next().is_some() {
-                    return Err(MdsError::network_denied(
-                        &graph.frontier().collect::<Vec<_>>(),
-                    ));
+                    return Err(MdsError::internal());
                 }
                 for node in graph.unreplayed() {
                     let Source::File(written) = &node.entry.source else {
-                        return Err(MdsError::network_denied(&[(node.module, &node.entry.name)]));
+                        return Err(MdsError::internal());
                     };
                     let label = DataLabel {
                         module: node.module,
@@ -354,11 +362,11 @@ impl ModuleCache {
                     mem.charge(Part::Buffers, binding_bytes)?;
                     vars.insert(node.entry.name.clone(), value);
                 }
-                Ok(())
+                Ok(pending)
             },
         );
         self.commit_retained(self.budget.mem.buffers - before);
-        result.map(drop)
+        result.map(Option::unwrap_or_default)
     }
 }
 
@@ -414,6 +422,7 @@ mod tests {
     struct CountReads {
         fs: VirtualFs,
         data_reads: Arc<AtomicUsize>,
+        module_reads: Arc<AtomicUsize>,
     }
 
     impl FileSystem for CountReads {
@@ -427,6 +436,7 @@ mod tests {
             self.fs.parent_dir(key)
         }
         fn read(&self, key: &str) -> Result<String, MdsError> {
+            self.module_reads.fetch_add(1, Ordering::Relaxed);
             self.fs.read(key)
         }
         fn read_data(&self, key: &str) -> Result<String, MdsError> {
@@ -453,11 +463,12 @@ mod tests {
         .with_aliases(HashMap::from([("alias.json".into(), "item.json".into())]))
         .unwrap();
         let reads = Arc::new(AtomicUsize::new(0));
-        let mut cache = ModuleCache::with_fs(Box::new(CountReads {
+        let module_reads = Arc::new(AtomicUsize::new(0));
+        let mut cache = ModuleCache::compiling(Box::new(CountReads {
             fs,
             data_reads: Arc::clone(&reads),
+            module_reads: Arc::clone(&module_reads),
         }));
-        cache.data.mode = resolve::Mode::Collect;
         let out = cache
             .resolve_virtual_intrinsic("main.mds", &HashMap::new(), &mut vec![])
             .unwrap();
@@ -465,6 +476,7 @@ mod tests {
             matches!(out, crate::CompiledOutput::Markdown(text) if text.ends_with("42\n42\n42\n"))
         );
         assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert_eq!(module_reads.load(Ordering::Relaxed), 3);
         assert_eq!(cache.data.bytes, 2);
     }
 }

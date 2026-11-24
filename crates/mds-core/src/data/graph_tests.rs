@@ -13,8 +13,10 @@ fn parse(raw: &str, module: &str) -> Result<Vec<Entry>, MdsError> {
 fn nodes<'a>(entries: &'a [Entry], module: &'a str) -> Vec<Node<'a>> {
     entries
         .iter()
-        .map(|entry| Node {
+        .enumerate()
+        .map(|(ordinal, entry)| Node {
             entry,
+            position: (module, ordinal),
             module,
             dir: ".",
         })

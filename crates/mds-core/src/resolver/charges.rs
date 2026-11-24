@@ -64,6 +64,7 @@ impl ModuleCache {
         if self.resolving.is_empty() {
             self.budget = EvalBudget::default();
             self.data.entries = 0;
+            self.data.pending = false;
             self.kept = 0;
             self.commit_retained(0);
             #[cfg(test)]
