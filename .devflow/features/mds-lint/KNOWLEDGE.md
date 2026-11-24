@@ -11,7 +11,7 @@ directories:
   - crates/mds-python/src
   - packages/mds/src
 created: 2026-07-11
-updated: 2026-11-21
+updated: 2026-11-24
 ---
 
 # mds lint — Static Analysis Engine and Tiered --fix
@@ -106,7 +106,7 @@ The `fixable` flag in the canonical JSON output is computed as `(fix_removals.is
 
 **unused-import (merge)**: Merge imports (`@import "path"`) are always treated as used — they inject all exports plus `prompt` into scope. Conservative; false negatives are acceptable here.
 
-**unused-variable**: Uses are tracked across all recursive bodies: `Expr::Var`, `Arg::Var`, `Arg::MemberAccess`, condition operands, `@for` iterables, call arguments. Code-fence content is `Text` (interpolation suppressed) — correct by construction. Reserved skip-set: `{imports, type, extends, prompt}`.
+**unused-variable**: Uses are tracked across all recursive bodies: `Expr::Var`, `Arg::Var`, `Arg::MemberAccess`, condition operands, `@for` iterables, call arguments. Code-fence content is `Text` (interpolation suppressed) — correct by construction. Reserved skip-set (`RESERVED` in `lint/facts.rs`): `{imports, type, extends, prompt, data, indented-directives}`. The entries of a `data:` mapping are facts of their own (`FmVarKind::DataEntry`), reported with "data entry" text, and a `{{…}}` reference in a data declaration counts as a use.
 
 **unused-* suppression**: When `ctx.is_partial_or_extends == true` (file starts with `_` OR has `@extends`), the unused-variable, unused-import, and unused-function rules are entirely suppressed. shadow-variable is NOT suppressed — it is already default-off.
 
