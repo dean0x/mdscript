@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use crate::error::MdsError;
 use crate::limits::{
-    MAX_FILE_SIZE, MAX_MODULE_ALIASES, MAX_MODULE_ALIASES_SIZE, MAX_TRAVERSAL_DEPTH,
+    MAX_DATA_FILE_BYTES, MAX_FILE_SIZE, MAX_MODULE_ALIASES, MAX_MODULE_ALIASES_SIZE,
+    MAX_TRAVERSAL_DEPTH,
 };
 
 /// Maximum number of path segments allowed in a single import path.
@@ -140,6 +141,29 @@ pub trait FileSystem: Send + Sync {
 
     /// Read the content of a normalized key.
     fn read(&self, normalized: &str) -> Result<String, MdsError>;
+
+    /// Read UTF-8 data from a data file key that the compile resolved through
+    /// [`FileSystem::normalize_in_dir`] and the data path rules.
+    ///
+    /// The default never uses [`FileSystem::read`]. A backend that supports data
+    /// must enforce the data path rules and the 10 MiB file cap before it returns
+    /// content. For host files, it must check that the open file is the regular
+    /// file that resolution accepted, before the first byte read.
+    ///
+    /// [`VirtualFs`] and [`NativeFs`] check the key itself before the read, also
+    /// when a caller gives the key directly. The key must end in exactly `.json`,
+    /// `.yaml` or `.yml`, and no segment of it may start with `.` or be
+    /// `node_modules`. A [`NativeFs`] key must stay inside the project root, and a
+    /// [`VirtualFs`] key must be relative.
+    ///
+    /// # Errors
+    ///
+    /// The default returns `mds::io`: `this file system does not read data files`.
+    /// [`VirtualFs`] and [`NativeFs`] return `mds::import` for a key that fails the
+    /// rules above.
+    fn read_data(&self, _normalized: &str) -> Result<String, MdsError> {
+        Err(MdsError::io("this file system does not read data files"))
+    }
 
     /// Return `true` if the key refers to a `.md` (Markdown) file rather than `.mds`.
     fn is_markdown(&self, normalized: &str) -> bool;
@@ -309,7 +333,7 @@ fn key_of(canonical: &Path, shown: &str) -> Result<String, MdsError> {
 /// Called by `normalize_in_dir` on both `NativeFs` and `VirtualFs`, so the error
 /// strings stay identical across backends. The null-byte check runs before the
 /// forbidden-character check (U+0000 is in that class) and keeps its own message.
-fn validate_relative_import(relative: &str) -> Result<(), MdsError> {
+pub(crate) fn validate_relative_import(relative: &str) -> Result<(), MdsError> {
     if relative.is_empty() {
         return Err(MdsError::import_error("import path is empty"));
     }
@@ -406,8 +430,12 @@ fn check_segment_count(path: &str) -> Result<(), MdsError> {
 /// # Ok::<(), mds::MdsError>(())
 /// ```
 pub fn check_module_bytes(bytes: Vec<u8>, display: &str) -> Result<String, MdsError> {
-    if bytes.len() as u64 > MAX_FILE_SIZE {
-        return Err(file_too_large(bytes.len() as u64, display));
+    checked_text(bytes, display, MAX_FILE_SIZE)
+}
+
+fn checked_text(bytes: Vec<u8>, display: &str, cap: u64) -> Result<String, MdsError> {
+    if bytes.len() as u64 > cap {
+        return Err(file_too_large(bytes.len() as u64, display, cap));
     }
     String::from_utf8(bytes).map_err(|e| {
         MdsError::io(format!(
@@ -417,20 +445,11 @@ pub fn check_module_bytes(bytes: Vec<u8>, display: &str) -> Result<String, MdsEr
     })
 }
 
-/// The refusal of a module file of `size` bytes, over [`crate::MAX_FILE_SIZE`], named
-/// by `display`, escaped.
-fn file_too_large(size: u64, display: &str) -> MdsError {
+fn file_too_large(size: u64, display: &str, cap: u64) -> MdsError {
     MdsError::resource_limit(format!(
-        "file too large ({size} bytes, max {MAX_FILE_SIZE} bytes): {}",
+        "file too large ({size} bytes, max {cap} bytes): {}",
         crate::lint::escape_path_for_message(display)
     ))
-}
-
-fn module_text(read: Capped, display: &str) -> Result<String, MdsError> {
-    match read {
-        Capped::Bytes(bytes) => check_module_bytes(bytes, display),
-        Capped::TooLarge(size) => Err(file_too_large(size, display)),
-    }
 }
 
 fn read_error(display: &str, error: std::io::Error) -> MdsError {
@@ -465,6 +484,7 @@ pub(crate) enum Capped {
 #[derive(Clone, Copy)]
 enum ReadRule<'a> {
     Module,
+    Data,
     Vars {
         lookup_type: std::fs::FileType,
         typed: &'a str,
@@ -474,7 +494,7 @@ enum ReadRule<'a> {
 impl ReadRule<'_> {
     fn io_error(self, display: &str, error: std::io::Error) -> MdsError {
         match self {
-            Self::Module => read_error(display, error),
+            Self::Module | Self::Data => read_error(display, error),
             Self::Vars { typed, .. } => MdsError::io(format!(
                 "cannot read vars file {}: {error}",
                 crate::lint::escape_path_for_message(typed)
@@ -484,7 +504,9 @@ impl ReadRule<'_> {
 
     fn check_before(self, before: &std::fs::Metadata, display: &str) -> Result<(), MdsError> {
         match self {
-            Self::Module if !before.is_file() => Err(self.io_error(display, not_a_regular_file())),
+            Self::Module | Self::Data if !before.is_file() => {
+                Err(self.io_error(display, not_a_regular_file()))
+            }
             Self::Vars { lookup_type, .. }
                 if (lookup_type.is_file() && !before.is_file())
                     || (!lookup_type.is_file() && !is_fifo(lookup_type)) =>
@@ -497,15 +519,22 @@ impl ReadRule<'_> {
 
     fn open(self, path: &Path) -> std::io::Result<std::fs::File> {
         #[cfg(unix)]
-        if matches!(self, Self::Vars { lookup_type, .. } if lookup_type.is_file()) {
-            use std::os::unix::fs::OpenOptionsExt;
+        {
+            let nonblocking = match self {
+                Self::Data => true,
+                Self::Vars { lookup_type, .. } => lookup_type.is_file(),
+                Self::Module => false,
+            };
+            if nonblocking {
+                use std::os::unix::fs::OpenOptionsExt;
 
-            // A regular-file lookup must not wait if the path now names a pipe.
-            // The opened-handle type check runs before any byte is read.
-            return std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
-                .open(path);
+                // A regular-file lookup must not wait if the path now names a pipe.
+                // The handle type check runs before the first byte read.
+                return std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+                    .open(path);
+            }
         }
         std::fs::File::open(path)
     }
@@ -1083,6 +1112,18 @@ impl FileSystem for VirtualFs {
         Ok(content.clone())
     }
 
+    fn read_data(&self, normalized: &str) -> Result<String, MdsError> {
+        crate::data::path::check_data_key(normalized, None, normalized)?;
+        let content = self
+            .module(normalized)
+            .ok_or_else(|| MdsError::data_file_not_found(normalized))?;
+        let size = content.len() as u64;
+        if size > MAX_DATA_FILE_BYTES {
+            return Err(file_too_large(size, normalized, MAX_DATA_FILE_BYTES));
+        }
+        Ok(content.to_owned())
+    }
+
     fn is_markdown(&self, normalized: &str) -> bool {
         Path::new(normalized).extension().and_then(|e| e.to_str()) == Some("md")
     }
@@ -1584,6 +1625,36 @@ impl NativeFs {
         Ok(key)
     }
 
+    fn read_text(
+        &self,
+        normalized: &str,
+        cap: u64,
+        rule: ReadRule<'_>,
+    ) -> Result<String, MdsError> {
+        let path = Path::new(normalized);
+        let display = self.display_of(path);
+        if matches!(rule, ReadRule::Data) {
+            let root = self.root_dir.get().ok_or_else(|| not_resolved(&display))?;
+            crate::data::path::check_data_key(normalized, Some(root), &display)?;
+        }
+        let id = self
+            .ids
+            .lock()
+            .map_err(|_| not_resolved(&display))?
+            .get(normalized)
+            .cloned()
+            .ok_or_else(|| not_resolved(&display))?;
+        match read_verified_capped(path, &display, &id, cap, rule)? {
+            Capped::Bytes(bytes) => {
+                if let Some(log) = &self.read_log {
+                    log.record(normalized, bytes.len() as u64);
+                }
+                checked_text(bytes, &display, cap)
+            }
+            Capped::TooLarge(size) => Err(file_too_large(size, &display, cap)),
+        }
+    }
+
     /// Initialize root_dir from a canonical entry-point directory.
     fn init_root(&self, canonical_dir: &Path) {
         // Skip the up-to-256 exists() calls if the root is already established.
@@ -1641,20 +1712,11 @@ impl FileSystem for NativeFs {
     }
 
     fn read(&self, normalized: &str) -> Result<String, MdsError> {
-        let path = Path::new(normalized);
-        let display = self.display_of(path);
-        let id = self
-            .ids
-            .lock()
-            .map_err(|_| not_resolved(&display))?
-            .get(normalized)
-            .cloned()
-            .ok_or_else(|| not_resolved(&display))?;
-        let read = read_verified_capped(path, &display, &id, MAX_FILE_SIZE, ReadRule::Module)?;
-        if let (Some(log), Capped::Bytes(bytes)) = (&self.read_log, &read) {
-            log.record(normalized, bytes.len() as u64);
-        }
-        module_text(read, &display)
+        self.read_text(normalized, MAX_FILE_SIZE, ReadRule::Module)
+    }
+
+    fn read_data(&self, normalized: &str) -> Result<String, MdsError> {
+        self.read_text(normalized, MAX_DATA_FILE_BYTES, ReadRule::Data)
     }
 
     fn is_markdown(&self, normalized: &str) -> bool {
@@ -3136,6 +3198,43 @@ mod tests {
     #[test]
     fn vars_open_refuses_a_regular_file_replaced_by_a_pipe_after_metadata() {
         assert_vars_pipe_replacement_refused(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_open_refuses_a_pipe_after_the_pre_open_type_check() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("data.json");
+        std::fs::write(&path, "true").unwrap();
+        let rule = ReadRule::Data;
+        rule.check_before(&std::fs::metadata(&path).unwrap(), "data.json")
+            .unwrap();
+        let control = rule.open(&path).unwrap();
+        assert!(!rule
+            .skip_identity(&control.metadata().unwrap(), "data.json")
+            .unwrap());
+
+        std::fs::rename(&path, dir.path().join("saved")).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        assert!(is_fifo(std::fs::metadata(&path).unwrap().file_type()));
+        let (tx, rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let file = rule.open(&path).unwrap();
+            tx.send(rule.skip_identity(&file.metadata().unwrap(), "data.json"))
+                .unwrap();
+        });
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a data open must not wait for a writer");
+        reader.join().unwrap();
+        assert_eq!(code_of(&result.unwrap_err()).as_deref(), Some("mds::io"));
     }
 
     #[cfg(unix)]

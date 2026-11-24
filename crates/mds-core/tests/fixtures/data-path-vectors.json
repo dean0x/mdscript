@@ -1,0 +1,21 @@
+{
+  "portable": [
+    { "path": "./modules/a.json", "code": null },
+    { "path": "./modules/a.yaml", "code": null },
+    { "path": "./modules/a.yml", "code": null },
+    { "path": "../a.json", "code": null, "from": "modules" },
+    { "path": "../a.json", "code": "mds::import", "reason": "escapes project directory" },
+    { "path": "./.env/a.json", "code": "mds::import", "reason": "dot-prefixed" },
+    { "path": "./node_modules/a.json", "code": "mds::import", "reason": "node_modules" },
+    { "path": "./NoDe_MoDuLeS/a.json", "code": "mds::import", "reason": "node_modules" },
+    { "path": "./modules/a.JSON", "code": "mds::import", "reason": "extension" },
+    { "path": "./modules/a.txt", "code": "mds::import", "reason": "extension" },
+    { "path": "modules/a.json", "code": "mds::import", "reason": "must start" },
+    { "path": "./modules/a@CODEPOINT@.json", "codePoint": 8238, "code": "mds::import", "reason": "U+202E" },
+    { "path": "./modules/{{name}}.json", "code": "mds::import", "reason": "references" }
+  ],
+  "windows": [
+    { "path": "./node_modules./a.json", "code": "mds::import", "reason": "node_modules" },
+    { "path": "./NODE_M~1/a.json", "code": "mds::import", "reason": "node_modules" }
+  ]
+}

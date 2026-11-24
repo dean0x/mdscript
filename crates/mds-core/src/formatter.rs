@@ -422,9 +422,8 @@ fn rewrite_body(
 ///
 /// When `source` compiles standalone, this is an exact check: both are
 /// compiled with the same `base_dir` and their [`crate::CompiledOutput`]s must
-/// match. The warning-collecting compile (the body of
-/// `compile_str_collecting_warnings`, not `compile_str_with`) is used so the gate
-/// never duplicates warnings to stderr on every format call.
+/// match. The tooling resolver does not read data files or print warnings.
+/// If data entries are pending, compare structure instead of output.
 ///
 /// The base directory is resolved first, once, exactly as `check_str_with`
 /// resolves it, and a failure there is returned as it is: a base directory that
@@ -458,9 +457,10 @@ fn assert_equivalent(
     file_name: &str,
 ) -> Result<(), MdsError> {
     let dir = crate::resolve_base_dir(base_dir)?;
-    match crate::compile_source_in_dir(source, &dir, None) {
-        Ok(orig) => match crate::compile_source_in_dir(formatted, &dir, None) {
-            Ok(after) if after.output == orig.output => Ok(()),
+    let vars = std::collections::HashMap::new();
+    match crate::tooling_output_in_dir(source, &dir, &vars) {
+        Ok(Some(orig)) => match crate::tooling_output_in_dir(formatted, &dir, &vars) {
+            Ok(Some(after)) if after == orig => Ok(()),
             Ok(_) => Err(MdsError::formatter_invariant(
                 "formatted source compiles to different output than the original",
             )),
@@ -493,7 +493,7 @@ fn assert_equivalent(
         // Any other compile failure (undefined var/fn, unresolved import, …)
         // means the token stream is well-formed and only later analysis failed,
         // so the rule-aware structural comparison is a meaningful fallback.
-        Err(_) => {
+        Ok(None) | Err(_) => {
             if structural_equivalent(source, formatted, raw_content) {
                 Ok(())
             } else {
@@ -634,6 +634,20 @@ fn structural_equivalent(source: &str, formatted: &str, raw_content: &[Range<usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_output_requires_structural_equivalence() {
+        let a = "---\ndata:\n  item: ./a.yml\n---\n{{item}}\n";
+        let b = a.replace("./a.yml", "./b.yml");
+        assert!(!structural_equivalent(a, &b, &[]));
+        let err = assert_equivalent(a, &b, None, &[], "test.mds").unwrap_err();
+        assert!(err.to_string().contains("diverges structurally"), "{err}");
+
+        let a = "{{upper(\"yes\")}}\n";
+        let b = "{{upper(\"YES\")}}\n";
+        assert!(!structural_equivalent(a, b, &[]));
+        assert_equivalent(a, b, None, &[], "test.mds").unwrap();
+    }
 
     #[test]
     fn format_str_returns_the_same_frontmatter_form_error_as_compile() {

@@ -1,7 +1,106 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::data::DataLabel;
 use crate::error::MdsError;
+use crate::escape_class::is_control_char;
+
+const DATA_NUMBER_LIMIT: u64 = 1 << 53;
+const DATA_NUMBER_ERROR: &str = "number exceeds the allowed range of -2^53 to 2^53";
+
+type DataPolicy<'a> = Option<DataContext<'a>>;
+
+#[derive(Clone, Copy)]
+struct DataContext<'a> {
+    label: DataLabel<'a>,
+    path: Option<&'a DataPath<'a>>,
+}
+
+struct DataPath<'a> {
+    parent: Option<&'a DataPath<'a>>,
+    segment: Segment<'a>,
+}
+
+enum Segment<'a> {
+    Key(&'a str),
+    Index(usize),
+}
+
+impl fmt::Display for DataPath<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(parent) = self.parent {
+            write!(f, "{parent}")?;
+        }
+        match self.segment {
+            Segment::Key(key) if self.parent.is_some() => write!(f, ".{key}"),
+            Segment::Key(key) => f.write_str(key),
+            Segment::Index(i) => write!(f, "[{i}]"),
+        }
+    }
+}
+
+impl DataContext<'_> {
+    fn error(self, reason: &str) -> MdsError {
+        self.label
+            .error(self.path.map(ToString::to_string).as_deref(), reason)
+    }
+
+    fn check_chars(self, text: &str) -> Result<(), MdsError> {
+        if text.chars().any(is_control_char) {
+            return Err(self.error("forbidden character in a data string or key"));
+        }
+        Ok(())
+    }
+
+    fn string(self, text: &str) -> Result<Value, MdsError> {
+        // CRLF is the only exception to the class rule. Remove its CR in values only.
+        let mut rest = text;
+        while let Some((prefix, suffix)) = rest.split_once("\r\n") {
+            self.check_chars(prefix)?;
+            rest = suffix;
+        }
+        self.check_chars(rest)?;
+        let text = if rest.len() == text.len() {
+            text.to_owned()
+        } else {
+            // `replace` can reserve more than the result length. Bound allocation
+            // by building into a buffer no larger than the original string.
+            let mut out = String::with_capacity(text.len());
+            for (i, segment) in text.split("\r\n").enumerate() {
+                if i != 0 {
+                    out.push('\n');
+                }
+                out.push_str(segment);
+            }
+            out
+        };
+        Ok(Value::String(text))
+    }
+
+    fn number(self, n: &serde_yaml_ng::Number) -> Result<Value, MdsError> {
+        // Check integer magnitudes before a cast can round them to the limit.
+        let magnitude = n.as_i64().map(i64::unsigned_abs).or_else(|| n.as_u64());
+        if magnitude.is_some_and(|n| n > DATA_NUMBER_LIMIT) {
+            return Err(self.error(DATA_NUMBER_ERROR));
+        }
+        let n = n
+            .as_f64()
+            .filter(|n| n.is_finite())
+            .ok_or_else(|| self.error("data numbers must be finite"))?;
+        // A parser can report a large integer as a float.
+        if n.abs() > DATA_NUMBER_LIMIT as f64 {
+            return Err(self.error(DATA_NUMBER_ERROR));
+        }
+        Ok(Value::Number(n))
+    }
+}
+
+fn conversion_error(data: DataPolicy<'_>, reason: &str) -> MdsError {
+    match data {
+        Some(data) => data.error(reason),
+        None => MdsError::yaml_error(reason),
+    }
+}
 
 /// Maximum nesting depth for YAML and JSON value trees.
 pub(crate) const MAX_VALUE_DEPTH: usize = 64;
@@ -50,28 +149,64 @@ impl Value {
     /// Convert a borrowed serde_yaml_ng::Value into our Value enum. The tree is not
     /// cloned: only the converted strings are copied.
     pub(crate) fn from_yaml_ref(yaml: &serde_yaml_ng::Value) -> Result<Value, MdsError> {
-        Self::from_yaml_inner(yaml, 0)
+        Self::from_yaml_inner(yaml, 0, None)
     }
 
-    fn from_yaml_inner(yaml: &serde_yaml_ng::Value, depth: usize) -> Result<Value, MdsError> {
+    pub(crate) fn from_data_yaml(
+        yaml: &serde_yaml_ng::Value,
+        label: DataLabel<'_>,
+    ) -> Result<Value, MdsError> {
+        Self::from_yaml_inner(yaml, 0, Some(DataContext { label, path: None }))
+    }
+
+    pub(crate) fn from_data_text(text: &str, label: DataLabel<'_>) -> Result<Value, MdsError> {
+        DataContext { label, path: None }.string(text)
+    }
+
+    fn from_yaml_inner(
+        yaml: &serde_yaml_ng::Value,
+        depth: usize,
+        data: DataPolicy<'_>,
+    ) -> Result<Value, MdsError> {
         if depth > MAX_VALUE_DEPTH {
-            return Err(MdsError::yaml_error(format!(
-                "value nesting exceeds maximum depth of {MAX_VALUE_DEPTH}"
-            )));
+            return Err(conversion_error(
+                data,
+                &format!("value nesting exceeds maximum depth of {MAX_VALUE_DEPTH}"),
+            ));
         }
         match yaml {
             serde_yaml_ng::Value::Null => Ok(Value::Null),
             serde_yaml_ng::Value::Bool(b) => Ok(Value::Boolean(*b)),
-            serde_yaml_ng::Value::Number(n) => n
-                .as_i64()
-                .map(|i| i as f64)
-                .or_else(|| n.as_f64())
-                .map(Value::Number)
-                .ok_or_else(|| MdsError::yaml_error(format!("unsupported number: {n:?}"))),
-            serde_yaml_ng::Value::String(s) => Ok(Value::String(s.clone())),
+            serde_yaml_ng::Value::Number(n) => match data {
+                Some(data) => data.number(n),
+                None => n
+                    .as_i64()
+                    .map(|i| i as f64)
+                    .or_else(|| n.as_f64())
+                    .map(Value::Number)
+                    .ok_or_else(|| MdsError::yaml_error(format!("unsupported number: {n:?}"))),
+            },
+            serde_yaml_ng::Value::String(s) => match data {
+                Some(data) => data.string(s),
+                None => Ok(Value::String(s.clone())),
+            },
             serde_yaml_ng::Value::Sequence(seq) => seq
                 .iter()
-                .map(|v| Self::from_yaml_inner(v, depth + 1))
+                .enumerate()
+                .map(|(i, v)| {
+                    let path = DataPath {
+                        parent: data.and_then(|d| d.path),
+                        segment: Segment::Index(i),
+                    };
+                    Self::from_yaml_inner(
+                        v,
+                        depth + 1,
+                        data.map(|d| DataContext {
+                            path: Some(&path),
+                            ..d
+                        }),
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()
                 .map(Value::Array),
             serde_yaml_ng::Value::Mapping(mapping) => {
@@ -83,18 +218,29 @@ impl Value {
                     let key = match k {
                         serde_yaml_ng::Value::String(s) => s,
                         other => {
-                            return Err(MdsError::yaml_error(format!(
+                            return Err(conversion_error(data, &format!(
                                 "MDS only supports string keys in objects; found {} key — use a quoted string key instead",
                                 yaml_type_name(other)
                             )));
                         }
                     };
-                    let value = Self::from_yaml_inner(v, depth + 1)?;
+                    let path = DataPath {
+                        parent: data.and_then(|d| d.path),
+                        segment: Segment::Key(key),
+                    };
+                    let child = data.map(|d| DataContext {
+                        path: Some(&path),
+                        ..d
+                    });
+                    if let Some(child) = child {
+                        child.check_chars(key)?;
+                    }
+                    let value = Self::from_yaml_inner(v, depth + 1, child)?;
                     map.insert(key.clone(), value);
                 }
                 Ok(Value::Object(map))
             }
-            serde_yaml_ng::Value::Tagged(t) => Self::from_yaml_inner(&t.value, depth + 1),
+            serde_yaml_ng::Value::Tagged(t) => Self::from_yaml_inner(&t.value, depth + 1, data),
         }
     }
 

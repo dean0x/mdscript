@@ -267,3 +267,46 @@ pub(crate) const MAX_MODULE_ALIASES: usize = 65_536;
 /// With `MAX_MODULE_ALIASES` it bounds what an alias map holds before any alias in it
 /// is checked (#414).
 pub(crate) const MAX_MODULE_ALIASES_SIZE: usize = MAX_FILE_SIZE as usize;
+
+// ── Data source limits ────────────────────────────────────────────────────────
+
+/// Maximum source bytes for one data file, checked during input admission.
+/// A sparse file with long strings can reach this cap first. A dense file can
+/// reach the node cap first, at about 1 to 2 MiB.
+pub(crate) const MAX_DATA_FILE_BYTES: u64 = MAX_FILE_SIZE;
+
+/// Maximum nodes built by the parser for one data file.
+/// A dense file can reach this cap at about 1 to 2 MiB. A sparse file with long
+/// strings can reach the file byte cap first.
+pub(crate) const MAX_DATA_NODES_PER_FILE: usize = 200_000;
+
+/// Maximum distinct data files admitted in one compile, apart from modules.
+/// Each file read needs an entry, and `MAX_DATA_ENTRIES_PER_COMPILE` counts the
+/// entries before the reads, so many small files reach the entry cap first. Dense
+/// files can reach a node or memory cap first. Large sparse files can reach a byte
+/// cap first.
+pub(crate) const MAX_DATA_FILES: usize = 256;
+
+/// Maximum data entries admitted during declaration analysis in one module.
+/// This cap applies before file reads, for both dense and sparse data.
+pub(crate) const MAX_DATA_ENTRIES_PER_MODULE: usize = 64;
+
+/// Maximum data entries admitted across modules in one compile.
+/// This cap depends on declarations, not on whether the data is dense or sparse.
+pub(crate) const MAX_DATA_ENTRIES_PER_COMPILE: usize = 256;
+
+/// Maximum references (`{{…}}`) in the URL, headers and body of one data entry,
+/// counted during declaration analysis, before the graph check.
+/// The graph check does a name lookup for each reference, in each scope check and
+/// through each `@extends` link. This cap and the entry caps bound that work. The
+/// frontmatter byte cap does not.
+pub(crate) const MAX_DATA_REFS_PER_ENTRY: usize = 256;
+
+/// Maximum dependency levels in the data graph, checked before reads.
+/// This cap depends on graph depth, not on whether the data is dense or sparse.
+pub(crate) const MAX_DATA_LEVELS: usize = 16;
+
+/// Maximum total source bytes admitted for distinct data files in one compile.
+/// Large sparse files can reach this cap without reaching the node cap.
+/// Dense data can reach the compile memory budget before the byte aggregate.
+pub(crate) const MAX_DATA_BYTES_PER_COMPILE: usize = 32 * 1024 * 1024;

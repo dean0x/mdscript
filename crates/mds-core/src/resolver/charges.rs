@@ -8,6 +8,35 @@ use super::{
 #[cfg(test)]
 use super::{tests, ModuleProbe};
 
+use crate::limits::{MAX_DATA_BYTES_PER_COMPILE, MAX_DATA_ENTRIES_PER_COMPILE, MAX_DATA_FILES};
+
+pub(super) fn count_data_entries(total: &mut usize, count: usize) -> Result<(), MdsError> {
+    let Some(next @ ..=MAX_DATA_ENTRIES_PER_COMPILE) = total.checked_add(count) else {
+        return Err(crate::data::graph::entry_limit());
+    };
+    *total = next;
+    Ok(())
+}
+
+pub(super) fn check_data_file_count(count: usize) -> Result<(), MdsError> {
+    if count >= MAX_DATA_FILES {
+        return Err(MdsError::resource_limit(format!(
+            "too many data files (max {MAX_DATA_FILES} per compile)"
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn count_data_bytes(total: &mut usize, count: usize) -> Result<(), MdsError> {
+    let Some(next @ ..=MAX_DATA_BYTES_PER_COMPILE) = total.checked_add(count) else {
+        return Err(MdsError::resource_limit(format!(
+            "data files exceed {MAX_DATA_BYTES_PER_COMPILE} bytes per compile"
+        )));
+    };
+    *total = next;
+    Ok(())
+}
+
 impl ModuleCache {
     /// Enforce `MAX_FILE_SIZE` on a string entry source at the core string funnels.
     ///
@@ -34,6 +63,8 @@ impl ModuleCache {
         let mut layer = Ok(0);
         if self.resolving.is_empty() {
             self.budget = EvalBudget::default();
+            self.data.entries = 0;
+            self.data.pending = false;
             self.kept = 0;
             self.commit_retained(0);
             #[cfg(test)]

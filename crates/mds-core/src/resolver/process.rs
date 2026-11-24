@@ -1,14 +1,378 @@
 //! Module processing, output evaluation, and source-map finalization.
 
+use super::charges::count_data_entries;
 use super::{
-    build_scope_from_frontmatter, bytes, evaluate_messages_seeded, evaluate_seeded,
-    evaluate_with_map_seeded, fragment_map_from, has_message_block, is_visible_export,
-    parse_frontmatter_mapping, seed_effective_blocks, spliced_regions, validate_exports, validator,
-    Arc, CollectedDefs, CompileOptions, ExtendsComponents, MapBuilder, MdsError, MemBudget, Module,
-    ModuleCache, ModuleCtx, Node, Origin, Part, PromptText, ResolvedModule, Scope,
-    MAX_SOURCES_CONTENT_BYTES,
+    bytes, evaluate_messages_seeded, evaluate_seeded, evaluate_with_map_seeded, fragment_map_from,
+    has_message_block, is_visible_export, parse_frontmatter_mapping, seed_effective_blocks,
+    spliced_regions, validate_exports, validator, Arc, CollectedDefs, CompileOptions,
+    ExtendsComponents, MapBuilder, MdsError, MemBudget, Module, ModuleCache, ModuleCtx, Node,
+    Origin, Part, PromptText, ResolvedModule, Scope, MAX_SOURCES_CONTENT_BYTES,
 };
+use super::{check_module_type, parse_frontmatter_imports_from_yaml, validate_import_path};
+use crate::ast::{ExportDirective, ImportDirective};
+use crate::data::resolve::{Chain, DeclarationSite, Declarations, FrontmatterNames};
 use crate::MarkdownFrontmatter;
+
+/// Module bytes and import keys that the graph check used. The compile pass
+/// takes modules from here, so both passes see the same bytes and edges.
+#[derive(Default)]
+pub(super) struct SourceSnapshot {
+    sources: super::HashMap<String, Arc<String>>,
+    edges: super::HashMap<String, super::HashMap<String, String>>,
+    pub(super) charge: usize,
+}
+
+impl SourceSnapshot {
+    /// The bytes that the graph check read for `key`.
+    pub(super) fn source(&self, key: &str) -> Option<&Arc<String>> {
+        self.sources.get(key)
+    }
+
+    /// The module key that `path`, written in module `from`, resolved to.
+    pub(super) fn edge(&self, from: &str, path: &str) -> Option<&str> {
+        self.edges.get(from)?.get(path).map(String::as_str)
+    }
+}
+
+/// One winning entry that no replay satisfies.
+pub(super) struct Unreplayed {
+    pub(super) module: String,
+    pub(super) entry: String,
+    pub(super) url: bool,
+    key: String,
+    ordinal: usize,
+}
+
+/// The result of the graph check, taken before any module evaluates.
+pub(super) struct DataPreflight {
+    pub(super) snapshot: SourceSnapshot,
+    /// Unreplayed entries in module first-resolution order, then declaration
+    /// order. Each `(module, entry)` pair occurs once.
+    pub(super) unreplayed: Vec<Unreplayed>,
+}
+
+impl DataPreflight {
+    /// The URL entries that no replay satisfies: the compile-wide frontier.
+    pub(super) fn frontier(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.unreplayed
+            .iter()
+            .filter(|item| item.url)
+            .map(|item| (item.module.as_str(), item.entry.as_str()))
+    }
+
+    /// True when an entry has no value before evaluation (tooling mode).
+    pub(super) fn has_pending(&self) -> bool {
+        !self.unreplayed.is_empty()
+    }
+}
+
+struct DataGraphWalk<'a> {
+    fs: &'a dyn super::FileSystem,
+    runtime: &'a super::VarLayer,
+    /// Insertion order is module first-resolution order.
+    seen: indexmap::IndexMap<String, Option<SeenDataScope>>,
+    snapshot: SourceSnapshot,
+    /// Bytes that stay charged to buffers after the walk (snapshot and labels).
+    kept: usize,
+    entries: usize,
+}
+
+struct SeenDataScope {
+    chain: Chain,
+    /// `None` until a full use of the module checks its scope.
+    labels: Option<Vec<Unreplayed>>,
+    merged: bool,
+}
+
+impl DataGraphWalk<'_> {
+    fn visit(
+        &mut self,
+        module_ref: super::ModuleRef<'_>,
+        is_base: bool,
+        depth: usize,
+        supplied: Option<&ModuleCtx<'_>>,
+        import_site: Option<super::ImportSite<'_>>,
+        mem: &mut MemBudget,
+    ) -> Result<Chain, MdsError> {
+        let key = module_ref.key;
+        if let Some(stored) = self.seen.get_mut(key) {
+            let Some(SeenDataScope {
+                chain,
+                labels,
+                merged,
+            }) = stored
+            else {
+                // An already active import edge is not another data scope.
+                // Inheritance needs the complete base chain, so it cannot skip this edge.
+                if is_base {
+                    return Err(MdsError::circular_import(
+                        crate::source_path::display_path_for(self.fs, key),
+                    ));
+                }
+                return Ok(None);
+            };
+            if !is_base && labels.is_none() {
+                *labels = Some(Self::check_scope(
+                    chain,
+                    *merged,
+                    self.runtime,
+                    &mut self.entries,
+                    &mut self.kept,
+                    mem,
+                )?);
+            }
+            return Ok(chain.clone());
+        }
+        if depth >= super::MAX_IMPORT_DEPTH {
+            return Err(MdsError::import_error(format!(
+                "import depth exceeds maximum of {} (possible deep chain)",
+                super::MAX_IMPORT_DEPTH
+            )));
+        }
+        if self.seen.len() > super::MAX_MODULE_COUNT {
+            return Err(crate::error::module_count_exceeded());
+        }
+        mem.charge(
+            Part::Buffers,
+            key.len()
+                .checked_add(2 * size_of::<(String, Option<SeenDataScope>)>()),
+        )?;
+        self.seen.insert(key.to_owned(), None);
+        let mark = mem.mark();
+        let result = self.check_module(module_ref, is_base, depth, supplied, import_site, mem);
+        mem.release_to(mark);
+        let (chain, merged, labels) = result?;
+        *self.seen.get_mut(key).ok_or_else(MdsError::internal)? = Some(SeenDataScope {
+            chain: chain.clone(),
+            labels,
+            merged,
+        });
+        Ok(chain)
+    }
+
+    /// Check one full scope and return its unreplayed winners in declaration order.
+    fn check_scope(
+        chain: &Chain,
+        merged: bool,
+        runtime: &super::VarLayer,
+        entries: &mut usize,
+        kept: &mut usize,
+        mem: &mut MemBudget,
+    ) -> Result<Vec<Unreplayed>, MdsError> {
+        Declarations::with_graph(
+            chain,
+            FrontmatterNames::Preflight { merged },
+            runtime,
+            mem,
+            |count, graph, mem| {
+                count_data_entries(entries, count)?;
+                let mut labels = Vec::new();
+                for node in graph.unreplayed() {
+                    let bytes = node
+                        .module
+                        .len()
+                        .checked_add(node.entry.name.len())
+                        .and_then(|n| n.checked_add(node.position.0.len()))
+                        .and_then(|n| n.checked_add(2 * size_of::<Unreplayed>()));
+                    *kept += mem.charge(Part::Buffers, bytes)?;
+                    labels.push(Unreplayed {
+                        module: node.module.to_owned(),
+                        entry: node.entry.name.clone(),
+                        url: matches!(node.entry.source, crate::data::decl::Source::Url(_)),
+                        key: node.position.0.to_owned(),
+                        ordinal: node.position.1,
+                    });
+                }
+                Ok(labels)
+            },
+        )
+        .map(Option::unwrap_or_default)
+    }
+
+    fn check_module(
+        &mut self,
+        module_ref: super::ModuleRef<'_>,
+        is_base: bool,
+        depth: usize,
+        supplied: Option<&ModuleCtx<'_>>,
+        import_site: Option<super::ImportSite<'_>>,
+        mem: &mut MemBudget,
+    ) -> Result<(Chain, bool, Option<Vec<Unreplayed>>), MdsError> {
+        let key = module_ref.key;
+        // A string-source root comes from the caller. Every other module is
+        // read once here and kept, so the compile pass sees the same bytes.
+        let read;
+        let source = if let Some(ctx) = supplied {
+            ctx.source
+        } else {
+            let text = self.fs.read(key)?;
+            let bytes = text
+                .capacity()
+                .checked_add(key.len())
+                .and_then(|n| n.checked_add(2 * size_of::<(String, Arc<String>)>()));
+            self.kept += mem.charge(Part::Buffers, bytes)?;
+            read = Arc::new(text);
+            self.snapshot
+                .sources
+                .insert(key.to_owned(), Arc::clone(&read));
+            check_module_type(module_ref, &read).map_err(|err| match import_site {
+                Some(site) => site.attach_type_error(err),
+                None => err,
+            })?;
+            read.as_str()
+        };
+        let display = crate::source_path::display_path_for(self.fs, key);
+        let tokens = super::tokenize(source, &display)?;
+        mem.charge(Part::Temp, super::tree_estimate(&tokens, source.len()))?;
+        let module = super::parse_with_ctx(&tokens, &display, source)?;
+        drop(tokens);
+        let (mapping, _) = parse_frontmatter_mapping(module.frontmatter.as_ref(), mem)?;
+        let imports = mapping
+            .as_ref()
+            .and_then(|m| m.get("imports"))
+            .map(parse_frontmatter_imports_from_yaml)
+            .transpose()?
+            .unwrap_or_default();
+        let owned_dir;
+        let dir = if let Some(ctx) = supplied {
+            ctx.base_dir
+        } else {
+            owned_dir = self.fs.parent_dir(key);
+            &owned_dir
+        };
+        let mut follow = |path: &str, base, offset: Option<usize>| {
+            let from = key;
+            let site = offset.map(|offset| super::ImportSite {
+                file_str: &display,
+                source,
+                offset,
+            });
+            let result = (|| {
+                validate_import_path(path)?;
+                let target =
+                    if let Some(target) = self.snapshot.edge(from, path) {
+                        target.to_owned()
+                    } else {
+                        let target = self.fs.normalize_in_dir(dir, path)?;
+                        let bytes =
+                            path.len()
+                                .checked_add(target.len())
+                                .and_then(|n| n.checked_add(from.len()))
+                                .and_then(|n| {
+                                    n.checked_add(2 * size_of::<(String, String)>()
+                            + 2 * size_of::<(String, super::HashMap<String, String>)>())
+                                });
+                        self.kept += mem.charge(Part::Buffers, bytes)?;
+                        self.snapshot
+                            .edges
+                            .entry(from.to_owned())
+                            .or_default()
+                            .insert(path.to_owned(), target.clone());
+                        target
+                    };
+                self.visit(
+                    super::ModuleRef::keyed(&target).typed(path),
+                    base,
+                    depth + 1,
+                    None,
+                    site,
+                    mem,
+                )
+            })();
+            if let Some(offset) = offset {
+                result.map_err(|err| super::attach_import_span(err, path, &display, source, offset))
+            } else {
+                result
+            }
+        };
+        let merged = module.extends.is_some();
+        let base = if !is_base {
+            module
+                .extends
+                .as_ref()
+                .map(|ext| follow(&ext.path, true, Some(ext.offset)))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        for (index, import) in imports.iter().enumerate() {
+            follow(import.path(), false, None)
+                .map_err(|err| super::attach_frontmatter_index(err, index))?;
+        }
+        for node in &module.body {
+            match node {
+                Node::Import(
+                    ImportDirective::Alias { path, offset, .. }
+                    | ImportDirective::Merge { path, offset }
+                    | ImportDirective::Selective { path, offset, .. },
+                )
+                | Node::Export(
+                    ExportDirective::ReExport { path, offset, .. }
+                    | ExportDirective::Wildcard { path, offset },
+                ) => {
+                    follow(path, false, Some(*offset))?;
+                }
+                _ => {}
+            }
+        }
+        let base = if let Some(ext) = module.extends.as_ref().filter(|_| is_base) {
+            follow(&ext.path, true, Some(ext.offset))?
+        } else {
+            base
+        };
+        let mark = mem.mark();
+        let chain = Declarations::extend(
+            &base,
+            DeclarationSite {
+                key,
+                module: &display,
+                dir,
+                is_md: self.fs.is_markdown(key),
+                preflight: true,
+            },
+            mapping.as_ref(),
+            &imports,
+            &module.body,
+            mem,
+        )?;
+        mem.transfer(Part::Temp, Part::Buffers, mem.mark() - mark);
+        let labels = if is_base {
+            None
+        } else {
+            Some(Self::check_scope(
+                &chain,
+                merged,
+                self.runtime,
+                &mut self.entries,
+                &mut self.kept,
+                mem,
+            )?)
+        };
+        Ok((chain, merged, labels))
+    }
+
+    /// Sort by the declaring module (not the merged scope) and deduplicate.
+    fn finish(mut self) -> Result<DataPreflight, MdsError> {
+        let mut unreplayed: Vec<_> = self
+            .seen
+            .values_mut()
+            .flatten()
+            .filter_map(|scope| scope.labels.take())
+            .flatten()
+            .collect();
+        // Each scope check counts its entries against the compile entry cap
+        // before it keeps its labels, so the sort gets at most that many items.
+        crate::data::graph::sort_entries_by_key(&mut unreplayed, |item| {
+            (self.seen.get_index_of(&item.key), item.ordinal)
+        })?;
+        unreplayed.dedup_by(|a, b| a.key == b.key && a.ordinal == b.ordinal);
+        Ok(DataPreflight {
+            snapshot: self.snapshot,
+            unreplayed,
+        })
+    }
+}
 
 /// Warning emitted when `source_map: true` is used with a messages-mode template.
 ///
@@ -26,6 +390,85 @@ type StandalonePrompt<'ctx> = (
 );
 
 impl ModuleCache {
+    /// Check the static data graph of the whole compile before any module
+    /// evaluates. The walk reads module sources only, never a data file.
+    /// `root` supplies the entry bytes and its anchored directory.
+    fn collect_data_preflight(&mut self, root: &ModuleCtx<'_>) -> Result<DataPreflight, MdsError> {
+        if self.resolving.first().map(String::as_str) != Some(root.key) {
+            return Err(MdsError::internal());
+        }
+        let mem = &mut self.budget.mem;
+        let before = mem.buffers;
+        let mut walk = DataGraphWalk {
+            fs: &*self.fs,
+            runtime: root.runtime_vars,
+            seen: indexmap::IndexMap::new(),
+            snapshot: SourceSnapshot::default(),
+            kept: 0,
+            entries: 0,
+        };
+        let result = walk.visit(
+            super::ModuleRef::keyed(root.key).typed(root.file_str),
+            false,
+            0,
+            Some(root),
+            None,
+            mem,
+        );
+        let kept = walk.kept;
+        let result = result.and_then(|_| walk.finish());
+        // The walk bookkeeping goes. The snapshot and the labels stay charged.
+        let spent = mem.buffers - before;
+        let kept = if result.is_ok() { kept } else { 0 };
+        let Some(release) = spent.checked_sub(kept) else {
+            mem.release_buffers(spent);
+            return Err(MdsError::internal());
+        };
+        mem.release_buffers(release);
+        result.map(|mut preflight| {
+            preflight.snapshot.charge = kept;
+            preflight
+        })
+    }
+
+    pub(super) fn prepare_data(
+        &mut self,
+        root: &ModuleCtx<'_>,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), MdsError> {
+        if !self.analyze_data || self.resolving.len() != 1 {
+            return Ok(());
+        }
+        // The walk reads every module before any evaluates, so a fault that it finds
+        // can sit after a fault that the compile meets first. Keep the refusal: the
+        // compile runs on, reports its own first fault, and binds no data.
+        let preflight = match self.collect_data_preflight(root) {
+            Ok(preflight) => preflight,
+            Err(refusal) => {
+                self.graph_refusal = Some(refusal);
+                return Ok(());
+            }
+        };
+        if self.data.compile {
+            let frontier: Vec<_> = preflight.frontier().collect();
+            if !frontier.is_empty() {
+                self.budget.mem.release_buffers(preflight.snapshot.charge);
+                return Err(MdsError::network_denied(&frontier));
+            }
+        } else if preflight.has_pending() {
+            self.data.pending = true;
+            let entries = preflight
+                .unreplayed
+                .iter()
+                .map(|item| crate::error::data_location(&item.module, Some(&item.entry), None))
+                .collect::<Vec<_>>()
+                .join("; ");
+            warnings.push(format!("data pending; output was not evaluated: {entries}"));
+        }
+        self.source_snapshot = Some(preflight.snapshot);
+        Ok(())
+    }
+
     /// Common intrinsic processing: tokenize, parse, build scope, then dispatch on
     /// output shape.
     ///
@@ -116,6 +559,9 @@ impl ModuleCache {
             let mut scope = components.scope.clone();
             Self::validate_extends_components(&components, &mut scope)?;
         }
+        if self.data.pending {
+            return Ok((crate::CompiledOutput::Markdown(String::new()), None));
+        }
 
         let ExtendsComponents {
             mut scope,
@@ -185,17 +631,10 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
         // The parsed tree is dropped once the scope layer is built from it.
-        let (mut scope, fm_imports) = {
+        let (mut scope, fm_imports, _) = {
             let (mapping, spent) =
                 parse_frontmatter_mapping(module.frontmatter.as_ref(), &mut self.budget.mem)?;
-            build_scope_from_frontmatter(
-                module.frontmatter.as_ref(),
-                mapping.as_ref(),
-                spent,
-                is_md,
-                ctx.runtime_vars,
-                &mut self.budget.mem,
-            )?
+            self.build_scope_from_frontmatter(module, mapping.as_ref(), spent, is_md, ctx)?
         };
 
         self.resolve_frontmatter_imports(&fm_imports, &mut scope, ctx, warnings)?;
@@ -210,6 +649,9 @@ impl ModuleCache {
 
         validator::validate(&module.body, &mut scope, ctx.file_str, ctx.source)?;
 
+        if self.data.pending {
+            return Ok((crate::CompiledOutput::Markdown(String::new()), None));
+        }
         if has_message_block(&module.body) {
             // AC-FUNC-07: source_map=true is incompatible with messages-mode templates.
             if opts.source_map {
@@ -408,7 +850,6 @@ impl ModuleCache {
         // module entry keeps the tree.
         let (frontmatter_values, frontmatter_bytes) =
             parse_frontmatter_mapping(module.frontmatter.as_ref(), &mut self.budget.mem)?;
-        self.keep(frontmatter_bytes);
 
         // Branch: child template (@extends) vs. standalone module.
         if let Some(ext) = module.extends.clone() {
@@ -422,10 +863,11 @@ impl ModuleCache {
             );
         }
 
+        self.keep(frontmatter_bytes);
         // ── Standalone (non-extending) path ──────────────────────────────────
         let raw_frontmatter = self.copy_raw_frontmatter(&module)?;
 
-        let (mut scope, defs) = self.standalone_scope(
+        let (mut scope, defs, data_chain) = self.standalone_scope(
             &module,
             frontmatter_values.as_ref(),
             frontmatter_bytes,
@@ -468,6 +910,8 @@ impl ModuleCache {
             skeleton_origin: origin.clone(),
             frontmatter_values,
             frontmatter_bytes,
+            data_chain,
+            data: scope.reaches_data(),
             is_skeleton: false,
         })
     }
@@ -480,15 +924,14 @@ impl ModuleCache {
         ctx: &ModuleCtx<'_>,
         is_md: bool,
         warnings: &mut Vec<String>,
-    ) -> Result<(Scope, CollectedDefs), MdsError> {
+    ) -> Result<(Scope, CollectedDefs, crate::data::resolve::Chain), MdsError> {
         // Build scope from frontmatter + runtime vars; extract any frontmatter imports.
-        let (mut scope, fm_imports) = build_scope_from_frontmatter(
-            module.frontmatter.as_ref(),
+        let (mut scope, fm_imports, data_chain) = self.build_scope_from_frontmatter(
+            module,
             frontmatter_values,
             frontmatter_bytes,
             is_md,
-            ctx.runtime_vars,
-            &mut self.budget.mem,
+            ctx,
         )?;
 
         // Resolve frontmatter imports BEFORE body imports (per spec: frontmatter imports
@@ -508,7 +951,7 @@ impl ModuleCache {
 
         // Validate semantic correctness before evaluation
         validator::validate(&module.body, &mut scope, ctx.file_str, ctx.source)?;
-        Ok((scope, defs))
+        Ok((scope, defs, data_chain))
     }
 
     fn eval_standalone_prompt<'ctx>(
@@ -520,6 +963,9 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<StandalonePrompt<'ctx>, MdsError> {
         let origin = ctx.origin(self)?;
+        if self.data.pending {
+            return Ok((None, None, origin));
+        }
 
         // Evaluate the body to get prompt text (and optionally a FragmentMap).
         //

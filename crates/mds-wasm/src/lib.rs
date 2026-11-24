@@ -58,10 +58,12 @@ const MAX_SOURCE_SIZE: usize = mds::MAX_FILE_SIZE as usize;
 ///
 /// Permits the entry plus 256 other modules. This input-size bound counts unused
 /// entries too. The core separately bounds the resolved graph, including modules
-/// still being resolved.
+/// still being resolved. Data file keys ([`mds::is_data_path`]) are counted apart,
+/// against [`mds::MAX_DATA_FILES`].
 const MAX_MODULE_COUNT: usize = 256 + 1;
 
 /// Maximum aggregate byte size of all module values combined (same as source limit).
+/// Data file values are counted apart, against [`mds::MAX_DATA_BYTES`].
 const MAX_MODULES_AGGREGATE_SIZE: usize = MAX_SOURCE_SIZE;
 
 // ── Defaults ─────────────────────────────────────────────────────────────────
@@ -319,23 +321,36 @@ fn extract_modules(obj: &js_sys::Object) -> Result<HashMap<String, String>, JsVa
 ///
 /// Extracted from the original `parse_modules` to allow reuse by `extract_modules` and
 /// `lint_virtual`.
+///
+/// A key with a data extension ([`mds::is_data_path`]) is a data file: data files have
+/// their own count and byte aggregate (#405), with the napi and Python messages.
 fn parse_modules_from_map(
     mods: serde_json::Map<String, serde_json::Value>,
     field_label: &str,
 ) -> Result<HashMap<String, String>, JsValue> {
-    if mods.len() > MAX_MODULE_COUNT {
+    let data_count = mods.keys().filter(|key| mds::is_data_path(key)).count();
+    let module_count = mods.len() - data_count;
+    if module_count > MAX_MODULE_COUNT {
         return Err(js_error(
             &format!(
-                "{field_label} exceeds maximum module count of {} ({} provided)",
-                MAX_MODULE_COUNT,
-                mods.len()
+                "{field_label} exceeds maximum module count of {MAX_MODULE_COUNT} ({module_count} provided)"
+            ),
+            "mds::resource_limit",
+        ));
+    }
+    if data_count > mds::MAX_DATA_FILES {
+        return Err(js_error(
+            &format!(
+                "{field_label} exceeds maximum data file count of {} ({data_count} provided)",
+                mds::MAX_DATA_FILES
             ),
             "mds::resource_limit",
         ));
     }
 
     let mut result = HashMap::with_capacity(mods.len());
-    let mut aggregate_size: usize = 0;
+    let mut module_bytes: usize = 0;
+    let mut data_bytes: usize = 0;
 
     for (key, val) in mods {
         // A key is caller input, escaped wherever a message names it (#265).
@@ -352,12 +367,16 @@ fn parse_modules_from_map(
                         "mds::resource_limit",
                     ));
                 }
-                aggregate_size = aggregate_size.saturating_add(s.len());
-                if aggregate_size > MAX_MODULES_AGGREGATE_SIZE {
+                let (total, cap, kind) = if mds::is_data_path(&key) {
+                    (&mut data_bytes, mds::MAX_DATA_BYTES, " data")
+                } else {
+                    (&mut module_bytes, MAX_MODULES_AGGREGATE_SIZE, "")
+                };
+                *total = total.saturating_add(s.len());
+                if *total > cap {
                     return Err(js_error(
                         &format!(
-                            "{field_label} aggregate size exceeds maximum of {} bytes",
-                            MAX_MODULES_AGGREGATE_SIZE
+                            "{field_label}{kind} aggregate size exceeds maximum of {cap} bytes"
                         ),
                         "mds::resource_limit",
                     ));
@@ -881,7 +900,11 @@ fn build_canonical_js(result: mds::CompileResult) -> Result<JsValue, JsValue> {
 /// - `source`: MDS template source text.
 /// - `options`: optional configuration object with the following optional fields:
 ///   - `filename` (string, default `"input.mds"`): the entry module key.
-///   - `modules` (`Record<string, string>`): additional virtual modules for import resolution.
+///   - `modules` (`Record<string, string>`): additional virtual modules for import
+///     resolution, and the text of the local data files that `data:` entries name. At
+///     most 257 modules and 10 MiB of module text, and apart from them
+///     [`mds::MAX_DATA_FILES`] data files ([`mds::is_data_path`]) and
+///     [`mds::MAX_DATA_BYTES`] bytes of data text; past a bound is `mds::resource_limit`.
 ///   - `moduleAliases` (`Record<string, string>`): other keys an import may reach a module
 ///     by — the key an import resolves to → the key of the module in `modules` (or
 ///     `filename`) it names ([`mds::VirtualFs::with_aliases`]); each is checked as a module
@@ -895,7 +918,8 @@ fn build_canonical_js(result: mds::CompileResult) -> Result<JsValue, JsValue> {
 /// - Messages: `{ kind: "messages", messages: [{role,content},...], warnings: string[], dependencies: string[] }`
 ///
 /// The inactive payload field is absent — a markdown result has no `messages` key;
-/// a messages result has no `output` key.
+/// a messages result has no `output` key. `dependencies` lists the imported modules,
+/// then the data files that the compile read ([`mds::CompileResult::dependencies`]).
 ///
 /// On failure, throws a JS `Error` with additional properties:
 /// - `code`: diagnostic code (e.g. `"mds::syntax"`)
@@ -1166,6 +1190,11 @@ pub fn scan_imports(source: &str) -> Result<JsValue, JsValue> {
 /// reached as the `@extends` base of another — the base comes after the imports. The
 /// `@extends` base is recorded on its own, even when an import names the same path.
 ///
+/// The records of frontmatter `data:` entries are left out (#405): `@mdscript/mds`'s
+/// WASM backend reads every record as a module, and it does not read data files yet.
+/// So its compile of a template with a local data entry fails with
+/// `mds::module_not_found`, naming the data file.
+///
 /// ## Returns
 ///
 /// An array of `{ path, kind, frontmatterIndex, span }` objects, every key present:
@@ -1201,7 +1230,11 @@ pub fn scan_import_records(source: &str, as_base: bool) -> Result<JsValue, JsVal
         };
         let records = mds::scan_import_records(&source, resolve_as).map_err(mds_error_to_js)?;
         let array = js_sys::Array::new();
-        for record in &records {
+        // The JS walker of `@mdscript/mds` reads each record as a module: a data record
+        // would make it read a data file as a module. Leaving data records out keeps a
+        // data entry fail-closed, refused by the compile with `mds::module_not_found`.
+        // PR 1-ts of #405 removes this filter when the walker reads data files.
+        for record in records.iter().filter(|r| r.kind != mds::ImportKind::Data) {
             let obj = js_sys::Object::new();
             set_prop(&obj, "path", &JsValue::from_str(&record.path));
             set_prop(&obj, "kind", &JsValue::from_str(record.kind.name()));
@@ -1276,5 +1309,43 @@ pub fn preflight_module(bytes: Vec<u8>, display: &str, typed: &str) -> Result<St
         let module = mds::ModuleRef::keyed(&display).typed(&typed);
         mds::check_module_type(module, &source).map_err(mds_error_to_js)?;
         Ok(source)
+    }))
+}
+
+/// Check the bytes of a local data file as the native backend checks the data files it
+/// reads, and return its text (#405).
+///
+/// The bytes check of [`preflight_module`] ([`mds::check_module_bytes`]): more than
+/// 10 MiB is `mds::resource_limit`
+/// (`file too large (<n> bytes, max 10485760 bytes): <display>`), and bytes that are not
+/// valid UTF-8 are `mds::io` (`invalid UTF-8 in <display>: <reason>`). No file type check
+/// runs: a data file is not an MDS file. The compile parses the text.
+///
+/// ## Arguments
+///
+/// - `bytes`: the file's content; a caller bounds what it passes, as for
+///   [`preflight_module`].
+/// - `display`: the file's path below the project root, in its on-disk spelling. It
+///   names the file in an error, escaped.
+///
+/// ## Returns
+///
+/// The file's text. On failure, throws a JS `Error` with the same structure as
+/// [`compile`].
+///
+/// ## Example (JavaScript)
+///
+/// ```js
+/// const bytes = new TextEncoder().encode('{"name": "Ada"}\n');
+/// const text = preflightData(bytes, 'cfg.json');
+/// console.log(text); // '{"name": "Ada"}\n'
+/// ```
+#[wasm_bindgen(js_name = "preflightData")]
+pub fn preflight_data(bytes: Vec<u8>, display: &str) -> Result<String, JsValue> {
+    // Owned String required so the closure satisfies UnwindSafe.
+    let display = display.to_string();
+
+    catch_panic(AssertUnwindSafe(move || {
+        mds::check_module_bytes(bytes, &display).map_err(mds_error_to_js)
     }))
 }

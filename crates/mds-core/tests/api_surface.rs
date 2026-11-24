@@ -453,6 +453,9 @@ fn mds_error_variants_exist() {
         | MdsError::NotMdsFile { .. }
         | MdsError::Io { .. }
         | MdsError::ResourceLimit { .. }
+        | MdsError::Data { .. }
+        | MdsError::NetworkDenied { .. }
+        | MdsError::DataFileNotFound { .. }
         | MdsError::YamlError { .. }
         | MdsError::JsonError { .. }
         | MdsError::Recursion { .. }
@@ -462,6 +465,30 @@ fn mds_error_variants_exist() {
         | MdsError::Internal => {}
         _ => {}
     }
+}
+
+/// The data error variants are `#[non_exhaustive]`, so an external crate builds each
+/// one with its named constructor. A data file miss has the code of a module miss, and
+/// its constructor escapes the key for the message.
+#[test]
+fn data_error_variants_have_named_constructors() {
+    let constructor: fn(&str) -> MdsError = MdsError::data_file_not_found;
+    let err = constructor("cfg.json");
+    assert!(matches!(err, MdsError::DataFileNotFound { .. }), "{err:?}");
+    assert_eq!(err.serialize().code, "mds::module_not_found");
+    assert_eq!(
+        err.to_string(),
+        "data file 'cfg.json' is not in the virtual module map"
+    );
+    let key = "a\x1b\n.json";
+    assert!(key.contains(char::from(0x1b)) && key.contains('\n'));
+    assert_eq!(
+        constructor(key).to_string(),
+        "data file 'a\\u001B\\u000A.json' is not in the virtual module map"
+    );
+    type DataFn = fn(&str, Option<&str>, Option<&str>, &str, Option<String>) -> MdsError;
+    let _: DataFn = MdsError::data;
+    let _: fn(&[(&str, &str)]) -> MdsError = MdsError::network_denied;
 }
 
 #[test]
@@ -611,8 +638,46 @@ fn mds_error_is_string_source() {
 fn constants_have_expected_values() {
     assert_eq!(MAX_FILE_SIZE, 10 * 1024 * 1024);
     assert_eq!(mds::MAX_MODULE_ALIASES, 65_536);
+    assert_eq!(mds::MAX_DATA_FILES, 256);
+    assert_eq!(mds::MAX_DATA_BYTES, 32 * 1024 * 1024);
+    assert_eq!(mds::MAX_DATA_REFS_PER_ENTRY, 256);
     const _: () = assert!(MAX_TRAVERSAL_DEPTH > 0);
     const _: () = assert!(MAX_TRAVERSAL_DEPTH <= 1000);
+}
+
+/// The bindings count the data files of a virtual map apart from its modules by the
+/// exact extension of each key: the extensions a `data:` entry may name (#405).
+#[test]
+fn data_paths_are_named_by_their_exact_extension() {
+    for path in ["a.json", "sub/a.yaml", "a.yml", "./x/a.b.json"] {
+        assert!(mds::is_data_path(path), "{path}");
+    }
+    for path in [
+        "a.mds",
+        "a.md",
+        "a.JSON",
+        "a.Yml",
+        "a.json.mds",
+        "a.jsonl",
+        "a.txt",
+    ] {
+        assert!(!mds::is_data_path(path), "{path}");
+    }
+    // The extension rule of the `data:` declaration is the same rule: a `.JSON` entry is
+    // refused as it is declared.
+    let fs = VirtualFs::new(HashMap::from([
+        (
+            "main.mds".to_owned(),
+            "---\ndata:\n  cfg: ./cfg.JSON\n---\n{{cfg}}\n".to_owned(),
+        ),
+        ("cfg.JSON".to_owned(), "1".to_owned()),
+    ]));
+    let err =
+        mds::compile_virtual_fs(fs, "main.mds", None, mds::CompileOptions::default()).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "import error: data path \"./cfg.JSON\": expected the .json, .yaml or .yml extension"
+    );
 }
 
 #[test]
@@ -1046,6 +1111,88 @@ fn dependencies_are_the_canonical_paths_off_windows() {
     for (api, deps) in native_dependency_lists(&main) {
         assert_eq!(deps, [lib.to_str().unwrap()], "{api}");
     }
+}
+
+/// A native compile lists its data files after its modules, as absolute paths of the
+/// files that it read, on every native entry point.
+#[test]
+fn native_dependencies_list_data_files_after_modules() {
+    let (guard, main, lib) = project_with_one_import();
+    std::fs::write(
+        &main,
+        "---\ndata:\n  item: ./data/item.json\n---\n@import \"./lib.mds\" as lib\n{{lib.hi()}} {{item}}\n",
+    )
+    .unwrap();
+    std::fs::create_dir(guard.path().join("data")).unwrap();
+    std::fs::write(guard.path().join("data/item.json"), "7").unwrap();
+    let item = std::fs::canonicalize(guard.path().join("data/item.json")).unwrap();
+    for (api, deps) in native_dependency_lists(&main) {
+        for dep in &deps {
+            assert!(Path::new(dep).is_absolute(), "{api}: {dep}");
+            assert!(!dep.starts_with(r"\\?\"), "{api}: {dep}");
+        }
+        let named: Vec<_> = deps
+            .iter()
+            .map(|dep| std::fs::canonicalize(dep).unwrap())
+            .collect();
+        assert_eq!(named, [lib.clone(), item.clone()], "{api}");
+    }
+}
+
+/// `scan_imports` lists modules only. `scan_import_records` lists each local data
+/// file of the frontmatter `data:` mapping as a separate `data` record after the
+/// module records, with no span and no frontmatter index. A data path that an
+/// import also names keeps both records.
+#[test]
+fn scan_import_records_list_local_data_files_as_a_separate_kind() {
+    let source = concat!(
+        "---\n",
+        "imports:\n  - path: ./lib.mds\n    as: lib\n",
+        "data:\n",
+        "  item: ./item.json\n",
+        "  again: ./item.json\n",
+        "  remote: https://example.com/data.json\n",
+        "  other: ../shared/other.yml\n",
+        "  odd: ./lib.mds\n",
+        "---\n",
+        "@extends \"./base.mds\"\n",
+        "@import \"./part.mds\" as part\n",
+    );
+    let rows = |resolve_as| -> Vec<(String, &'static str)> {
+        mds::scan_import_records(source, resolve_as)
+            .expect("the source scans")
+            .into_iter()
+            .map(|record| {
+                if record.kind.name() == "data" {
+                    assert_eq!(record.frontmatter_index, None, "{record:?}");
+                    assert_eq!(record.span, None, "{record:?}");
+                }
+                (record.path, record.kind.name())
+            })
+            .collect()
+    };
+    let data = [
+        ("./item.json".to_owned(), "data"),
+        ("../shared/other.yml".to_owned(), "data"),
+        ("./lib.mds".to_owned(), "data"),
+    ];
+    let modules = [
+        ("./lib.mds".to_owned(), "frontmatter"),
+        ("./part.mds".to_owned(), "import"),
+    ];
+    let base = ("./base.mds".to_owned(), "extends");
+    let standalone: Vec<_> = [base.clone()]
+        .into_iter()
+        .chain(modules.clone())
+        .chain(data.clone())
+        .collect();
+    assert_eq!(rows(mds::ResolveAs::Standalone), standalone);
+    let as_base: Vec<_> = modules.into_iter().chain([base]).chain(data).collect();
+    assert_eq!(rows(mds::ResolveAs::Base), as_base);
+    assert_eq!(
+        mds::scan_imports(source).expect("the source scans"),
+        ["./base.mds", "./lib.mds", "./part.mds"]
+    );
 }
 
 #[test]

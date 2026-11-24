@@ -2198,6 +2198,198 @@ describe('virtual map entry limit', () => {
       });
     });
   }
+
+  /** Assert that lintVirtual refuses `modules` with `mds::resource_limit` and `message`. */
+  const assertMapRefused = (modules, message) => {
+    assert.throws(() => lintVirtual(modules, 'm0.mds'), (err) => {
+      assert.equal(err.code, 'mds::resource_limit');
+      assert.equal(err.message, message);
+      return true;
+    });
+  };
+
+  // #405: the entry and 256 modules, and apart from them 256 data files — keys with the
+  // exact extension .json, .yaml or .yml. The messages are the WASM and Python ones.
+  test('lintVirtual counts modules and data files apart (#405)', () => {
+    const modules = Object.fromEntries(
+      Array.from({ length: 257 }, (_, i) => [`m${i}.mds`, 'Body\n']),
+    );
+    for (let i = 0; i < 256; i++) modules[`d${i}.${['json', 'yaml', 'yml'][i % 3]}`] = '1';
+    assert.ok(Array.isArray(lintVirtual(modules, 'm0.mds').files));
+    assertMapRefused(
+      { ...modules, 'd256.json': '1' },
+      'modules exceeds maximum data file count of 256 (257 provided)',
+    );
+    const moduleCount = 'modules exceeds maximum module count of 257 (258 provided)';
+    assertMapRefused({ ...modules, 'unused.mds': 'Body\n' }, moduleCount);
+    // The extension is compared exactly: a .JSON key is a module key.
+    assertMapRefused({ ...modules, 'D.JSON': '1' }, moduleCount);
+  });
+
+  test('lintVirtual bounds module and data bytes apart (#405)', () => {
+    const MIB = 1024 * 1024;
+    const modules = { 'm0.mds': 'OK\n', 'big.mds': 'x'.repeat(10 * MIB - 3) };
+    for (let i = 0; i < 4; i++) modules[`d${i}.json`] = 'x'.repeat(8 * MIB);
+    assert.ok(Array.isArray(lintVirtual(modules, 'm0.mds').files));
+    assertMapRefused(
+      { ...modules, 'd0.json': 'x'.repeat(8 * MIB + 1) },
+      'modules data aggregate size exceeds maximum of 33554432 bytes',
+    );
+    assertMapRefused(
+      { ...modules, 'big.mds': 'x'.repeat(10 * MIB - 2) },
+      'modules aggregate size exceeds maximum of 10485760 bytes',
+    );
+  });
+});
+
+// ── Local data (#405) ─────────────────────────────────────────────────────────
+
+describe('local data (#405)', () => {
+  /** Write `files` into a new project directory, run `fn(dir)`, then remove the directory. */
+  const inProject = (files, fn) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-napi-data-'));
+    try {
+      fs.writeFileSync(path.join(dir, '.mdsroot'), '');
+      for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), text);
+      return fn(dir);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  // The fixture of the WASM test `compile_binds_json_and_yaml_data_from_the_modules_map`.
+  const DATA_FIXTURE =
+    '---\ndata:\n  cfg: ./cfg.json\n  list: ./list.yaml\n  more: ./more.yml\n---\n' +
+    '{{cfg.name}}: {{list.count}} {{more.unit}}\n';
+  const MARKER = './fixture-marker.yml';
+
+  test('D-1: compile and compileFile bind .json, .yaml and .yml data to the same output', () => {
+    const files = {
+      'main.mds': DATA_FIXTURE,
+      'cfg.json': '{"name": "Ada"}\n',
+      'list.yaml': 'count: 3\n',
+      'more.yml': 'unit: items\n',
+    };
+    inProject(files, (dir) => {
+      const fromString = compile(DATA_FIXTURE, { basePath: dir });
+      const fromFile = compileFile(path.join(dir, 'main.mds'));
+      assert.equal(fromString.output, 'Ada: 3 items\n');
+      assert.equal(fromFile.output, fromString.output);
+      const names = (result) => result.dependencies.map((d) => path.basename(d));
+      assert.deepEqual(names(fromFile), ['cfg.json', 'list.yaml', 'more.yml']);
+      assert.deepEqual(names(fromString), names(fromFile));
+    });
+  });
+
+  test('D-2: a data header is absent from output in every plain form', () => {
+    const info = `info: ${MARKER}`;
+    const forms = [
+      [`data:\n  local: ${MARKER}`, ''],
+      [`data:\n# Data comment\n  local: ${MARKER}`, '# Data comment\n'],
+      [`data: {local: ${MARKER}}`, ''],
+    ];
+    inProject({ 'fixture-marker.yml': 'Local' }, (dir) => {
+      for (const [header, kept] of forms) {
+        const source = `---\n${header}\n${info}\n---\n{{local}}\n`;
+        // Control: the marker under the key `info` stays.
+        assert.equal(compile(source, { basePath: dir }).output, `---\n${kept}${info}\n---\nLocal\n`, header);
+      }
+    });
+  });
+
+  test('D-3: a quoted or flow data key fails with the fixed form message', () => {
+    inProject({ 'fixture-marker.yml': 'Local' }, (dir) => {
+      // Control: a quoted `info` key compiles and stays.
+      const control = `---\n'info': {local: ${MARKER}}\n---\nBody\n`;
+      assert.equal(compile(control, { basePath: dir }).output, control);
+      for (const header of [`'data': {local: ${MARKER}}`, `{data: {local: ${MARKER}}}`]) {
+        assert.throws(() => compile(`---\n${header}\n---\nBody\n`, { basePath: dir }), (err) => {
+          assert.equal(err.code, 'mds::yaml', header);
+          assert.equal(err.message, 'YAML parse error: write `data:` at the start of a line', header);
+          return true;
+        });
+      }
+    });
+  });
+
+  // Text that no data parser accepts: a read of it fails with mds::yaml.
+  const BAD_DATA = '[';
+
+  /** Assert that `fn` throws `mds::yaml` with a message that holds `needle`. */
+  const assertDataReadFails = (fn, needle) => {
+    assert.throws(fn, (err) => {
+      assert.equal(err.code, 'mds::yaml', err.message);
+      assert.ok(err.message.includes(needle), err.message);
+      return true;
+    });
+  };
+
+  test('D-4: a runtime var with the entry name replays the entry and reads no file', () => {
+    const source = '---\ndata:\n  title: ./title.json\n---\nTitle: {{title}}\n';
+    inProject({ 'main.mds': source, 'title.json': BAD_DATA }, (dir) => {
+      const replay = { vars: { title: 'Replayed' } };
+      for (const result of [
+        compile(source, { basePath: dir, ...replay }),
+        compileFile(path.join(dir, 'main.mds'), replay),
+      ]) {
+        assert.equal(result.output, 'Title: Replayed\n');
+        assert.deepEqual(result.dependencies, []);
+      }
+      // Control: with no replay, the compile reads the file and fails.
+      const needle = 'data file "title.json", entry "title"';
+      assertDataReadFails(() => compile(source, { basePath: dir }), needle);
+      assertDataReadFails(() => compileFile(path.join(dir, 'main.mds')), needle);
+    });
+  });
+
+  test('D-5: a runtime var named data defines no entry and reads no file', () => {
+    inProject({ 'bad.json': BAD_DATA }, (dir) => {
+      const result = compile('{{data.cfg}}\n', {
+        basePath: dir,
+        vars: { data: { cfg: './bad.json' } },
+      });
+      assert.equal(result.output, './bad.json\n');
+      assert.deepEqual(result.dependencies, []);
+      // Control: the same entry in frontmatter reads the file and fails.
+      const entry = '---\ndata:\n  cfg: ./bad.json\n---\n{{cfg}}\n';
+      assertDataReadFails(() => compile(entry, { basePath: dir }), 'data file "bad.json"');
+    });
+  });
+
+  // bad.yml does not parse and absent.json does not exist: a read of either fails.
+  const PENDING =
+    '---\ndata:\n  rows: ./bad.yml\n  other: ./absent.json\n---\n' +
+    '@for row in rows:\n{{row.name}}\n@end\n{{other}}\n';
+  const PENDING_FILES = { 'main.mds': PENDING, 'bad.yml': BAD_DATA };
+
+  test('D-6: check, checkFile, lint, lintFile and lintVirtual read no data file', () => {
+    inProject(PENDING_FILES, (dir) => {
+      const main = path.join(dir, 'main.mds');
+      for (const result of [check(PENDING, { basePath: dir }), checkFile(main)]) {
+        assert.equal(result.warnings.length, 1, JSON.stringify(result.warnings));
+        const [warning] = result.warnings;
+        assert.ok(warning.startsWith('data pending; output was not evaluated: '), warning);
+        assert.ok(warning.includes('entry "rows"') && warning.includes('entry "other"'), warning);
+      }
+      for (const result of [
+        lint(PENDING, { basePath: dir }),
+        lintFile(main),
+        lintVirtual(PENDING_FILES, 'main.mds'),
+      ]) {
+        assert.equal(result.version, 1);
+        assert.deepEqual(result.files.flatMap((f) => f.diagnostics), []);
+      }
+      // Controls: the compile calls read bad.yml and fail with mds::yaml, and a
+      // misspelled name that is not an entry still fails the check.
+      const needle = 'data file "bad.yml", entry "rows"';
+      assertDataReadFails(() => compile(PENDING, { basePath: dir }), needle);
+      assertDataReadFails(() => compileFile(main), needle);
+      const typo = PENDING.replace('{{other}}', '{{typo}}');
+      assert.throws(() => check(typo, { basePath: dir }), (err) => {
+        assert.equal(err.code, 'mds::undefined_var', err.message);
+        return true;
+      });
+    });
+  });
 });
 
 describe('resource limits', () => {

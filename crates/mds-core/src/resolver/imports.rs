@@ -4,7 +4,7 @@ use super::{
     attach_frontmatter_index, attach_import_span, collect_block, collect_define,
     count_module_defines, line_len_at, validate_import_path, Arc, CollectedDefs, ExportDirective,
     FrontmatterImport, HashMap, HashSet, ImportDirective, ImportSite, MdsError, ModuleCache,
-    ModuleCtx, ModuleRef, Node, ResolvedModule, Scope, VarLayer,
+    ModuleCtx, ModuleRef, Node, ResolvedModule, Scope,
 };
 
 impl ModuleCache {
@@ -15,19 +15,35 @@ impl ModuleCache {
     /// [`ModuleCache::resolve_by_key`], which names the module by `relative` as written.
     fn resolve_import_from(
         &mut self,
-        base_dir: &str,
+        ctx: &ModuleCtx<'_>,
         relative: &str,
-        runtime_vars: &Arc<VarLayer>,
         import_site: Option<ImportSite<'_>>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
         validate_import_path(relative)?;
-        let key = self.fs.normalize_in_dir(base_dir, relative)?;
+        let key = self.normalize_module_edge(ctx, relative)?;
         let module = ModuleRef {
             key: &key,
             typed: relative,
         };
-        self.resolve_by_key(module, runtime_vars, import_site, warnings)
+        self.resolve_by_key(module, ctx.runtime_vars, import_site, warnings)
+    }
+
+    /// Bind an exported prompt, or declare its type unknown if output is pending.
+    fn import_prompt(&self, resolved: &ResolvedModule, scope: &mut Scope) -> bool {
+        if let Some(prompt) = resolved.shared_prompt_value() {
+            scope.set_var_shared("prompt", prompt);
+            if resolved.data {
+                // Imports bind the global frame, so its variables can now hold data.
+                scope.mark_frame_data();
+            }
+            true
+        } else if self.data.pending && resolved.is_exported("prompt") {
+            scope.mark_pending_prompt();
+            true
+        } else {
+            false
+        }
     }
 
     /// Walk the AST body and collect `@define` functions (with closure capture),
@@ -94,13 +110,7 @@ impl ModuleCache {
                 // Note: resolve_import_from calls validate_import_path internally,
                 // so path validation errors surface with correct messages automatically.
                 let source_module = self
-                    .resolve_import_from(
-                        ctx.base_dir,
-                        import_path,
-                        ctx.runtime_vars,
-                        Some(ctx.import_site(*offset)),
-                        warnings,
-                    )
+                    .resolve_import_from(ctx, import_path, Some(ctx.import_site(*offset)), warnings)
                     .map_err(|e| {
                         attach_import_span(e, import_path, ctx.file_str, ctx.source, *offset)
                     })?;
@@ -121,13 +131,7 @@ impl ModuleCache {
                 // Note: resolve_import_from calls validate_import_path internally,
                 // so path validation errors surface with correct messages automatically.
                 let source_module = self
-                    .resolve_import_from(
-                        ctx.base_dir,
-                        import_path,
-                        ctx.runtime_vars,
-                        Some(ctx.import_site(*offset)),
-                        warnings,
-                    )
+                    .resolve_import_from(ctx, import_path, Some(ctx.import_site(*offset)), warnings)
                     .map_err(|e| {
                         attach_import_span(e, import_path, ctx.file_str, ctx.source, *offset)
                     })?;
@@ -169,13 +173,7 @@ impl ModuleCache {
             ));
         }
         let resolved = self
-            .resolve_import_from(
-                ctx.base_dir,
-                path,
-                ctx.runtime_vars,
-                Some(ctx.import_site(offset)),
-                warnings,
-            )
+            .resolve_import_from(ctx, path, Some(ctx.import_site(offset)), warnings)
             .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
         scope.set_namespace(alias, resolved.shared_namespace());
         Ok(())
@@ -197,13 +195,13 @@ impl ModuleCache {
                         return Err(MdsError::name_collision(alias.to_string()));
                     }
                     let resolved = self
-                        .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, None, warnings)
+                        .resolve_import_from(ctx, path, None, warnings)
                         .map_err(|e| attach_frontmatter_index(e, i))?;
                     scope.set_namespace(alias, resolved.shared_namespace());
                 }
                 FrontmatterImport::Merge { path } => {
                     let resolved = self
-                        .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, None, warnings)
+                        .resolve_import_from(ctx, path, None, warnings)
                         .map_err(|e| attach_frontmatter_index(e, i))?;
                     for (name, func) in resolved.get_all_exports() {
                         if scope.get_function(&name).is_some() {
@@ -211,13 +209,11 @@ impl ModuleCache {
                         }
                         scope.set_function(&name, func);
                     }
-                    if let Some(val) = resolved.shared_prompt_value() {
-                        scope.set_var_shared("prompt", val);
-                    }
+                    self.import_prompt(&resolved, scope);
                 }
                 FrontmatterImport::Selective { path, names } => {
                     let resolved = self
-                        .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, None, warnings)
+                        .resolve_import_from(ctx, path, None, warnings)
                         .map_err(|e| attach_frontmatter_index(e, i))?;
                     let not_exported = |name: &str| {
                         MdsError::import_error(format!(
@@ -226,12 +222,9 @@ impl ModuleCache {
                     };
                     for name in names {
                         if name == "prompt" {
-                            scope.set_var_shared(
-                                "prompt",
-                                resolved
-                                    .shared_prompt_value()
-                                    .ok_or_else(|| not_exported(name))?,
-                            );
+                            if !self.import_prompt(&resolved, scope) {
+                                return Err(not_exported(name));
+                            }
                         } else {
                             scope.set_function(
                                 name,
@@ -256,13 +249,7 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<(), MdsError> {
         let resolved = self
-            .resolve_import_from(
-                ctx.base_dir,
-                path,
-                ctx.runtime_vars,
-                Some(ctx.import_site(offset)),
-                warnings,
-            )
+            .resolve_import_from(ctx, path, Some(ctx.import_site(offset)), warnings)
             .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
         // Per spec: only functions and the prompt body are imported via merge.
         // Frontmatter variables from the imported module are NOT brought into scope.
@@ -279,9 +266,7 @@ impl ModuleCache {
             }
             scope.set_function(&name, func);
         }
-        if let Some(val) = resolved.shared_prompt_value() {
-            scope.set_var_shared("prompt", val);
-        }
+        self.import_prompt(&resolved, scope);
         Ok(())
     }
 
@@ -295,13 +280,7 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<(), MdsError> {
         let resolved = self
-            .resolve_import_from(
-                ctx.base_dir,
-                path,
-                ctx.runtime_vars,
-                Some(ctx.import_site(offset)),
-                warnings,
-            )
+            .resolve_import_from(ctx, path, Some(ctx.import_site(offset)), warnings)
             .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
         let line_len = line_len_at(ctx.source, offset);
         let not_exported = |name: &str| {
@@ -315,12 +294,9 @@ impl ModuleCache {
         };
         for name in names {
             if name == "prompt" {
-                scope.set_var_shared(
-                    "prompt",
-                    resolved
-                        .shared_prompt_value()
-                        .ok_or_else(|| not_exported(name))?,
-                );
+                if !self.import_prompt(&resolved, scope) {
+                    return Err(not_exported(name));
+                }
             } else {
                 scope.set_function(
                     name,

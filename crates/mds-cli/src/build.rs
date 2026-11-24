@@ -42,8 +42,8 @@ pub(crate) use vars::{
 ///
 /// Exit codes:
 /// - 0: success (never returned here — handled by happy path)
-/// - 1: logical/syntax error (undefined variable, arity mismatch, recursion, etc.)
-/// - 2: I/O or file-system error (file not found, not an MDS file, I/O failure)
+/// - 1: logical or syntax error (invalid data, undefined variable, arity mismatch, recursion)
+/// - 2: I/O error, file-system error, or denied network access
 /// - 3: resource limit exceeded (output too large, too many iterations)
 /// - 101: internal compiler error
 ///
@@ -61,14 +61,17 @@ pub(crate) fn exit_code(err: &miette::Error) -> i32 {
     });
     if let Some(mds_err) = mds_err {
         match mds_err {
-            MdsError::Io { .. } | MdsError::FileNotFound { .. } | MdsError::NotMdsFile { .. } => 2,
+            MdsError::Io { .. }
+            | MdsError::FileNotFound { .. }
+            | MdsError::NotMdsFile { .. }
+            | MdsError::NetworkDenied { .. } => 2,
             MdsError::ResourceLimit { .. } => 3,
             MdsError::Internal => crate::output::PANIC_EXIT,
             // R4: --set/--set-string collision is a usage error over runtime
             // VARIABLES — the logical/content error class (exit 1).  Explicit
             // arm so the classification is a decision, not an accident of the
             // fall-through below.
-            MdsError::VarConflict { .. } => 1,
+            MdsError::VarConflict { .. } | MdsError::Data { .. } => 1,
             _ => 1,
         }
     } else {
@@ -422,6 +425,22 @@ fn run_build_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_code_distinguishes_data_network_and_limit_failures() {
+        let errors = [
+            (
+                MdsError::data("main.mds", None, None, "expected a mapping", None),
+                1,
+            ),
+            (MdsError::network_denied(&[("main.mds", "entries")]), 2),
+            (mds::module_count_exceeded(), 3),
+        ];
+        for (error, expected) in errors {
+            let code = error.serialize().code;
+            assert_eq!(exit_code(&miette::Report::new(error)), expected, "{code}");
+        }
+    }
 
     #[test]
     fn exit_code_maps_internal_failures_to_101() {

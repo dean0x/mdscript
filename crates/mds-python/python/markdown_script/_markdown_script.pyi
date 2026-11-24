@@ -92,7 +92,15 @@ class CompileResult:
     @property
     def warnings(self) -> list[str]: ...
     @property
-    def dependencies(self) -> list[str]: ...
+    def dependencies(self) -> list[str]:
+        """The files that the compile read, without the entry.
+
+        First the imported modules, in depth-first resolution order. Then the local
+        data files that ``data:`` entries name, in first-read order. Each file occurs
+        once. An entry that a ``vars`` value replaces reads no file, so it adds
+        nothing. :func:`compile_virtual` gives the keys of ``modules``; the other
+        compile functions give absolute paths.
+        """
     @property
     def source_map(self) -> dict[str, Any] | None: ...
     def __new__(cls, canonical: Mapping[str, Any]) -> CompileResult: ...
@@ -229,7 +237,17 @@ def compile_virtual(
     vars: _Vars | None = ...,
     source_map: bool = ...,
     sources_content: bool = ...,
-) -> CompileResult: ...
+) -> CompileResult:
+    """Compile ``entry`` from the in-memory files of ``modules``.
+
+    ``modules`` maps a key to the text of a module or of a local data file. A key
+    that ends in ``.json``, ``.yaml`` or ``.yml`` (exact, lower case) is a data file;
+    every other key is a module. The two kinds have separate bounds: at most 257
+    module keys (the entry included) and 10 MiB of module text, and at most 256
+    data files and 32 MiB of data text. Each value is at most 10 MiB. A map past a
+    bound raises ``MdsError(code="mds::resource_limit")``.
+    """
+    ...
 def check(
     source: str,
     *,
@@ -252,7 +270,13 @@ def check_virtual(
     entry: str,
     *,
     vars: _Vars | None = ...,
-) -> CheckResult: ...
+) -> CheckResult:
+    """Validate ``entry`` from ``modules``, with the bounds of :func:`compile_virtual`.
+
+    No check reads a data file. A template with a ``data:`` entry that no ``vars``
+    value replaces is not evaluated, and gives one warning that names the entries.
+    """
+    ...
 def scan_imports(source: str, /) -> list[str]: ...
 def lint(
     source: str,
@@ -273,4 +297,9 @@ def lint_virtual(
     *,
     vars: _Vars | None = ...,
     rules: Mapping[str, str] | None = ...,
-) -> LintResult: ...
+) -> LintResult:
+    """Lint ``entry`` from ``modules``, with the bounds of :func:`compile_virtual`.
+
+    No lint reads a data file.
+    """
+    ...

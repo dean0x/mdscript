@@ -73,13 +73,6 @@ fn parse_fm_import_empty_array() {
 }
 
 #[test]
-fn parse_fm_no_imports_key() {
-    let result =
-        parse_frontmatter_imports("name: Alice\ngreeting: hello\n").expect("no imports key");
-    assert!(result.is_empty());
-}
-
-#[test]
 fn parse_fm_err_missing_path() {
     let v = yaml("- as: lib\n");
     let err = parse_frontmatter_imports_from_yaml(&v).expect_err("missing path should fail");
@@ -814,7 +807,10 @@ fn runtime_layer_is_shared_by_module_scopes() {
     let (first, _) =
         build_scope_from_frontmatter(None, None, 0, false, &vars, &mut MemBudget::default())
             .unwrap();
-    let inherited = build_scope_from_merged_mapping(&serde_yaml_ng::Mapping::new(), &vars).unwrap();
+    let inherited = Scope::with_layers(
+        Arc::clone(&vars),
+        Arc::new(merged_frontmatter_layer(&serde_yaml_ng::Mapping::new()).unwrap()),
+    );
     assert!(Arc::ptr_eq(
         first.get_slot("x").unwrap().root(),
         inherited.get_slot("x").unwrap().root()
@@ -6490,7 +6486,7 @@ fn the_extends_scope_layer_is_charged_with_the_merge_charge() {
     let (child, child_bytes) = parsed_mapping("b: 2\n");
     let vars = Arc::default();
     let ctx = extends_ctx("", &vars);
-    let (scope, merged, charge) = cache
+    let result = cache
         .build_merged_extends_scope(
             &base,
             &Some(child),
@@ -6500,8 +6496,9 @@ fn the_extends_scope_layer_is_charged_with_the_merge_charge() {
             &mut vec![],
         )
         .unwrap();
-    assert_eq!(merged.len(), 2);
-    assert!(scope.get_slot("b").is_some());
+    assert_eq!(result.mapping.len(), 2);
+    assert!(result.scope.get_slot("b").is_some());
+    let charge = result.charge;
     // The merged mapping and the scope layer each hold the merge charge.
     assert_eq!(charge, base.frontmatter_bytes + child_bytes);
     assert_eq!(cache.budget.mem.mark(), 2 * charge);
@@ -6825,7 +6822,7 @@ fn each_entry_kind_holds_the_tree_estimate_in_its_own_budget_part() {
     let root = "@import \"./part.mds\" as part\nroot\n";
     let files = [("main.mds", root), ("part.mds", part)];
     let part_kept = kept_bytes(part, "part.mds", part);
-    let root_kept = kept_bytes(root, "main.mds", "root\n");
+    let root_kept = kept_bytes(root, "main.mds", "root\n") + data_alias_bytes("main.mds", "part");
     let vars = HashMap::new();
 
     // The intrinsic entry holds its tree as a temporary while its import resolves.
@@ -6858,6 +6855,15 @@ fn each_entry_kind_holds_the_tree_estimate_in_its_own_budget_part() {
 /// key, its origin counts, its prompt `body` and its tree estimate.
 fn kept_bytes(source: &str, key: &str, body: &str) -> usize {
     source.len() + 2 * key.len() + 6 * size_of::<usize>() + body.len() + tree_of(source)
+}
+
+// The alias name and its declaration site stay live for future extends scopes.
+fn data_alias_bytes(key: &str, alias: &str) -> usize {
+    size_of::<crate::data::resolve::Declarations>()
+        + 2 * size_of::<usize>()
+        + 2 * size_of::<String>()
+        + alias.len()
+        + 2 * key.len()
 }
 
 type VarsEntry = fn(&mut ModuleCache, &str, &HashMap<String, Value>) -> Result<(), MdsError>;
@@ -7008,8 +7014,9 @@ fn a_reused_cache_retains_kept_bytes_and_never_the_caller_layer() {
     let mut cache = virtual_cache(&[IMPORT_FILES[0], IMPORT_FILES[1], ("other.mds", other)]);
     let vars = caller_vars();
     let layer = runtime_layer(&vars).bytes().unwrap();
-    let main_kept =
-        kept_bytes("part\n", "part.mds", "part\n") + kept_bytes(IMPORT_ROOT, "main.mds", "root\n");
+    let main_kept = kept_bytes("part\n", "part.mds", "part\n")
+        + kept_bytes(IMPORT_ROOT, "main.mds", "root\n")
+        + data_alias_bytes("main.mds", "part");
     let mut retained = 0;
     for (key, kept) in [
         ("main.mds", main_kept),

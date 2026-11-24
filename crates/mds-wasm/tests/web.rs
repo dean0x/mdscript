@@ -118,6 +118,120 @@ fn options_modules_graph_uses_the_shared_module_count_refusal() {
     }
 }
 
+type JsonMap = serde_json::Map<String, serde_json::Value>;
+
+/// The error that `lintVirtual` (`modules`) and then `compile`, `check` and `lint`
+/// (`options.modules`) give for `modules`: each `(code, message)`, the message with
+/// `<label>` for the field the call names.
+fn map_refusals(modules: &JsonMap) -> Vec<(String, String)> {
+    let mut errors = vec![(
+        "modules",
+        mds_wasm::lint_virtual(to_js_object(modules), "m0.mds", JsValue::NULL),
+    )];
+    for call in [mds_wasm::compile, mds_wasm::check, mds_wasm::lint] {
+        errors.push((
+            "options.modules",
+            call("OK\n", modules_opts(&modules.clone().into())),
+        ));
+    }
+    errors
+        .into_iter()
+        .map(|(label, result)| {
+            let err = result.expect_err("the map must be refused");
+            let message = get_str(&err, "message").replacen(label, "<label>", 1);
+            (get_str(&err, "code"), message)
+        })
+        .collect()
+}
+
+/// A virtual map holds the entry and 256 modules, and apart from them 256 data files:
+/// keys with the exact extension `.json`, `.yaml` or `.yml` (#405). One more of either
+/// kind is refused with the message that the napi and Python bindings give.
+#[wasm_bindgen_test]
+fn virtual_map_counts_modules_and_data_files_apart() {
+    let mut modules: JsonMap = (0..257)
+        .map(|i| (format!("m{i}.mds"), "Body\n".into()))
+        .collect();
+    for i in 0..256 {
+        let ext = ["json", "yaml", "yml"][i % 3];
+        modules.insert(format!("d{i}.{ext}"), "1".into());
+    }
+    mds_wasm::lint_virtual(to_js_object(&modules), "m0.mds", JsValue::NULL)
+        .expect("the entry, 256 modules and 256 data files must pass");
+    for call in [mds_wasm::compile, mds_wasm::check, mds_wasm::lint] {
+        call("OK\n", modules_opts(&modules.clone().into()))
+            .expect("256 modules and 256 data files must pass");
+    }
+
+    let refused = |code: &str, message: &str| vec![(code.to_owned(), message.to_owned()); 4];
+    let mut more_data = modules.clone();
+    more_data.insert("d256.json".into(), "1".into());
+    assert_eq!(
+        map_refusals(&more_data),
+        refused(
+            "mds::resource_limit",
+            "<label> exceeds maximum data file count of 256 (257 provided)"
+        )
+    );
+    let module_count = "<label> exceeds maximum module count of 257 (258 provided)";
+    let mut more_modules = modules.clone();
+    more_modules.insert("unused.mds".into(), "Body\n".into());
+    assert_eq!(
+        map_refusals(&more_modules),
+        refused("mds::resource_limit", module_count)
+    );
+    // The extension is compared exactly: a `.JSON` key is a module key.
+    let mut upper = modules;
+    upper.insert("D.JSON".into(), "1".into());
+    assert_eq!(
+        map_refusals(&upper),
+        refused("mds::resource_limit", module_count)
+    );
+}
+
+/// Modules and data files have separate byte aggregates (#405): 10 MiB of module text
+/// and 32 MiB of data pass together, and one byte more of either kind is refused.
+#[wasm_bindgen_test]
+fn virtual_map_bounds_module_and_data_bytes_apart() {
+    const MIB: usize = 1 << 20;
+    let mut modules: JsonMap = JsonMap::new();
+    modules.insert("m0.mds".into(), "OK\n".into());
+    modules.insert("big.mds".into(), "x".repeat(10 * MIB - 3).into());
+    for i in 0..4 {
+        modules.insert(format!("d{i}.json"), "x".repeat(8 * MIB).into());
+    }
+    mds_wasm::lint_virtual(to_js_object(&modules), "m0.mds", JsValue::NULL)
+        .expect("10 MiB of modules and 32 MiB of data must pass");
+    mds_wasm::compile("OK\n", modules_opts(&modules.clone().into()))
+        .expect("10 MiB of modules and 32 MiB of data must pass");
+
+    let mut more_data = modules.clone();
+    more_data.insert("d0.json".into(), "x".repeat(8 * MIB + 1).into());
+    let mut more_text = modules;
+    more_text.insert("big.mds".into(), "x".repeat(10 * MIB - 2).into());
+    for (map, message) in [
+        (
+            more_data,
+            "<label> data aggregate size exceeds maximum of 33554432 bytes",
+        ),
+        (
+            more_text,
+            "<label> aggregate size exceeds maximum of 10485760 bytes",
+        ),
+    ] {
+        let lint = mds_wasm::lint_virtual(to_js_object(&map), "m0.mds", JsValue::NULL);
+        let compile = mds_wasm::compile("OK\n", modules_opts(&map.into()));
+        for (label, result) in [("modules", lint), ("options.modules", compile)] {
+            let err = result.expect_err(message);
+            assert_eq!(get_str(&err, "code"), "mds::resource_limit");
+            assert_eq!(
+                get_str(&err, "message"),
+                message.replacen("<label>", label, 1)
+            );
+        }
+    }
+}
+
 // ── compile tests ─────────────────────────────────────────────────────────────
 
 #[wasm_bindgen_test]
@@ -798,6 +912,51 @@ fn scan_import_records_returns_error_for_malformed_source() {
     }
 }
 
+/// `scanImportRecords` leaves out the records of `data:` entries (#405). The
+/// `@mdscript/mds` walker reads each record as a module, so a data record would make a
+/// data file a module. Without it, the compile refuses the entry with
+/// `mds::module_not_found`, naming the data file.
+#[wasm_bindgen_test]
+fn scan_import_records_leave_out_data_records() {
+    let source = concat!(
+        "---\ndata:\n  cfg: ./cfg.json\nimports:\n  - path: ./fm.mds\n---\n",
+        "@import \"./a.mds\" as a\n{{cfg}}\n",
+    );
+    // Control: the engine's own scan lists the data record of this source.
+    let engine = mds::scan_import_records(source, mds::ResolveAs::Standalone).unwrap();
+    assert!(
+        engine
+            .iter()
+            .any(|r| r.kind == mds::ImportKind::Data && r.path == "./cfg.json"),
+        "{engine:?}"
+    );
+    for as_base in [false, true] {
+        let records = js_sys::Array::from(&mds_wasm::scan_import_records(source, as_base).unwrap());
+        let rows: Vec<(String, String)> = records
+            .iter()
+            .map(|r| (get_str(&r, "path"), get_str(&r, "kind")))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("./fm.mds".to_owned(), "frontmatter".to_owned()),
+                ("./a.mds".to_owned(), "import".to_owned())
+            ],
+            "as_base {as_base}"
+        );
+    }
+    let err = mds_wasm::compile(
+        source,
+        modules_opts(&serde_json::json!({ "fm.mds": "F\n", "a.mds": "A\n" })),
+    )
+    .unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::module_not_found");
+    assert_eq!(
+        get_str(&err, "message"),
+        "data file 'cfg.json' is not in the virtual module map"
+    );
+}
+
 /// #488: an import scan counts the syntax tree against the compile memory budget
 /// before it builds the tree, as a compile does. 2^17 repeats of `\{{a` (512 KiB, under
 /// the 10 MiB size cap) are two tokens each, and their estimate is past the budget. The
@@ -1098,6 +1257,234 @@ fn preflight_module_refuses_a_non_mds_file_naming_it_as_typed() {
     mds_wasm::preflight_module(b"hi\n".to_vec(), "Doc.mds", "./doc.txt").unwrap();
     mds_wasm::preflight_module(b"---\ntype: mds\n---\nhi\n".to_vec(), "page.md", "page.md")
         .unwrap();
+}
+
+// ── Local data (#405) ────────────────────────────────────────────────────────
+
+/// `preflightData` returns a data file's text and throws the native backend's error for
+/// bytes it refuses, with no file type check (#405).
+#[wasm_bindgen_test]
+fn preflight_data_returns_the_text_or_the_native_error() {
+    let json = b"{\"name\": \"Ada\"}\n".to_vec();
+    // Control: the module check refuses the same file as not an MDS file.
+    let err = mds_wasm::preflight_module(json.clone(), "cfg.json", "./cfg.json").unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::not_mds");
+    assert_eq!(
+        mds_wasm::preflight_data(json, "cfg.json").unwrap(),
+        "{\"name\": \"Ada\"}\n"
+    );
+    for display in ["list.yaml", "notes.txt"] {
+        assert_eq!(
+            mds_wasm::preflight_data(b"a: 1\n".to_vec(), display).unwrap(),
+            "a: 1\n"
+        );
+    }
+
+    let hostile = format!("sub/a{}b.json", char::from_u32(0x1b).unwrap());
+    let err = mds_wasm::preflight_data(vec![b'{', 0xff, b'}'], &hostile).unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::io");
+    assert_eq!(
+        get_str(&err, "message"),
+        format!(
+            "invalid UTF-8 in sub/a{}u001Bb.json: invalid utf-8 sequence of 1 bytes from index 1",
+            '\\'
+        )
+    );
+
+    // The per-file cap of a data file: exactly 10 MiB passes, one byte more is refused.
+    let cap = 10 * 1024 * 1024;
+    assert_eq!(
+        mds_wasm::preflight_data(vec![b'x'; cap], "big.json")
+            .unwrap()
+            .len(),
+        cap
+    );
+    let err = mds_wasm::preflight_data(vec![b'x'; cap + 1], "big.json").unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::resource_limit");
+    assert_eq!(
+        get_str(&err, "message"),
+        format!(
+            "resource limit exceeded: file too large ({} bytes, max {cap} bytes): big.json",
+            cap + 1
+        )
+    );
+}
+
+/// The data fixture that the napi tests compile from disk: a `.json`, a `.yaml` and a
+/// `.yml` entry, each bound under its name.
+const DATA_FIXTURE: &str = concat!(
+    "---\ndata:\n  cfg: ./cfg.json\n  list: ./list.yaml\n  more: ./more.yml\n---\n",
+    "{{cfg.name}}: {{list.count}} {{more.unit}}\n",
+);
+
+#[wasm_bindgen_test]
+fn compile_binds_json_and_yaml_data_from_the_modules_map() {
+    let opts = modules_opts(&serde_json::json!({
+        "cfg.json": "{\"name\": \"Ada\"}\n",
+        "list.yaml": "count: 3\n",
+        "more.yml": "unit: items\n",
+    }));
+    let result = mds_wasm::compile(DATA_FIXTURE, opts).unwrap();
+    assert_eq!(get_str(&result, "output"), "Ada: 3 items\n");
+    let deps = js_sys::Array::from(&get_prop(&result, "dependencies"));
+    let deps: Vec<String> = deps.iter().filter_map(|d| d.as_string()).collect();
+    assert_eq!(deps, ["cfg.json", "list.yaml", "more.yml"]);
+}
+
+/// A `data` header never reaches the output: a marker in its value is absent in the
+/// plain block form, the block form with a column-0 comment, and the one-line flow form
+/// (#405). Control: the same marker under the key `info` stays.
+#[wasm_bindgen_test]
+fn data_headers_do_not_reach_output() {
+    let marker = "./fixture-marker.yml";
+    let info = format!("info: {marker}");
+    for (header, kept) in [
+        (format!("data:\n  local: {marker}"), ""),
+        (
+            format!("data:\n# Data comment\n  local: {marker}"),
+            "# Data comment\n",
+        ),
+        (format!("data: {{local: {marker}}}"), ""),
+    ] {
+        let source = format!("---\n{header}\n{info}\n---\n{{{{local}}}}\n");
+        let opts = modules_opts(&serde_json::json!({ "fixture-marker.yml": "Local" }));
+        let result = mds_wasm::compile(&source, opts).unwrap();
+        assert_eq!(
+            get_str(&result, "output"),
+            format!("---\n{kept}{info}\n---\nLocal\n"),
+            "{header}"
+        );
+    }
+}
+
+/// A quoted or flow `data` key fails with the fixed form message (#405). Control: a
+/// quoted `info` key compiles and stays in the output.
+#[wasm_bindgen_test]
+fn non_plain_data_key_forms_return_the_fixed_form_error() {
+    let marker = "./fixture-marker.yml";
+    let opts = || modules_opts(&serde_json::json!({ "fixture-marker.yml": "Local" }));
+    let control = format!("---\n'info': {{local: {marker}}}\n---\nBody\n");
+    let result = mds_wasm::compile(&control, opts()).unwrap();
+    assert_eq!(get_str(&result, "output"), control);
+    for header in [
+        format!("'data': {{local: {marker}}}"),
+        format!("{{data: {{local: {marker}}}}}"),
+    ] {
+        let source = format!("---\n{header}\n---\nBody\n");
+        let err = mds_wasm::compile(&source, opts()).unwrap_err();
+        assert_eq!(get_str(&err, "code"), "mds::yaml", "{header}");
+        assert_eq!(
+            get_str(&err, "message"),
+            "YAML parse error: write `data:` at the start of a line"
+        );
+    }
+}
+
+/// Text that no data parser accepts: a read of it fails with `mds::yaml`.
+const BAD_DATA: &str = "[";
+
+/// Assert that `result` is an `mds::yaml` error whose message holds `needle`.
+fn assert_data_read_fails(result: Result<JsValue, JsValue>, needle: &str) {
+    let err = result.expect_err("the data read must fail");
+    let message = get_str(&err, "message");
+    assert_eq!(get_str(&err, "code"), "mds::yaml", "{message}");
+    assert!(message.contains(needle), "{message}");
+}
+
+/// A runtime var with an entry's name replays the entry, and its data file is not read
+/// (#405). Control: with no replay, the compile reads the file and fails with `mds::yaml`.
+#[wasm_bindgen_test]
+fn runtime_vars_replay_an_entry_and_read_no_file() {
+    let source = "---\ndata:\n  title: ./title.json\n---\nTitle: {{title}}\n";
+    let modules = serde_json::json!({ "title.json": BAD_DATA });
+    let replay = to_js_object(&serde_json::json!({
+        "modules": modules,
+        "vars": { "title": "Replayed" },
+    }));
+    let result = mds_wasm::compile(source, replay).unwrap();
+    assert_eq!(get_str(&result, "output"), "Title: Replayed\n");
+    assert_eq!(
+        js_sys::Array::from(&get_prop(&result, "dependencies")).length(),
+        0
+    );
+    assert_data_read_fails(
+        mds_wasm::compile(source, modules_opts(&modules)),
+        "data file \"title.json\", entry \"title\"",
+    );
+}
+
+/// A runtime var named `data` is an ordinary variable: it defines no entry and reads no
+/// file (#405). Control: the same entry in frontmatter reads the file and fails.
+#[wasm_bindgen_test]
+fn a_runtime_data_variable_defines_no_entry() {
+    let modules = serde_json::json!({ "bad.json": BAD_DATA });
+    let runtime = to_js_object(&serde_json::json!({
+        "modules": modules,
+        "vars": { "data": { "cfg": "./bad.json" } },
+    }));
+    let result = mds_wasm::compile("{{data.cfg}}\n", runtime).unwrap();
+    assert_eq!(get_str(&result, "output"), "./bad.json\n");
+    assert_eq!(
+        js_sys::Array::from(&get_prop(&result, "dependencies")).length(),
+        0
+    );
+    assert_data_read_fails(
+        mds_wasm::compile(
+            "---\ndata:\n  cfg: ./bad.json\n---\n{{cfg}}\n",
+            modules_opts(&modules),
+        ),
+        "data file \"bad.json\"",
+    );
+}
+
+/// `check`, `lint` and `lintVirtual` read no data file (#405): a data file that does not
+/// parse and one that does not exist fail none of them. `check` returns one warning that
+/// names the pending entries. Controls: `compile` reads the files and fails with
+/// `mds::yaml`, and a misspelled name that is not an entry still fails `check`.
+#[wasm_bindgen_test]
+fn check_and_lint_read_no_data_file() {
+    let source = concat!(
+        "---\ndata:\n  rows: ./bad.yml\n  other: ./absent.json\n---\n",
+        "@for row in rows:\n{{row.name}}\n@end\n{{other}}\n",
+    );
+    let opts = || {
+        to_js_object(&serde_json::json!({
+            "filename": "main.mds",
+            "modules": { "bad.yml": BAD_DATA },
+        }))
+    };
+
+    let result = mds_wasm::check(source, opts()).unwrap();
+    let warnings: Vec<String> = js_sys::Array::from(&get_prop(&result, "warnings"))
+        .iter()
+        .filter_map(|w| w.as_string())
+        .collect();
+    assert_eq!(
+        warnings,
+        ["data pending; output was not evaluated: \"main.mds\", entry \"rows\"; \"main.mds\", entry \"other\""]
+    );
+
+    let map = to_js_object(&serde_json::json!({ "main.mds": source, "bad.yml": BAD_DATA }));
+    for result in [
+        mds_wasm::lint(source, opts()),
+        mds_wasm::lint_virtual(map, "main.mds", JsValue::NULL),
+    ] {
+        let result = result.unwrap();
+        let files = js_sys::Array::from(&get_prop(&result, "files"));
+        let diagnostics: u32 = files
+            .iter()
+            .map(|f| js_sys::Array::from(&get_prop(&f, "diagnostics")).length())
+            .sum();
+        assert_eq!(diagnostics, 0);
+    }
+
+    assert_data_read_fails(
+        mds_wasm::compile(source, opts()),
+        "data file \"bad.yml\", entry \"rows\"",
+    );
+    let typo = source.replace("{{other}}", "{{typo}}");
+    let err = mds_wasm::check(&typo, opts()).unwrap_err();
+    assert_eq!(get_str(&err, "code"), "mds::undefined_var");
 }
 
 #[wasm_bindgen_test]

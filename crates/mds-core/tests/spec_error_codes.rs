@@ -13,6 +13,63 @@
 
 use std::path::Path;
 
+use mds::MdsError;
+
+#[test]
+fn data_error_names_its_location_without_a_source_span() {
+    let err = MdsError::data(
+        "sub/mo\tdule.mds",
+        Some("en\x1btry"),
+        Some("fi\neld"),
+        "expected a string",
+        Some("quote the value".to_owned()),
+    );
+    let serialized = err.serialize();
+    let message = concat!(
+        r#"data error in "sub/mo\u"#,
+        r#"0009dule.mds", entry "en\u"#,
+        r#"001Btry", field "fi\u"#,
+        r#"000Aeld": expected a string"#,
+    );
+    assert_eq!(serialized.code, "mds::data");
+    assert_eq!(err.to_string(), message);
+    assert_eq!(serialized.message, message);
+    assert_eq!(serialized.help.as_deref(), Some("quote the value"));
+    assert_eq!(serialized.span, None);
+    assert_eq!(err.source_name(), None);
+}
+
+#[test]
+fn data_error_can_name_the_module_without_an_entry_or_field() {
+    let err = MdsError::data("module.mds", None, None, "expected a mapping", None);
+    let serialized = err.serialize();
+    assert_eq!(
+        serialized.message,
+        r#"data error in "module.mds": expected a mapping"#
+    );
+    assert_eq!(serialized.help, None);
+}
+
+#[test]
+fn network_denied_names_each_frontier_entry_without_a_source_span() {
+    let err = MdsError::network_denied(&[("sub/mod\nule.mds", "d\x1bata"), ("main.mds", "next")]);
+    let serialized = err.serialize();
+    let message = concat!(
+        r#"network access denied for data entries: "sub/mod\u"#,
+        r#"000Aule.mds", entry "d\u"#,
+        r#"001Bata"; "main.mds", entry "next""#,
+    );
+    assert_eq!(serialized.code, "mds::network_denied");
+    assert_eq!(err.to_string(), message);
+    assert_eq!(serialized.message, message);
+    assert_eq!(
+        serialized.help.as_deref(),
+        Some("provide a runtime value for each entry to replay it without network access")
+    );
+    assert_eq!(serialized.span, None);
+    assert_eq!(err.source_name(), None);
+}
+
 /// Codes the napi, WASM, or Python bindings return but `mds-core` does not declare.
 const BINDING_ONLY_CODES: &[&str] = &[
     "mds::invalid_options",
@@ -148,6 +205,20 @@ fn core_codes_are_documented_in_spec() {
         "code(mds::…) attributes in error.rs with no matching `mds::<name>` cell in \
          spec.md's \"### Error Codes\" section: {missing:?}"
     );
+}
+
+#[test]
+fn data_codes_have_core_declarations_and_spec_exit_classes() {
+    let codes = extract_codes(&read_error_rs());
+    let section = error_codes_section(&read_spec_md()).expect("spec error registry");
+    for (code, exits) in [("mds::data", "1 / 2"), ("mds::network_denied", "2 / 2")] {
+        assert!(codes.iter().any(|declared| declared == code), "{code}");
+        let row = section
+            .lines()
+            .find(|line| line.starts_with(&format!("| `{code}` |")))
+            .expect("spec error row");
+        assert_eq!(row.split('|').nth(4).map(str::trim), Some(exits), "{code}");
+    }
 }
 
 #[test]

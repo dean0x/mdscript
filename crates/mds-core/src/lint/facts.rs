@@ -93,9 +93,20 @@ pub struct DefineFact {
 pub struct FmVarFact {
     /// The YAML key name.
     pub name: String,
+    /// The kind of frontmatter name.
+    pub kind: FmVarKind,
     /// Approximate byte offset in the source (from FM content + substring search).
     /// `None` when the key cannot be located via substring search.
     pub approx_offset: Option<usize>,
+}
+
+/// Discriminant for a frontmatter name fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FmVarKind {
+    /// A top-level frontmatter key.
+    Key,
+    /// An entry name in the `data` mapping.
+    DataEntry,
 }
 
 /// A shadow variable pair: a name in an inner scope that shadows an outer-scope binding.
@@ -122,6 +133,8 @@ pub enum ShadowKind {
     ForVar,
     /// A `@define` parameter.
     DefineParam,
+    /// An entry name in the frontmatter `data` mapping.
+    DataEntry,
 }
 
 // ── AnalysisContext ────────────────────────────────────────────────────────────
@@ -151,7 +164,8 @@ pub struct AnalysisContext {
     pub defines: Vec<DefineFact>,
 
     // ── Frontmatter variable facts ────────────────────────────────────────────
-    /// Frontmatter variable keys (excludes reserved keys: imports, type, extends, prompt).
+    /// Frontmatter variable keys (excludes reserved keys: imports, type, extends,
+    /// prompt, data), then the entry names of the `data` mapping.
     pub frontmatter_vars: Vec<FmVarFact>,
 
     // ── Usage tracking ────────────────────────────────────────────────────────
@@ -180,6 +194,8 @@ pub struct AnalysisContext {
 struct WalkScope {
     /// Frontmatter variable names (available at all times).
     fm_keys: HashSet<String>,
+    /// Data entry names (available at all times).
+    data_entries: HashSet<String>,
     /// Import alias names (available at module level).
     import_aliases: HashSet<String>,
     /// Stack of active @for loop variable names (innermost last).
@@ -194,6 +210,7 @@ impl WalkScope {
     fn new() -> Self {
         WalkScope {
             fm_keys: HashSet::new(),
+            data_entries: HashSet::new(),
             import_aliases: HashSet::new(),
             for_var_stack: Vec::new(),
             for_key_stack: Vec::new(),
@@ -230,7 +247,11 @@ pub(super) fn collect_facts(
     // ── 2. Build walk scope for shadow detection ─────────────────────────────
     let mut scope = WalkScope::new();
     for fv in &ctx.frontmatter_vars {
-        scope.fm_keys.insert(fv.name.clone());
+        let names = match fv.kind {
+            FmVarKind::Key => &mut scope.fm_keys,
+            FmVarKind::DataEntry => &mut scope.data_entries,
+        };
+        names.insert(fv.name.clone());
     }
 
     // ── 3. Pre-scan top-level imports into scope (for shadow detection of ForVar over ImportAlias)
@@ -251,6 +272,19 @@ pub(super) fn collect_facts(
     Ok(ctx)
 }
 
+// Reserved keys per Appendix A (unused-variable skip-set).
+// SYNC POINT: audit `RESERVED_OUTPUT_KEYS` in lib.rs (stripper and proof),
+// `RESERVED_MERGE_KEYS` in resolver/frontmatter.rs, `build_scope_from_frontmatter` in
+// resolver/module_scope.rs, `is_scope_key` in data/resolve.rs and `RESERVED_NAMES` in data/decl.rs.
+const RESERVED: &[&str] = &[
+    "imports",
+    "type",
+    "extends",
+    "prompt",
+    "data",
+    crate::lexer::INDENTED_DIRECTIVES,
+];
+
 /// Collect frontmatter variable keys from the raw YAML string.
 ///
 /// Reserved keys are excluded.
@@ -260,17 +294,6 @@ fn collect_frontmatter_vars(
     source: &str,
     ctx: &mut AnalysisContext,
 ) -> Result<(), MdsError> {
-    // Reserved keys per Appendix A (unused-variable skip-set).
-    // SYNC POINT: audit `RESERVED_OUTPUT_KEYS` in lib.rs (stripper and proof),
-    // `RESERVED_MERGE_KEYS` in resolver/frontmatter.rs, and `build_scope_from_frontmatter` in resolver/module_scope.rs.
-    const RESERVED: &[&str] = &[
-        "imports",
-        "type",
-        "extends",
-        "prompt",
-        crate::lexer::INDENTED_DIRECTIVES,
-    ];
-
     // Route through the bounded choke point (#162). A resource limit (size cap / node
     // budget) propagates so the lint pass fails closed on an amplification attack; a plain
     // YAML syntax error stays swallowed (lenient) — the resolver surfaces the diagnostic.
@@ -303,11 +326,65 @@ fn collect_frontmatter_vars(
 
         ctx.frontmatter_vars.push(FmVarFact {
             name: key_str.clone(),
+            kind: FmVarKind::Key,
             approx_offset,
         });
     }
 
+    if let Some(data) = mapping.get("data") {
+        // The `data:` key starts the search region, and the raw frontmatter ends it.
+        let region = fm_content_start.and_then(|start| {
+            let key = find_yaml_key_in_source(source, start, "data")?;
+            Some((key, source.get(key..start.checked_add(fm.raw.len())?)?))
+        });
+        collect_data_entries(data, region, ctx);
+    }
+
     Ok(())
+}
+
+/// Collect the entry names of the `data` mapping, and count each name that a
+/// declaration references as a use. Read source only.
+///
+/// `region` is the frontmatter text from the `data:` key, with its source offset.
+fn collect_data_entries(
+    data: &serde_yaml_ng::Value,
+    region: Option<(usize, &str)>,
+    ctx: &mut AnalysisContext,
+) {
+    // The check gate reports declaration errors. The parse reads the bounded
+    // frontmatter tree and does no I/O.
+    let mut mem = crate::evaluator::budget::MemBudget::default();
+    let Ok(entries) = crate::data::decl::parse_declarations(data, "", &mut mem) else {
+        return;
+    };
+    for entry in entries {
+        if let crate::data::decl::Source::Url(paths) = &entry.source {
+            ctx.used_vars.extend(paths.iter().map(|path| {
+                path.split_once('.')
+                    .map_or(path.as_str(), |(root, _)| root)
+                    .to_owned()
+            }));
+        }
+        let approx_offset = region.and_then(|(start, text)| {
+            find_data_entry_in_source(text, &entry.name).map(|offset| start + offset)
+        });
+        ctx.frontmatter_vars.push(FmVarFact {
+            name: entry.name,
+            kind: FmVarKind::DataEntry,
+            approx_offset,
+        });
+    }
+}
+
+/// Find a data entry key in `region`, the frontmatter text from the `data:` key.
+/// The key can be indented (block form) or follow `{` or `,` (flow form).
+fn find_data_entry_in_source(region: &str, name: &str) -> Option<usize> {
+    let search = format!("{name}:");
+    region
+        .match_indices(search.as_str())
+        .find(|(at, _)| region[..*at].ends_with([' ', '\t', '{', ',']))
+        .map(|(at, _)| at)
 }
 
 /// Find the byte offset where frontmatter YAML content starts in `source`.
@@ -516,13 +593,21 @@ fn collect_define_fact(
         end_offset: b.end_offset,
     });
 
-    // Shadow detection: @define params over FM keys or @for vars.
+    // Shadow detection: @define params over FM keys, data entries or @for vars.
     for pname in &param_names {
         if scope.fm_keys.contains(pname) {
             ctx.shadow_pairs.push(ShadowPair {
                 name: pname.clone(),
                 inner_kind: ShadowKind::DefineParam,
                 outer_kind: ShadowKind::FmVar,
+                offset: b.offset,
+            });
+        }
+        if scope.data_entries.contains(pname) {
+            ctx.shadow_pairs.push(ShadowPair {
+                name: pname.clone(),
+                inner_kind: ShadowKind::DefineParam,
+                outer_kind: ShadowKind::DataEntry,
                 offset: b.offset,
             });
         }
@@ -600,6 +685,13 @@ fn check_for_var_shadow(var: &str, offset: usize, scope: &WalkScope, ctx: &mut A
             name: var.to_string(),
             inner_kind: ShadowKind::ForVar,
             outer_kind: ShadowKind::FmVar,
+            offset,
+        });
+    } else if scope.data_entries.contains(var) {
+        ctx.shadow_pairs.push(ShadowPair {
+            name: var.to_string(),
+            inner_kind: ShadowKind::ForVar,
+            outer_kind: ShadowKind::DataEntry,
             offset,
         });
     } else if scope.import_aliases.contains(var) {
@@ -964,17 +1056,29 @@ mod tests {
 
     #[test]
     fn collects_frontmatter_vars_excludes_reserved() {
-        let src =
-            "---\nname: World\ntype: mds\nimports: []\nextends: base\nprompt: hi\n---\nHello!\n";
+        let src = "---\nname: World\ntype: mds\nimports: []\nextends: base\nprompt: hi\ndata: {}\n---\nHello!\n";
         let ctx = facts(src);
         assert!(
             ctx.frontmatter_vars.iter().any(|v| v.name == "name"),
             "should collect 'name' var"
         );
-        for reserved in &["type", "imports", "extends", "prompt"] {
+        for reserved in &["type", "imports", "extends", "prompt", "data"] {
             assert!(
                 !ctx.frontmatter_vars.iter().any(|v| &v.name == reserved),
                 "should exclude reserved key '{reserved}'"
+            );
+        }
+    }
+
+    /// A reserved output key is never an unused-variable fact, so a new reserved
+    /// key cannot become a lint finding.
+    #[test]
+    fn lint_reserves_every_reserved_output_key() {
+        for key in crate::RESERVED_OUTPUT_KEYS {
+            assert!(
+                RESERVED.contains(&key.name),
+                "`{}` must be reserved in the lint",
+                key.name,
             );
         }
     }
@@ -988,6 +1092,50 @@ mod tests {
             .map(|var| var.name.as_str())
             .collect();
         assert_eq!(names, ["name"]);
+    }
+
+    #[test]
+    fn data_entries_are_facts_of_their_own_kind_with_key_offsets() {
+        for src in [
+            "---\nname: World\ndata:\n  first: ./a.yml\n  settings: ./b.yml\n---\nHello!\n",
+            "---\nname: World\ndata: {first: ./a.yml, settings: ./b.yml}\n---\nHello!\n",
+        ] {
+            let ctx = facts(src);
+            let names: Vec<_> = ctx
+                .frontmatter_vars
+                .iter()
+                .map(|var| (var.name.as_str(), var.kind))
+                .collect();
+            assert_eq!(
+                names,
+                [
+                    ("name", FmVarKind::Key),
+                    ("first", FmVarKind::DataEntry),
+                    ("settings", FmVarKind::DataEntry),
+                ],
+                "{src}"
+            );
+            let offset = ctx.frontmatter_vars[2].approx_offset.expect("key offset");
+            assert_eq!(
+                &src[offset..offset + "settings:".len()],
+                "settings:",
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_define_param_named_like_a_data_entry_is_a_shadow_pair() {
+        let pair = |param: &str| {
+            let src = format!("---\ndata: {{user: ./a.yml}}\n---\n@define greet({param}):\n{{{{{param}}}}}\n@end\n");
+            facts(&src).shadow_pairs.into_iter().any(|p| {
+                p.name == param
+                    && p.inner_kind == ShadowKind::DefineParam
+                    && p.outer_kind == ShadowKind::DataEntry
+            })
+        };
+        assert!(!pair("other"));
+        assert!(pair("user"));
     }
 
     /// Regression: a non-ASCII frontmatter key that ALSO appears inside an earlier

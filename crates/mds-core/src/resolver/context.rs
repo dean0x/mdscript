@@ -48,13 +48,16 @@ pub(super) struct ExtendsComponents {
     /// children emit the full merged key set rather than only their own keys (#154).
     /// `None` when the merged mapping is empty (no non-reserved FM keys on either side).
     pub(super) merged_frontmatter: Option<String>,
+    pub(super) data_chain: crate::data::resolve::Chain,
+    pub(super) merged_mapping: serde_yaml_ng::Mapping,
+    pub(super) merged_mapping_bytes: usize,
 }
 
 /// The immediate directive that requests a module's type check.
 pub(super) struct ImportSite<'a> {
-    file_str: &'a str,
-    source: &'a str,
-    offset: usize,
+    pub(super) file_str: &'a str,
+    pub(super) source: &'a str,
+    pub(super) offset: usize,
 }
 
 impl ImportSite<'_> {

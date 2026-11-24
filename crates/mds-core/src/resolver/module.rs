@@ -113,6 +113,9 @@ pub struct ResolvedModule {
     pub(crate) frontmatter_values: Option<serde_yaml_ng::Mapping>,
     /// The bytes charged for `frontmatter_values`, part of this entry's kept bytes.
     pub(crate) frontmatter_bytes: usize,
+    pub(super) data_chain: crate::data::resolve::Chain,
+    /// The module scope reached data, so the exported prompt can hold data.
+    pub(super) data: bool,
     /// `true` when this entry was produced by `process_module_skeleton` (resolved as an
     /// `@extends` base: collect-only, NO standalone validate/evaluate, `prompt_body = None`).
     ///
@@ -157,6 +160,8 @@ impl Clone for ResolvedModule {
             skeleton_origin: self.skeleton_origin.clone(),
             frontmatter_values: self.frontmatter_values.clone(),
             frontmatter_bytes: self.frontmatter_bytes,
+            data_chain: self.data_chain.clone(),
+            data: self.data,
             is_skeleton: self.is_skeleton,
         }
     }
@@ -167,7 +172,7 @@ impl ResolvedModule {
     ///
     /// When no explicit `@export` list is present every name is visible.
     /// When an explicit list exists only the listed names are visible.
-    fn is_exported(&self, name: &str) -> bool {
+    pub(super) fn is_exported(&self, name: &str) -> bool {
         is_visible_export(self.has_explicit_exports, &self.explicit_exports, name)
     }
 

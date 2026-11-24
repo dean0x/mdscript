@@ -8886,6 +8886,37 @@ fn watch_rebuilds_once_when_the_vars_file_changes() {
     }
 }
 
+/// A local data file that an entry of the source reads is a dependency like any other
+/// (#405): one edit, one rebuild of the source, and no output of its own.
+#[test]
+fn watch_rebuilds_once_when_a_data_file_changes() {
+    for args in ENTRY_AND_DIRECTORY {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::write(base.join("src/cfg.json"), r#"{"name": "one"}"#).unwrap();
+        std::fs::write(
+            base.join("src/a.mds"),
+            "---\ndata:\n  cfg: ./cfg.json\n---\nHello {{cfg.name}}\n",
+        )
+        .unwrap();
+
+        let edited = base.join("src").join("cfg.json");
+        let stderr = one_edit(
+            base,
+            args,
+            &edited,
+            r#"{"name": "two"}"#,
+            ("Hello one", "Hello two"),
+        );
+        assert_one_rebuild(args, &stderr);
+        assert!(
+            !base.join("src").join("cfg.md").exists(),
+            "{args:?}: a data file has no output of its own"
+        );
+    }
+}
+
 /// A dependency outside the directory argument — `../shared/y.mds`, inside the project
 /// a `.mdsroot` marker bounds — is keyed by the path the compile reports for it, and
 /// directory mode watches its directory as an out-of-root dependency directory: one
@@ -12054,4 +12085,32 @@ fn watch_never_writes_over_a_source_its_entry_imports() {
             was: LIB,
         }],
     );
+}
+
+/// `mds watch` never writes an output over a data file that its entry reads (#405), in
+/// file mode and in directory mode: the data file `chat.json` at the output of the
+/// messages template `chat.mds` is refused at startup and by the rebuild an edit makes, as
+/// a file the run reads, and keeps what it held; the session keeps watching.
+#[test]
+fn watch_never_writes_over_a_data_file_its_entry_reads() {
+    const CFG: &str = "{\"name\": \"Dean\"}\n";
+    const CHAT: &str =
+        "---\ndata:\n  cfg: ./chat.json\n---\n@message user:\nHi {{cfg.name}}\n@end\n";
+    for (mode, cwd, args, shown_dir) in CHAT_SESSIONS {
+        let base = notes_with(&[("chat.mds", CHAT), ("chat.json", CFG)]);
+        let notes = base.path().join("notes");
+        let (src, json) = (notes.join("chat.mds"), notes.join("chat.json"));
+        assert_never_writes_over(
+            mode,
+            &base.path().join(cwd),
+            args,
+            &[Guarded {
+                source: &src,
+                edit: &CHAT.replace("Hi", "Hi again"),
+                shown: below(shown_dir, "chat.json"),
+                file: &json,
+                was: CFG,
+            }],
+        );
+    }
 }

@@ -69,10 +69,13 @@ use crate::value::Value;
 use context::{
     fragment_map_from, is_visible_export, CollectedDefs, ExtendsComponents, ImportSite, ModuleCtx,
 };
-use frontmatter::{build_scope_from_merged_mapping, deep_merge_yaml};
+use frontmatter::{deep_merge_yaml, merged_frontmatter_layer};
 pub(crate) use frontmatter::{
-    parse_frontmatter_imports, parse_frontmatter_imports_from_yaml, parse_frontmatter_yaml,
-    parse_frontmatter_yaml_with, Allowance, FrontmatterImport,
+    parse_data_json_with, parse_data_yaml_with, NODE_YAML, RESERVED_MERGE_KEYS,
+};
+pub(crate) use frontmatter::{
+    parse_frontmatter_imports_from_yaml, parse_frontmatter_yaml, parse_frontmatter_yaml_with,
+    Allowance, FrontmatterImport,
 };
 #[cfg(test)]
 use import_paths::ImportPathViolation;
@@ -166,6 +169,14 @@ pub struct ModuleCache {
     /// Zero-cost path: when false (the default), no `MapBuilder` is allocated
     /// for sub-modules (AC-PERF-01).
     source_map_mode: bool,
+    data: crate::data::resolve::State,
+    analyze_data: bool,
+    source_snapshot: Option<process::SourceSnapshot>,
+    /// The refusal of the whole-graph check, kept until the root closes. The compile
+    /// then runs without a snapshot, so the fault that it meets first is reported.
+    /// A data bind returns this refusal and reads nothing, and a compile that meets
+    /// no fault of its own fails with it at the root.
+    graph_refusal: Option<MdsError>,
     budget: EvalBudget,
     retained: usize,
     kept: usize,
@@ -232,6 +243,10 @@ impl ModuleCache {
             modules: IndexMap::new(),
             resolving: IndexSet::new(),
             source_map_mode: false,
+            data: crate::data::resolve::State::default(),
+            analyze_data: false,
+            source_snapshot: None,
+            graph_refusal: None,
             budget: EvalBudget::default(),
             retained: 0,
             kept: 0,
@@ -246,15 +261,65 @@ impl ModuleCache {
         }
     }
 
+    /// Only compile entry points may opt in to local data reads.
+    pub(crate) fn compiling(fs: Box<dyn FileSystem>) -> Self {
+        let mut cache = Self::tooling(fs);
+        cache.data.compile = true;
+        cache
+    }
+
+    /// The check gate can validate without returning a rendered artifact.
+    pub(crate) fn tooling(fs: Box<dyn FileSystem>) -> Self {
+        let mut cache = Self::with_fs(fs);
+        cache.analyze_data = true;
+        cache
+    }
+
+    pub(crate) fn has_pending_data(&self) -> bool {
+        self.data.pending
+    }
+
+    fn read_module(&self, key: &str) -> Result<(Arc<String>, usize), MdsError> {
+        if let Some(snapshot) = &self.source_snapshot {
+            let source = snapshot.source(key).ok_or_else(MdsError::internal)?;
+            return Ok((Arc::clone(source), 0));
+        }
+        let source = self.fs.read(key)?;
+        let capacity = source.capacity();
+        Ok((Arc::new(source), capacity))
+    }
+
+    fn normalize_module_edge(&self, ctx: &ModuleCtx<'_>, path: &str) -> Result<String, MdsError> {
+        if let Some(snapshot) = &self.source_snapshot {
+            return snapshot
+                .edge(ctx.key, path)
+                .map(str::to_owned)
+                .ok_or_else(MdsError::internal);
+        }
+        self.fs.normalize_in_dir(ctx.base_dir, path)
+    }
+
     /// Returns normalized keys of all modules resolved during compilation,
-    /// in first-resolution order (depth-first traversal).
+    /// in first-resolution order (depth-first traversal), then the keys of the
+    /// local data files the compile read, in first-read order.
     ///
     /// This includes the entry module itself. Use this after a successful
     /// `resolve_path` / `resolve_key` / `resolve_source` call to obtain the
     /// dependency graph. Callers that want to exclude the entry point should
     /// filter it out themselves (see `compile_virtual_with_deps`).
+    ///
+    /// A key occurs once: a data file that a module import also names is listed
+    /// with the modules. Only a compile entry point reads data files, so a cache
+    /// from [`ModuleCache::new`], [`ModuleCache::native`], [`ModuleCache::virtual_fs`]
+    /// or [`ModuleCache::with_fs`] lists modules only. A data entry that a runtime
+    /// variable replaces reads no file, and no URL is ever listed.
     pub fn dependencies(&self) -> Vec<String> {
-        self.modules.keys().cloned().collect()
+        let data = self
+            .data
+            .files
+            .keys()
+            .filter(|key| !self.modules.contains_key(*key));
+        self.modules.keys().chain(data).cloned().collect()
     }
 
     fn commit_retained(&mut self, kept: usize) {
@@ -382,7 +447,7 @@ impl ModuleCache {
         self.check_module_count(key)?;
 
         // Step 4: read the file only on a cache miss.
-        let source = self.fs.read(key)?;
+        let (source, read_bytes) = self.read_module(key)?;
 
         // Step 5: determine if markdown (for frontmatter type-key handling).
         let is_md = self.fs.is_markdown(key);
@@ -397,7 +462,7 @@ impl ModuleCache {
         // Mark as resolving before recursing into process_module.
         // IndexSet preserves insertion order, so it serves as both the set (O(1) lookup)
         // and the ordered stack (for cycle path reconstruction).
-        let (mark, read) = self.begin_module(key, runtime_vars, source.capacity());
+        let (mark, read) = self.begin_module(key, runtime_vars, read_bytes);
         let resolved = read.and_then(|()| {
             let base_dir_owned = self.fs.parent_dir(key);
             let display_owned = crate::source_path::display_path_for(&*self.fs, key);
@@ -409,6 +474,7 @@ impl ModuleCache {
                 runtime_vars,
                 origin: OnceCell::new(),
             };
+            self.prepare_data(&ctx, warnings)?;
             self.process_module(&ctx, is_md, upgrade, warnings)
         });
         #[cfg(test)]
@@ -504,7 +570,10 @@ impl ModuleCache {
             runtime_vars: &runtime,
             origin: OnceCell::new(),
         };
-        let resolved = read.and_then(|()| self.process_module(&ctx, false, false, warnings));
+        let resolved = read.and_then(|()| {
+            self.prepare_data(&ctx, warnings)?;
+            self.process_module(&ctx, false, false, warnings)
+        });
         self.close_module(mark);
 
         let popped = self.pop_resolving(SOURCE_LABEL);
@@ -617,6 +686,7 @@ impl ModuleCache {
                 runtime_vars,
                 origin: OnceCell::new(),
             };
+            self.prepare_data(&ctx, warnings)?;
             self.process_module_intrinsic_opts(&ctx, is_md, opts, warnings)
         });
         self.close_module(mark);
@@ -653,7 +723,10 @@ impl ModuleCache {
             runtime_vars: &runtime,
             origin: OnceCell::new(),
         };
-        let result = read.and_then(|()| self.process_module_intrinsic(&ctx, false, warnings));
+        let result = read.and_then(|()| {
+            self.prepare_data(&ctx, warnings)?;
+            self.process_module_intrinsic(&ctx, false, warnings)
+        });
         self.close_module(mark);
         let popped = self.pop_resolving(SOURCE_LABEL);
         let result = result?;
@@ -686,8 +759,10 @@ impl ModuleCache {
             runtime_vars: &runtime,
             origin: OnceCell::new(),
         };
-        let result =
-            read.and_then(|()| self.process_module_intrinsic_opts(&ctx, false, opts, warnings));
+        let result = read.and_then(|()| {
+            self.prepare_data(&ctx, warnings)?;
+            self.process_module_intrinsic_opts(&ctx, false, opts, warnings)
+        });
         self.close_module(mark);
         let popped = self.pop_resolving(SOURCE_LABEL);
         let result = result?;
@@ -761,8 +836,19 @@ impl ModuleCache {
     }
 
     // Call even on error. Only propagate the pop error if the module result is Ok.
+    // At the root, a kept graph refusal becomes the pop error, so a module error
+    // that the compile met first still wins.
     fn pop_resolving(&mut self, key: &str) -> Result<(), MdsError> {
-        Self::check_lifo_pop(self.resolving.pop(), key)
+        let result = Self::check_lifo_pop(self.resolving.pop(), key);
+        if self.resolving.is_empty() {
+            if let Some(snapshot) = self.source_snapshot.take() {
+                self.budget.mem.release_buffers(snapshot.charge);
+            }
+            if let Some(refusal) = self.graph_refusal.take() {
+                return result.and(Err(refusal));
+            }
+        }
+        result
     }
 
     fn check_lifo_pop(popped: Option<String>, expected: &str) -> Result<(), MdsError> {
