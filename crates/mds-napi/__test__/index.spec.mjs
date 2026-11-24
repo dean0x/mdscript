@@ -2310,6 +2310,86 @@ describe('local data (#405)', () => {
       }
     });
   });
+
+  // Text that no data parser accepts: a read of it fails with mds::yaml.
+  const BAD_DATA = '[';
+
+  /** Assert that `fn` throws `mds::yaml` with a message that holds `needle`. */
+  const assertDataReadFails = (fn, needle) => {
+    assert.throws(fn, (err) => {
+      assert.equal(err.code, 'mds::yaml', err.message);
+      assert.ok(err.message.includes(needle), err.message);
+      return true;
+    });
+  };
+
+  test('D-4: a runtime var with the entry name replays the entry and reads no file', () => {
+    const source = '---\ndata:\n  title: ./title.json\n---\nTitle: {{title}}\n';
+    inProject({ 'main.mds': source, 'title.json': BAD_DATA }, (dir) => {
+      const replay = { vars: { title: 'Replayed' } };
+      for (const result of [
+        compile(source, { basePath: dir, ...replay }),
+        compileFile(path.join(dir, 'main.mds'), replay),
+      ]) {
+        assert.equal(result.output, 'Title: Replayed\n');
+        assert.deepEqual(result.dependencies, []);
+      }
+      // Control: with no replay, the compile reads the file and fails.
+      const needle = 'data file "title.json", entry "title"';
+      assertDataReadFails(() => compile(source, { basePath: dir }), needle);
+      assertDataReadFails(() => compileFile(path.join(dir, 'main.mds')), needle);
+    });
+  });
+
+  test('D-5: a runtime var named data defines no entry and reads no file', () => {
+    inProject({ 'bad.json': BAD_DATA }, (dir) => {
+      const result = compile('{{data.cfg}}\n', {
+        basePath: dir,
+        vars: { data: { cfg: './bad.json' } },
+      });
+      assert.equal(result.output, './bad.json\n');
+      assert.deepEqual(result.dependencies, []);
+      // Control: the same entry in frontmatter reads the file and fails.
+      const entry = '---\ndata:\n  cfg: ./bad.json\n---\n{{cfg}}\n';
+      assertDataReadFails(() => compile(entry, { basePath: dir }), 'data file "bad.json"');
+    });
+  });
+
+  // bad.yml does not parse and absent.json does not exist: a read of either fails.
+  const PENDING =
+    '---\ndata:\n  rows: ./bad.yml\n  other: ./absent.json\n---\n' +
+    '@for row in rows:\n{{row.name}}\n@end\n{{other}}\n';
+  const PENDING_FILES = { 'main.mds': PENDING, 'bad.yml': BAD_DATA };
+
+  test('D-6: check, checkFile, lint, lintFile and lintVirtual read no data file', () => {
+    inProject(PENDING_FILES, (dir) => {
+      const main = path.join(dir, 'main.mds');
+      for (const result of [check(PENDING, { basePath: dir }), checkFile(main)]) {
+        assert.equal(result.warnings.length, 1, JSON.stringify(result.warnings));
+        const [warning] = result.warnings;
+        assert.ok(warning.startsWith('data pending; output was not evaluated: '), warning);
+        assert.ok(warning.includes('entry "rows"') && warning.includes('entry "other"'), warning);
+      }
+      for (const result of [
+        lint(PENDING, { basePath: dir }),
+        lintFile(main),
+        lintVirtual(PENDING_FILES, 'main.mds'),
+      ]) {
+        assert.equal(result.version, 1);
+        assert.deepEqual(result.files.flatMap((f) => f.diagnostics), []);
+      }
+      // Controls: the compile calls read bad.yml and fail with mds::yaml, and a
+      // misspelled name that is not an entry still fails the check.
+      const needle = 'data file "bad.yml", entry "rows"';
+      assertDataReadFails(() => compile(PENDING, { basePath: dir }), needle);
+      assertDataReadFails(() => compileFile(main), needle);
+      const typo = PENDING.replace('{{other}}', '{{typo}}');
+      assert.throws(() => check(typo, { basePath: dir }), (err) => {
+        assert.equal(err.code, 'mds::undefined_var', err.message);
+        return true;
+      });
+    });
+  });
 });
 
 describe('resource limits', () => {
