@@ -273,13 +273,11 @@ pub(crate) const MAX_MODULE_ALIASES_SIZE: usize = MAX_FILE_SIZE as usize;
 /// Maximum source bytes for one data file, checked during input admission.
 /// A sparse file with long strings can reach this cap first. A dense file can
 /// reach the node cap first, at about 1 to 2 MiB.
-#[expect(dead_code, reason = "the data parser and readers land in later phases")]
 pub(crate) const MAX_DATA_FILE_BYTES: u64 = MAX_FILE_SIZE;
 
 /// Maximum nodes built by the parser for one data file.
 /// A dense file can reach this cap at about 1 to 2 MiB. A sparse file with long
 /// strings can reach the file byte cap first.
-#[expect(dead_code, reason = "the data parser lands in a later phase")]
 pub(crate) const MAX_DATA_NODES_PER_FILE: usize = 200_000;
 
 /// Maximum distinct data files admitted in one compile, apart from modules.

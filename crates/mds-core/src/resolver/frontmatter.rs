@@ -12,8 +12,9 @@ use serde::de::{self, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, Variant
 use crate::error::MdsError;
 use crate::evaluator::budget::MemBudget;
 use crate::limits::{
-    MAX_FRONTMATTER_FLOW_DEPTH, MAX_FRONTMATTER_IMPORTS, MAX_FRONTMATTER_MERGE_DEPTH,
-    MAX_FRONTMATTER_NODES, MAX_FRONTMATTER_SIZE, MAX_OUTPUT_SIZE,
+    MAX_DATA_FILE_BYTES, MAX_DATA_NODES_PER_FILE, MAX_FRONTMATTER_FLOW_DEPTH,
+    MAX_FRONTMATTER_IMPORTS, MAX_FRONTMATTER_MERGE_DEPTH, MAX_FRONTMATTER_NODES,
+    MAX_FRONTMATTER_SIZE, MAX_OUTPUT_SIZE,
 };
 use crate::parser::is_valid_identifier;
 use crate::scope::{Scope, VarLayer};
@@ -166,10 +167,58 @@ pub(crate) fn parse_frontmatter_yaml_with(
     raw: &str,
     allowance: Allowance,
 ) -> Result<(serde_yaml_ng::Value, usize), MdsError> {
-    parse_bounded(raw, MAX_FRONTMATTER_SIZE, MAX_FRONTMATTER_NODES, allowance)
+    parse_bounded(
+        raw,
+        MAX_FRONTMATTER_SIZE,
+        MAX_FRONTMATTER_NODES,
+        allowance,
+        YamlInput::Frontmatter,
+    )
 }
 
-/// The byte allowance of one frontmatter parse.
+/// Parse data with the data file caps. Return the tree and its charged bytes.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the data converter lands in the next phase")
+)]
+pub(crate) fn parse_data_yaml_with(
+    raw: &str,
+    allowance: Allowance,
+) -> Result<(serde_yaml_ng::Value, usize), MdsError> {
+    parse_bounded(
+        raw,
+        MAX_DATA_FILE_BYTES as usize,
+        MAX_DATA_NODES_PER_FILE,
+        allowance,
+        YamlInput::DataFile,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum YamlInput {
+    Frontmatter,
+    DataFile,
+}
+
+impl YamlInput {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Frontmatter => "frontmatter",
+            Self::DataFile => "data file",
+        }
+    }
+
+    fn expansion_exceeded(self) -> MdsError {
+        match self {
+            Self::Frontmatter => MdsError::frontmatter_expansion_exceeded(),
+            Self::DataFile => MdsError::resource_limit(format!(
+                "data file YAML expands beyond maximum of {MAX_OUTPUT_SIZE} bytes"
+            )),
+        }
+    }
+}
+
+/// The byte allowance of one YAML parse.
 #[derive(Clone, Copy)]
 pub(crate) struct Allowance {
     bytes: usize,
@@ -210,23 +259,28 @@ fn parse_frontmatter_yaml_bounded(
     max_bytes: usize,
     max_nodes: usize,
 ) -> Result<(serde_yaml_ng::Value, usize), MdsError> {
-    parse_bounded(raw, max_bytes, max_nodes, Allowance::PER_PARSE)
+    parse_bounded(
+        raw,
+        max_bytes,
+        max_nodes,
+        Allowance::PER_PARSE,
+        YamlInput::Frontmatter,
+    )
 }
 
-/// Bounds-parameterised core of [`parse_frontmatter_yaml_with`], so unit tests can pin
-/// node accounting on tiny documents without allocating a real attack.
+/// Apply the byte, depth and node caps before the work they limit.
 fn parse_bounded(
     raw: &str,
     max_bytes: usize,
     max_nodes: usize,
     allowance: Allowance,
+    input: YamlInput,
 ) -> Result<(serde_yaml_ng::Value, usize), MdsError> {
-    // 1. Size cap FIRST — before the eager loader touches the input. Bounds total work
-    //    (the flow-nesting depth guard below bounds libyaml's O(depth^2) flow scanner,
-    //    which the byte cap alone does not: a deep nest under 1 MiB still hangs).
+    // Apply the source byte cap before the eager loader reads the input.
+    let label = input.label();
     if raw.len() > max_bytes {
         return Err(MdsError::resource_limit(format!(
-            "frontmatter too large ({} bytes, max {max_bytes} bytes)",
+            "{label} too large ({} bytes, max {max_bytes} bytes)",
             raw.len()
         )));
     }
@@ -236,7 +290,7 @@ fn parse_bounded(
     //     is a CPU bound the node budget cannot provide: the scanner runs UPSTREAM of
     //     deserialisation (at trivial RSS, few nodes), so a ~1 MiB pure deep flow-nest
     //     hangs for seconds before the budget or any downstream depth limit fires. #162.
-    check_flow_nesting_depth(raw, MAX_FRONTMATTER_FLOW_DEPTH)?;
+    check_flow_nesting_depth(raw, MAX_FRONTMATTER_FLOW_DEPTH, label)?;
 
     // 2. Budgeted deserialisation. `from_str::<Value>` is exactly
     //    `Value::deserialize(Deserializer::from_str(raw))`; driving the same deserializer
@@ -250,18 +304,18 @@ fn parse_bounded(
         // carries the parser position.
         Err(e) => Err(match budget.trip.get() {
             Some(Trip::Nodes) => MdsError::resource_limit(format!(
-                "frontmatter YAML node count exceeds maximum of {max_nodes} \
+                "{label} YAML node count exceeds maximum of {max_nodes} \
                  (anchors expanded by aliases count once per expansion)"
             )),
             Some(Trip::Bytes) if allowance.by_budget => MdsError::compile_memory_exceeded(),
-            Some(Trip::Bytes) => MdsError::frontmatter_expansion_exceeded(),
+            Some(Trip::Bytes) => input.expansion_exceeded(),
             None => MdsError::yaml_error(e.to_string()),
         }),
     }
 }
 
-/// Reject frontmatter whose running flow-collection nesting depth ever exceeds
-/// `max_depth`, in one O(n) pass over the raw bytes (#162).
+/// Reject YAML whose running flow-collection nesting depth exceeds `max_depth`.
+/// Scan the raw bytes once (#162).
 ///
 /// This is the pre-parse CPU bound: libyaml's flow scanner is O(depth^2) in flow nesting
 /// and runs UPSTREAM of the node budget, so a ~1 MiB pure deep flow-nest hangs for seconds
@@ -277,8 +331,8 @@ fn parse_bounded(
 /// openers inside scalar/comment content, which no legitimate frontmatter contains: a
 /// document serde accepts has structural flow depth <= 64 (`MAX_VALUE_DEPTH`). The high
 /// threshold, not a lexer, is the guard against false positives.
-fn check_flow_nesting_depth(raw: &str, max_depth: usize) -> Result<(), MdsError> {
-    // Bounded by `raw.len()`, which the size cap has already bounded by MAX_FRONTMATTER_SIZE.
+fn check_flow_nesting_depth(raw: &str, max_depth: usize, label: &str) -> Result<(), MdsError> {
+    // The source byte cap bounds this scan.
     let mut depth: usize = 0;
     for &byte in raw.as_bytes() {
         match byte {
@@ -287,7 +341,7 @@ fn check_flow_nesting_depth(raw: &str, max_depth: usize) -> Result<(), MdsError>
                 if depth > max_depth {
                     // Never echo the (adversarial) raw input in the message.
                     return Err(MdsError::resource_limit(format!(
-                        "frontmatter YAML flow nesting exceeds maximum depth of {max_depth}"
+                        "{label} YAML flow nesting exceeds maximum depth of {max_depth}"
                     )));
                 }
             }
@@ -696,6 +750,10 @@ pub(crate) fn parse_frontmatter_imports(raw: &str) -> Result<Vec<FrontmatterImpo
 
     parse_frontmatter_imports_from_yaml(imports_val)
 }
+
+#[cfg(test)]
+#[path = "../data/corpus_tests.rs"]
+mod corpus_tests;
 
 #[cfg(test)]
 #[path = "frontmatter_tests.rs"]
