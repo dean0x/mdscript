@@ -145,8 +145,34 @@ impl Declarations {
         mem: &mut MemBudget,
         use_graph: impl FnOnce(usize, &graph::Graph<'_>, &mut MemBudget) -> Result<T, MdsError>,
     ) -> Result<Option<T>, MdsError> {
+        let mut use_graph = Some(use_graph);
+        let mut output = None;
+        Self::check_graph(
+            chain,
+            frontmatter,
+            runtime,
+            mem,
+            &mut |count, graph, mem| {
+                let use_graph = use_graph.take().ok_or_else(MdsError::internal)?;
+                output = Some(use_graph(count, graph, mem)?);
+                Ok(())
+            },
+        )?;
+        Ok(output)
+    }
+
+    /// The body of `with_graph`. It is not generic, so the WASM build carries one
+    /// copy of the graph check for all callers.
+    #[inline(never)]
+    fn check_graph(
+        chain: &Chain,
+        frontmatter: FrontmatterNames<'_>,
+        runtime: &VarLayer,
+        mem: &mut MemBudget,
+        use_graph: &mut dyn FnMut(usize, &graph::Graph<'_>, &mut MemBudget) -> Result<(), MdsError>,
+    ) -> Result<(), MdsError> {
         if !Self::contains_data(chain) {
-            return Ok(None);
+            return Ok(());
         }
         let mut sources = [None; crate::limits::MAX_MODULE_COUNT + 1];
         let mut next = chain.as_deref();
@@ -212,7 +238,7 @@ impl Declarations {
             )?;
             let nodes: Vec<_> = entries.into_values().collect();
             let graph = graph::analyze(&nodes, has_frontmatter, |name| runtime.contains_key(name))?;
-            use_graph(nodes.len(), &graph, mem).map(Some)
+            use_graph(nodes.len(), &graph, mem)
         })();
         mem.release_to(mark);
         result

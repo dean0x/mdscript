@@ -70,7 +70,7 @@ pub(crate) fn analyze<'a>(
     let mut indices: [usize; MAX_DATA_ENTRIES_PER_COMPILE] = std::array::from_fn(|index| index);
     let indices = &mut indices[..nodes.len()];
     let name_at = |index: usize| nodes[index].entry.name.as_str();
-    indices.sort_unstable_by_key(|&index| name_at(index));
+    sort_entries_by_key(indices, |&index| name_at(index))?;
 
     let mut replayed = NodeSet::default();
     let mut waiting = [None; MAX_DATA_ENTRIES_PER_COMPILE];
@@ -107,6 +107,30 @@ pub(crate) fn entry_limit() -> MdsError {
     MdsError::resource_limit(format!(
         "too many data entries (max {MAX_DATA_ENTRIES_PER_COMPILE} per compile)"
     ))
+}
+
+/// Sort at most `MAX_DATA_ENTRIES_PER_COMPILE` items by key. Items with equal keys
+/// keep their input order. A longer list is an internal error and stays as it is.
+///
+/// This is an insertion sort. The lists are short, and the WASM build then
+/// carries no general sort code for the data checks.
+pub(crate) fn sort_entries_by_key<T, K: Ord>(
+    items: &mut [T],
+    key: impl Fn(&T) -> K,
+) -> Result<(), MdsError> {
+    if items.len() > MAX_DATA_ENTRIES_PER_COMPILE {
+        return Err(MdsError::internal());
+    }
+    for end in 1..items.len() {
+        // Move the item at `end` down past each item with a greater key.
+        for at in (1..=end).rev() {
+            if key(&items[at - 1]) <= key(&items[at]) {
+                break;
+            }
+            items.swap(at - 1, at);
+        }
+    }
+    Ok(())
 }
 
 fn check_levels(nodes: &[Node<'_>], waiting: &mut [Option<NodeSet>]) -> Result<(), MdsError> {

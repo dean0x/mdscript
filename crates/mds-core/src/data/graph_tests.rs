@@ -181,6 +181,24 @@ fn frontier_keeps_module_and_declaration_order() {
 }
 
 #[test]
+fn entry_sort_keeps_equal_keys_in_input_order_up_to_the_cap() {
+    let mut items = [(2, 'a'), (1, 'b'), (2, 'c'), (1, 'd'), (0, 'e')];
+    sort_entries_by_key(&mut items, |&(key, _)| key).unwrap();
+    assert_eq!(items, [(0, 'e'), (1, 'b'), (1, 'd'), (2, 'a'), (2, 'c')]);
+
+    let cap = MAX_DATA_ENTRIES_PER_COMPILE;
+    let mut at_cap = (0..cap).rev().collect::<Vec<_>>();
+    sort_entries_by_key(&mut at_cap, |&n| n).unwrap();
+    assert!(at_cap.iter().copied().eq(0..cap));
+
+    // Past the cap the sort refuses and leaves the items as they were.
+    let mut over = (0..=cap).rev().collect::<Vec<_>>();
+    let error = sort_entries_by_key(&mut over, |&n| n).unwrap_err();
+    assert_eq!(error.serialize().code, "mds::internal");
+    assert!(over.iter().copied().eq((0..=cap).rev()));
+}
+
+#[test]
 fn merged_graph_accepts_the_compile_entry_cap_but_not_more() {
     // A merged scope can have more entries than one module can declare.
     let cap = MAX_DATA_ENTRIES_PER_COMPILE;

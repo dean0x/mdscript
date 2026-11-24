@@ -353,7 +353,7 @@ impl DataGraphWalk<'_> {
     }
 
     /// Sort by the declaring module (not the merged scope) and deduplicate.
-    fn finish(mut self) -> DataPreflight {
+    fn finish(mut self) -> Result<DataPreflight, MdsError> {
         let mut unreplayed: Vec<_> = self
             .seen
             .values_mut()
@@ -361,12 +361,16 @@ impl DataGraphWalk<'_> {
             .filter_map(|scope| scope.labels.take())
             .flatten()
             .collect();
-        unreplayed.sort_unstable_by_key(|item| (self.seen.get_index_of(&item.key), item.ordinal));
+        // Each scope check counts its entries against the compile entry cap
+        // before it keeps its labels, so the sort gets at most that many items.
+        crate::data::graph::sort_entries_by_key(&mut unreplayed, |item| {
+            (self.seen.get_index_of(&item.key), item.ordinal)
+        })?;
         unreplayed.dedup_by(|a, b| a.key == b.key && a.ordinal == b.ordinal);
-        DataPreflight {
+        Ok(DataPreflight {
             snapshot: self.snapshot,
             unreplayed,
-        }
+        })
     }
 }
 
@@ -411,16 +415,17 @@ impl ModuleCache {
             None,
             mem,
         );
+        let kept = walk.kept;
+        let result = result.and_then(|_| walk.finish());
         // The walk bookkeeping goes. The snapshot and the labels stay charged.
         let spent = mem.buffers - before;
-        let kept = if result.is_ok() { walk.kept } else { 0 };
+        let kept = if result.is_ok() { kept } else { 0 };
         let Some(release) = spent.checked_sub(kept) else {
             mem.release_buffers(spent);
             return Err(MdsError::internal());
         };
         mem.release_buffers(release);
-        result.map(|_| {
-            let mut preflight = walk.finish();
+        result.map(|mut preflight| {
             preflight.snapshot.charge = kept;
             preflight
         })

@@ -144,6 +144,31 @@ fn inherited_frontier_follows_each_declaring_modules_order() {
 }
 
 #[test]
+fn frontier_lists_a_shared_base_entry_once_in_declaring_module_order() {
+    // Both children inherit the base entries, so the walk collects them twice
+    // and after the entry of the first child.
+    let main = "@import \"./a.mds\" as a\n@import \"./b.mds\" as b\n@include a\n@include b\n";
+    let a = "---\ndata:\n  a_url: https://example.com/a\n---\n@extends \"./base.mds\"\n";
+    let b = "@extends \"./base.mds\"\n";
+    let base = "---\ndata:\n  base_z: https://example.com/z\n  base_a: https://example.com/a\n---\nBody.\n";
+    let files = modules(&[
+        ("main.mds", main),
+        ("a.mds", a),
+        ("b.mds", b),
+        ("base.mds", base),
+    ]);
+    let err = mds::compile_virtual(files, "main.mds", None).unwrap_err();
+    assert_eq!(err.serialize().code, "mds::network_denied");
+    let text = err.to_string();
+    let names = ["a_url", "base_z", "base_a"];
+    for name in names {
+        assert_eq!(text.matches(name).count(), 1, "{text}");
+    }
+    let offsets = names.map(|name| text.find(name).unwrap());
+    assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
+}
+
+#[test]
 fn replay_keeps_static_type_checks() {
     let src = "---\ndata:\n  rows: ./missing.yml\n---\n@for row in rows:\n{{row}}\n@end\n";
     mds::check_str(src).unwrap();
