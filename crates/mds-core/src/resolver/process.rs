@@ -8,6 +8,7 @@ use super::{
     ModuleCache, ModuleCtx, Node, Origin, Part, PromptText, ResolvedModule, Scope,
     MAX_SOURCES_CONTENT_BYTES,
 };
+use crate::MarkdownFrontmatter;
 
 /// Warning emitted when `source_map: true` is used with a messages-mode template.
 ///
@@ -163,7 +164,9 @@ impl ModuleCache {
         )?;
         self.finalize_markdown(
             body_raw,
-            merged_frontmatter.as_deref(),
+            merged_frontmatter
+                .as_deref()
+                .map(MarkdownFrontmatter::Merged),
             builder.map(|b| (b, 0)),
             ctx.base_dir,
             opts,
@@ -284,7 +287,7 @@ impl ModuleCache {
 
         self.finalize_markdown(
             body_raw,
-            raw_frontmatter,
+            raw_frontmatter.map(MarkdownFrontmatter::Standalone),
             builder,
             ctx.base_dir,
             opts,
@@ -294,13 +297,12 @@ impl ModuleCache {
 
     /// Add the frontmatter prefix to the Markdown body.
     ///
-    /// For a standalone module, `frontmatter` is the same raw text that the
-    /// parse-time proof used. The prefix uses the same deterministic strip.
-    /// For `@extends`, the serializer checks the merged map before this step.
+    /// For a standalone module, use the same raw text and stripper as the parse-time proof.
+    /// For `@extends`, use the checked serializer output directly.
     fn finalize_markdown(
         &mut self,
         body_raw: String,
-        frontmatter: Option<&str>,
+        frontmatter: Option<MarkdownFrontmatter<'_>>,
         builder: Option<(MapBuilder, usize)>,
         base_dir: &str,
         opts: &CompileOptions,
@@ -308,13 +310,15 @@ impl ModuleCache {
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
         let mem = &mut self.budget.mem;
         let mark = mem.mark();
-        if let Some(raw) = frontmatter {
+        let prefix = if let Some(frontmatter) = frontmatter {
             mem.charge(
                 Part::Temp,
-                bytes(raw.len(), 2).and_then(|n| n.checked_add(9)),
+                bytes(frontmatter.text().len(), 2).and_then(|n| n.checked_add(9)),
             )?;
-        }
-        let prefix = crate::frontmatter_prefix(frontmatter);
+            crate::frontmatter_prefix(frontmatter)
+        } else {
+            None
+        };
         let fm_prefix_len = prefix.as_ref().map_or(0, String::len);
         // Reserve the output's charge before optional map work can use headroom.
         // The empty body takes the prefix as-is, without a final newline reserve.

@@ -6343,6 +6343,19 @@ fn parsed_mapping(yaml: &str) -> (serde_yaml_ng::Mapping, usize) {
 }
 
 #[test]
+fn extends_emits_the_checked_merged_frontmatter_bytes() {
+    let base = "---\n'imports:label': value\n---\n@block content:\nBody\n@end\n";
+    let files = [
+        ("base.mds", base),
+        ("child.mds", "@extends \"./base.mds\"\n"),
+    ];
+    assert_eq!(
+        compile_virtual(&files, "child.mds").unwrap(),
+        "---\nimports:label: value\n---\nBody\n",
+    );
+}
+
+#[test]
 fn merged_frontmatter_refuses_a_reserved_top_level_key() {
     let (mapping, spent) = parsed_mapping("imports: []\n");
     let mut cache = virtual_cache(&[]);

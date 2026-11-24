@@ -57,13 +57,16 @@ config:
 
 Write `imports`, `type` (when its YAML value is `mds`), and `indented-directives` as plain top-level block keys.
 Put each key at the start of a line, without quotes or a space before the colon.
+Follow the colon with a space, a tab, or the end of the line.
 See [Indented directives](#indented-directives) for the Boolean value rule.
 `plain_reserved_keys_are_removed_without_changing_other_bytes` checks all three keys.
+`strip_reserved_keys_preserves_colons_in_plain_keys` checks keys such as `imports:label`.
 `frontmatter_without_reserved_keys_keeps_its_bytes` confirms that `type: post` stays in standalone output.
 
 MDS reports `mds::yaml` for a non-plain reserved key in parsed frontmatter.
 Examples include quoted keys, explicit YAML keys, and reserved keys in flow-style frontmatter.
 `reserved_keys_in_non_plain_forms_return_fixed_errors` checks `imports` and `type`.
+`flow_frontmatter_refuses_imports_even_when_the_strip_matches` checks the flow rule apart from the value comparison.
 `indented_directives_yaml_agreement_covers_all_module_kinds` checks `indented-directives`.
 The [syntax errors for indented directives](#indented-directives) take precedence over the YAML form check.
 
@@ -903,7 +906,7 @@ Each file follows the [reserved output key form](#reserved-output-keys) before M
 | Template type | Emitted frontmatter |
 |---------------|---------------------|
 | **Standalone** | Raw source YAML after removal of plain reserved output key blocks. See [Frontmatter Preservation](#frontmatter-preservation). |
-| **`@extends` child** | MDS serializes the deep-merged mapping as YAML, without the reserved top-level keys. See `merged_frontmatter_text_matches_the_text_of_a_cloned_value`. |
+| **`@extends` child** | MDS emits the checked YAML from the serializer without further key removal. See `extends_emits_the_checked_merged_frontmatter_bytes`. |
 
 Runtime `--set`/`--set-string` variables do not alter the emitted frontmatter in either case — they affect only the compiled body.
 

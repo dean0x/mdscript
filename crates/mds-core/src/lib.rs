@@ -917,6 +917,13 @@ pub(crate) const RESERVED_OUTPUT_KEYS: &[ReservedOutputKey] = &[
 ];
 const RESERVED_KEY_FORM: &str = "write reserved frontmatter keys at the start of a line";
 const YAML_COMMENT_BREAKS: [char; 3] = ['\u{85}', '\u{2028}', '\u{2029}'];
+const YAML_LINE_BREAKS: [char; 5] = [
+    '\r',
+    '\n',
+    YAML_COMMENT_BREAKS[0],
+    YAML_COMMENT_BREAKS[1],
+    YAML_COMMENT_BREAKS[2],
+];
 
 impl ReservedOutputKey {
     fn reserves(self, value: &serde_yaml_ng::Value) -> bool {
@@ -932,6 +939,12 @@ impl ReservedOutputKey {
         else {
             return false;
         };
+        if !matches!(
+            value.as_bytes().first(),
+            None | Some(b' ' | b'\t' | b'\r' | b'\n')
+        ) {
+            return false;
+        }
         let Some(expected) = self.only_value else {
             return true;
         };
@@ -982,7 +995,36 @@ fn strip_reserved_keys<'a>(
         })
 }
 
-/// Verify that the strip removes only the reserved keys from the parsed mapping.
+/// Detect a flow mapping after leading comments and YAML node properties.
+/// The YAML parse already validated the tokens and the frontmatter byte limit.
+fn starts_with_flow_mapping(raw: &str) -> bool {
+    for line in raw.split(YAML_LINE_BREAKS) {
+        let line = line.trim_start_matches('\u{feff}');
+        if line.starts_with('%') {
+            continue;
+        }
+        let line = line
+            .strip_prefix("---")
+            .filter(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
+            .unwrap_or(line);
+        let mut node = line.trim_start_matches([' ', '\t']);
+        // A node can have one tag and one anchor, in either order.
+        for _ in 0..2 {
+            if !node.starts_with(['!', '&']) {
+                break;
+            }
+            node = node
+                .split_once([' ', '\t'])
+                .map_or("", |(_, rest)| rest.trim_start_matches([' ', '\t']));
+        }
+        if !node.is_empty() && !node.starts_with('#') {
+            return node.starts_with('{');
+        }
+    }
+    false
+}
+
+/// Verify block style and that the strip removes only the reserved keys.
 #[must_use = "the caller must propagate a reserved-key proof error"]
 pub(crate) fn prove_reserved_strip(
     raw: &str,
@@ -1003,6 +1045,9 @@ pub(crate) fn prove_reserved_strip(
 
     let form_error =
         || MdsError::yaml_error(first_reserved.map_or(RESERVED_KEY_FORM, |key| key.form_message));
+    if starts_with_flow_mapping(raw) {
+        return Err(form_error());
+    }
     let mark = mem.mark();
     let result = (|| {
         let stripped = if kept_len == raw.len() {
@@ -1027,18 +1072,10 @@ pub(crate) fn prove_reserved_strip(
             serde_yaml_ng::Value::Mapping(map) => map,
             // A document with only white space and comments has no YAML value.
             serde_yaml_ng::Value::Null
-                if stripped
-                    .split([
-                        '\r',
-                        '\n',
-                        YAML_COMMENT_BREAKS[0],
-                        YAML_COMMENT_BREAKS[1],
-                        YAML_COMMENT_BREAKS[2],
-                    ])
-                    .all(|line| {
-                        let line = line.trim_start_matches([' ', '\t']);
-                        line.is_empty() || line.starts_with('#')
-                    }) =>
+                if stripped.split(YAML_LINE_BREAKS).all(|line| {
+                    let line = line.trim_start_matches([' ', '\t']);
+                    line.is_empty() || line.starts_with('#')
+                }) =>
             {
                 serde_yaml_ng::Mapping::new()
             }
@@ -1077,16 +1114,34 @@ pub(crate) fn is_frontmatter_form_message(message: &str) -> bool {
             .any(|key| message == key.form_message)
 }
 
-/// Return fenced frontmatter if non-whitespace content remains after key removal.
+#[derive(Clone, Copy)]
+pub(crate) enum MarkdownFrontmatter<'a> {
+    Standalone(&'a str),
+    Merged(&'a str),
+}
+
+impl<'a> MarkdownFrontmatter<'a> {
+    pub(crate) fn text(self) -> &'a str {
+        match self {
+            Self::Standalone(text) | Self::Merged(text) => text,
+        }
+    }
+}
+
+/// Return fenced frontmatter if it contains non-whitespace content.
 ///
-/// For standalone output, the deterministic stripper uses the same raw frontmatter
-/// as [`prove_reserved_strip`]. It yields the same slices before fence insertion.
-pub(crate) fn frontmatter_prefix(raw: Option<&str>) -> Option<String> {
+/// For standalone output, use the same stripper and raw text as [`prove_reserved_strip`].
+/// For `@extends` output, use the checked serializer text directly.
+pub(crate) fn frontmatter_prefix(frontmatter: MarkdownFrontmatter<'_>) -> Option<String> {
     const FENCE: &str = "---\n";
-    let raw = raw?;
-    let mut prefix = String::with_capacity(raw.len() + 2 * FENCE.len() + 1);
+    let mut prefix = String::with_capacity(frontmatter.text().len() + 2 * FENCE.len() + 1);
     prefix.push_str(FENCE);
-    prefix.extend(strip_reserved_keys(raw, RESERVED_OUTPUT_KEYS));
+    match frontmatter {
+        MarkdownFrontmatter::Standalone(raw) => {
+            prefix.extend(strip_reserved_keys(raw, RESERVED_OUTPUT_KEYS));
+        }
+        MarkdownFrontmatter::Merged(text) => prefix.push_str(text),
+    }
     if prefix[FENCE.len()..].trim().is_empty() {
         return None;
     }
@@ -2470,15 +2525,18 @@ mod tests {
     }
 
     #[test]
-    fn strip_reserved_keys_no_space_after_colon() {
-        // `type:mds` — no space after colon — must also be stripped.
-        let raw = "type:mds\nname: Alice\n";
-        let result = stripped_for_test(raw);
+    fn strip_reserved_keys_preserves_colons_in_plain_keys() {
+        let raw = "imports:label: value\ntype:mds-x: y\nimports: [a]\n";
         assert_eq!(
-            result,
-            Some("name: Alice\n".to_string()),
-            "no-space type:mds should be stripped, got: {result:?}"
+            stripped_for_test(raw).as_deref(),
+            Some("imports:label: value\ntype:mds-x: y\n"),
         );
+    }
+
+    #[test]
+    fn strip_reserved_keys_preserves_unseparated_type_scalar() {
+        let raw = "type:mds\n";
+        assert_eq!(stripped_for_test(raw).as_deref(), Some(raw));
     }
 
     #[test]
@@ -2589,7 +2647,7 @@ mod tests {
     fn reserved_strip_keeps_comment_and_drops_the_rest_of_the_block() {
         let raw = "imports:\n  - ./a.mds\n# keep this\n \t\n  - ./b.mds\nname: World\n";
         assert_eq!(
-            frontmatter_prefix(Some(raw)).as_deref(),
+            frontmatter_prefix(MarkdownFrontmatter::Standalone(raw)).as_deref(),
             Some("---\n# keep this\nname: World\n---\n"),
         );
     }
@@ -2599,7 +2657,7 @@ mod tests {
         for value in ["mds # marker", "\"mds\"\t# marker", "'mds' # marker"] {
             let raw = format!("type: {value}\nname: World\n");
             assert_eq!(
-                frontmatter_prefix(Some(&raw)).as_deref(),
+                frontmatter_prefix(MarkdownFrontmatter::Standalone(&raw)).as_deref(),
                 Some("---\nname: World\n---\n"),
                 "value: {value}",
             );
@@ -2610,7 +2668,7 @@ mod tests {
     fn reserved_strip_preserves_kept_line_bytes() {
         let raw = "\n# keep  \nimports: []\nname: World  \n\n";
         assert_eq!(
-            frontmatter_prefix(Some(raw)).as_deref(),
+            frontmatter_prefix(MarkdownFrontmatter::Standalone(raw)).as_deref(),
             Some("---\n\n# keep  \nname: World  \n\n---\n"),
         );
     }
@@ -2620,7 +2678,7 @@ mod tests {
         for separator in [char::from(0x85), '\u{2028}', '\u{2029}'] {
             let raw = format!("indented-directives: false # marker{separator}name: World\n");
             assert_eq!(
-                frontmatter_prefix(Some(&raw)).as_deref(),
+                frontmatter_prefix(MarkdownFrontmatter::Standalone(&raw)).as_deref(),
                 Some("---\nname: World\n---\n"),
             );
         }
@@ -2662,6 +2720,37 @@ mod tests {
         fn prove(raw: &str, mem: &mut MemBudget) -> Result<(), MdsError> {
             let original = resolver::parse_frontmatter_yaml(raw).expect("valid original YAML");
             prove_reserved_strip(raw, original.as_mapping(), mem)
+        }
+
+        fn assert_flow_imports_form(raw: &str) {
+            let error = prove(raw, &mut MemBudget::default())
+                .expect_err("flow mapping must not pass the reserved-key proof")
+                .serialize();
+            assert_eq!(error.code, "mds::yaml");
+            assert_eq!(
+                error.message,
+                "YAML parse error: write `imports:` at the start of a line",
+            );
+        }
+
+        #[test]
+        fn reserved_strip_proof_refuses_flow_mapping() {
+            assert_flow_imports_form("{ title: x,\nimports: [a.mds],\n}\n");
+        }
+
+        #[test]
+        fn reserved_strip_proof_refuses_tagged_flow_mapping() {
+            assert_flow_imports_form("\n# Comment\n!!map { title: x,\nimports: [a.mds],\n}\n");
+        }
+
+        #[test]
+        fn reserved_strip_proof_refuses_anchored_flow_mapping() {
+            assert_flow_imports_form("&a { title: x,\nimports: [a.mds],\n}\n");
+        }
+
+        #[test]
+        fn reserved_strip_proof_refuses_flow_mapping_after_document_start() {
+            assert_flow_imports_form("%YAML 1.1\n--- &a !!map { title: x,\nimports: [a.mds],\n}\n");
         }
 
         #[test]
@@ -2713,16 +2802,15 @@ mod tests {
 
         #[test]
         fn reserved_strip_proof_uses_generic_message_if_no_listed_key_differs() {
-            for raw in ["type:mds\n", "note: 'before\nimports: []\nafter'\n"] {
-                let error = prove(raw, &mut MemBudget::default())
-                    .expect_err("the strip drops text that is not a reserved key")
-                    .serialize();
-                assert_eq!(error.code, "mds::yaml");
-                assert_eq!(
-                    error.message,
-                    "YAML parse error: write reserved frontmatter keys at the start of a line",
-                );
-            }
+            let raw = "note: 'before\nimports: []\nafter'\n";
+            let error = prove(raw, &mut MemBudget::default())
+                .expect_err("the strip drops text that is not a reserved key")
+                .serialize();
+            assert_eq!(error.code, "mds::yaml");
+            assert_eq!(
+                error.message,
+                "YAML parse error: write reserved frontmatter keys at the start of a line",
+            );
         }
 
         #[test]

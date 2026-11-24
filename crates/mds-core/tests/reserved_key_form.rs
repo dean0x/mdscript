@@ -75,6 +75,12 @@ fn reserved_keys_in_non_plain_forms_return_fixed_errors() {
 }
 
 #[test]
+fn flow_frontmatter_refuses_imports_even_when_the_strip_matches() {
+    let raw = format!("{{ title: x,\nimports: {IMPORTS_VALUE},\n}}");
+    assert_form_error(with_entry(frontmatter(&raw, "Body\n")), IMPORTS_FORM, &raw);
+}
+
+#[test]
 fn a_strip_that_changes_only_other_yaml_returns_a_generic_error() {
     let raw = format!("info: 'before\nimports: {IMPORTS_VALUE}\nafter'");
     assert_form_error(
