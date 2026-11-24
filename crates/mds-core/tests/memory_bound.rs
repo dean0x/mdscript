@@ -765,8 +765,12 @@ fn assert_extends_chain_trees_share_one_limit() {
     );
 }
 
+const MAPPED_CORNER_TYPE: &str = "type: mds\n";
+
 fn mapped_corner(extra: usize) -> (Result<CompileResult, MdsError>, usize) {
-    let raw = format!("label: {}\n", "a".repeat(MIB - "label: \n".len()));
+    // Fill the frontmatter cap with a reserved key and metadata that the proof must parse.
+    let label = "a".repeat(MIB - MAPPED_CORNER_TYPE.len() - "label: \n".len());
+    let raw = format!("{MAPPED_CORNER_TYPE}label: {label}\n");
     let mut root = format!("---\n{raw}---\n");
     let mut modules = HashMap::new();
     for i in 0..5 {
@@ -809,7 +813,7 @@ fn assert_mapped_max_output_with_frontmatter() {
         "{source_bytes} B"
     );
     let output = control.into_markdown().unwrap();
-    assert_eq!(output.len(), 51 * MIB + 8);
+    assert_eq!(output.len(), 51 * MIB + 8 - MAPPED_CORNER_TYPE.len());
     assert!(output.starts_with("---\nlabel: a"));
     assert!(output.ends_with("bc\n"));
     assert!(!output.contains('\r'));
@@ -821,8 +825,11 @@ fn assert_mapped_max_output_with_frontmatter() {
         over.expect_err("output cap error").to_string(),
         "resource limit exceeded: output exceeds maximum size of 52428800 bytes"
     );
-    // The control holds the 50 MiB output, so the check below reads real data.
-    assert!(peak >= 50 * MIB, "mapped corner control: {peak} B");
+    // The control holds the 50 MiB output and stays within the compile budget plus slack.
+    assert!(
+        (50 * MIB..=200 * MIB + SLACK).contains(&peak),
+        "mapped corner control: {peak} B"
+    );
     // One more output byte is refused, so its peak is at most 1 MiB above the control.
     assert!(
         over_peak <= peak + MIB,

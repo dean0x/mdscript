@@ -983,10 +983,6 @@ fn strip_reserved_keys<'a>(
 }
 
 /// Verify that the strip removes only the reserved keys from the parsed mapping.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the parse-site gate follows this phase")
-)]
 #[must_use = "the caller must propagate a reserved-key proof error"]
 pub(crate) fn prove_reserved_strip(
     raw: &str,
