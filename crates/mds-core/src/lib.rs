@@ -934,6 +934,11 @@ pub(crate) const RESERVED_OUTPUT_KEYS: &[ReservedOutputKey] = &[
         only_value: None,
         form_message: "write `indented-directives:` at the start of a line",
     },
+    ReservedOutputKey {
+        name: "data",
+        only_value: None,
+        form_message: "write `data:` at the start of a line",
+    },
 ];
 const RESERVED_KEY_FORM: &str = "write reserved frontmatter keys at the start of a line";
 const YAML_ONLY_BREAKS: [char; 3] = ['\u{85}', '\u{2028}', '\u{2029}'];
