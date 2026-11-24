@@ -264,15 +264,16 @@ jobs:
           #   - toolchain or wasm-bindgen drift with no source change: +7,011 B
           #     (PR #401), and the 600K -> 650K raise (2026-06);
           #   - a new dependency path: serde_json's text parser was about 30 KB (#426).
-          # The limit used the CI size at PR #492 (790,820 B raw) plus 30,000 B,
-          # rounded up to the next 1,000 B. The current size of 809,019 B leaves
-          # 11,981 B of headroom, below the design margin of 18,851 B. That margin
+          # The limit uses the CI size of PR #527 (823,539 B raw) plus 30,000 B,
+          # rounded up to the next 1,000 B. On main, the size of 811,347 B leaves
+          # 42,653 B of headroom. With PR #527, 30,461 B stays. That is above
+          # the design margin of 18,851 B. That margin
           # covers one large feature PR (+11,840 B, PR #294) plus one toolchain
           # update (+7,011 B, PR #401). It does not cover a lost codegen setting.
           # If a PR would leave less than the design margin, state its size cost
           # in the PR body. Raise the limit only in a separate PR with a ledger
           # entry. Keep the limit equal in release.yml; the WASM parity test checks it.
-          WASM_SIZE_LIMIT=821000
+          WASM_SIZE_LIMIT=854000
           for f in crates/mds-wasm/pkg/mds_wasm_bg.wasm crates/mds-wasm/pkg-web/mds_wasm_bg.wasm; do
             if [ ! -f "$f" ]; then
               echo "::error::WASM file missing: $f"
@@ -356,6 +357,13 @@ jobs:
             #   #128 catch-up: PRs #493–#502 have no ledger entry. CI baseline at
             #   0de0f35: 809,019 bytes raw, 337,075 bytes gzipped (run 45055089420).
             #   The limit stays the same. The baseline leaves 11,981 bytes of headroom.
+            #   ci/wasm-limit-854k (2026-11-24, for PR #527, #405): no source change.
+            #   CI baseline at f64c139: 811,347 bytes raw, 338,015 bytes gzipped
+            #   (run 45221754338). PR #527 at 6f6d133: 823,539 bytes raw, 342,800
+            #   bytes gzipped (run 45372229333). Delta: +12,192 bytes (+1.50%): the
+            #   reserved frontmatter key proof and its fixed error text.
+            #   Guard RAISED 821,000 -> 854,000 (the rule above): 30,461 bytes
+            #   headroom with PR #527.
             if [ "$raw" -gt "$WASM_SIZE_LIMIT" ]; then
               echo "::error::WASM binary exceeds the ${WASM_SIZE_LIMIT}-byte limit: ${label} is ${raw} bytes"
               exit 1
