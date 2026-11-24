@@ -4,7 +4,25 @@ use miette::{Diagnostic, SourceSpan};
 use thiserror::Error;
 
 use crate::limits::{MAX_COMPILE_MEMORY, MAX_OUTPUT_SIZE};
-use crate::lint::{named_source_for_render, sanitize_control_chars, sanitize_control_chars_wire};
+use crate::lint::{
+    escape_path_for_message, named_source_for_render, sanitize_control_chars,
+    sanitize_control_chars_wire,
+};
+
+fn data_location(module: &str, entry: Option<&str>, field: Option<&str>) -> String {
+    let mut location = format!("\"{}\"", escape_path_for_message(module));
+    if let Some(entry) = entry {
+        location.push_str(", entry \"");
+        location.push_str(&sanitize_control_chars_wire(entry));
+        location.push('"');
+    }
+    if let Some(field) = field {
+        location.push_str(", field \"");
+        location.push_str(&sanitize_control_chars_wire(field));
+        location.push('"');
+    }
+    location
+}
 
 // ── Serializable error types ──────────────────────────────────────────────────
 
@@ -441,6 +459,25 @@ pub enum MdsError {
     #[error("resource limit exceeded: {message}")]
     #[diagnostic(code(mds::resource_limit))]
     ResourceLimit { message: String },
+
+    /// A data declaration or data value is invalid.
+    #[error("data error in {message}")]
+    #[diagnostic(code(mds::data))]
+    #[non_exhaustive]
+    Data {
+        message: String,
+        #[help]
+        help: Option<String>,
+    },
+
+    /// Data entries need network access but have no replay value.
+    #[error("network access denied for data entries: {entries}")]
+    #[diagnostic(
+        code(mds::network_denied),
+        help("provide a runtime value for each entry to replay it without network access")
+    )]
+    #[non_exhaustive]
+    NetworkDenied { entries: String },
 
     #[error("YAML parse error: {message}")]
     #[diagnostic(code(mds::yaml))]
@@ -958,6 +995,35 @@ impl MdsError {
         }
     }
 
+    /// Construct a spanless data error. Pass a project-relative module label.
+    /// Supply the entry and field if the error applies to them.
+    /// Pass diagnostic prose as `reason` and `help`, not raw paths or names.
+    pub fn data(
+        module: &str,
+        entry: Option<&str>,
+        field: Option<&str>,
+        reason: &str,
+        help: Option<String>,
+    ) -> Self {
+        let location = data_location(module, entry, field);
+        Self::Data {
+            message: format!("{location}: {reason}"),
+            help,
+        }
+    }
+
+    /// Construct a spanless denial for the ordered list of entries with no replay value.
+    /// Each pair contains the project-relative module label and the entry name.
+    pub fn network_denied(entries: &[(&str, &str)]) -> Self {
+        Self::NetworkDenied {
+            entries: entries
+                .iter()
+                .map(|&(module, entry)| data_location(module, Some(entry), None))
+                .collect::<Vec<_>>()
+                .join("; "),
+        }
+    }
+
     /// The output-cap error: an output buffer would grow past `MAX_OUTPUT_SIZE`.
     ///
     /// The only place this message is built (#415); every output append reports it
@@ -1160,6 +1226,8 @@ impl MdsError {
             }
             MdsError::Io { .. }
             | MdsError::ResourceLimit { .. }
+            | MdsError::Data { .. }
+            | MdsError::NetworkDenied { .. }
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }
             | MdsError::InvalidVars { .. }
@@ -1254,6 +1322,8 @@ impl MdsError {
             | MdsError::MixedContent { src, .. } => src.as_deref(),
             MdsError::Io { .. }
             | MdsError::ResourceLimit { .. }
+            | MdsError::Data { .. }
+            | MdsError::NetworkDenied { .. }
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }
             | MdsError::InvalidVars { .. }

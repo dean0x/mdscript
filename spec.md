@@ -117,6 +117,24 @@ than 64 levels. The frontmatter bounds are pinned by the `parse_frontmatter_yaml
 `crates/mds-core/src/resolver/frontmatter.rs` and by the
 `yaml_parse_sites_are_funnelled` test.
 
+**Local data limits:**
+
+| Limit | Value and stage |
+|-------|-----------------|
+| `MAX_DATA_FILE_BYTES` | 10 MiB per data file, at input admission |
+| `MAX_DATA_NODES_PER_FILE` | 200,000 nodes per data file, during parsing |
+| `MAX_DATA_FILES` | 256 distinct data files per compile, at input admission |
+| `MAX_DATA_ENTRIES_PER_MODULE` | 64 entries per module, during declaration analysis |
+| `MAX_DATA_ENTRIES_PER_COMPILE` | 256 entries across modules per compile, at declaration admission |
+| `MAX_DATA_LEVELS` | 16 levels in the data dependency graph, before file reads |
+| `MAX_DATA_BYTES_PER_COMPILE` | 32 MiB of source text across distinct data files, at input admission |
+
+A dense data file can reach the node cap at about 1 to 2 MiB, before the file byte cap.
+Dense data can also reach the compile memory budget before the 32 MiB aggregate.
+Sparse data, such as a few long strings, can reach a byte cap before the node cap.
+Many small files can reach the file count first.
+The entry and level caps depend on declarations, not on data density.
+
 ---
 
 ### 4.2 Interpolation
@@ -1186,8 +1204,8 @@ Codes are stable identifiers a consumer may branch on; renaming or removing one 
 breaking change.
 
 "Exit" is the CLI exit class (§7.9) for `mds build`, `mds check`, `mds fmt` and
-`mds watch` startup — 1 template or content error, 2 I/O or file-system error,
-3 resource limit, 101 internal compiler error — followed by the `mds lint` code, which
+`mds watch` startup — 1 template or content error, 2 I/O error, file-system error, or
+network access denied, 3 resource limit, 101 internal compiler error — followed by the `mds lint` code, which
 reports analysis failures as 2 except for the two carve-outs shown. The CLI's own stream
 and I/O failures are described below the table.
 
@@ -1209,6 +1227,8 @@ and I/O failures are described below the table.
 | `mds::resource_limit` | A documented limit exceeded (§4.1 resource-limits table, `SECURITY.md`), CLI stdin over 10 MiB included; bindings also raise it before compilation for oversized sources, module and alias maps, and their counts (as `VirtualFs::with_aliases` does for an alias map); `@mdscript/mds`'s WASM-backend pre-scanner raises the native error for a path over the segment cap, a file over the size cap and a module over the module count, and one of its own for modules that together pass 10 MiB. The WASM file APIs also report this code if the resolved path of an alias target has more than 256 segments below the project root. This applies even to a short import path. | evaluator, resolver, `VirtualFs`, bindings, `@mdscript/mds` WASM-backend pre-scanner | 3 / 3 | all |
 | `mds::yaml` | Frontmatter YAML the parser refuses (syntax, duplicate keys, nesting beyond the parser's limits — §4.1), or a [reserved output key form error](#reserved-output-keys) | resolver | 1 / 2 | all |
 | `mds::json` | Malformed JSON, or a non-object root, in `load_vars_str` and other JSON sites | `mds-core` vars API | 1 / 2 | Rust, CLI |
+| `mds::data` | Invalid data declaration or value. The message names the project-relative module and, where applicable, the entry and field. These labels are escaped. The error has no source span. | resolver | 1 / 2 | CLI, Rust, napi, WASM, Python |
+| `mds::network_denied` | A compile needs a network data entry with no replay value. The message names the entries and their project-relative modules, escaped, with no source span. | resolver | 2 / 2 | CLI, Rust, napi, WASM, Python |
 | `mds::invalid_vars` | `--vars` file is malformed JSON or not an object (`load_vars_file`) | `mds-core` vars API | 1 / 2 | CLI, Rust |
 | `mds::var_conflict` | Same key given to both `--set` and `--set-string` | CLI | 1 / 1 | CLI |
 | `mds::module_not_found` | Virtual backend: a key absent from the module map | `VirtualFs` | 1 / 2 | napi, WASM, Python, Rust |
@@ -1950,6 +1970,9 @@ Maximum config file size: 1 MiB (1,048,576 bytes).
 | `2` | I/O or file-system error (file not found, not an MDS file, I/O failure, a path that is not valid UTF-8, a path carrying a forbidden path character — §4.6); also an output location (`-o`, `--out-dir`, `build.output_dir`) or `mds init` filename carrying one, a `-o`/`--out-dir` value that is not valid UTF-8, a relative `-o`/`--out-dir` when the working directory cannot be determined, and a working directory that auto-detection cannot list (§7.2, §7.7, #390), a `build.output_dir` that is absolute or contains `..`, a directory argument that is a symlink or the filesystem root (§7.2), an output that is the entry file itself, and one that would replace an MDS module or a file the run reads (§7.2). The CLI's I/O failures listed in §5 "Streams and I/O failures" are `mds::io`, exit 2: an output, `.map` sidecar or starter file that cannot be written (a symlink at the destination included), an output directory that cannot be created, a stale sidecar, or a stale `.json` output shown to be mds's, that cannot be removed or whose removal is refused (§7.2), a stale sidecar or `.json` output that cannot be read, a stdout write that fails other than by a closed pipe, and stdin that cannot be read or is not valid UTF-8 (#157). In directory mode a failure of this row — one of these, or a file's own, such as a source that cannot be read — makes the run exit 2 while the other files are still processed (§7.2 continue-on-error). (Changed in v0.5.0: these exited 1, a directory run whose failed files included one of this row's errors exited 1, and a stale sibling or sidecar that could not be removed, or a stale sidecar that could not be read, only warned.) |
 | `3` | Resource limit exceeded (output too large, too many iterations, message count exceeds `MAX_MESSAGE_COUNT` (10,000), cumulative message content exceeds 50 MB, frontmatter over 1 MiB, over 200,000 YAML nodes, deeper than 1024 flow-nesting levels or past its byte allowance, compile memory over its budget, or stdin over 10 MiB — changed in v0.5.0; previously exit 1). In directory mode a run in which any file fails with one of these exits 3, whatever else failed, as `mds lint <dir>` does (§7.2 continue-on-error; changed in v0.5.0, previously exit 1) |
 | `101` | Internal compiler error: a panic (§5 "Panics on the CLI", #389), or a failed memory-counter check under `mds build` or `mds check` (`mds::internal`, §5 "Compile memory budget") — wins over every other code |
+
+For data sources, `mds::data` is a content error (exit 1).
+`mds::network_denied` has exit 2. A data limit has exit 3 (`mds::resource_limit`).
 
 A closed stdout or stderr pipe never changes any of these codes (§5 "Streams and I/O failures").
 
