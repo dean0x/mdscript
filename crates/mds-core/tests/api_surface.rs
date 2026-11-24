@@ -453,6 +453,9 @@ fn mds_error_variants_exist() {
         | MdsError::NotMdsFile { .. }
         | MdsError::Io { .. }
         | MdsError::ResourceLimit { .. }
+        | MdsError::Data { .. }
+        | MdsError::NetworkDenied { .. }
+        | MdsError::DataFileNotFound { .. }
         | MdsError::YamlError { .. }
         | MdsError::JsonError { .. }
         | MdsError::Recursion { .. }
@@ -462,6 +465,30 @@ fn mds_error_variants_exist() {
         | MdsError::Internal => {}
         _ => {}
     }
+}
+
+/// The data error variants are `#[non_exhaustive]`, so an external crate builds each
+/// one with its named constructor. A data file miss has the code of a module miss, and
+/// its constructor escapes the key for the message.
+#[test]
+fn data_error_variants_have_named_constructors() {
+    let constructor: fn(&str) -> MdsError = MdsError::data_file_not_found;
+    let err = constructor("cfg.json");
+    assert!(matches!(err, MdsError::DataFileNotFound { .. }), "{err:?}");
+    assert_eq!(err.serialize().code, "mds::module_not_found");
+    assert_eq!(
+        err.to_string(),
+        "data file 'cfg.json' is not in the virtual module map"
+    );
+    let key = "a\x1b\n.json";
+    assert!(key.contains(char::from(0x1b)) && key.contains('\n'));
+    assert_eq!(
+        constructor(key).to_string(),
+        "data file 'a\\u001B\\u000A.json' is not in the virtual module map"
+    );
+    type DataFn = fn(&str, Option<&str>, Option<&str>, &str, Option<String>) -> MdsError;
+    let _: DataFn = MdsError::data;
+    let _: fn(&[(&str, &str)]) -> MdsError = MdsError::network_denied;
 }
 
 #[test]

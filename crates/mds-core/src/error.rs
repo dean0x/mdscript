@@ -547,6 +547,7 @@ pub enum MdsError {
         code(mds::module_not_found),
         help("add the data file to `options.modules` or use the native backend")
     )]
+    #[non_exhaustive]
     DataFileNotFound { key: String },
 
     #[error("recursion detected in function '{name}'")]
@@ -911,7 +912,9 @@ impl MdsError {
         }
     }
 
-    pub(crate) fn data_file_not_found(key: &str) -> Self {
+    /// Construct the error for a data file key that a virtual module map does not hold.
+    /// The key is escaped for the message.
+    pub fn data_file_not_found(key: &str) -> Self {
         Self::DataFileNotFound {
             key: crate::escape_path_for_message(key).into_owned(),
         }
