@@ -1,14 +1,23 @@
 //! Inheritance resolution, merged frontmatter, and skeleton modules.
 
+use crate::data::resolve::Chain;
+
 use super::{
     apply_block_overrides, attach_import_span, build_cycle_string, build_scope_from_frontmatter,
-    build_scope_from_merged_mapping, bytes, check_child_only_blocks, check_module_type,
-    evaluate_messages_seeded, is_visible_export, parse_frontmatter_imports_from_yaml,
-    parse_frontmatter_mapping, seed_effective_blocks, spliced_regions, validate_exports,
-    validate_import_path, validator, Arc, CollectedDefs, EffectiveBlock, EvalBudget,
-    ExtendsComponents, FrontmatterImport, ImportSite, IndexMap, MdsError, ModuleCache, ModuleCtx,
-    ModuleRef, Node, OnceCell, Origin, Part, PromptText, ResolvedModule, Scope, VarLayer,
+    bytes, check_child_only_blocks, check_module_type, evaluate_messages_seeded, is_visible_export,
+    merged_frontmatter_layer, parse_frontmatter_imports_from_yaml, parse_frontmatter_mapping,
+    seed_effective_blocks, spliced_regions, validate_exports, validate_import_path, validator, Arc,
+    CollectedDefs, EffectiveBlock, EvalBudget, ExtendsComponents, FrontmatterImport, ImportSite,
+    IndexMap, MdsError, ModuleCache, ModuleCtx, ModuleRef, Node, OnceCell, Origin, Part,
+    PromptText, ResolvedModule, Scope, VarLayer,
 };
+
+pub(super) struct MergedScope {
+    pub(super) scope: Scope,
+    pub(super) mapping: serde_yaml_ng::Mapping,
+    pub(super) charge: usize,
+    pub(super) data_chain: Chain,
+}
 
 impl ModuleCache {
     /// Evaluate an `@extends` chain's spliced regions: the terminal step the entry's
@@ -89,7 +98,7 @@ impl ModuleCache {
         base_key: &str,
         ctx: &ModuleCtx<'_>,
         warnings: &mut Vec<String>,
-    ) -> Result<(Scope, serde_yaml_ng::Mapping, usize), MdsError> {
+    ) -> Result<MergedScope, MdsError> {
         // 3d-i: Extract frontmatter imports from BOTH base and child BEFORE the deep merge.
         //
         // Base imports resolve relative to the BASE file's directory (base_base_dir, derived
@@ -123,7 +132,25 @@ impl ModuleCache {
         // merge charge as a temporary first. It stays a temporary: an extending child
         // has only @block overrides, so no function of its own can capture the layer.
         self.budget.mem.charge(Part::Temp, Some(charge))?;
-        let mut scope = build_scope_from_merged_mapping(&merged_mapping, ctx.runtime_vars)?;
+        let mut vars = merged_frontmatter_layer(&merged_mapping)?;
+        let is_md = self.fs.is_markdown(ctx.key);
+        // A valid extending child has no top-level body imports.
+        let data_chain = self.extend_data_chain(
+            &base.data_chain,
+            ctx,
+            is_md,
+            child_fm.as_ref(),
+            &child_fm_imports,
+            &[],
+        )?;
+        self.bind_data(
+            &data_chain,
+            Some(&merged_mapping),
+            false,
+            ctx.runtime_vars,
+            &mut vars,
+        )?;
+        let mut scope = Scope::with_layers(Arc::clone(ctx.runtime_vars), Arc::new(vars));
 
         // 3d-iv: Resolve base frontmatter imports against base_key (frontmatter-first ordering,
         // PF-004 safe via resolve_frontmatter_imports → resolve_import_from).
@@ -150,14 +177,70 @@ impl ModuleCache {
 
         // 3d-vi: Merge base functions into scope (F12: base default block calling a base @define).
         // Collision with child frontmatter-imported functions → name_collision.
-        for (name, func) in &base.functions {
+        let rebound = self.collect_cached_base_definitions(base, ctx.runtime_vars, warnings)?;
+        let functions = rebound
+            .as_ref()
+            .map_or(&base.functions, |defs| &defs.functions);
+        for (name, func) in functions {
             if scope.get_function(name).is_some() {
                 return Err(MdsError::name_collision(name.clone()));
             }
             scope.set_function(name, Arc::clone(func));
         }
 
-        Ok((scope, merged_mapping, charge))
+        Ok(MergedScope {
+            scope,
+            mapping: merged_mapping,
+            charge,
+            data_chain,
+        })
+    }
+
+    /// Rebuild a cached standalone base's lexical closures without its data values.
+    /// The leaf scope supplies the winning values, as it does for skeleton closures.
+    fn collect_cached_base_definitions(
+        &mut self,
+        base: &ResolvedModule,
+        runtime: &Arc<VarLayer>,
+        warnings: &mut Vec<String>,
+    ) -> Result<Option<CollectedDefs>, MdsError> {
+        let origin = &base.skeleton_origin;
+        let Some(root) = self.modules.get(origin.file.as_ref()).cloned() else {
+            return Ok(None);
+        };
+        if root.is_skeleton
+            || !crate::data::resolve::Declarations::contains_data(&root.data_chain)
+            || !base
+                .effective_skeleton
+                .iter()
+                .any(|node| matches!(node, Node::Define(_)))
+            || base.functions.is_empty()
+        {
+            return Ok(None);
+        }
+        let dir = self.fs.parent_dir(&origin.file);
+        let ctx = ModuleCtx {
+            key: &origin.file,
+            file_str: &origin.display,
+            source: &origin.source,
+            base_dir: &dir,
+            runtime_vars: runtime,
+            origin: OnceCell::from(origin.clone()),
+        };
+        // The tree charge covers the new definitions and capture maps.
+        let module = self.parse_charged(&ctx, true)?;
+        let (mut scope, imports) = build_scope_from_frontmatter(
+            module.frontmatter.as_ref(),
+            root.frontmatter_values.as_ref(),
+            root.frontmatter_bytes,
+            self.fs.is_markdown(ctx.key),
+            runtime,
+            &mut self.budget.mem,
+        )?;
+        self.keep(root.frontmatter_bytes);
+        self.resolve_frontmatter_imports(&imports, &mut scope, &ctx, warnings)?;
+        self.collect_definitions_and_imports(&module.body, &mut scope, &ctx, warnings)
+            .map(Some)
     }
 
     /// Serialize a deep-merged frontmatter `Mapping` for `frontmatter_prefix`, by
@@ -287,7 +370,12 @@ impl ModuleCache {
         // exclusion, array wholesale replace, both sets of FM imports resolved per-file).
         // The merged_mapping is also returned so we can serialize it for the output
         // frontmatter (#154: @extends emits deep-merged frontmatter).
-        let (mut scope, merged_mapping, charge) = self.build_merged_extends_scope(
+        let MergedScope {
+            mut scope,
+            mapping: merged_mapping,
+            charge,
+            data_chain,
+        } = self.build_merged_extends_scope(
             &base,
             frontmatter_values,
             frontmatter_bytes,
@@ -323,6 +411,9 @@ impl ModuleCache {
             has_explicit_exports,
             explicit_exports,
             merged_frontmatter,
+            data_chain,
+            merged_mapping,
+            merged_mapping_bytes: charge,
         })
     }
 
@@ -400,6 +491,9 @@ impl ModuleCache {
             has_explicit_exports,
             explicit_exports,
             merged_frontmatter,
+            data_chain,
+            merged_mapping,
+            merged_mapping_bytes,
         } = components;
 
         // Base-skeleton nodes, base defaults and child overrides index into different
@@ -428,6 +522,7 @@ impl ModuleCache {
             prompt_body.as_ref(),
             prompt_map.as_ref(),
         );
+        self.keep(merged_mapping_bytes);
         Ok(ResolvedModule {
             functions,
             prompt_body,
@@ -441,8 +536,9 @@ impl ModuleCache {
             effective_skeleton,
             effective_blocks,
             skeleton_origin,
-            frontmatter_values,
-            frontmatter_bytes,
+            frontmatter_values: Some(merged_mapping),
+            frontmatter_bytes: merged_mapping_bytes,
+            data_chain,
             is_skeleton: false,
         })
     }
@@ -536,8 +632,8 @@ impl ModuleCache {
     fn resolve_intermediate_base(
         &mut self,
         ext: &crate::ast::ExtendsDirective,
-        own_fm: &Option<serde_yaml_ng::Mapping>,
-        own_fm_bytes: usize,
+        own_frontmatter: (&Option<serde_yaml_ng::Mapping>, usize),
+        imports: &[FrontmatterImport],
         module_body: &[Node],
         ctx: &ModuleCtx<'_>,
         warnings: &mut Vec<String>,
@@ -548,9 +644,11 @@ impl ModuleCache {
             Origin,
             Option<serde_yaml_ng::Mapping>,
             usize,
+            Chain,
         ),
         MdsError,
     > {
+        let (own_fm, own_fm_bytes) = own_frontmatter;
         validate_import_path(&ext.path)
             .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
         let grandparent_key = self
@@ -594,12 +692,21 @@ impl ModuleCache {
             (Some(merged_fm), charge)
         };
 
+        let data_chain = self.extend_data_chain(
+            &grandparent.data_chain,
+            ctx,
+            self.fs.is_markdown(ctx.key),
+            own_fm.as_ref(),
+            imports,
+            module_body,
+        )?;
         Ok((
             Arc::clone(&grandparent.effective_skeleton),
             eff_blocks,
             skel_origin,
             accumulated_fm,
             accumulated_bytes,
+            data_chain,
         ))
     }
 
@@ -656,17 +763,26 @@ impl ModuleCache {
             skeleton_origin,
             frontmatter_values,
             frontmatter_bytes,
+            data_chain,
         ) = if let Some(ext) = module.extends.as_ref() {
             self.resolve_intermediate_base(
                 ext,
-                &own_fm_values,
-                own_fm_bytes,
+                (&own_fm_values, own_fm_bytes),
+                &fm_imports,
                 &module.body,
                 ctx,
                 warnings,
             )?
         } else {
             // Root base: own body is the skeleton; blocks seeded from own @block declarations.
+            let data_chain = self.extend_data_chain(
+                &None,
+                ctx,
+                is_md,
+                own_fm_values.as_ref(),
+                &fm_imports,
+                &module.body,
+            )?;
             let root_origin = ctx.origin(self)?.clone();
             // Seed blocks first so module.body can be moved into the Arc (no element clones, P1).
             let eff_blocks = seed_effective_blocks(&module.body, &block_names, &root_origin);
@@ -678,6 +794,7 @@ impl ModuleCache {
                 root_origin,
                 own_fm_values,
                 own_fm_bytes,
+                data_chain,
             )
         };
         // The entry keeps its frontmatter tree.
@@ -709,6 +826,7 @@ impl ModuleCache {
             skeleton_origin,
             frontmatter_values,
             frontmatter_bytes,
+            data_chain,
             is_skeleton: true,
         })
     }

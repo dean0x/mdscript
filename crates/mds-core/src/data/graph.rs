@@ -10,6 +10,7 @@ pub(crate) struct Node<'a> {
     pub(crate) entry: &'a Entry,
     /// Project-relative label of the module that declares the entry.
     pub(crate) module: &'a str,
+    pub(crate) dir: &'a str,
 }
 
 impl Node<'_> {
@@ -17,6 +18,7 @@ impl Node<'_> {
         DataLabel {
             module: self.module,
             entry: &self.entry.name,
+            file: None,
         }
     }
 }
@@ -54,9 +56,7 @@ pub(crate) fn analyze<'a>(
     has_runtime: impl Fn(&str) -> bool,
 ) -> Result<Graph<'a>, MdsError> {
     if nodes.len() > MAX_DATA_ENTRIES_PER_COMPILE {
-        return Err(MdsError::resource_limit(format!(
-            "too many data entries (max {MAX_DATA_ENTRIES_PER_COMPILE} per compile)"
-        )));
+        return Err(entry_limit());
     }
 
     // Sort only the lookup table. The graph and frontier keep the input order.
@@ -94,6 +94,12 @@ pub(crate) fn analyze<'a>(
     }
     check_levels(nodes, waiting)?;
     Ok(Graph { nodes, replayed })
+}
+
+pub(crate) fn entry_limit() -> MdsError {
+    MdsError::resource_limit(format!(
+        "too many data entries (max {MAX_DATA_ENTRIES_PER_COMPILE} per compile)"
+    ))
 }
 
 fn check_levels(nodes: &[Node<'_>], waiting: &mut [Option<NodeSet>]) -> Result<(), MdsError> {

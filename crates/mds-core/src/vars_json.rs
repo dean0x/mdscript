@@ -82,6 +82,7 @@ struct Scan<'a> {
 #[derive(Clone, Copy)]
 pub(crate) enum DataScanError {
     Invalid,
+    Number,
     Duplicate,
     Depth,
 }
@@ -315,7 +316,16 @@ pub(crate) fn check_data_json(
         data: Some(charge),
         ..Scan::default()
     };
-    scan_json(json, &mut scan).map_err(|_| scan.rejection.unwrap_or(DataScanError::Invalid))
+    scan_json(json, &mut scan).map_err(|err| {
+        scan.rejection.unwrap_or_else(|| {
+            // serde_json groups numeric overflow with syntax and has no public subkind.
+            if err.to_string().starts_with("number out of range at line ") {
+                DataScanError::Number
+            } else {
+                DataScanError::Invalid
+            }
+        })
+    })
 }
 
 fn scan_json(json: &str, scan: &mut Scan<'_>) -> Result<(), serde_json::Error> {

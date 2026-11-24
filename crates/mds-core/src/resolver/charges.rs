@@ -12,9 +12,7 @@ use crate::limits::{MAX_DATA_BYTES_PER_COMPILE, MAX_DATA_ENTRIES_PER_COMPILE, MA
 
 pub(super) fn count_data_entries(total: &mut usize, count: usize) -> Result<(), MdsError> {
     let Some(next @ ..=MAX_DATA_ENTRIES_PER_COMPILE) = total.checked_add(count) else {
-        return Err(MdsError::resource_limit(format!(
-            "too many data entries (max {MAX_DATA_ENTRIES_PER_COMPILE} per compile)"
-        )));
+        return Err(crate::data::graph::entry_limit());
     };
     *total = next;
     Ok(())

@@ -9,6 +9,12 @@
 //! frontmatter_tests;`, so the private helpers (`parse_frontmatter_yaml_bounded`) are in
 //! scope via `super::`.
 
+const DATA_LABEL: crate::data::DataLabel<'static> = crate::data::DataLabel {
+    module: "test.mds",
+    entry: "item",
+    file: Some("item.yml"),
+};
+
 use super::{
     parse_data_yaml_with, parse_frontmatter_yaml, parse_frontmatter_yaml_bounded, Allowance,
     NODE_YAML,
@@ -233,17 +239,21 @@ fn c2_size_cap_end_to_end() {
 fn data_file_parser_checks_the_byte_cap_before_the_parse() {
     let cap = MAX_DATA_FILE_BYTES as usize;
     let raw = fm_of_size(2 * 1024 * 1024);
-    assert!(parse_data_yaml_with(&raw, Allowance::PER_PARSE).is_ok());
+    assert!(parse_data_yaml_with(&raw, Allowance::PER_PARSE, DATA_LABEL).is_ok());
     assert_eq!(
         msg(&parse_frontmatter_yaml(&raw)),
         "resource limit exceeded: frontmatter too large (2097152 bytes, max 1048576 bytes)"
     );
-    assert!(parse_data_yaml_with(&fm_of_size(cap), Allowance::PER_PARSE).is_ok());
+    assert!(parse_data_yaml_with(&fm_of_size(cap), Allowance::PER_PARSE, DATA_LABEL).is_ok());
 
     // The invalid YAML also crosses the size cap by one byte.
     let raw = format!("[{}", "x".repeat(cap));
     assert_eq!(
-        msg(&parse_data_yaml_with(&raw, Allowance::PER_PARSE)),
+        msg(&parse_data_yaml_with(
+            &raw,
+            Allowance::PER_PARSE,
+            DATA_LABEL
+        )),
         format!(
             "resource limit exceeded: data file too large ({} bytes, max {cap} bytes)",
             cap + 1
@@ -254,13 +264,17 @@ fn data_file_parser_checks_the_byte_cap_before_the_parse() {
 #[test]
 fn data_file_parser_charges_nodes_through_the_exact_cap() {
     let cap = MAX_DATA_NODES_PER_FILE;
-    assert!(parse_data_yaml_with(&alias_bomb_at(cap), Allowance::PER_PARSE).is_ok());
+    assert!(parse_data_yaml_with(&alias_bomb_at(cap), Allowance::PER_PARSE, DATA_LABEL).is_ok());
     let raw = alias_bomb_at(cap + 1);
     let detail = format!(
         "YAML node count exceeds maximum of {cap} (anchors expanded by aliases count once per expansion)"
     );
     assert_eq!(
-        msg(&parse_data_yaml_with(&raw, Allowance::PER_PARSE)),
+        msg(&parse_data_yaml_with(
+            &raw,
+            Allowance::PER_PARSE,
+            DATA_LABEL
+        )),
         format!("resource limit exceeded: data file {detail}")
     );
     assert_eq!(
@@ -271,12 +285,16 @@ fn data_file_parser_charges_nodes_through_the_exact_cap() {
 
 #[test]
 fn data_file_parser_checks_flow_depth_before_the_parse() {
-    assert!(parse_data_yaml_with("[0]", Allowance::PER_PARSE).is_ok());
+    assert!(parse_data_yaml_with("[0]", Allowance::PER_PARSE, DATA_LABEL).is_ok());
     let cap = MAX_FRONTMATTER_FLOW_DEPTH;
     let raw = nested_flow_seq(cap + 1);
     let detail = format!("YAML flow nesting exceeds maximum depth of {cap}");
     assert_eq!(
-        msg(&parse_data_yaml_with(&raw, Allowance::PER_PARSE)),
+        msg(&parse_data_yaml_with(
+            &raw,
+            Allowance::PER_PARSE,
+            DATA_LABEL
+        )),
         format!("resource limit exceeded: data file {detail}")
     );
     assert_eq!(
@@ -289,7 +307,8 @@ fn data_file_parser_checks_flow_depth_before_the_parse() {
 fn data_file_parser_returns_the_bytes_spent_and_refuses_excess() {
     let raw = "value";
     let cost = NODE_YAML + raw.len();
-    let parse = |bytes, by_budget| parse_data_yaml_with(raw, Allowance { bytes, by_budget });
+    let parse =
+        |bytes, by_budget| parse_data_yaml_with(raw, Allowance { bytes, by_budget }, DATA_LABEL);
     let (yaml, spent) = parse(cost, false).unwrap();
     assert_eq!(yaml.as_str(), Some(raw));
     assert_eq!(spent, cost);

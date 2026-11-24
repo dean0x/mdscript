@@ -17,9 +17,18 @@ pub(crate) struct DataLabel<'a> {
     /// Project-relative label of the declaring module.
     pub(crate) module: &'a str,
     pub(crate) entry: &'a str,
+    pub(crate) file: Option<&'a str>,
 }
 
 impl DataLabel<'_> {
+    pub(crate) fn syntax(self, format: &str) -> MdsError {
+        MdsError::yaml_error(format!(
+            "data file \"{}\", entry \"{}\": invalid {format} data",
+            crate::escape_path_for_message(self.file.unwrap_or(self.module)),
+            crate::sanitize_control_chars_wire(self.entry),
+        ))
+    }
+
     pub(crate) fn error(self, field: Option<&str>, reason: &str) -> MdsError {
         MdsError::data(self.module, Some(self.entry), field, reason, None)
     }
@@ -58,10 +67,7 @@ pub(crate) fn convert(
         Accept::Yaml | Accept::Json => {
             let (tree, spent) = match accept {
                 Accept::Json => parse_data_json_with(raw, allowance, label),
-                _ => parse_data_yaml_with(raw, allowance).map_err(|err| match err {
-                    MdsError::YamlError { .. } => label.error(None, "invalid YAML data"),
-                    other => other,
-                }),
+                _ => parse_data_yaml_with(raw, allowance, label),
             }?;
             // Reserve space for both trees while they are live. The node charge
             // covers either representation.

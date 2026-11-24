@@ -237,7 +237,7 @@ impl ModuleCache {
         spent: usize,
         is_md: bool,
         ctx: &ModuleCtx<'_>,
-    ) -> Result<(Scope, Vec<FrontmatterImport>), MdsError> {
+    ) -> Result<(Scope, Vec<FrontmatterImport>, resolve::Chain), MdsError> {
         let is_mds = uses_mds_scope(is_md, module.frontmatter.as_ref());
         let (mut vars, imports) = frontmatter_layer(
             mapping,
@@ -247,23 +247,73 @@ impl ModuleCache {
             ctx.runtime_vars,
             &mut self.budget.mem,
         )?;
-        if let Some(mapping) = mapping.filter(|m| is_mds && m.contains_key("data")) {
-            if self.data.mode == resolve::Mode::Collect {
-                self.collect_compile_data_graphs(ctx.runtime_vars)?;
-                self.data.mode = resolve::Mode::Read;
-            }
-            let declarations = resolve::Declarations {
+        let data = if is_mds {
+            self.extend_data_chain(&None, ctx, is_md, mapping, &imports, &module.body)?
+        } else {
+            None
+        };
+        self.bind_data(&data, mapping, is_md, ctx.runtime_vars, &mut vars)?;
+        Ok((
+            Scope::with_layers(Arc::clone(ctx.runtime_vars), Arc::new(vars)),
+            imports,
+            data,
+        ))
+    }
+
+    /// Keep the declaring location even when a cached module becomes a base.
+    pub(super) fn extend_data_chain(
+        &mut self,
+        base: &resolve::Chain,
+        ctx: &ModuleCtx<'_>,
+        is_md: bool,
+        mapping: Option<&serde_yaml_ng::Mapping>,
+        imports: &[FrontmatterImport],
+        body: &[Node],
+    ) -> Result<resolve::Chain, MdsError> {
+        let mem = &mut self.budget.mem;
+        let mark = mem.mark();
+        let data = resolve::Declarations::extend(
+            base,
+            resolve::DeclarationSite {
+                key: ctx.key,
                 module: ctx.file_str,
-                mapping,
-                imports: &imports,
-                body: &module.body,
-                runtime: ctx.runtime_vars,
+                dir: ctx.base_dir,
                 is_md,
-            };
-            let before = self.budget.mem.buffers;
-            let fs = &*self.fs;
-            let data = &mut self.data;
-            let result = declarations.with_graph(&mut self.budget.mem, |count, graph, mem| {
+                preflight: false,
+            },
+            mapping,
+            imports,
+            body,
+            mem,
+        )?;
+        self.keep(self.budget.mem.mark() - mark);
+        Ok(data)
+    }
+
+    pub(super) fn bind_data(
+        &mut self,
+        chain: &resolve::Chain,
+        mapping: Option<&serde_yaml_ng::Mapping>,
+        is_md: bool,
+        runtime: &VarLayer,
+        vars: &mut VarLayer,
+    ) -> Result<(), MdsError> {
+        if !resolve::Declarations::contains_data(chain) {
+            return Ok(());
+        }
+        if self.data.mode == resolve::Mode::Collect {
+            self.collect_compile_data_graphs(runtime)?;
+            self.data.mode = resolve::Mode::Read;
+        }
+        let before = self.budget.mem.buffers;
+        let fs = &*self.fs;
+        let data = &mut self.data;
+        let result = resolve::Declarations::with_graph(
+            chain,
+            resolve::FrontmatterNames::Parsed { mapping, is_md },
+            runtime,
+            &mut self.budget.mem,
+            |count, graph, mem| {
                 count_data_entries(&mut data.entries, count)?;
                 if data.mode != resolve::Mode::Read {
                     return Ok(());
@@ -280,8 +330,9 @@ impl ModuleCache {
                     let label = DataLabel {
                         module: node.module,
                         entry: &node.entry.name,
+                        file: None,
                     };
-                    let (key, accept) = resolve::canonical_file(fs, ctx.base_dir, written, label)?;
+                    let (key, accept) = resolve::canonical_file(fs, node.dir, written, label)?;
                     let value = if let Some(value) = data.files.get(&key) {
                         Arc::clone(value)
                     } else {
@@ -304,14 +355,10 @@ impl ModuleCache {
                     vars.insert(node.entry.name.clone(), value);
                 }
                 Ok(())
-            });
-            self.commit_retained(self.budget.mem.buffers - before);
-            result?;
-        }
-        Ok((
-            Scope::with_layers(Arc::clone(ctx.runtime_vars), Arc::new(vars)),
-            imports,
-        ))
+            },
+        );
+        self.commit_retained(self.budget.mem.buffers - before);
+        result.map(drop)
     }
 }
 

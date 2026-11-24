@@ -11,7 +11,14 @@ fn parse(raw: &str, module: &str) -> Result<Vec<Entry>, MdsError> {
 }
 
 fn nodes<'a>(entries: &'a [Entry], module: &'a str) -> Vec<Node<'a>> {
-    entries.iter().map(|entry| Node { entry, module }).collect()
+    entries
+        .iter()
+        .map(|entry| Node {
+            entry,
+            module,
+            dir: ".",
+        })
+        .collect()
 }
 
 fn check<'a>(

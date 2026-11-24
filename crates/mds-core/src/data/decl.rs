@@ -70,8 +70,8 @@ pub(crate) fn parse_declarations(
 
 /// Check claims in the final scope, after any entry merge. Omit runtime variables.
 #[must_use = "a data entry can collide with another name in scope"]
-pub(crate) fn check_collisions(
-    entries: &[Entry],
+pub(crate) fn check_collisions<'a>(
+    entries: impl IntoIterator<Item = &'a Entry>,
     mut is_claimed: impl FnMut(&str) -> bool,
 ) -> Result<(), MdsError> {
     for entry in entries {
@@ -102,6 +102,7 @@ fn parse_mapping(
         let label = DataLabel {
             module,
             entry: name,
+            file: None,
         };
         if RESERVED_NAMES.contains(&name.as_str()) {
             return Err(label.error(None, "data entry name is reserved"));

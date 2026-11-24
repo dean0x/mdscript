@@ -81,7 +81,22 @@ fn data_uses_bounded_format_parsers() {
         .unwrap()
         .ends_with("42\n"));
     data_error("yaml", "42\n---\n43");
-    data_error("json", "{\"a\":1 # YAML only\n}");
+}
+
+#[test]
+fn syntax_errors_name_the_data_file_and_entry_without_source_text() {
+    for (ext, raw) in [
+        ("yaml", "outer: [UNPARSED_MARKER"),
+        ("json", r#"{"outer": ["UNPARSED_MARKER""#),
+        ("json", "{\"a\":1 # UNPARSED_MARKER\n}"),
+    ] {
+        let err = compile(SOURCE, ext, raw).unwrap_err();
+        let expected = format!("data file \"settings.{ext}\", entry \"settings\":");
+        assert_eq!(err.serialize().code, "mds::yaml", "{err}");
+        assert!(err.to_string().contains(&expected), "{err}");
+        assert!(!err.to_string().contains("UNPARSED_MARKER"), "{err}");
+        assert!(compile(SOURCE, ext, "42").unwrap().ends_with("42\n"));
+    }
 }
 
 #[test]

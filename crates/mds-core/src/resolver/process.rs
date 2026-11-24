@@ -10,7 +10,7 @@ use super::{
 };
 use super::{check_module_type, parse_frontmatter_imports_from_yaml, validate_import_path};
 use crate::ast::{ExportDirective, ImportDirective};
-use crate::data::resolve::Declarations;
+use crate::data::resolve::{Chain, DeclarationSite, Declarations, FrontmatterNames};
 use crate::MarkdownFrontmatter;
 
 /// Check the static graph before the first data read. This pass uses the same
@@ -18,8 +18,14 @@ use crate::MarkdownFrontmatter;
 struct DataGraphWalk<'a> {
     fs: &'a dyn super::FileSystem,
     runtime: &'a super::VarLayer,
-    seen: super::HashSet<String>,
+    seen: super::HashMap<String, Option<SeenDataScope>>,
     entries: usize,
+}
+
+struct SeenDataScope {
+    chain: Chain,
+    checked: bool,
+    merged: bool,
 }
 
 impl DataGraphWalk<'_> {
@@ -29,10 +35,29 @@ impl DataGraphWalk<'_> {
         is_base: bool,
         depth: usize,
         mem: &mut MemBudget,
-    ) -> Result<(), MdsError> {
+    ) -> Result<Chain, MdsError> {
         let key = module_ref.key;
-        if self.seen.contains(key) {
-            return Ok(());
+        if let Some(stored) = self.seen.get_mut(key) {
+            let Some(SeenDataScope {
+                chain,
+                checked,
+                merged,
+            }) = stored
+            else {
+                // An already active import edge is not another data scope.
+                // Inheritance needs the complete base chain, so it cannot skip this edge.
+                if is_base {
+                    return Err(MdsError::circular_import(
+                        crate::source_path::display_path_for(self.fs, key),
+                    ));
+                }
+                return Ok(None);
+            };
+            if !is_base && !*checked {
+                Self::check_scope(chain, *merged, self.runtime, &mut self.entries, mem)?;
+                *checked = true;
+            }
+            return Ok(chain.clone());
         }
         if depth >= super::MAX_IMPORT_DEPTH {
             return Err(MdsError::import_error(format!(
@@ -45,13 +70,37 @@ impl DataGraphWalk<'_> {
         }
         mem.charge(
             Part::Buffers,
-            key.len().checked_add(2 * size_of::<String>()),
+            key.len()
+                .checked_add(2 * size_of::<(String, Option<SeenDataScope>)>()),
         )?;
-        self.seen.insert(key.to_owned());
+        self.seen.insert(key.to_owned(), None);
         let mark = mem.mark();
         let result = self.check_module(module_ref, is_base, depth, mem);
         mem.release_to(mark);
-        result
+        let (chain, merged) = result?;
+        *self.seen.get_mut(key).ok_or_else(MdsError::internal)? = Some(SeenDataScope {
+            chain: chain.clone(),
+            checked: !is_base,
+            merged,
+        });
+        Ok(chain)
+    }
+
+    fn check_scope(
+        chain: &Chain,
+        merged: bool,
+        runtime: &super::VarLayer,
+        entries: &mut usize,
+        mem: &mut MemBudget,
+    ) -> Result<(), MdsError> {
+        Declarations::with_graph(
+            chain,
+            FrontmatterNames::Preflight { merged },
+            runtime,
+            mem,
+            |count, _, _| count_data_entries(entries, count),
+        )
+        .map(drop)
     }
 
     fn check_module(
@@ -60,7 +109,7 @@ impl DataGraphWalk<'_> {
         is_base: bool,
         depth: usize,
         mem: &mut MemBudget,
-    ) -> Result<(), MdsError> {
+    ) -> Result<(Chain, bool), MdsError> {
         let key = module_ref.key;
         let source = self.fs.read(key)?;
         mem.charge(Part::Temp, Some(source.capacity()))?;
@@ -77,28 +126,6 @@ impl DataGraphWalk<'_> {
             .map(parse_frontmatter_imports_from_yaml)
             .transpose()?
             .unwrap_or_default();
-        if let Some(mapping) = mapping.as_ref().filter(|m| m.contains_key("data")) {
-            if is_base || module.extends.is_some() {
-                return Err(MdsError::data(
-                    &display,
-                    None,
-                    None,
-                    "data requires a standalone module",
-                    None,
-                ));
-            }
-            Declarations {
-                module: &display,
-                mapping,
-                imports: &imports,
-                body: &module.body,
-                runtime: self.runtime,
-                is_md: self.fs.is_markdown(key),
-            }
-            .with_graph(mem, |count, _, _| {
-                count_data_entries(&mut self.entries, count)
-            })?;
-        }
         let dir = self.fs.parent_dir(key);
         let mut follow = |path: &str, base| {
             validate_import_path(path)?;
@@ -110,9 +137,17 @@ impl DataGraphWalk<'_> {
                 mem,
             )
         };
-        if let Some(ext) = module.extends.as_ref().filter(|_| !is_base) {
-            follow(&ext.path, true)?;
-        }
+        let merged = module.extends.is_some();
+        let base = if !is_base {
+            module
+                .extends
+                .as_ref()
+                .map(|ext| follow(&ext.path, true))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
         for import in &imports {
             follow(import.path(), false)?;
         }
@@ -125,14 +160,37 @@ impl DataGraphWalk<'_> {
                 )
                 | Node::Export(
                     ExportDirective::ReExport { path, .. } | ExportDirective::Wildcard { path, .. },
-                ) => follow(path, false)?,
+                ) => {
+                    follow(path, false)?;
+                }
                 _ => {}
             }
         }
-        if let Some(ext) = module.extends.as_ref().filter(|_| is_base) {
-            follow(&ext.path, true)?;
+        let base = if let Some(ext) = module.extends.as_ref().filter(|_| is_base) {
+            follow(&ext.path, true)?
+        } else {
+            base
+        };
+        let mark = mem.mark();
+        let chain = Declarations::extend(
+            &base,
+            DeclarationSite {
+                key,
+                module: &display,
+                dir: &dir,
+                is_md: self.fs.is_markdown(key),
+                preflight: true,
+            },
+            mapping.as_ref(),
+            &imports,
+            &module.body,
+            mem,
+        )?;
+        mem.transfer(Part::Temp, Part::Buffers, mem.mark() - mark);
+        if !is_base {
+            Self::check_scope(&chain, merged, self.runtime, &mut self.entries, mem)?;
         }
-        Ok(())
+        Ok((chain, merged))
     }
 }
 
@@ -162,12 +220,12 @@ impl ModuleCache {
         let mut walk = DataGraphWalk {
             fs: &*self.fs,
             runtime,
-            seen: super::HashSet::new(),
+            seen: super::HashMap::new(),
             entries: 0,
         };
         let result = walk.visit(super::ModuleRef::keyed(key).typed(key), false, 0, mem);
         mem.release_buffers(mem.buffers - before);
-        result
+        result.map(drop)
     }
 
     /// Common intrinsic processing: tokenize, parse, build scope, then dispatch on
@@ -329,7 +387,7 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
         // The parsed tree is dropped once the scope layer is built from it.
-        let (mut scope, fm_imports) = {
+        let (mut scope, fm_imports, _) = {
             let (mapping, spent) =
                 parse_frontmatter_mapping(module.frontmatter.as_ref(), &mut self.budget.mem)?;
             self.build_scope_from_frontmatter(module, mapping.as_ref(), spent, is_md, ctx)?
@@ -545,7 +603,6 @@ impl ModuleCache {
         // module entry keeps the tree.
         let (frontmatter_values, frontmatter_bytes) =
             parse_frontmatter_mapping(module.frontmatter.as_ref(), &mut self.budget.mem)?;
-        self.keep(frontmatter_bytes);
 
         // Branch: child template (@extends) vs. standalone module.
         if let Some(ext) = module.extends.clone() {
@@ -559,10 +616,11 @@ impl ModuleCache {
             );
         }
 
+        self.keep(frontmatter_bytes);
         // ── Standalone (non-extending) path ──────────────────────────────────
         let raw_frontmatter = self.copy_raw_frontmatter(&module)?;
 
-        let (mut scope, defs) = self.standalone_scope(
+        let (mut scope, defs, data_chain) = self.standalone_scope(
             &module,
             frontmatter_values.as_ref(),
             frontmatter_bytes,
@@ -605,6 +663,7 @@ impl ModuleCache {
             skeleton_origin: origin.clone(),
             frontmatter_values,
             frontmatter_bytes,
+            data_chain,
             is_skeleton: false,
         })
     }
@@ -617,9 +676,9 @@ impl ModuleCache {
         ctx: &ModuleCtx<'_>,
         is_md: bool,
         warnings: &mut Vec<String>,
-    ) -> Result<(Scope, CollectedDefs), MdsError> {
+    ) -> Result<(Scope, CollectedDefs, crate::data::resolve::Chain), MdsError> {
         // Build scope from frontmatter + runtime vars; extract any frontmatter imports.
-        let (mut scope, fm_imports) = self.build_scope_from_frontmatter(
+        let (mut scope, fm_imports, data_chain) = self.build_scope_from_frontmatter(
             module,
             frontmatter_values,
             frontmatter_bytes,
@@ -644,7 +703,7 @@ impl ModuleCache {
 
         // Validate semantic correctness before evaluation
         validator::validate(&module.body, &mut scope, ctx.file_str, ctx.source)?;
-        Ok((scope, defs))
+        Ok((scope, defs, data_chain))
     }
 
     fn eval_standalone_prompt<'ctx>(

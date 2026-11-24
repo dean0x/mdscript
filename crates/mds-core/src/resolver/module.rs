@@ -113,6 +113,7 @@ pub struct ResolvedModule {
     pub(crate) frontmatter_values: Option<serde_yaml_ng::Mapping>,
     /// The bytes charged for `frontmatter_values`, part of this entry's kept bytes.
     pub(crate) frontmatter_bytes: usize,
+    pub(super) data_chain: crate::data::resolve::Chain,
     /// `true` when this entry was produced by `process_module_skeleton` (resolved as an
     /// `@extends` base: collect-only, NO standalone validate/evaluate, `prompt_body = None`).
     ///
@@ -157,6 +158,7 @@ impl Clone for ResolvedModule {
             skeleton_origin: self.skeleton_origin.clone(),
             frontmatter_values: self.frontmatter_values.clone(),
             frontmatter_bytes: self.frontmatter_bytes,
+            data_chain: self.data_chain.clone(),
             is_skeleton: self.is_skeleton,
         }
     }

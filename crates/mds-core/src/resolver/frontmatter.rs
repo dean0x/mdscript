@@ -3,6 +3,8 @@
 //! These functions merge frontmatter maps, build variable scopes, and parse
 //! `imports:` declarations from YAML frontmatter.
 
+#[cfg(test)]
+use crate::scope::Scope;
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -18,7 +20,7 @@ use crate::limits::{
     MAX_FRONTMATTER_SIZE, MAX_OUTPUT_SIZE,
 };
 use crate::parser::is_valid_identifier;
-use crate::scope::{Scope, VarLayer};
+use crate::scope::VarLayer;
 use crate::value::{Value, MAX_VALUE_DEPTH};
 use crate::vars_json::{check_data_json, DataScanError};
 
@@ -49,11 +51,12 @@ impl FrontmatterImport {
 // SYNC POINT: also audit `RESERVED_OUTPUT_KEYS` in lib.rs (stripper and proof),
 // `build_scope_from_frontmatter` in resolver/module_scope.rs, and `RESERVED` in lint/facts.rs.
 // The merge reserves `extends` in addition to the reserved output keys.
-pub(super) const RESERVED_MERGE_KEYS: &[&str] = &[
+pub(crate) const RESERVED_MERGE_KEYS: &[&str] = &[
     "imports",
     "type",
     "extends",
     crate::lexer::INDENTED_DIRECTIVES,
+    "data",
 ];
 
 /// Deep-merge two YAML `Mapping`s with base-wins-if-absent / child-wins-if-present semantics.
@@ -182,13 +185,14 @@ pub(crate) fn parse_frontmatter_yaml_with(
 pub(crate) fn parse_data_yaml_with(
     raw: &str,
     allowance: Allowance,
+    label: DataLabel<'_>,
 ) -> Result<(serde_yaml_ng::Value, usize), MdsError> {
     parse_bounded(
         raw,
         MAX_DATA_FILE_BYTES as usize,
         MAX_DATA_NODES_PER_FILE,
         allowance,
-        YamlInput::DataFile,
+        YamlInput::DataFile(label),
     )
 }
 
@@ -231,13 +235,16 @@ pub(crate) fn parse_data_json_with(
             "data file JSON node count exceeds maximum of {MAX_DATA_NODES_PER_FILE}"
         )),
         Some(Trip::Bytes) => byte_error(),
+        Some(Trip::Duplicate) => label.error(None, "duplicate JSON object key"),
+        Some(Trip::Number) => label.error(None, "invalid JSON data"),
         None => match reason {
             DataScanError::Depth => label.error(
                 None,
                 &format!("value nesting exceeds maximum depth of {MAX_VALUE_DEPTH}"),
             ),
             DataScanError::Duplicate => label.error(None, "duplicate JSON object key"),
-            DataScanError::Invalid => label.error(None, "invalid JSON data"),
+            DataScanError::Invalid => label.syntax("JSON"),
+            DataScanError::Number => label.error(None, "invalid JSON data"),
         },
     };
     check_data_json(raw, &|len| budget.charge::<serde_json::Error>(len).is_ok())
@@ -257,23 +264,23 @@ pub(crate) fn parse_data_json_with(
 }
 
 #[derive(Clone, Copy)]
-enum YamlInput {
+enum YamlInput<'a> {
     Frontmatter,
-    DataFile,
+    DataFile(DataLabel<'a>),
 }
 
-impl YamlInput {
+impl YamlInput<'_> {
     const fn label(self) -> &'static str {
         match self {
             Self::Frontmatter => "frontmatter",
-            Self::DataFile => "data file",
+            Self::DataFile(_) => "data file",
         }
     }
 
     fn expansion_exceeded(self) -> MdsError {
         match self {
             Self::Frontmatter => MdsError::frontmatter_expansion_exceeded(),
-            Self::DataFile => MdsError::resource_limit(format!(
+            Self::DataFile(_) => MdsError::resource_limit(format!(
                 "data file YAML expands beyond maximum of {MAX_OUTPUT_SIZE} bytes"
             )),
         }
@@ -336,7 +343,7 @@ fn parse_bounded(
     max_bytes: usize,
     max_nodes: usize,
     allowance: Allowance,
-    input: YamlInput,
+    input: YamlInput<'_>,
 ) -> Result<(serde_yaml_ng::Value, usize), MdsError> {
     // Apply the source byte cap before the eager loader reads the input.
     let label = input.label();
@@ -371,7 +378,23 @@ fn parse_bounded(
             )),
             Some(Trip::Bytes) if allowance.by_budget => MdsError::compile_memory_exceeded(),
             Some(Trip::Bytes) => input.expansion_exceeded(),
-            None => MdsError::yaml_error(e.to_string()),
+            trip => match input {
+                YamlInput::Frontmatter => MdsError::yaml_error(e.to_string()),
+                YamlInput::DataFile(label) => {
+                    // The YAML crate does not expose these reader and document errors as kinds.
+                    let message = e.to_string();
+                    if matches!(trip, Some(Trip::Duplicate | Trip::Number))
+                        || message.starts_with("control characters are not allowed")
+                        || message == "deserializing from YAML containing more than one document is not supported"
+                        || message.starts_with("recursion limit exceeded")
+                        || message.starts_with("repetition limit exceeded")
+                    {
+                        label.error(None, "invalid YAML data")
+                    } else {
+                        label.syntax("YAML")
+                    }
+                }
+            },
         }),
     }
 }
@@ -438,6 +461,8 @@ const _: () = {
 enum Trip {
     Nodes,
     Bytes,
+    Duplicate,
+    Number,
 }
 
 /// A saturating-free node and byte budget with a trip latch, shared by reference across
@@ -524,6 +549,21 @@ impl<'de, 'b> Visitor<'de> for BoundedYaml<'b> {
         Ok(serde_yaml_ng::Value::Number(v.into()))
     }
 
+    fn visit_i128<E: de::Error>(self, value: i128) -> Result<Self::Value, E> {
+        self.budget.trip.set(Some(Trip::Number));
+        Err(E::invalid_type(
+            de::Unexpected::Other(&format!("integer `{value}` as i128")),
+            &self,
+        ))
+    }
+
+    fn visit_u128<E: de::Error>(self, value: u128) -> Result<Self::Value, E> {
+        self.budget.trip.set(Some(Trip::Number));
+        Err(E::invalid_type(
+            de::Unexpected::Other(&format!("integer `{value}` as u128")),
+            &self,
+        ))
+    }
     fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
         self.budget.charge::<E>(0)?;
         Ok(serde_yaml_ng::Value::Number(v.into()))
@@ -581,6 +621,7 @@ impl<'de, 'b> Visitor<'de> for BoundedYaml<'b> {
         while let Some(key) = map.next_key_seed(self)? {
             match out.entry(key) {
                 serde_yaml_ng::mapping::Entry::Occupied(entry) => {
+                    self.budget.trip.set(Some(Trip::Duplicate));
                     return Err(<A::Error as de::Error>::custom(duplicate_key_message(
                         entry.key(),
                     )));
@@ -636,17 +677,10 @@ fn duplicate_key_message(key: &serde_yaml_ng::Value) -> String {
     message
 }
 
-/// Build a scope from a pre-merged `Mapping` and runtime variable overrides.
-///
-/// Used by the template inheritance path after `deep_merge_yaml` has already
-/// excluded reserved keys (`imports`, `type`, `extends`). The mapping is pure
-/// value data — no reserved-key handling needed here.
-///
-/// Runtime vars are applied LAST so precedence is: base < child < runtime (F7).
-pub(super) fn build_scope_from_merged_mapping(
+/// Convert the non-reserved variables of an inherited mapping.
+pub(super) fn merged_frontmatter_layer(
     mapping: &serde_yaml_ng::Mapping,
-    runtime_vars: &Arc<VarLayer>,
-) -> Result<Scope, MdsError> {
+) -> Result<VarLayer, MdsError> {
     let mut frontmatter = VarLayer::new();
     for (key, val) in mapping {
         let serde_yaml_ng::Value::String(key_str) = key else {
@@ -655,10 +689,7 @@ pub(super) fn build_scope_from_merged_mapping(
         let value = Value::from_yaml_ref(val)?;
         frontmatter.insert(key_str.clone(), Arc::new(value));
     }
-    Ok(Scope::with_layers(
-        Arc::clone(runtime_vars),
-        Arc::new(frontmatter),
-    ))
+    Ok(frontmatter)
 }
 
 /// Parse the `imports` key from an already-parsed YAML value.
@@ -1181,8 +1212,10 @@ mod tests {
             let (base_mapping, base_spent) = parsed(base);
             let (child_mapping, child_spent) = parsed(child);
             let merged = deep_merge_yaml(&base_mapping, &child_mapping, 0).unwrap();
-            let scope =
-                build_scope_from_merged_mapping(&merged, &Arc::new(VarLayer::new())).unwrap();
+            let scope = Scope::with_layers(
+                Arc::default(),
+                Arc::new(merged_frontmatter_layer(&merged).unwrap()),
+            );
             // The merged layer is charged with the bytes of both parses.
             let charge = base_spent + child_spent;
             let layer = layer_bytes(&scope, &merged);

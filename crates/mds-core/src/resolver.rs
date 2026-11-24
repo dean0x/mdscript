@@ -69,8 +69,10 @@ use crate::value::Value;
 use context::{
     fragment_map_from, is_visible_export, CollectedDefs, ExtendsComponents, ImportSite, ModuleCtx,
 };
-use frontmatter::{build_scope_from_merged_mapping, deep_merge_yaml};
-pub(crate) use frontmatter::{parse_data_json_with, parse_data_yaml_with, NODE_YAML};
+use frontmatter::{deep_merge_yaml, merged_frontmatter_layer};
+pub(crate) use frontmatter::{
+    parse_data_json_with, parse_data_yaml_with, NODE_YAML, RESERVED_MERGE_KEYS,
+};
 pub(crate) use frontmatter::{
     parse_frontmatter_imports, parse_frontmatter_imports_from_yaml, parse_frontmatter_yaml,
     parse_frontmatter_yaml_with, Allowance, FrontmatterImport,

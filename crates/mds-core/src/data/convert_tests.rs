@@ -7,6 +7,7 @@ use crate::value::{Value, MAX_VALUE_DEPTH};
 const LABEL: DataLabel<'static> = DataLabel {
     module: "entry.mds",
     entry: "settings",
+    file: None,
 };
 
 fn read(raw: &str, accept: Accept) -> Result<Value, MdsError> {
@@ -151,8 +152,14 @@ fn one_document_only_and_yaml_tags_are_accepted() {
     );
     data_error(read("42\n---\n43", Accept::Yaml));
     data_error(read("a: 1\na: 2", Accept::Yaml));
-    data_error(read("42 43", Accept::Json));
-    data_error(read("{\"a\":1 # YAML only\n}", Accept::Json));
+    assert!(matches!(
+        read("42 43", Accept::Json),
+        Err(MdsError::YamlError { .. })
+    ));
+    assert!(matches!(
+        read("{\"a\":1 # YAML only\n}", Accept::Json),
+        Err(MdsError::YamlError { .. })
+    ));
 }
 
 #[test]
@@ -220,5 +227,27 @@ fn conversion_failure_keeps_no_data_charge() {
         let err = convert(raw.as_bytes(), accept, LABEL, &mut mem).unwrap_err();
         assert!(matches!(err, MdsError::ResourceLimit { .. }), "{err}");
         assert_eq!(mem, before);
+    }
+}
+
+#[test]
+fn syntax_diagnostic_wire_escapes_the_file_and_entry_labels() {
+    let label = DataLabel {
+        file: Some("sub/settings\t.yml"),
+        entry: "my\nentry",
+        ..LABEL
+    };
+    for (accept, format) in [(Accept::Yaml, "YAML"), (Accept::Json, "JSON")] {
+        let error = convert(b"[", accept, label, &mut MemBudget::default())
+            .unwrap_err()
+            .serialize();
+        let expected = format!(
+            r#"data file "sub/settings{slash}u0009.yml", entry "my{slash}u000Aentry": invalid {format} data"#,
+            slash = char::from(92),
+        );
+        assert_eq!(error.code, "mds::yaml");
+        assert!(error.message.ends_with(&expected), "{}", error.message);
+        assert_eq!(error.span, None);
+        assert!(convert(b"42", accept, label, &mut MemBudget::default()).is_ok());
     }
 }

@@ -67,6 +67,9 @@ fn runtime_data_mapping_is_not_a_declaration() {
         )),
         "./bad.yml\n"
     );
+    let source = "---\ndata:\n  settings: ./bad.yml\n---\n{{settings}}\n";
+    let error = compile(&[("main.mds", source), ("bad.yml", "[")], None).unwrap_err();
+    assert_eq!(error.serialize().code, "mds::yaml", "{error}");
 }
 
 #[test]
@@ -93,8 +96,8 @@ fn replay_replaces_the_entry_in_the_root_and_in_imported_modules() {
     let files = [("main.mds", main), ("part.mds", part), ("bad.yml", "[")];
     assert!(rendered(compile(&files, replay("settings"))).ends_with("replayed\nreplayed\n"));
     let err = compile(&files, None).unwrap_err();
-    assert!(matches!(err, MdsError::Data { .. }), "{err}");
-    assert!(err.to_string().contains("invalid YAML data"), "{err}");
+    assert_eq!(err.serialize().code, "mds::yaml", "{err}");
+    assert!(err.to_string().contains("data file \"bad.yml\""), "{err}");
 }
 
 #[test]
@@ -136,8 +139,8 @@ fn graph_errors_in_a_later_module_precede_local_data_reads() {
         ("bad.yml", "["),
     ];
     let err = compile(&files, replay("remote")).unwrap_err();
-    assert!(matches!(err, MdsError::Data { .. }), "{err}");
-    assert!(err.to_string().contains("invalid YAML data"), "{err}");
+    assert_eq!(err.serialize().code, "mds::yaml", "{err}");
+    assert!(err.to_string().contains("data file \"bad.yml\""), "{err}");
 }
 
 #[test]
@@ -201,7 +204,8 @@ fn default_cache_does_not_resolve_or_read_data_files() {
         .unwrap_err();
     assert!(matches!(err, MdsError::UndefinedVariable { .. }), "{err}");
     let err = compile(&[("main.mds", main), ("bad.yml", "[")], None).unwrap_err();
-    assert!(err.to_string().contains("invalid YAML data"), "{err}");
+    assert_eq!(err.serialize().code, "mds::yaml", "{err}");
+    assert!(err.to_string().contains("data file \"bad.yml\""), "{err}");
 }
 
 #[test]
