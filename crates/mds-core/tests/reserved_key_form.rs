@@ -75,9 +75,94 @@ fn reserved_keys_in_non_plain_forms_return_fixed_errors() {
 }
 
 #[test]
-fn flow_frontmatter_refuses_imports_even_when_the_strip_matches() {
-    let raw = format!("{{ title: x,\nimports: {IMPORTS_VALUE},\n}}");
-    assert_form_error(with_entry(frontmatter(&raw, "Body\n")), IMPORTS_FORM, &raw);
+fn column_zero_sequence_under_a_reserved_key_returns_the_key_form_error() {
+    for suffix in ["", "\nnote: keep"] {
+        let raw = format!("imports:\n  - path: ./fixture-marker.mds{suffix}");
+        let output = assert_accepts(with_entry(frontmatter(&raw, "Body\n")))
+            .into_markdown()
+            .unwrap();
+        let expected = if suffix.is_empty() {
+            "Body\n".to_owned()
+        } else {
+            frontmatter("note: keep", "Body\n")
+        };
+        assert_eq!(output, expected);
+
+        let raw = format!("imports:\n- path: ./fixture-marker.mds{suffix}");
+        assert_form_error(with_entry(frontmatter(&raw, "Body\n")), IMPORTS_FORM, &raw);
+    }
+}
+
+fn import_path_module(raw: &str, path: &str) -> HashMap<String, String> {
+    HashMap::from([
+        (ENTRY.to_owned(), frontmatter(raw, "{{lib.word()}}\n")),
+        (path.to_owned(), "@define word():\nBody\n@end\n".to_owned()),
+    ])
+}
+
+#[test]
+fn folded_import_path_cannot_leave_a_scalar_line_in_output() {
+    let path = "lib#x.mds";
+    let control =
+        "imports:\n  - path: \"./lib#x.mds\"\n# Keep this comment\n    as: lib\nname: World";
+    let output = assert_accepts(import_path_module(control, path))
+        .into_markdown()
+        .unwrap();
+    assert_eq!(
+        output,
+        frontmatter("# Keep this comment\nname: World", "Body\n")
+    );
+
+    let raw = "imports:\n  - path: \"./lib\\\n#x.mds\"\n    as: lib\nname: World";
+    assert_form_error(import_path_module(raw, path), IMPORTS_FORM, "folded path");
+}
+
+#[test]
+fn single_quoted_flow_import_path_cannot_leave_a_scalar_line_in_output() {
+    let path = "x #y.mds";
+    let control = "imports: [{path: './x #y.mds',\n# Keep this comment\n  as: lib}]\ntitle: T";
+    let output = assert_accepts(import_path_module(control, path))
+        .into_markdown()
+        .unwrap();
+    assert_eq!(
+        output,
+        frontmatter("# Keep this comment\ntitle: T", "Body\n")
+    );
+
+    let raw = "imports: [{path: './x\n#y.mds', as: lib}]\ntitle: T";
+    assert_form_error(
+        import_path_module(raw, path),
+        IMPORTS_FORM,
+        "single-quoted path",
+    );
+}
+
+#[test]
+fn block_frontmatter_accepts_a_flow_mapping_as_its_first_key() {
+    for field in [
+        "{a: 1}: x",
+        r#"{a: {b: "}\""}} : "}""#,
+        r#"{a: &a 1, *a:"}"}: x"#,
+    ] {
+        let raw = format!("{field}\nimports: []");
+        let output = assert_accepts(with_entry(frontmatter(&raw, "Body\n")))
+            .into_markdown()
+            .unwrap();
+        assert_eq!(output, frontmatter(field, "Body\n"));
+    }
+}
+
+#[test]
+fn reserved_keys_preserve_fields_after_yaml_only_line_breaks() {
+    for separator in ['\u{85}', '\u{2028}', '\u{2029}'] {
+        for reserved in ["type: mds", "imports: []", "imports: [] # marker"] {
+            let raw = format!("{reserved}{separator}name: x");
+            let output = assert_accepts(with_entry(frontmatter(&raw, "Body\n")))
+                .into_markdown()
+                .unwrap();
+            assert_eq!(output, frontmatter("name: x", "Body\n"));
+        }
+    }
 }
 
 #[test]

@@ -67,6 +67,10 @@ MDS reports `mds::yaml` for a non-plain reserved key in parsed frontmatter.
 Examples include quoted keys, explicit YAML keys, and reserved keys in flow-style frontmatter.
 `reserved_keys_in_non_plain_forms_return_fixed_errors` checks `imports` and `type`.
 `flow_frontmatter_refuses_imports_even_when_the_strip_matches` checks the flow rule apart from the value comparison.
+A block mapping can have a flow mapping as its first key.
+`block_frontmatter_accepts_a_flow_mapping_as_its_first_key` checks this form.
+MDS refuses an unindented sequence under a reserved key.
+`column_zero_sequence_under_a_reserved_key_returns_the_key_form_error` checks this refusal.
 `indented_directives_yaml_agreement_covers_all_module_kinds` checks `indented-directives`.
 The [syntax errors for indented directives](#indented-directives) take precedence over the YAML form check.
 
@@ -1134,9 +1138,15 @@ Two base directories are possible:
 
 For standalone Markdown output, MDS removes the [plain reserved output keys](#reserved-output-keys) and their blocks.
 MDS removes each key line and the indented and blank lines that follow it.
-A comment at the start of a line stays and does not end the block.
+A YAML-only line break (U+0085, U+2028, or U+2029) can end a removed key line.
+`reserved_keys_preserve_fields_after_yaml_only_line_breaks` checks that the next field stays.
+A YAML comment at the start of a line stays and does not end the block.
+`plain_reserved_keys_are_removed_without_changing_other_bytes` checks this rule.
+MDS reports `mds::yaml` if those lines cannot stay as comments without a change to the original mapping.
+`folded_import_path_cannot_leave_a_scalar_line_in_output` and
+`single_quoted_flow_import_path_cannot_leave_a_scalar_line_in_output` check this refusal.
 MDS keeps the remaining lines byte for byte. With no reserved keys, it keeps the original frontmatter content.
-See `plain_reserved_keys_are_removed_without_changing_other_bytes` and `frontmatter_without_reserved_keys_keeps_its_bytes`.
+See `reserved_strip_preserves_kept_line_bytes` and `frontmatter_without_reserved_keys_keeps_its_bytes`.
 
 - MDS puts the retained YAML before the body, between `---` fences. See `frontmatter_preserved_in_str_output`.
 - If nothing but whitespace remains, MDS omits the fences. See `frontmatter_type_mds_only_no_fences`.

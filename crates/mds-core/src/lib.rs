@@ -887,7 +887,6 @@ pub(crate) struct ReservedOutputKey {
     // None reserves any value. Some reserves only the given YAML string.
     only_value: Option<&'static str>,
     form_message: &'static str,
-    split_at_yaml_break: bool,
 }
 
 /// Keys to remove from standalone output. Order sets form-message priority.
@@ -900,29 +899,32 @@ pub(crate) const RESERVED_OUTPUT_KEYS: &[ReservedOutputKey] = &[
         name: "type",
         only_value: Some("mds"),
         form_message: "write `type:` at the start of a line",
-        split_at_yaml_break: false,
     },
     ReservedOutputKey {
         name: "imports",
         only_value: None,
         form_message: "write `imports:` at the start of a line",
-        split_at_yaml_break: false,
     },
     ReservedOutputKey {
         name: lexer::INDENTED_DIRECTIVES,
         only_value: None,
         form_message: "write `indented-directives:` at the start of a line",
-        split_at_yaml_break: true,
     },
 ];
 const RESERVED_KEY_FORM: &str = "write reserved frontmatter keys at the start of a line";
-const YAML_COMMENT_BREAKS: [char; 3] = ['\u{85}', '\u{2028}', '\u{2029}'];
+const YAML_ONLY_BREAKS: [char; 3] = ['\u{85}', '\u{2028}', '\u{2029}'];
+const STRIP_BREAKS: [char; 4] = [
+    '\n',
+    YAML_ONLY_BREAKS[0],
+    YAML_ONLY_BREAKS[1],
+    YAML_ONLY_BREAKS[2],
+];
 const YAML_LINE_BREAKS: [char; 5] = [
     '\r',
     '\n',
-    YAML_COMMENT_BREAKS[0],
-    YAML_COMMENT_BREAKS[1],
-    YAML_COMMENT_BREAKS[2],
+    YAML_ONLY_BREAKS[0],
+    YAML_ONLY_BREAKS[1],
+    YAML_ONLY_BREAKS[2],
 ];
 
 impl ReservedOutputKey {
@@ -963,36 +965,51 @@ impl ReservedOutputKey {
     }
 }
 
-/// Yield the raw slices to keep. Keep each slice's bytes, including its line end.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReservedLine {
+    Keep,
+    Drop,
+    BlockComment,
+}
+
+/// Classify each slice without changing its bytes, including its line end.
+fn reserved_lines<'a>(
+    raw: &'a str,
+    keys: &'a [ReservedOutputKey],
+) -> impl Iterator<Item = (&'a str, ReservedLine)> + Clone {
+    raw.split_inclusive(STRIP_BREAKS)
+        .scan(false, move |in_block, line| {
+            let content = line.trim_end_matches(STRIP_BREAKS);
+            let kind = if keys.iter().any(|key| key.matches_line(content)) {
+                *in_block = true;
+                ReservedLine::Drop
+            } else if *in_block && content.starts_with('#') {
+                ReservedLine::BlockComment
+            } else if content.is_empty() || content.starts_with([' ', '\t', '\r']) {
+                if *in_block {
+                    ReservedLine::Drop
+                } else {
+                    ReservedLine::Keep
+                }
+            } else {
+                *in_block = false;
+                ReservedLine::Keep
+            };
+            Some((line, kind))
+        })
+}
+
 fn strip_reserved_keys<'a>(
     raw: &'a str,
     keys: &'a [ReservedOutputKey],
 ) -> impl Iterator<Item = &'a str> + Clone {
-    let line_key = move |line| keys.iter().find(|key| key.matches_line(line));
-    raw.split_inclusive('\n')
-        .scan(false, move |in_block, mut line| {
-            let mut key = line_key(line);
-            // YAML can end the file key's comment before the next LF.
-            if let Some((_, rest)) = key
-                .filter(|key| key.split_at_yaml_break)
-                .and_then(|_| line.split_once(YAML_COMMENT_BREAKS))
-            {
-                *in_block = false;
-                line = rest;
-                key = line_key(line);
-            }
-            if key.is_some() {
-                *in_block = true;
-                Some("")
-            } else if line.starts_with('#') {
-                Some(line)
-            } else if line.starts_with([' ', '\t', '\r', '\n']) {
-                Some(if *in_block { "" } else { line })
-            } else {
-                *in_block = false;
-                Some(line)
-            }
-        })
+    kept_reserved_lines(reserved_lines(raw, keys))
+}
+
+fn kept_reserved_lines<'a>(
+    lines: impl Iterator<Item = (&'a str, ReservedLine)> + Clone,
+) -> impl Iterator<Item = &'a str> + Clone {
+    lines.filter_map(|(line, kind)| (kind != ReservedLine::Drop).then_some(line))
 }
 
 /// Detect a flow mapping after leading comments and YAML node properties.
@@ -1018,8 +1035,70 @@ fn starts_with_flow_mapping(raw: &str) -> bool {
                 .map_or("", |(_, rest)| rest.trim_start_matches([' ', '\t']));
         }
         if !node.is_empty() && !node.starts_with('#') {
-            return node.starts_with('{');
+            return node
+                .strip_prefix('{')
+                .is_some_and(|rest| !flow_mapping_is_block_key(rest));
         }
+    }
+    false
+}
+
+/// An implicit block key must end on its first YAML line. Find the outer
+/// closing brace on that line, not braces in nested mappings or quoted text.
+fn flow_mapping_is_block_key(line: &str) -> bool {
+    #[derive(Clone, Copy)]
+    enum Token {
+        Start,
+        Plain,
+        Tag,
+        Anchor,
+        Delimited(u8),
+    }
+
+    let mut bytes = line.bytes().enumerate().peekable();
+    let mut depth = 1usize; // The caller consumed the opening brace.
+    let mut token = Token::Start;
+    for _ in 0..line.len() {
+        let Some((offset, byte)) = bytes.next() else {
+            break;
+        };
+        if let Token::Delimited(end) = token {
+            if byte == end {
+                token = Token::Start;
+            } else if end == b'"' && byte == b'\\' {
+                bytes.next();
+            }
+            continue;
+        }
+        let next = bytes.peek().map(|&(_, byte)| byte);
+        token = match (byte, token) {
+            (b'{', _) => {
+                depth += 1;
+                Token::Start
+            }
+            (b'}', _) => {
+                depth -= 1;
+                if depth == 0 {
+                    return line[offset + 1..]
+                        .trim_start_matches([' ', '\t'])
+                        .starts_with(':');
+                }
+                Token::Start
+            }
+            (b'[' | b']' | b',', _)
+            | (b' ' | b'\t', Token::Tag | Token::Anchor)
+            | (b':' | b'?', Token::Start | Token::Anchor) => Token::Start,
+            (b' ' | b'\t', _) => token,
+            (b':', Token::Plain) if matches!(next, None | Some(b' ' | b'\t')) => Token::Start,
+            (b'#', Token::Start) => return false,
+            (b'#', Token::Plain) if line[..offset].ends_with([' ', '\t']) => return false,
+            (b'!', Token::Start) if next == Some(b'<') => Token::Delimited(b'>'),
+            (b'!', Token::Start) => Token::Tag,
+            (b'&' | b'*', Token::Start) => Token::Anchor,
+            (b'\'' | b'"', Token::Start) => Token::Delimited(byte),
+            (_, Token::Tag | Token::Anchor) => token,
+            _ => Token::Plain,
+        };
     }
     false
 }
@@ -1031,9 +1110,15 @@ pub(crate) fn prove_reserved_strip(
     original: Option<&serde_yaml_ng::Mapping>,
     mem: &mut MemBudget,
 ) -> Result<(), MdsError> {
-    let kept = strip_reserved_keys(raw, RESERVED_OUTPUT_KEYS);
-    // The slices do not overlap, so their total length is at most raw.len().
-    let kept_len: usize = kept.clone().map(str::len).sum();
+    let lines = reserved_lines(raw, RESERVED_OUTPUT_KEYS);
+    // The slices do not overlap, so each total is at most raw.len().
+    let (kept_len, comment_len) = lines
+        .clone()
+        .fold((0, 0), |(kept, comments), (line, kind)| match kind {
+            ReservedLine::Keep => (kept + line.len(), comments),
+            ReservedLine::Drop => (kept, comments),
+            ReservedLine::BlockComment => (kept + line.len(), comments + line.len()),
+        });
     let first_reserved = RESERVED_OUTPUT_KEYS.iter().find(|key| {
         original
             .and_then(|map| map.get(key.name))
@@ -1055,15 +1140,10 @@ pub(crate) fn prove_reserved_strip(
         } else {
             mem.charge(Part::Temp, Some(kept_len))?;
             let mut text = String::with_capacity(kept_len);
-            text.extend(kept);
+            text.extend(kept_reserved_lines(lines.clone()));
             Cow::Owned(text)
         };
-        let (proof, spent) = parse_frontmatter_yaml_with(&stripped, Allowance::in_compile(mem))
-            .map_err(|err| match err {
-                MdsError::YamlError { .. } => form_error(),
-                other => other,
-            })?;
-        mem.charge(Part::Temp, Some(spent))?;
+        let proof = parse_strip_proof_yaml(&stripped, mem, form_error)?;
 
         let Some(original) = original else {
             return Err(form_error());
@@ -1098,10 +1178,39 @@ pub(crate) fn prove_reserved_strip(
         {
             return Err(MdsError::yaml_error(RESERVED_KEY_FORM));
         }
+
+        if comment_len != 0 {
+            // A kept `#` line could be scalar text in the original YAML.
+            let masked_len = raw.len() - comment_len;
+            mem.charge(Part::Temp, Some(masked_len))?;
+            let mut masked = String::with_capacity(masked_len);
+            masked.extend(
+                lines.filter_map(|(line, kind)| {
+                    (kind != ReservedLine::BlockComment).then_some(line)
+                }),
+            );
+            if parse_strip_proof_yaml(&masked, mem, form_error)?.as_mapping() != Some(original) {
+                return Err(form_error());
+            }
+        }
         Ok(())
     })();
     mem.release_to(mark);
     result
+}
+
+fn parse_strip_proof_yaml(
+    text: &str,
+    mem: &mut MemBudget,
+    form_error: impl FnOnce() -> MdsError,
+) -> Result<serde_yaml_ng::Value, MdsError> {
+    let (yaml, spent) =
+        parse_frontmatter_yaml_with(text, Allowance::in_compile(mem)).map_err(|err| match err {
+            MdsError::YamlError { .. } => form_error(),
+            other => other,
+        })?;
+    mem.charge(Part::Temp, Some(spent))?;
+    Ok(yaml)
 }
 
 /// Identify the fixed YAML form messages, not other YAML errors.
@@ -2676,11 +2785,17 @@ mod tests {
     #[test]
     fn reserved_strip_keeps_field_after_yaml_line_break() {
         for separator in [char::from(0x85), '\u{2028}', '\u{2029}'] {
-            let raw = format!("indented-directives: false # marker{separator}name: World\n");
-            assert_eq!(
-                frontmatter_prefix(MarkdownFrontmatter::Standalone(&raw)).as_deref(),
-                Some("---\nname: World\n---\n"),
-            );
+            for reserved in [
+                "indented-directives: false # marker",
+                "imports: []",
+                "type: mds",
+            ] {
+                let raw = format!("{reserved}{separator}name: World\n");
+                assert_eq!(
+                    frontmatter_prefix(MarkdownFrontmatter::Standalone(&raw)).as_deref(),
+                    Some("---\nname: World\n---\n"),
+                );
+            }
         }
     }
 
@@ -2692,7 +2807,6 @@ mod tests {
             name: "extra",
             only_value: None,
             form_message: "write `extra:` at the start of a line",
-            split_at_yaml_break: false,
         });
         assert_eq!(
             strip_reserved_keys(raw, &keys).collect::<String>(),
@@ -2723,7 +2837,14 @@ mod tests {
         }
 
         fn assert_flow_imports_form(raw: &str) {
-            let error = prove(raw, &mut MemBudget::default())
+            let original = resolver::parse_frontmatter_yaml(raw).unwrap();
+            let mut expected = original.as_mapping().unwrap().clone();
+            assert!(expected.remove("imports").is_some());
+            let kept: String = strip_reserved_keys(raw, RESERVED_OUTPUT_KEYS).collect();
+            let kept = resolver::parse_frontmatter_yaml(&kept).unwrap();
+            assert_eq!(kept.as_mapping(), Some(&expected));
+
+            let error = prove_reserved_strip(raw, original.as_mapping(), &mut MemBudget::default())
                 .expect_err("flow mapping must not pass the reserved-key proof")
                 .serialize();
             assert_eq!(error.code, "mds::yaml");
@@ -2736,6 +2857,33 @@ mod tests {
         #[test]
         fn reserved_strip_proof_refuses_flow_mapping() {
             assert_flow_imports_form("{ title: x,\nimports: [a.mds],\n}\n");
+        }
+
+        #[test]
+        fn flow_frontmatter_refuses_imports_even_when_the_strip_matches() {
+            assert_flow_imports_form("{ title: x,\nimports: [{path: ./fixture-marker.mds}],\n}\n");
+        }
+
+        #[test]
+        fn reserved_strip_proof_refuses_flow_document_with_a_flow_mapping_key() {
+            assert_flow_imports_form("{{a: 1}: x,\nimports: [a.mds],\n}\n");
+        }
+
+        #[test]
+        fn reserved_strip_proof_refuses_non_mapping_when_a_line_is_dropped() {
+            let raw = "[a,\nimports: b,\nc]\n";
+            let original = resolver::parse_frontmatter_yaml(raw).unwrap();
+            assert!(original.is_sequence());
+            let kept: String = strip_reserved_keys(raw, RESERVED_OUTPUT_KEYS).collect();
+            assert_eq!(kept, "[a,\nc]\n");
+            let error = prove_reserved_strip(raw, original.as_mapping(), &mut MemBudget::default())
+                .expect_err("original YAML is not a mapping and the strip drops one line")
+                .serialize();
+            assert_eq!(error.code, "mds::yaml");
+            assert_eq!(
+                error.message,
+                "YAML parse error: write reserved frontmatter keys at the start of a line",
+            );
         }
 
         #[test]
