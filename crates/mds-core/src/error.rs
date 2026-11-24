@@ -541,6 +541,14 @@ pub enum MdsError {
         src: Option<Arc<miette::NamedSource<String>>>,
     },
 
+    /// A data file key is absent from the virtual module map.
+    #[error("data file '{key}' is not in the virtual module map")]
+    #[diagnostic(
+        code(mds::module_not_found),
+        help("add the data file to `options.modules` or use the native backend")
+    )]
+    DataFileNotFound { key: String },
+
     #[error("recursion detected in function '{name}'")]
     #[diagnostic(
         code(mds::recursion),
@@ -903,6 +911,12 @@ impl MdsError {
         }
     }
 
+    pub(crate) fn data_file_not_found(key: &str) -> Self {
+        Self::DataFileNotFound {
+            key: crate::escape_path_for_message(key).into_owned(),
+        }
+    }
+
     /// Construct a `ModuleNotFound` error with an import-site span.
     pub(crate) fn module_not_found_at(
         key: impl Into<String>,
@@ -1225,6 +1239,7 @@ impl MdsError {
                 })
             }
             MdsError::Io { .. }
+            | MdsError::DataFileNotFound { .. }
             | MdsError::ResourceLimit { .. }
             | MdsError::Data { .. }
             | MdsError::NetworkDenied { .. }
@@ -1321,6 +1336,7 @@ impl MdsError {
             | MdsError::Extends { src, .. }
             | MdsError::MixedContent { src, .. } => src.as_deref(),
             MdsError::Io { .. }
+            | MdsError::DataFileNotFound { .. }
             | MdsError::ResourceLimit { .. }
             | MdsError::Data { .. }
             | MdsError::NetworkDenied { .. }

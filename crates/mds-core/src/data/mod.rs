@@ -1,6 +1,7 @@
 //! Data source input boundaries.
 
 mod convert;
+pub(crate) mod path;
 
 pub(crate) use convert::DataLabel;
 #[cfg_attr(

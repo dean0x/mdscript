@@ -168,6 +168,23 @@ fn a_module_read_holds_at_most_the_cap_plus_one_byte() {
         measured.push((case, outcome, peak));
     }
 
+    let fs = NativeFs::new();
+    let base = fs.anchor_base_dir(dir.path().to_str().unwrap()).unwrap();
+    for (case, size) in [
+        ("large data file", 64 * 1024 * 1024),
+        ("exact data file", CAP),
+    ] {
+        let path = sized("data.json", size);
+        let (outcome, peak) = peak_growth(|| {
+            let key = fs.normalize_data_in_dir(&base, "./data.json").unwrap();
+            fs.read_data(&key)
+                .map(|text| text.len())
+                .map_err(|e| e.to_string())
+        });
+        measured.push((case, outcome, peak));
+        std::fs::remove_file(path).unwrap();
+    }
+
     // A FIFO reports no size: a module one is refused before it is opened, and only the
     // bound on the read itself holds a vars one.
     #[cfg(unix)]
@@ -189,6 +206,27 @@ fn a_module_read_holds_at_most_the_cap_plus_one_byte() {
         });
         stop(writer);
         measured.push(("vars FIFO fed cap + 2 MiB", outcome, peak));
+
+        let data_path = sized("swap.json", 4);
+        let key = fs.normalize_data_in_dir(&base, "./swap.json").unwrap();
+        assert_eq!(fs.read_data(&key).unwrap().len(), 4);
+        std::fs::rename(&data_path, dir.path().join("saved.json")).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&data_path)
+            .status()
+            .unwrap()
+            .success());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            sender.send(fs.read_data(&key)).unwrap();
+        });
+        let err = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("data read must not wait for a writer")
+            .unwrap_err();
+        reader.join().unwrap();
+        assert_eq!(err.serialize().code, "mds::io");
+        assert_eq!(err.to_string(), "cannot read swap.json: not a regular file");
     }
 
     let report = format!("(case, outcome, peak heap growth in bytes): {measured:#?}");
@@ -197,6 +235,11 @@ fn a_module_read_holds_at_most_the_cap_plus_one_byte() {
         ("64 MiB file", Err(too_large(64 * 1024 * 1024, "far.mds"))),
         ("cap + 1 file", Err(too_large(CAP + 1, "over.mds"))),
         ("exactly the cap", Ok(CAP)),
+        (
+            "large data file",
+            Err(too_large(64 * 1024 * 1024, "data.json")),
+        ),
+        ("exact data file", Ok(CAP)),
         (
             "FIFO fed cap + 2 MiB",
             Err("cannot read fifo.mds: not a regular file".to_string()),
@@ -222,9 +265,12 @@ fn a_module_read_holds_at_most_the_cap_plus_one_byte() {
     }
     // Positive control: the allocator saw the exact-cap file read whole — a counter
     // that missed allocations would pass the bound above vacuously.
-    let (_, _, exact_peak) = measured[2];
-    assert!(
-        exact_peak >= CAP,
-        "exactly the cap: peak heap growth is below the {CAP} B read; {report}"
-    );
+    for (case, _, peak) in &measured {
+        if matches!(*case, "exactly the cap" | "exact data file") {
+            assert!(
+                peak >= &CAP,
+                "{case}: peak heap growth is below the {CAP} B read; {report}"
+            );
+        }
+    }
 }
