@@ -74,11 +74,13 @@ const MAX_SOURCE_SIZE: usize = mds::MAX_FILE_SIZE as usize;
 ///
 /// Mirrors the WASM and napi bindings: the entry plus 256 other modules.
 /// This input-size bound counts unused entries too. The core separately bounds
-/// the resolved graph, including modules still being resolved.
+/// the resolved graph, including modules still being resolved. Data file keys
+/// ([`mds::is_data_path`]) are counted apart, against [`mds::MAX_DATA_FILES`].
 const MAX_MODULE_COUNT: usize = 256 + 1;
 
 /// Maximum aggregate byte size of all module values combined (same ceiling as a
-/// single source input).
+/// single source input). Data file values are counted apart, against
+/// [`mds::MAX_DATA_BYTES`].
 const MAX_MODULES_AGGREGATE_SIZE: usize = MAX_SOURCE_SIZE;
 
 // ── Native exception ───────────────────────────────────────────────────────────
@@ -1222,23 +1224,39 @@ fn extract_vars(
     })
 }
 
-/// `mds::resource_limit` for an oversized `modules` mapping.
+/// `mds::resource_limit` for a `modules` mapping past its module count or its data
+/// file count (#405), else `Ok`.
 ///
 /// Shared by `parse_modules`'s pre-`depythonize` `PyDict` fast-path and its
 /// post-`depythonize` backstop so both independent checks raise a
-/// byte-identical message.
-fn module_count_error(py: Python<'_>, count: usize) -> PyErr {
-    resource_limit_error(
-        py,
-        &format!("modules exceeds maximum module count of {MAX_MODULE_COUNT} ({count} provided)"),
-    )
+/// byte-identical message, the message of the WASM and napi bindings.
+fn check_map_counts(py: Python<'_>, modules: usize, data: usize) -> PyResult<()> {
+    if modules > MAX_MODULE_COUNT {
+        return Err(resource_limit_error(
+            py,
+            &format!(
+                "modules exceeds maximum module count of {MAX_MODULE_COUNT} ({modules} provided)"
+            ),
+        ));
+    }
+    if data > mds::MAX_DATA_FILES {
+        return Err(resource_limit_error(
+            py,
+            &format!(
+                "modules exceeds maximum data file count of {} ({data} provided)",
+                mds::MAX_DATA_FILES
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Parse and validate a virtual `modules` mapping (`str -> str`).
 ///
-/// Enforces `MAX_MODULE_COUNT` and the aggregate size ceiling (both →
-/// `mds::resource_limit`); non-mapping input and non-string values →
-/// `mds::invalid_options`. Mirrors the WASM binding's module parsing.
+/// Enforces `MAX_MODULE_COUNT`, `mds::MAX_DATA_FILES` and the module and data
+/// aggregate size ceilings (each → `mds::resource_limit`); non-mapping input and
+/// non-string values → `mds::invalid_options`. A key with a data extension
+/// ([`mds::is_data_path`]) is a data file. Mirrors the WASM binding's module parsing.
 fn parse_modules(py: Python<'_>, modules: &Bound<'_, PyAny>) -> PyResult<HashMap<String, String>> {
     // Cheap pre-check against the live Python object: `dict.__len__` doesn't
     // touch any key or value, so an oversized mapping is rejected *before*
@@ -1252,8 +1270,20 @@ fn parse_modules(py: Python<'_>, modules: &Bound<'_, PyAny>) -> PyResult<HashMap
     // through to the post-`depythonize` count check, which stays as a
     // defense-in-depth backstop for that case.
     if let Ok(dict) = modules.cast::<PyDict>() {
-        if dict.len() > MAX_MODULE_COUNT {
-            return Err(module_count_error(py, dict.len()));
+        // Past both counts together, so past one of them: count the data keys to
+        // name it, with no copy of any value. A key that is not a `str` counts as a
+        // module key.
+        if dict.len() > MAX_MODULE_COUNT + mds::MAX_DATA_FILES {
+            let data = dict
+                .iter()
+                .filter(|(key, _)| {
+                    key.cast::<PyString>()
+                        .ok()
+                        .and_then(|key| key.to_str().ok())
+                        .is_some_and(mds::is_data_path)
+                })
+                .count();
+            check_map_counts(py, dict.len() - data, data)?;
         }
     }
 
@@ -1268,12 +1298,12 @@ fn parse_modules(py: Python<'_>, modules: &Bound<'_, PyAny>) -> PyResult<HashMap
             ),
         ));
     };
-    if map.len() > MAX_MODULE_COUNT {
-        return Err(module_count_error(py, map.len()));
-    }
+    let data_count = map.keys().filter(|key| mds::is_data_path(key)).count();
+    check_map_counts(py, map.len() - data_count, data_count)?;
 
     let mut result = HashMap::with_capacity(map.len());
-    let mut aggregate: usize = 0;
+    let mut module_bytes: usize = 0;
+    let mut data_bytes: usize = 0;
     for (key, val) in map {
         // A key is caller input, escaped wherever a message names it — the same
         // six-character escapes as the napi and WASM bindings (#265).
@@ -1296,13 +1326,16 @@ fn parse_modules(py: Python<'_>, modules: &Bound<'_, PyAny>) -> PyResult<HashMap
                 ),
             ));
         }
-        aggregate = aggregate.saturating_add(s.len());
-        if aggregate > MAX_MODULES_AGGREGATE_SIZE {
+        let (total, cap, kind) = if mds::is_data_path(&key) {
+            (&mut data_bytes, mds::MAX_DATA_BYTES, " data")
+        } else {
+            (&mut module_bytes, MAX_MODULES_AGGREGATE_SIZE, "")
+        };
+        *total = total.saturating_add(s.len());
+        if *total > cap {
             return Err(resource_limit_error(
                 py,
-                &format!(
-                    "modules aggregate size exceeds maximum of {MAX_MODULES_AGGREGATE_SIZE} bytes"
-                ),
+                &format!("modules{kind} aggregate size exceeds maximum of {cap} bytes"),
             ));
         }
         result.insert(key, s);
@@ -1458,7 +1491,10 @@ fn compile_file(
 /// `modules` maps module key → source; `entry` is the key to compile and must be a
 /// key present in `modules`. `vars`, `source_map`, and `sources_content` are
 /// keyword-only. No source injection occurs — all modules (entry included) are
-/// supplied by the caller.
+/// supplied by the caller. `modules` also holds the text of the local data files that
+/// `data:` entries name: at most 257 modules and 10 MiB of module text, and apart from
+/// them 256 data files (keys ending in `.json`, `.yaml` or `.yml`) and 32 MiB of data
+/// text; past a bound is `mds::resource_limit`.
 #[pyfunction]
 #[pyo3(signature = (modules, entry, *, vars=None, source_map=false, sources_content=false, **kwargs))]
 fn compile_virtual(
