@@ -3,7 +3,7 @@ use std::collections::HashMap;
 #[test]
 fn dot_notation_object_access_works() {
     // {obj.key} now works as object field access (not an error).
-    let source = "---\ndata:\n  name: Alice\n---\n{{data.name}}\n";
+    let source = "---\nperson:\n  name: Alice\n---\n{{person.name}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(result.contains("Alice\n"), "got: {result}");
 }
