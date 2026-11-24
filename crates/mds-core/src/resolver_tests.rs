@@ -73,13 +73,6 @@ fn parse_fm_import_empty_array() {
 }
 
 #[test]
-fn parse_fm_no_imports_key() {
-    let result =
-        parse_frontmatter_imports("name: Alice\ngreeting: hello\n").expect("no imports key");
-    assert!(result.is_empty());
-}
-
-#[test]
 fn parse_fm_err_missing_path() {
     let v = yaml("- as: lib\n");
     let err = parse_frontmatter_imports_from_yaml(&v).expect_err("missing path should fail");

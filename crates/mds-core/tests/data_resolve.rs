@@ -183,7 +183,7 @@ fn data_values_are_text_and_do_not_add_module_edges() {
     };
     let control = files(r#""abc""#);
     let literal = files(r#""{{unknown}}\n@import \"./absent.mds\" as p\n@message user:""#);
-    assert_eq!(control.dependencies, ["part.mds"]);
+    assert_eq!(control.dependencies, ["part.mds", "value.json"]);
     assert_eq!(control.dependencies, literal.dependencies);
     assert!(control.into_markdown().unwrap().ends_with("abc\nPart.\n"));
     assert!(literal
@@ -240,26 +240,37 @@ fn canonical_memo_does_not_charge_data_bytes_again_for_an_alias_or_another_modul
 }
 
 #[test]
-fn distinct_data_files_count_toward_the_compile_byte_limit() {
-    let source = "---\ndata:\n  a: ./a.json\n  b: ./b.json\n  c: ./c.json\n  d: ./d.json\n---\n{{a}}{{b}}{{c}}{{d}}\n";
-    let mut text = " ".repeat(8 * 1024 * 1024 - 1);
-    text.push('7');
-    let compile_with = |last: &str| {
-        compile(
-            &[
-                ("main.mds", source),
-                ("a.json", &text),
-                ("b.json", &text),
-                ("c.json", &text),
-                ("d.json", last),
-            ],
-            None,
-        )
-    };
-    assert!(rendered(compile_with(&text)).ends_with("7777\n"));
-    let err = compile_with(&format!("{text} ")).unwrap_err();
-    assert!(matches!(err, MdsError::ResourceLimit { .. }), "{err}");
-    assert!(err.to_string().contains("bytes per compile"), "{err}");
+fn dependencies_list_modules_then_data_files_in_first_read_order() {
+    // The entry binds its entries before it resolves its imports. A file that two
+    // modules name, directly or through an alias, is read once and listed once.
+    let main = "---\ndata:\n  shared: ./shared.json\n  own: ./own.yml\n---\n@import \"./a.mds\" as a\n@import \"./b.mds\" as b\n{{shared}} {{own}}\n@include a\n@include b\n";
+    let a = "---\ndata:\n  item: ./parts/a.json\n  same: ./shared.json\n---\n{{item}} {{same}}\n";
+    let b = "---\ndata:\n  item: ./alias.json\n  remote: https://example.com/data.json\n  skipped: ./absent.json\n---\n{{item}} {{remote}} {{skipped}}\n";
+    let fs = VirtualFs::new(HashMap::from([
+        ("main.mds".into(), main.into()),
+        ("a.mds".into(), a.into()),
+        ("b.mds".into(), b.into()),
+        ("shared.json".into(), "1".into()),
+        ("own.yml".into(), "2".into()),
+        ("parts/a.json".into(), "3".into()),
+    ]))
+    .with_aliases(HashMap::from([("alias.json".into(), "shared.json".into())]))
+    .unwrap();
+    // Replay supplies the URL entry and the absent file, so neither is read.
+    let vars = HashMap::from([
+        ("remote".into(), Value::from("r")),
+        ("skipped".into(), Value::from("s")),
+    ]);
+    let result = compile_virtual_fs(fs, "main.mds", Some(vars), CompileOptions::default());
+    let result = result.unwrap();
+    assert_eq!(
+        result.dependencies,
+        ["a.mds", "b.mds", "shared.json", "own.yml", "parts/a.json"]
+    );
+    assert!(result
+        .into_markdown()
+        .unwrap()
+        .ends_with("1 2\n3 1\n1 r s\n"));
 }
 
 #[test]

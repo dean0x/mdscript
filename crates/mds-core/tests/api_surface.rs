@@ -1048,6 +1048,88 @@ fn dependencies_are_the_canonical_paths_off_windows() {
     }
 }
 
+/// A native compile lists its data files after its modules, as absolute paths of the
+/// files that it read, on every native entry point.
+#[test]
+fn native_dependencies_list_data_files_after_modules() {
+    let (guard, main, lib) = project_with_one_import();
+    std::fs::write(
+        &main,
+        "---\ndata:\n  item: ./data/item.json\n---\n@import \"./lib.mds\" as lib\n{{lib.hi()}} {{item}}\n",
+    )
+    .unwrap();
+    std::fs::create_dir(guard.path().join("data")).unwrap();
+    std::fs::write(guard.path().join("data/item.json"), "7").unwrap();
+    let item = std::fs::canonicalize(guard.path().join("data/item.json")).unwrap();
+    for (api, deps) in native_dependency_lists(&main) {
+        for dep in &deps {
+            assert!(Path::new(dep).is_absolute(), "{api}: {dep}");
+            assert!(!dep.starts_with(r"\\?\"), "{api}: {dep}");
+        }
+        let named: Vec<_> = deps
+            .iter()
+            .map(|dep| std::fs::canonicalize(dep).unwrap())
+            .collect();
+        assert_eq!(named, [lib.clone(), item.clone()], "{api}");
+    }
+}
+
+/// `scan_imports` lists modules only. `scan_import_records` lists each local data
+/// file of the frontmatter `data:` mapping as a separate `data` record after the
+/// module records, with no span and no frontmatter index. A data path that an
+/// import also names keeps both records.
+#[test]
+fn scan_import_records_list_local_data_files_as_a_separate_kind() {
+    let source = concat!(
+        "---\n",
+        "imports:\n  - path: ./lib.mds\n    as: lib\n",
+        "data:\n",
+        "  item: ./item.json\n",
+        "  again: ./item.json\n",
+        "  remote: https://example.com/data.json\n",
+        "  other: ../shared/other.yml\n",
+        "  odd: ./lib.mds\n",
+        "---\n",
+        "@extends \"./base.mds\"\n",
+        "@import \"./part.mds\" as part\n",
+    );
+    let rows = |resolve_as| -> Vec<(String, &'static str)> {
+        mds::scan_import_records(source, resolve_as)
+            .expect("the source scans")
+            .into_iter()
+            .map(|record| {
+                if record.kind.name() == "data" {
+                    assert_eq!(record.frontmatter_index, None, "{record:?}");
+                    assert_eq!(record.span, None, "{record:?}");
+                }
+                (record.path, record.kind.name())
+            })
+            .collect()
+    };
+    let data = [
+        ("./item.json".to_owned(), "data"),
+        ("../shared/other.yml".to_owned(), "data"),
+        ("./lib.mds".to_owned(), "data"),
+    ];
+    let modules = [
+        ("./lib.mds".to_owned(), "frontmatter"),
+        ("./part.mds".to_owned(), "import"),
+    ];
+    let base = ("./base.mds".to_owned(), "extends");
+    let standalone: Vec<_> = [base.clone()]
+        .into_iter()
+        .chain(modules.clone())
+        .chain(data.clone())
+        .collect();
+    assert_eq!(rows(mds::ResolveAs::Standalone), standalone);
+    let as_base: Vec<_> = modules.into_iter().chain([base]).chain(data).collect();
+    assert_eq!(rows(mds::ResolveAs::Base), as_base);
+    assert_eq!(
+        mds::scan_imports(source).expect("the source scans"),
+        ["./base.mds", "./lib.mds", "./part.mds"]
+    );
+}
+
 #[test]
 fn compile_result_type_importable() {
     // CompileResult is produced by the compile API (it is #[non_exhaustive] — not externally

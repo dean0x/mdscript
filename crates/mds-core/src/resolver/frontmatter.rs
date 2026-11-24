@@ -826,24 +826,6 @@ fn parse_selective_entry(
     Ok(FrontmatterImport::Selective { path, names })
 }
 
-/// Parse frontmatter imports from a raw YAML string.
-///
-/// Returns an empty `Vec` if the `imports` key is absent. Propagates any
-/// parse or validation error from [`parse_frontmatter_imports_from_yaml`].
-pub(crate) fn parse_frontmatter_imports(raw: &str) -> Result<Vec<FrontmatterImport>, MdsError> {
-    let yaml = parse_frontmatter_yaml(raw)?;
-
-    let serde_yaml_ng::Value::Mapping(ref map) = yaml else {
-        return Ok(vec![]);
-    };
-
-    let Some(imports_val) = map.get("imports") else {
-        return Ok(vec![]);
-    };
-
-    parse_frontmatter_imports_from_yaml(imports_val)
-}
-
 #[cfg(test)]
 #[path = "frontmatter_tests.rs"]
 mod frontmatter_tests;

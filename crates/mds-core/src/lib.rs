@@ -142,9 +142,9 @@ pub enum CompiledOutput {
 /// The result of compiling an MDS template with full dependency tracking.
 ///
 /// Returned by every `compile*` entry point. The `output` is intrinsic to the
-/// template (Markdown or Messages). The `dependencies` list is in depth-first
-/// resolution order and excludes the entry module itself — it contains only
-/// the files imported (transitively) by the entry.
+/// template (Markdown or Messages). The `dependencies` list holds the modules
+/// that the entry imports (transitively), in depth-first resolution order, then
+/// the local data files that the compile read. It excludes the entry module.
 ///
 /// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
 /// Obtain values from the compile API; do not construct via struct literal in
@@ -157,9 +157,12 @@ pub struct CompileResult {
     /// Warnings emitted during compilation (e.g. empty `@include`).
     pub warnings: Vec<String>,
     /// The modules imported during compilation, in first-resolution (depth-first)
-    /// order. Excludes the entry module.
+    /// order, then the local data files that the compile read, in first-read order.
+    /// Excludes the entry module. Each file occurs once, also when several modules
+    /// name it. A data entry that a runtime variable replaces reads no file, so it
+    /// adds nothing, and no URL is ever listed.
     ///
-    /// A virtual compile reports module keys. A native compile reports the
+    /// A virtual compile reports module and data file keys. A native compile reports the
     /// absolute path of each file, spelled as it is on disk; on Windows the
     /// verbatim `\\?\` prefix that canonicalization adds is dropped (`C:\…`,
     /// `\\server\share\…`) wherever the conventional form names the same file,
@@ -2039,6 +2042,8 @@ pub fn compile_file(path: &str) -> Result<CompileResult, MdsError> {
 /// - `@export name from "path"` → path
 /// - `@export * from "path"` → path
 /// - `@export name` (named, no path) → skipped
+/// - Frontmatter `data:` entries → skipped: data files are not modules
+///   ([`scan_import_records`] lists them as [`ImportKind::Data`] records)
 ///
 /// The `@extends` path comes first, then the frontmatter paths, then the body's: the
 /// order [`scan_import_records`] gives a module [`ResolveAs::Standalone`].
@@ -2065,6 +2070,7 @@ pub fn compile_file(path: &str) -> Result<CompileResult, MdsError> {
 pub fn scan_imports(source: &str) -> Result<Vec<String>, MdsError> {
     let paths: indexmap::IndexSet<String> = scan_import_records(source, ResolveAs::Standalone)?
         .into_iter()
+        .filter(|record| record.kind != ImportKind::Data)
         .map(|record| record.path)
         .collect();
     Ok(paths.into_iter().collect())
@@ -2084,15 +2090,18 @@ pub enum ImportKind {
     Import,
     /// `@export name from "path"` or `@export * from "path"`.
     ExportFrom,
+    /// The local file of a frontmatter `data:` entry: a data file, never a module.
+    Data,
 }
 
 impl ImportKind {
-    /// The kind's name: `extends`, `frontmatter`, `import` or `export-from`.
+    /// The kind's name: `extends`, `frontmatter`, `import`, `export-from` or `data`.
     ///
     /// # Examples
     ///
     /// ```
     /// assert_eq!(mds::ImportKind::ExportFrom.name(), "export-from");
+    /// assert_eq!(mds::ImportKind::Data.name(), "data");
     /// ```
     #[must_use]
     pub fn name(self) -> &'static str {
@@ -2101,6 +2110,7 @@ impl ImportKind {
             ImportKind::Frontmatter => "frontmatter",
             ImportKind::Import => "import",
             ImportKind::ExportFrom => "export-from",
+            ImportKind::Data => "data",
         }
     }
 }
@@ -2165,10 +2175,19 @@ pub enum ResolveAs {
 /// raises some of their errors before its engine runs; it reports them with this
 /// context, so they match the native backend's (#414).
 ///
+/// The [`ImportKind::Data`] records come last, in both orders: the local file path
+/// of each frontmatter `data:` entry, as written, once per path, in declaration
+/// order. A data file is not a module. A data record has no span and no frontmatter
+/// index, and a module record of the same path stays a separate record. URL entries
+/// are not listed. The scan does not know the file type, so it also lists the
+/// entries of a plain `.md` file, which a compile keeps as a variable. A declaration
+/// error leaves out every data record of the module, for the compile to report.
+///
 /// # Errors
 ///
-/// A syntax error in the source, a frontmatter over a resource limit, or a source whose
-/// syntax tree estimate does not fit the compile memory budget — as [`scan_imports`].
+/// A syntax error in the source, a frontmatter over a resource limit, more data
+/// entries than one module can declare, or a source whose syntax tree estimate does
+/// not fit the compile memory budget — as [`scan_imports`].
 ///
 /// # Examples
 ///
@@ -2204,6 +2223,8 @@ pub fn scan_import_records(
         Frontmatter(usize),
         /// An `@extends`, `@import` or `@export … from` directive, at this byte offset.
         Directive(usize),
+        /// A frontmatter `data:` entry. A data error carries no source span.
+        Data,
     }
 
     let tokens = lexer::tokenize(source, "")?;
@@ -2227,11 +2248,27 @@ pub fn scan_import_records(
 
     // Frontmatter imports resolve before body imports. Best-effort: a plain parse or
     // validation error is left for the compile to report, but a resource limit
-    // (frontmatter size cap / node budget / too many imports) fails closed rather than
-    // return only the body's imports (#162).
+    // (frontmatter size cap / node budget / too many imports or data entries) fails
+    // closed rather than return only the body's imports (#162).
+    let lenient = |error: MdsError| match error {
+        MdsError::ResourceLimit { .. } => Err(error),
+        _ => Ok(()),
+    };
+    let mut data = indexmap::IndexSet::new();
     if let Some(fm) = module.frontmatter.as_ref() {
-        match resolver::parse_frontmatter_imports(&fm.raw) {
-            Ok(fm_imports) => {
+        let yaml = match resolver::parse_frontmatter_yaml(&fm.raw) {
+            Ok(yaml) => Some(yaml),
+            Err(e) => {
+                lenient(e)?;
+                None
+            }
+        };
+        let mapping = yaml.as_ref().and_then(serde_yaml_ng::Value::as_mapping);
+        match mapping
+            .and_then(|map| map.get("imports"))
+            .map(resolver::parse_frontmatter_imports_from_yaml)
+        {
+            Some(Ok(fm_imports)) => {
                 for (i, imp) in fm_imports.iter().enumerate() {
                     record(
                         imp.path(),
@@ -2240,8 +2277,23 @@ pub fn scan_import_records(
                     );
                 }
             }
-            Err(e @ MdsError::ResourceLimit { .. }) => return Err(e),
-            Err(_) => {}
+            Some(Err(e)) => lenient(e)?,
+            None => {}
+        }
+        // The declaration parser reads the bounded tree and does no I/O.
+        let mut mem = evaluator::budget::MemBudget::default();
+        match mapping
+            .and_then(|map| map.get("data"))
+            .map(|field| data::decl::parse_declarations(field, "", &mut mem))
+        {
+            Some(Ok(entries)) => {
+                data.extend(entries.into_iter().filter_map(|entry| match entry.source {
+                    data::decl::Source::File(path) => Some(path),
+                    data::decl::Source::Url(_) => None,
+                }));
+            }
+            Some(Err(e)) => lenient(e)?,
+            None => {}
         }
     }
 
@@ -2272,12 +2324,18 @@ pub fn scan_import_records(
     // imports, so the cursor starts over at most once — around the @extends base,
     // wherever it is listed — and walks the source about twice at most.
     let mut positions = error::LineColumns::new(source);
+    // A data file is a leaf read after every module, so its records come last.
+    let data = data
+        .into_iter()
+        .map(|path| (path, (ImportKind::Data, Placement::Data)));
     Ok(first
         .into_iter()
         .chain(found)
         .chain(last)
+        .chain(data)
         .map(|(path, (kind, placement))| {
             let (frontmatter_index, span) = match placement {
+                Placement::Data => (None, None),
                 Placement::Frontmatter(index) => (Some(index), None),
                 Placement::Directive(offset) => {
                     let span = SerializedSpan::new(offset, resolver::line_len_at(source, offset));
@@ -3051,6 +3109,53 @@ mod tests {
         );
         let paths = scan_imports(source).expect("syntax error in FM must be swallowed");
         assert_eq!(paths, vec!["./x.mds".to_string()]);
+    }
+
+    /// The data entries of one module at the cap give one record each. One more entry
+    /// fails the scan closed, as the compile does. A declaration error leaves out the
+    /// data records, and the module records stay.
+    #[test]
+    fn scan_import_records_bound_data_records_like_the_compile() {
+        let source = |count: usize, extra: &str| {
+            let entries: String = (0..count)
+                .map(|i| format!("  e{i}: ./d{i}.json\n"))
+                .collect();
+            format!("---\ndata:\n{entries}{extra}---\n@import \"./m.mds\" as m\n")
+        };
+        let kinds = |source: &str| -> Result<Vec<ImportKind>, MdsError> {
+            Ok(scan_import_records(source, ResolveAs::Standalone)?
+                .into_iter()
+                .map(|record| record.kind)
+                .collect())
+        };
+        let cap = limits::MAX_DATA_ENTRIES_PER_MODULE;
+        let at_cap = kinds(&source(cap, "")).expect("the cap scans");
+        assert_eq!(at_cap.len(), 1 + cap);
+        assert_eq!(
+            at_cap.iter().filter(|&&k| k == ImportKind::Data).count(),
+            cap
+        );
+        assert_eq!(scan_imports(&source(cap, "")).unwrap(), ["./m.mds"]);
+        for over in [
+            scan_import_records(&source(cap + 1, ""), ResolveAs::Standalone).map(|_| ()),
+            scan_imports(&source(cap + 1, "")).map(|_| ()),
+        ] {
+            let error = over.expect_err("one entry past the cap").serialize();
+            assert_eq!(error.code, "mds::resource_limit");
+            assert!(error.message.contains("too many data entries"), "{error:?}");
+        }
+        for invalid in ["  prompt: ./p.json\n", "  bad: plain\n"] {
+            let source = source(2, invalid);
+            assert_eq!(kinds(&source).unwrap(), [ImportKind::Import], "{invalid}");
+            let error = compile_virtual_collecting_warnings(
+                HashMap::from([("main.mds".into(), source), ("m.mds".into(), "M\n".into())]),
+                "main.mds",
+                None,
+            )
+            .expect_err("the compile reports the declaration error")
+            .serialize();
+            assert_eq!(error.code, "mds::data", "{error:?}");
+        }
     }
 
     #[test]

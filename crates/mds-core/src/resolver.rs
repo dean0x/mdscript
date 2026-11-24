@@ -74,8 +74,8 @@ pub(crate) use frontmatter::{
     parse_data_json_with, parse_data_yaml_with, NODE_YAML, RESERVED_MERGE_KEYS,
 };
 pub(crate) use frontmatter::{
-    parse_frontmatter_imports, parse_frontmatter_imports_from_yaml, parse_frontmatter_yaml,
-    parse_frontmatter_yaml_with, Allowance, FrontmatterImport,
+    parse_frontmatter_imports_from_yaml, parse_frontmatter_yaml, parse_frontmatter_yaml_with,
+    Allowance, FrontmatterImport,
 };
 #[cfg(test)]
 use import_paths::ImportPathViolation;
@@ -294,14 +294,26 @@ impl ModuleCache {
     }
 
     /// Returns normalized keys of all modules resolved during compilation,
-    /// in first-resolution order (depth-first traversal).
+    /// in first-resolution order (depth-first traversal), then the keys of the
+    /// local data files the compile read, in first-read order.
     ///
     /// This includes the entry module itself. Use this after a successful
     /// `resolve_path` / `resolve_key` / `resolve_source` call to obtain the
     /// dependency graph. Callers that want to exclude the entry point should
     /// filter it out themselves (see `compile_virtual_with_deps`).
+    ///
+    /// A key occurs once: a data file that a module import also names is listed
+    /// with the modules. Only a compile entry point reads data files, so a cache
+    /// from [`ModuleCache::new`], [`ModuleCache::native`], [`ModuleCache::virtual_fs`]
+    /// or [`ModuleCache::with_fs`] lists modules only. A data entry that a runtime
+    /// variable replaces reads no file, and no URL is ever listed.
     pub fn dependencies(&self) -> Vec<String> {
-        self.modules.keys().cloned().collect()
+        let data = self
+            .data
+            .files
+            .keys()
+            .filter(|key| !self.modules.contains_key(*key));
+        self.modules.keys().chain(data).cloned().collect()
     }
 
     fn commit_retained(&mut self, kept: usize) {
