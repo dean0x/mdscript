@@ -1380,7 +1380,11 @@ in `web.rs`). The WASM backend of `@mdscript/mds` reads these files for `compile
 path rules of the native backend. Its output and its errors are equal to those of the native
 backend for a data file that it reads, a missing data file, a missing data file of an imported
 module, a base entry that a child entry replaces, and a `node_modules` segment reached through a
-symbolic link (U-WCF15 in `packages/mds/__test__/wasm-compileFile.spec.mjs`). The napi `compile` and `compileFile`, and the WASM
+symbolic link (U-WCF15 in `packages/mds/__test__/wasm-compileFile.spec.mjs`). They are also equal
+for each row of the shared data path vector table, a symbolic link as the final component, a linked
+directory outside the project root, a named pipe, a file over 10 MiB, an entry with more than 256
+references and, on a case-insensitive volume, a resolved key with no data extension
+(`packages/mds/__test__/data-scanner.spec.mjs`). The napi `compile` and `compileFile`, and the WASM
 `compile` with an `options.modules` map, bind data
 ('D-1: compile and compileFile bind .json, .yaml and .yml data to the same output' in
 `index.spec.mjs`, `compile_binds_json_and_yaml_data_from_the_modules_map` in `web.rs`).
