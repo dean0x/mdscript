@@ -264,16 +264,16 @@ jobs:
           #   - toolchain or wasm-bindgen drift with no source change: +7,011 B
           #     (PR #401), and the 600K -> 650K raise (2026-06);
           #   - a new dependency path: serde_json's text parser was about 30 KB (#426).
-          # The limit uses the CI size of PR #527 (823,539 B raw) plus 30,000 B,
-          # rounded up to the next 1,000 B. On main, the size of 811,347 B leaves
-          # 42,653 B of headroom. With PR #527, 30,461 B stays. That is above
+          # The limit uses the CI size of PR #529 (944,833 B raw) plus 30,000 B,
+          # rounded up to the next 1,000 B. On main, the size of 823,539 B leaves
+          # 151,461 B of headroom. With PR #529, 30,167 B stays. That is above
           # the design margin of 18,851 B. That margin
           # covers one large feature PR (+11,840 B, PR #294) plus one toolchain
           # update (+7,011 B, PR #401). It does not cover a lost codegen setting.
           # If a PR would leave less than the design margin, state its size cost
           # in the PR body. Raise the limit only in a separate PR with a ledger
           # entry. Keep the limit equal in release.yml; the WASM parity test checks it.
-          WASM_SIZE_LIMIT=854000
+          WASM_SIZE_LIMIT=975000
           for f in crates/mds-wasm/pkg/mds_wasm_bg.wasm crates/mds-wasm/pkg-web/mds_wasm_bg.wasm; do
             if [ ! -f "$f" ]; then
               echo "::error::WASM file missing: $f"
@@ -364,6 +364,16 @@ jobs:
             #   reserved frontmatter key proof and its fixed error text.
             #   Guard RAISED 821,000 -> 854,000 (the rule above): 30,461 bytes
             #   headroom with PR #527.
+            #   ci/wasm-limit-975k (2026-11-24, for PR #529, #405): no source change.
+            #   CI baseline at 5876eda: 823,539 bytes raw, 342,800 bytes gzipped
+            #   (run 45379168497). PR #529 at 6ecfaed: 944,833 bytes raw, 393,190
+            #   bytes gzipped (run 45429639346). Delta: +121,294 bytes (+14.73%):
+            #   local data sources (data graph check, data binding, extends merge,
+            #   bounded JSON parse). PR #529 already removes 37,774 bytes of sort
+            #   code. opt-level "z" for mds-core was 248,311 bytes smaller, but
+            #   51.4% slower in a compile benchmark, so it is not used.
+            #   Guard RAISED 854,000 -> 975,000 (the rule above): 30,167 bytes
+            #   headroom with PR #529.
             if [ "$raw" -gt "$WASM_SIZE_LIMIT" ]; then
               echo "::error::WASM binary exceeds the ${WASM_SIZE_LIMIT}-byte limit: ${label} is ${raw} bytes"
               exit 1
