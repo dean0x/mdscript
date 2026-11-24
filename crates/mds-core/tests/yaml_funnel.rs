@@ -7,6 +7,8 @@
 //! the two parse entry points may appear ONLY in `resolver/frontmatter.rs`, anywhere else
 //! in `src/**` is a violation.
 //!
+//! JSON parse entry points can occur only in the data funnel and vars reader.
+//!
 //! Scope: `crates/mds-core/src/**`, excluding `*_tests.rs` files and `#[cfg(test)]`
 //! modules (test code legitimately calls the raw parser to assert parity). Comment and
 //! string-literal text is masked so a needle named in rustdoc or a string does not count.
@@ -141,6 +143,106 @@ fn builtin_production_parse_inserted_in_memory_is_detected() {
     );
 }
 
+#[test]
+fn json_gate_detects_each_parse_entry_point_in_a_child_module() {
+    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let path = src_dir.join("resolver/import_paths.rs");
+    assert!(rust_files(&src_dir).contains(&path));
+    let source = std::fs::read_to_string(&path).expect("child module must be readable");
+    let matches = |raw: &str| json_parse_violations(&src_dir, &path, raw);
+    assert!(matches(&source).is_empty());
+    for (plant, needle) in [
+        ("serde_json::from_str(input);", "from_str"),
+        ("serde_json :: from_slice(input);", "from_slice"),
+        ("serde_json::from_reader(input);", "from_reader"),
+        ("use serde_json::{Value, from_reader};", "from_reader"),
+        ("serde_json::de::from_reader(input);", "from_reader"),
+        ("serde_json::Deserializer::from_str(input);", "Deserializer"),
+    ] {
+        let planted = format!("{source}\nfn planted() {{ {plant} }}\n");
+        let violations = matches(&planted);
+        assert_eq!(
+            violations,
+            [needle],
+            "the planted parse must be found: {plant}"
+        );
+    }
+}
+
+const JSON_OWNERS: &[&str] = &["resolver/frontmatter.rs", "vars_json.rs"];
+const JSON_ENTRY_POINTS: &[&str] = &["from_str", "from_slice", "from_reader", "Deserializer"];
+
+#[test]
+fn json_parse_sites_are_funnelled() {
+    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let files = rust_files(&src_dir);
+    for owner in JSON_OWNERS {
+        let path = src_dir.join(owner);
+        assert!(files.contains(&path), "missing parse owner: {owner}");
+        let raw = std::fs::read_to_string(path).expect("parse owner must be readable");
+        assert!(
+            !json_parse_sites(&raw).is_empty(),
+            "no parse found in {owner}"
+        );
+    }
+    let mut violations = Vec::new();
+    for path in files.iter().filter(|path| {
+        !path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("_tests.rs")
+    }) {
+        let raw = std::fs::read_to_string(path).expect("source must be readable");
+        for name in json_parse_violations(&src_dir, path, &raw) {
+            violations.push(format!("{}: serde_json::{name}", rel(&src_dir, path)));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "JSON parse sites outside the data funnel and vars reader:\n{}",
+        violations.join("\n")
+    );
+}
+
+fn json_parse_violations(base: &Path, path: &Path, raw: &str) -> Vec<&'static str> {
+    if JSON_OWNERS.iter().any(|owner| path == base.join(owner)) {
+        return Vec::new();
+    }
+    json_parse_sites(raw)
+}
+
+fn json_parse_sites(raw: &str) -> Vec<&'static str> {
+    let code = strip_cfg_test_mods(&mask_comments_and_strings(raw));
+    let mut found = Vec::new();
+    for (start, _) in code.match_indices("serde_json") {
+        if prev_is_ident_byte(code.as_bytes(), start) {
+            continue;
+        }
+        let tail = code[start + "serde_json".len()..].trim_start();
+        let Some(tail) = tail.strip_prefix("::").map(str::trim_start) else {
+            continue;
+        };
+        let tail = tail
+            .strip_prefix("de")
+            .and_then(|rest| rest.trim_start().strip_prefix("::"))
+            .map_or(tail, str::trim_start);
+        let separator = |c: char| !(c.is_ascii_alphanumeric() || c == '_');
+        let names = if tail.starts_with('{') {
+            let end = match_brace(tail, 0).expect("JSON import group must have a closing brace");
+            &tail[..end]
+        } else {
+            &tail[..tail.find(separator).unwrap_or(tail.len())]
+        };
+        for word in names.split(separator) {
+            if let Some(&name) = JSON_ENTRY_POINTS.iter().find(|&&name| name == word) {
+                found.push(name);
+            }
+        }
+    }
+    found
+}
+
 fn is_choke_point(path: &Path) -> bool {
     let comps: Vec<String> = path
         .components()
@@ -161,12 +263,13 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
     let mut stack = vec![dir.to_path_buf()];
     // Bounded: the source tree is finite and acyclic (read_dir does not traverse symlinks).
     while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for entry in rd.flatten() {
+        let rd = std::fs::read_dir(&d).expect("source directory must be readable");
+        for entry in rd {
+            let entry = entry.expect("source directory entry must be readable");
             let p = entry.path();
-            let Ok(ft) = entry.file_type() else { continue };
+            let ft = entry
+                .file_type()
+                .expect("source file type must be readable");
             if ft.is_dir() {
                 stack.push(p);
             } else if ft.is_file() && p.extension().and_then(|e| e.to_str()) == Some("rs") {

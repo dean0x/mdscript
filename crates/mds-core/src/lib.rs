@@ -42,6 +42,14 @@
 pub(crate) mod arity;
 pub(crate) mod ast;
 pub(crate) mod builtins;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the data resolver calls the converter in a later phase"
+    )
+)]
+pub(crate) mod data;
 pub(crate) mod error;
 pub(crate) mod escape_class;
 pub(crate) mod evaluator;
@@ -2397,7 +2405,7 @@ fn load_vars_file_into(path: &Path, log: Option<&ReadLog>) -> Result<VarsLoad, M
     };
     let content = String::from_utf8(bytes)
         .map_err(|e| MdsError::io(format!("invalid UTF-8 in vars file {path_str}: {e}")))?;
-    let json: serde_json::Value = serde_json::from_str(&content)
+    let json = vars_json::parse_vars_json(&content)
         .map_err(|e| MdsError::invalid_vars(format!("{path_str}: {e}")))?;
 
     let serde_json::Value::Object(map) = json else {
@@ -2478,8 +2486,8 @@ pub fn load_vars_str_reporting_duplicates(json: &str) -> Result<VarsLoad, MdsErr
             MAX_FILE_SIZE,
         )));
     }
-    let parsed: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| MdsError::json_error(e.to_string()))?;
+    let parsed =
+        vars_json::parse_vars_json(json).map_err(|e| MdsError::json_error(e.to_string()))?;
     let serde_json::Value::Object(map) = parsed else {
         return Err(MdsError::json_error("vars must be a JSON object"));
     };

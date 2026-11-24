@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use serde::de::{self, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor};
 
+use crate::data::DataLabel;
 use crate::error::MdsError;
 use crate::evaluator::budget::MemBudget;
 use crate::limits::{
@@ -19,6 +20,8 @@ use crate::limits::{
 use crate::parser::is_valid_identifier;
 use crate::scope::{Scope, VarLayer};
 use crate::value::Value;
+use crate::value::{DATA_INTEGER_ERROR, MAX_VALUE_DEPTH};
+use crate::vars_json::{check_data_json, DataScanError};
 
 use super::import_path_violation;
 
@@ -177,10 +180,6 @@ pub(crate) fn parse_frontmatter_yaml_with(
 }
 
 /// Parse data with the data file caps. Return the tree and its charged bytes.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the data converter lands in the next phase")
-)]
 pub(crate) fn parse_data_yaml_with(
     raw: &str,
     allowance: Allowance,
@@ -192,6 +191,115 @@ pub(crate) fn parse_data_yaml_with(
         allowance,
         YamlInput::DataFile,
     )
+}
+
+/// Parse JSON with the data file caps. Use the same intermediate tree as YAML.
+pub(crate) fn parse_data_json_with(
+    raw: &str,
+    allowance: Allowance,
+    label: DataLabel<'_>,
+) -> Result<(serde_yaml_ng::Value, usize), MdsError> {
+    let max = MAX_DATA_FILE_BYTES as usize;
+    if raw.len() > max {
+        return Err(MdsError::resource_limit(format!(
+            "data file too large ({} bytes, max {max} bytes)",
+            raw.len()
+        )));
+    }
+    // serde_json can allocate scratch space before the visitor sees an escaped
+    // string. Its slice reader borrows strings without escapes.
+    let scratch = if raw.as_bytes().contains(&b'\\') {
+        2 * raw.len()
+    } else {
+        0
+    };
+    let byte_error = || {
+        if allowance.by_budget {
+            MdsError::compile_memory_exceeded()
+        } else {
+            MdsError::resource_limit(format!(
+                "data file JSON expands beyond maximum of {MAX_OUTPUT_SIZE} bytes"
+            ))
+        }
+    };
+    let available = allowance
+        .bytes
+        .checked_sub(scratch)
+        .ok_or_else(byte_error)?;
+    let budget = NodeBudget::new(MAX_DATA_NODES_PER_FILE, available);
+    let error = |budget: &NodeBudget, reason| match budget.trip.get() {
+        Some(Trip::Nodes) => MdsError::resource_limit(format!(
+            "data file JSON node count exceeds maximum of {MAX_DATA_NODES_PER_FILE}"
+        )),
+        Some(Trip::Bytes) => byte_error(),
+        None => match reason {
+            DataScanError::Depth => label.error(
+                None,
+                &format!("value nesting exceeds maximum depth of {MAX_VALUE_DEPTH}"),
+            ),
+            DataScanError::Duplicate => label.error(None, "duplicate JSON object key"),
+            DataScanError::Invalid => label.error(None, "invalid JSON data"),
+        },
+    };
+    check_json_integer_overflow(raw, label)?;
+    check_data_json(raw, &|len| budget.charge::<serde_json::Error>(len).is_ok())
+        .map_err(|reason| error(&budget, reason))?;
+
+    // The scan bounds nesting before this pass. The deserializer also has its
+    // own recursion guard. Both guards are tighter than the YAML flow limit.
+    let mut de = serde_json::Deserializer::from_str(raw);
+    let tree_budget = NodeBudget::new(MAX_DATA_NODES_PER_FILE, available);
+    let tree = BoundedYaml {
+        budget: &tree_budget,
+    }
+    .deserialize(&mut de)
+    .and_then(|tree| de.end().map(|()| tree))
+    .map_err(|_| error(&tree_budget, DataScanError::Invalid))?;
+    Ok((tree, available - tree_budget.bytes.get()))
+}
+
+/// Refuse integer spellings that would reach the converter as floats. The
+/// deserializer still checks the document syntax.
+fn check_json_integer_overflow(raw: &str, label: DataLabel<'_>) -> Result<(), MdsError> {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut start = None;
+    for (i, b) in raw.bytes().chain([b' ']).enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E' => {
+                if start.is_none() && (b.is_ascii_digit() || b == b'-') {
+                    start = Some(i);
+                }
+            }
+            _ => {
+                if let Some(from) = start.take() {
+                    let token = &raw[from..i];
+                    if token.len() >= 19 && !token.contains(['.', 'e', 'E']) {
+                        let overflow = if token.starts_with('-') {
+                            token.parse::<i64>().is_err()
+                        } else {
+                            token.parse::<u64>().is_err()
+                        };
+                        if overflow {
+                            return Err(label.error(None, DATA_INTEGER_ERROR));
+                        }
+                    }
+                }
+                in_string = b == b'"';
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -354,7 +462,7 @@ fn check_flow_nesting_depth(raw: &str, max_depth: usize, label: &str) -> Result<
 
 /// Bytes charged per parsed node, on top of its string or key bytes. A fixed number,
 /// so every surface trips at the same document.
-const NODE_YAML: usize = 192;
+pub(crate) const NODE_YAML: usize = 192;
 
 // Compile-time checks. Each `>` also covers the fraction that the division drops.
 const _: () = {
@@ -750,10 +858,6 @@ pub(crate) fn parse_frontmatter_imports(raw: &str) -> Result<Vec<FrontmatterImpo
 
     parse_frontmatter_imports_from_yaml(imports_val)
 }
-
-#[cfg(test)]
-#[path = "../data/corpus_tests.rs"]
-mod corpus_tests;
 
 #[cfg(test)]
 #[path = "frontmatter_tests.rs"]

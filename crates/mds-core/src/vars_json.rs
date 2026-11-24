@@ -1,27 +1,9 @@
-//! Duplicate JSON object key detection for `--vars` files (#326).
+//! JSON vars reader and shared duplicate-key detection.
 //!
-//! # Why a second, value-free pass (D1)
-//!
-//! `serde_json`'s own `Value` deserializer (`value/de.rs`, `visit_map`) builds an
-//! object by repeatedly calling `Map::insert` and discarding the previous value on
-//! a repeated key — by the time `serde_json::from_str::<Value>` returns, every
-//! duplicate has already vanished; there is nothing left in the parsed `Value` to
-//! detect a duplicate from. Rather than replace that deserializer with one that
-//! tracks duplicates while also building the value (and re-deriving its numeric
-//! parsing, non-finite-float-to-`Null` handling, and borrowed-vs-owned string
-//! rules along the way), this module runs a SECOND pass over the same JSON text
-//! with a value-free (`Self::Value = ()`) visitor. The two passes are independent:
-//! the first (unchanged, in `lib.rs`) produces the `Value`; this one only records
-//! which key paths repeat. Fidelity of the parsed value is preserved by
-//! construction — this module never constructs or approximates a `Value`.
-//!
-//! # Where the duplicate vanishes
-//!
-//! `serde_json::Value`'s `Deserialize` impl inserts each key into a `Map` via
-//! `Map::insert`, which returns (and drops) the previous value for a repeated
-//! key. `load_vars_file`/`load_vars_str` in `lib.rs` call `duplicate_json_keys`
-//! (this module) as a second pass over the *same* text to recover exactly the
-//! information that first pass already discarded.
+//! The `serde_json::Value` reader keeps the last value for a repeated key.
+//! Vars readers use a second pass to report repeats without changes to those
+//! values. Data sources use the same scan before tree construction. They
+//! refuse the first repeat and limit the nodes, bytes and depth of the tree.
 //!
 //! # Path grammar
 //!
@@ -46,20 +28,16 @@
 //! recorded per key, however many times that key repeats within its enclosing
 //! object (a key appearing 3 times still yields one path).
 //!
-//! # Recursion bound (D7)
+//! # Recursion bound
 //!
-//! This module adds no depth cap of its own. `serde_json::Deserializer`'s own
-//! recursion guard (`check_recursion!`, limit 128, not configurable in this
-//! build) bounds the scan's recursion and returns an `Err`, never panics.
-//! `Value::from_json`'s separate `MAX_VALUE_DEPTH = 64` has already rejected any
-//! document deep enough to matter for the parsed `Value` before this scan ever
-//! runs — this module's 128-level ceiling exists only so the scan itself cannot
-//! overflow the stack on adversarial input, and a document between 64 and 128
-//! levels deep fails earlier in `Value::from_json` regardless.
+//! The JSON deserializer limits recursion to 128 levels. The data scan also
+//! limits value depth to 64 before it visits a child. Vars readers apply the
+//! value depth limit before they call the duplicate-key scan.
 
 use std::collections::HashSet;
 use std::fmt;
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 
@@ -85,20 +63,42 @@ pub(crate) struct DuplicateKeys {
 /// One segment of the path to the object currently being scanned: a named object
 /// key, or a 0-based array index.
 enum Seg {
-    Key(String),
+    Key(Arc<str>),
     Index(usize),
 }
 
 /// Scan state threaded through the recursive visitor: the path to the object
 /// currently being visited, the duplicate paths found so far, and the count of
 /// duplicates omitted past the cap.
-struct Scan {
+#[derive(Default)]
+struct Scan<'a> {
     path: Vec<Seg>,
     found: Vec<String>,
     omitted: usize,
+    data: Option<&'a dyn Fn(usize) -> bool>,
+    rejection: Option<DataScanError>,
 }
 
-impl Scan {
+#[derive(Clone, Copy)]
+pub(crate) enum DataScanError {
+    Invalid,
+    Duplicate,
+    Depth,
+}
+
+impl Scan<'_> {
+    fn charge<E: de::Error>(&self, len: usize) -> Result<(), E> {
+        if self.data.is_some_and(|charge| !charge(len)) {
+            return Err(E::custom("data JSON budget exhausted"));
+        }
+        Ok(())
+    }
+
+    fn reject<E: de::Error>(&mut self, reason: DataScanError) -> E {
+        self.rejection = Some(reason);
+        E::custom("invalid data JSON")
+    }
+
     /// Record one duplicate occurrence of `key` inside the object at the current
     /// `path`. Renders the full path (container path + `key`) into a single
     /// `String` via `write!`/`push_str` — no per-segment `format!` allocation
@@ -136,97 +136,90 @@ impl Scan {
 /// Value-free visitor/seed pair: recurses through a JSON document recording
 /// duplicate object keys, without building a `Value`. Holds a reborrowed `&mut
 /// Scan` so the same scan state threads through every recursive call.
-struct DupScan<'a> {
-    scan: &'a mut Scan,
+struct DupScan<'a, 'budget> {
+    scan: &'a mut Scan<'budget>,
 }
 
-impl<'de> DeserializeSeed<'de> for DupScan<'_> {
+// Charge decoded key bytes before retaining a copy. The path and the set
+// share the same allocation.
+struct Key<'a, 'budget>(&'a Scan<'budget>);
+
+impl<'de> DeserializeSeed<'de> for Key<'_, '_> {
+    type Value = Arc<str>;
+
+    fn deserialize<D: de::Deserializer<'de>>(self, de: D) -> Result<Self::Value, D::Error> {
+        de.deserialize_str(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Key<'_, '_> {
+    type Value = Arc<str>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON object key")
+    }
+
+    fn visit_str<E: de::Error>(self, key: &str) -> Result<Self::Value, E> {
+        self.0.charge(key.len())?;
+        Ok(Arc::from(key))
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for DupScan<'_, '_> {
     type Value = ();
 
     fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
     where
         D: de::Deserializer<'de>,
     {
+        if self.scan.data.is_some() && self.scan.path.len() > crate::value::MAX_VALUE_DEPTH {
+            return Err(self.scan.reject(DataScanError::Depth));
+        }
         deserializer.deserialize_any(self)
     }
 }
 
-impl<'de> Visitor<'de> for DupScan<'_> {
+impl<'de> Visitor<'de> for DupScan<'_, '_> {
     type Value = ();
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("any valid JSON value")
     }
 
-    // Every leaf shape serde_json's `deserialize_any` can call for a JSON leaf
-    // (de.rs): null, bool, signed/unsigned integer, float, string. None of these
-    // carry nested structure, so each is simply accepted.
-    fn visit_unit<E>(self) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(())
+    fn visit_unit<E: de::Error>(self) -> Result<(), E> {
+        self.scan.charge(0)
     }
 
-    fn visit_bool<E>(self, _v: bool) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(())
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<(), E> {
+        self.scan.charge(0)
     }
 
-    fn visit_i64<E>(self, _v: i64) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(())
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<(), E> {
+        self.scan.charge(0)
     }
 
-    fn visit_u64<E>(self, _v: u64) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(())
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<(), E> {
+        self.scan.charge(0)
     }
 
-    fn visit_f64<E>(self, _v: f64) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(())
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<(), E> {
+        self.scan.charge(0)
     }
 
-    fn visit_str<E>(self, _v: &str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(())
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<(), E> {
+        self.scan.charge(v.len())
     }
 
-    // Defence only: not reachable via plain serde_json::Deserializer (no
-    // arbitrary-precision integers, no explicit Option variant in JSON — `null`
-    // already routes to `visit_unit`), but spelled out so a future serde_json
-    // configuration change fails loudly via T9 (`invalid_type`) rather than
-    // silently mis-scanning.
-    fn visit_i128<E>(self, _v: i128) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(())
+    fn visit_i128<E: de::Error>(self, _: i128) -> Result<(), E> {
+        self.scan.charge(0)
     }
 
-    fn visit_u128<E>(self, _v: u128) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(())
+    fn visit_u128<E: de::Error>(self, _: u128) -> Result<(), E> {
+        self.scan.charge(0)
     }
 
-    fn visit_none<E>(self) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(())
+    fn visit_none<E: de::Error>(self) -> Result<(), E> {
+        self.scan.charge(0)
     }
 
     fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
@@ -241,6 +234,7 @@ impl<'de> Visitor<'de> for DupScan<'_> {
         A: SeqAccess<'de>,
     {
         let Self { scan } = self;
+        scan.charge(0)?;
         let mut i = 0usize;
         loop {
             scan.path.push(Seg::Index(i));
@@ -264,14 +258,17 @@ impl<'de> Visitor<'de> for DupScan<'_> {
         A: MapAccess<'de>,
     {
         let Self { scan } = self;
+        scan.charge(0)?;
         let mut seen = HashSet::new();
         let mut reported = HashSet::new();
-        while let Some(key) = map.next_key::<String>()? {
-            // Record once per key per enclosing object: the second occurrence
-            // trips `reported.insert`, later repeats of the same key find
-            // `reported.insert` already false and are skipped.
-            if !seen.insert(key.clone()) && reported.insert(key.clone()) {
-                scan.record(&key);
+        while let Some(key) = map.next_key_seed(Key(scan))? {
+            if !seen.insert(Arc::clone(&key)) {
+                if scan.data.is_some() {
+                    return Err(scan.reject(DataScanError::Duplicate));
+                }
+                if reported.insert(Arc::clone(&key)) {
+                    scan.record(&key);
+                }
             }
             scan.path.push(Seg::Key(key));
             let v = map.next_value_seed(DupScan { scan: &mut *scan });
@@ -297,20 +294,35 @@ impl<'de> Visitor<'de> for DupScan<'_> {
 /// accepted, so an error here is a divergence between the two passes and is
 /// propagated rather than swallowed.
 pub(crate) fn duplicate_json_keys(json: &str) -> Result<DuplicateKeys, serde_json::Error> {
-    let mut scan = Scan {
-        path: Vec::new(),
-        found: Vec::new(),
-        omitted: 0,
-    };
-    let mut de = serde_json::Deserializer::from_str(json);
-    DupScan { scan: &mut scan }.deserialize(&mut de)?;
-    // Reject trailing garbage after a complete value (e.g. "{} {}") — omitting
-    // this call would silently ignore anything after the first valid value.
-    de.end()?;
+    let mut scan = Scan::default();
+    scan_json(json, &mut scan)?;
     Ok(DuplicateKeys {
         paths: scan.found,
         omitted: scan.omitted,
     })
+}
+
+pub(crate) fn parse_vars_json(json: &str) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::from_str(json)
+}
+
+/// Refuse repeated keys and bound the data tree before its construction.
+pub(crate) fn check_data_json(
+    json: &str,
+    charge: &dyn Fn(usize) -> bool,
+) -> Result<(), DataScanError> {
+    let mut scan = Scan {
+        data: Some(charge),
+        ..Scan::default()
+    };
+    scan_json(json, &mut scan).map_err(|_| scan.rejection.unwrap_or(DataScanError::Invalid))
+}
+
+fn scan_json(json: &str, scan: &mut Scan<'_>) -> Result<(), serde_json::Error> {
+    let mut de = serde_json::Deserializer::from_str(json);
+    DupScan { scan }.deserialize(&mut de)?;
+    // Require one complete document.
+    de.end()
 }
 
 #[cfg(test)]
