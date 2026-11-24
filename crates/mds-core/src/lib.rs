@@ -401,6 +401,38 @@ pub const MAX_DIAGNOSTICS: usize = limits::MAX_DIAGNOSTICS;
 /// and the WASM `moduleAliases` option is refused as it is read (#414).
 pub const MAX_MODULE_ALIASES: usize = limits::MAX_MODULE_ALIASES;
 
+/// Maximum number of local data files one compile reads: 256.
+///
+/// A binding's virtual module map takes the same number of data files, apart from its
+/// modules ([`is_data_path`] tells the two kinds apart).
+pub const MAX_DATA_FILES: usize = limits::MAX_DATA_FILES;
+
+/// Maximum total size in bytes of the local data files one compile reads: 32 MiB.
+///
+/// A binding's virtual module map takes the same total of data file text, apart from
+/// the total of its module text.
+pub const MAX_DATA_BYTES: usize = limits::MAX_DATA_BYTES_PER_COMPILE;
+
+/// Whether `path` names a local data file: it ends with `.json`, `.yaml` or `.yml`,
+/// compared byte for byte, so `a.JSON` is not a data path.
+///
+/// A frontmatter `data:` entry must name a path with one of these extensions.
+///
+/// # Examples
+///
+/// ```
+/// assert!(mds::is_data_path("config/site.json"));
+/// assert!(mds::is_data_path("list.yml"));
+/// assert!(!mds::is_data_path("site.JSON"));
+/// assert!(!mds::is_data_path("page.mds"));
+/// ```
+#[must_use]
+pub fn is_data_path(path: &str) -> bool {
+    [".json", ".yaml", ".yml"]
+        .iter()
+        .any(|ext| path.ends_with(ext))
+}
+
 /// Compile an MDS file, returning a [`CompileResult`].
 ///
 /// The output shape is intrinsic to the template: a template containing any

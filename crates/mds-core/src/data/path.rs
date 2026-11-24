@@ -17,10 +17,7 @@ pub(crate) fn normalize(
     if relative.contains("{{") {
         return Err(refused(relative, "references are not allowed"));
     }
-    if ![".json", ".yaml", ".yml"]
-        .iter()
-        .any(|ext| relative.ends_with(ext))
-    {
+    if !crate::is_data_path(relative) {
         return Err(refused(
             relative,
             "expected the .json, .yaml or .yml extension",

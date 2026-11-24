@@ -611,8 +611,45 @@ fn mds_error_is_string_source() {
 fn constants_have_expected_values() {
     assert_eq!(MAX_FILE_SIZE, 10 * 1024 * 1024);
     assert_eq!(mds::MAX_MODULE_ALIASES, 65_536);
+    assert_eq!(mds::MAX_DATA_FILES, 256);
+    assert_eq!(mds::MAX_DATA_BYTES, 32 * 1024 * 1024);
     const _: () = assert!(MAX_TRAVERSAL_DEPTH > 0);
     const _: () = assert!(MAX_TRAVERSAL_DEPTH <= 1000);
+}
+
+/// The bindings count the data files of a virtual map apart from its modules by the
+/// exact extension of each key: the extensions a `data:` entry may name (#405).
+#[test]
+fn data_paths_are_named_by_their_exact_extension() {
+    for path in ["a.json", "sub/a.yaml", "a.yml", "./x/a.b.json"] {
+        assert!(mds::is_data_path(path), "{path}");
+    }
+    for path in [
+        "a.mds",
+        "a.md",
+        "a.JSON",
+        "a.Yml",
+        "a.json.mds",
+        "a.jsonl",
+        "a.txt",
+    ] {
+        assert!(!mds::is_data_path(path), "{path}");
+    }
+    // The extension rule of the `data:` declaration is the same rule: a `.JSON` entry is
+    // refused as it is declared.
+    let fs = VirtualFs::new(HashMap::from([
+        (
+            "main.mds".to_owned(),
+            "---\ndata:\n  cfg: ./cfg.JSON\n---\n{{cfg}}\n".to_owned(),
+        ),
+        ("cfg.JSON".to_owned(), "1".to_owned()),
+    ]));
+    let err =
+        mds::compile_virtual_fs(fs, "main.mds", None, mds::CompileOptions::default()).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "import error: data path \"./cfg.JSON\": expected the .json, .yaml or .yml extension"
+    );
 }
 
 #[test]
