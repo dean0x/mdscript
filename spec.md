@@ -74,6 +74,11 @@ MDS refuses an unindented sequence under a reserved key.
 `indented_directives_yaml_agreement_covers_all_module_kinds` checks `indented-directives`.
 The [syntax errors for indented directives](#indented-directives) take precedence over the YAML form check.
 
+MDS does not apply `<<` merges.
+It treats `<<` as ordinary metadata (`merge_metadata_with_only_ordinary_keys_keeps_its_bytes`).
+A top-level `<<` whose mapping contains a reserved key gets the same form error (`merge_metadata_refuses_reserved_keys`).
+This rule also applies to sequences of mappings (`merge_metadata_refuses_reserved_keys_in_a_sequence`) and aliases to mappings (`merge_metadata_refuses_reserved_keys_in_an_alias`).
+
 The YAML that remains after removal must match the original mapping without its reserved output keys.
 If it does not, MDS reports `mds::yaml` and returns no compiled output.
 `reserved_keys_in_non_plain_forms_return_fixed_errors` checks the messages that name the key and show its plain form.

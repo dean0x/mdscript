@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The rule applies to the entry, imported modules, and `@extends` bases.
   If flow-style frontmatter contains one of these keys, MDS reports `mds::yaml`.
 - MDS refuses a block sequence under a reserved key if its list items start at column 0.
+- MDS refuses a top-level `<<` with a reserved output key in its mapping or sequence of mappings.
 
 ### Changed
 

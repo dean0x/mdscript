@@ -934,6 +934,10 @@ impl ReservedOutputKey {
         )
     }
 
+    fn reserves_in(self, map: &serde_yaml_ng::Mapping) -> bool {
+        map.get(self.name).is_some_and(|value| self.reserves(value))
+    }
+
     fn matches_line(self, line: &str) -> bool {
         let Some(value) = line
             .strip_prefix(self.name)
@@ -1110,6 +1114,22 @@ pub(crate) fn prove_reserved_strip(
     original: Option<&serde_yaml_ng::Mapping>,
     mem: &mut MemBudget,
 ) -> Result<(), MdsError> {
+    if let Some(merge) = original.and_then(|map| map.get("<<")) {
+        // The parser resolves aliases and bounds the sequence by its node limit.
+        // Check only the immediate mappings, not nested `<<` entries.
+        if let Some(key) = RESERVED_OUTPUT_KEYS.iter().find(|key| {
+            let holds_key = |map: &serde_yaml_ng::Mapping| key.reserves_in(map);
+            merge.as_mapping().is_some_and(holds_key)
+                || merge.as_sequence().is_some_and(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_yaml_ng::Value::as_mapping)
+                        .any(holds_key)
+                })
+        }) {
+            return Err(MdsError::yaml_error(key.form_message));
+        }
+    }
     let lines = reserved_lines(raw, RESERVED_OUTPUT_KEYS);
     // The slices do not overlap, so each total is at most raw.len().
     let (kept_len, comment_len) = lines
@@ -1119,11 +1139,9 @@ pub(crate) fn prove_reserved_strip(
             ReservedLine::Drop => (kept, comments),
             ReservedLine::BlockComment => (kept + line.len(), comments + line.len()),
         });
-    let first_reserved = RESERVED_OUTPUT_KEYS.iter().find(|key| {
-        original
-            .and_then(|map| map.get(key.name))
-            .is_some_and(|value| key.reserves(value))
-    });
+    let first_reserved = RESERVED_OUTPUT_KEYS
+        .iter()
+        .find(|key| original.is_some_and(|map| key.reserves_in(map)));
     if kept_len == raw.len() && first_reserved.is_none() {
         return Ok(());
     }

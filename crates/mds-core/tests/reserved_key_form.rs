@@ -75,6 +75,57 @@ fn reserved_keys_in_non_plain_forms_return_fixed_errors() {
 }
 
 #[test]
+fn merge_metadata_refuses_reserved_keys() {
+    let raw = "<<: {imports: [./a.mds]}";
+    assert_form_error(with_entry(frontmatter(raw, "Body\n")), IMPORTS_FORM, raw);
+}
+
+#[test]
+fn merge_metadata_refuses_reserved_keys_in_a_sequence() {
+    let raw = "<<:\n  - {author: x}\n  - {imports: [./a.mds]}";
+    assert_form_error(with_entry(frontmatter(raw, "Body\n")), IMPORTS_FORM, raw);
+}
+
+#[test]
+fn merge_metadata_refuses_reserved_keys_in_an_alias() {
+    let raw = "info: &info {imports: [./a.mds]}\n<<: *info";
+    assert_form_error(with_entry(frontmatter(raw, "Body\n")), IMPORTS_FORM, raw);
+}
+
+#[test]
+fn merge_metadata_refuses_type_mds() {
+    let raw = "<<: {type: mds}";
+    assert_form_error(with_entry(frontmatter(raw, "Body\n")), TYPE_FORM, raw);
+}
+
+#[test]
+fn merge_metadata_refuses_indented_directives() {
+    let raw = "<<: {indented-directives: true}";
+    assert_form_error(
+        with_entry(frontmatter(raw, "Body\n")),
+        "write `indented-directives:` at the start of a line",
+        raw,
+    );
+}
+
+#[test]
+fn merge_metadata_with_only_ordinary_keys_keeps_its_bytes() {
+    for raw in [
+        "<<: {author: x}",
+        "<<: {type: post}",
+        "<<: [{author: x}, {type: post}]",
+        "info: &info {author: x}\n<<: *info",
+        "<<: {<<: {imports: [./a.mds]}}",
+    ] {
+        let source = frontmatter(raw, "Body\n");
+        let output = assert_accepts(with_entry(source.clone()))
+            .into_markdown()
+            .unwrap();
+        assert_eq!(output, source);
+    }
+}
+
+#[test]
 fn column_zero_sequence_under_a_reserved_key_returns_the_key_form_error() {
     for suffix in ["", "\nnote: keep"] {
         let raw = format!("imports:\n  - path: ./fixture-marker.mds{suffix}");
