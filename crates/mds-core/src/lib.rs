@@ -1082,6 +1082,9 @@ pub(crate) fn is_frontmatter_form_message(message: &str) -> bool {
 }
 
 /// Return fenced frontmatter if non-whitespace content remains after key removal.
+///
+/// For standalone output, the deterministic stripper uses the same raw frontmatter
+/// as [`prove_reserved_strip`]. It yields the same slices before fence insertion.
 pub(crate) fn frontmatter_prefix(raw: Option<&str>) -> Option<String> {
     const FENCE: &str = "---\n";
     let raw = raw?;

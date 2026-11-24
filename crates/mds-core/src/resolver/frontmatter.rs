@@ -42,6 +42,17 @@ impl FrontmatterImport {
     }
 }
 
+// Exclude these keys at depth 0 only. Nested keys are user data.
+// SYNC POINT: also audit `RESERVED_OUTPUT_KEYS` in lib.rs (stripper and proof),
+// `build_scope_from_frontmatter` in resolver/module_scope.rs, and `RESERVED` in lint/facts.rs.
+// The merge reserves `extends` in addition to the reserved output keys.
+pub(super) const RESERVED_MERGE_KEYS: &[&str] = &[
+    "imports",
+    "type",
+    "extends",
+    crate::lexer::INDENTED_DIRECTIVES,
+];
+
 /// Deep-merge two YAML `Mapping`s with base-wins-if-absent / child-wins-if-present semantics.
 ///
 /// Semantics (decision #7):
@@ -51,8 +62,7 @@ impl FrontmatterImport {
 /// - Key ORDER: base-then-child (determinism A6). Keys present in base keep their
 ///   original position; their value may be replaced by the merged/child value.
 ///   Child-only keys are appended in child order after all base keys.
-/// - Reserved keys (`imports`, `type`, `extends`) are excluded from the output —
-///   they are not value data (decision #7). Callers handle them separately.
+/// - Exclude [`RESERVED_MERGE_KEYS`] at depth 0. Callers handle them separately.
 /// - Recursion is bounded by `MAX_FRONTMATTER_MERGE_DEPTH`; exceeding it returns
 ///   `mds::resource_limit` (P4 — no stack overflow).
 ///
@@ -67,24 +77,6 @@ pub(super) fn deep_merge_yaml(
             "frontmatter merge depth exceeds maximum of {MAX_FRONTMATTER_MERGE_DEPTH}"
         )));
     }
-
-    // Reserved keys excluded from the merged output at the TOP LEVEL only (depth == 0).
-    // These keys are directives, not value data, so they are stripped from the emitted
-    // frontmatter to prevent them from appearing in the compiled output.
-    //
-    // !! IMPORTANT: the guard is `depth == 0` — do NOT filter reserved names in
-    // recursive calls (depth > 0).  A nested key like `config.type` is not a
-    // top-level directive; filtering it would silently discard user data.
-    //
-    // SYNC POINT: also audit `RESERVED_OUTPUT_KEYS` in lib.rs (stripper and proof),
-    // `build_scope_from_frontmatter` in resolver/module_scope.rs, and `RESERVED` in lint/facts.rs.
-    // Each site reserves keys for its own purpose. Only the merge sees `extends`.
-    const RESERVED_MERGE_KEYS: &[&str] = &[
-        "imports",
-        "type",
-        "extends",
-        crate::lexer::INDENTED_DIRECTIVES,
-    ];
 
     let mut result = serde_yaml_ng::Mapping::new();
 

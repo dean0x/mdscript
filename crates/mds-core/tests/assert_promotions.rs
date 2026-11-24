@@ -16,8 +16,8 @@
 //!   the next reader learns why this one is release-critical when the surrounding
 //!   assertions are not.
 //!
-//! The scan is a fixed per-site table, not a repo-wide sweep: every OTHER `debug_assert!`
-//! in the workspace is deliberately debug-only, so a blanket rule would be wrong.
+//! The per-site scan also keeps debug assertions out of the reserved-key stripper.
+//! The parse-time proof checks the strip result in every build.
 
 use std::path::Path;
 
@@ -103,30 +103,30 @@ const PROMOTED: &[Promoted] = &[
     },
 ];
 
-/// A span site that must DEGRADE rather than assert: it routes the line length through
-/// the shared helper and no longer slices the source itself.
-struct Degraded {
+/// A function that must not use debug assertions. Span sites also use a safe helper.
+struct NoDebugAssert {
     file: &'static str,
     anchor: &'static str,
-    needle: &'static str,
+    span_helper: Option<&'static str>,
 }
 
-const DEGRADED: &[Degraded] = &[
-    Degraded {
+const NO_DEBUG_ASSERT: &[NoDebugAssert] = &[
+    NoDebugAssert {
         file: "resolver.rs",
         anchor: "fn attach_import_span(",
-        needle: "line_len_at(",
+        span_helper: Some("line_len_at("),
     },
-    Degraded {
+    NoDebugAssert {
         file: "resolver/inheritance.rs",
         anchor: "pub(super) fn check_child_only_blocks(",
-        needle: "super::line_len_at(",
+        span_helper: Some("super::line_len_at("),
+    },
+    NoDebugAssert {
+        file: "lib.rs",
+        anchor: "fn strip_reserved_keys<'a>(",
+        span_helper: None,
     },
 ];
-
-/// Forms the degraded sites must NOT regain: a boundary assert that is compiled out in
-/// release, or the raw slice that panics one line below it.
-const DEGRADED_FORBIDDEN: &[&str] = &["debug_assert", "[offset..]"];
 
 #[test]
 fn promoted_asserts_are_unconditional_prose_and_justified() {
@@ -200,7 +200,7 @@ fn promoted_asserts_are_unconditional_prose_and_justified() {
         );
     }
 
-    for site in DEGRADED {
+    for site in NO_DEBUG_ASSERT {
         let path = src_dir.join(site.file);
         let masked = mask_comments_and_strings(&read(&path));
         let anchor_line = unique_anchor_line(&masked, site.anchor, &path);
@@ -208,21 +208,18 @@ fn promoted_asserts_are_unconditional_prose_and_justified() {
 
         let body = function_body(&masked, anchor_line);
         assert!(
-            body.contains(site.needle),
-            "{}: `{}` must compute its span length through `{}` so a bad offset degrades \
-             to a zero-length span instead of slicing",
+            !body.contains("debug_assert"),
+            "{}: `{}` must not use a debug assertion",
             site.file,
             site.anchor,
-            site.needle
         );
-        for forbidden in DEGRADED_FORBIDDEN {
+        if let Some(helper) = site.span_helper {
             assert!(
-                !body.contains(forbidden),
-                "{}: `{}` must not contain `{}` — that is the debug-only-guard-plus-slice \
-                 shape #220 replaced",
+                body.contains(helper) && !body.contains("[offset..]"),
+                "{}: `{}` must compute its span length through `{helper}` so a bad offset \
+                 returns a zero-length span instead of panicking",
                 site.file,
                 site.anchor,
-                forbidden
             );
         }
     }
@@ -231,7 +228,7 @@ fn promoted_asserts_are_unconditional_prose_and_justified() {
     // above by never entering a loop body.
     assert_eq!(
         anchors_found,
-        PROMOTED.len() + DEGRADED.len(),
+        PROMOTED.len() + NO_DEBUG_ASSERT.len(),
         "non-vacuity: every table anchor must have been located"
     );
 }

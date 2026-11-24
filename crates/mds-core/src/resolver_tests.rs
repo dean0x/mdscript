@@ -2308,6 +2308,17 @@ fn deep_merge_yaml_array_wholesale_replace() {
 }
 
 #[test]
+fn deep_merge_yaml_reserves_every_reserved_output_key() {
+    for key in crate::RESERVED_OUTPUT_KEYS {
+        assert!(
+            super::frontmatter::RESERVED_MERGE_KEYS.contains(&key.name),
+            "`{}` must be reserved in the merge",
+            key.name,
+        );
+    }
+}
+
+#[test]
 fn deep_merge_yaml_reserved_keys_excluded() {
     // imports, type, extends must be excluded from the merged output.
     let base = mapping(&[
@@ -6329,6 +6340,23 @@ fn parsed_mapping(yaml: &str) -> (serde_yaml_ng::Mapping, usize) {
         panic!("expected a mapping");
     };
     (mapping, spent)
+}
+
+#[test]
+fn merged_frontmatter_refuses_a_reserved_top_level_key() {
+    let (mapping, spent) = parsed_mapping("imports: []\n");
+    let mut cache = virtual_cache(&[]);
+    let result = cache.serialize_merged_frontmatter(&mapping, spent);
+    assert_internal(result.expect_err("reserved top-level key must not serialize"));
+}
+
+#[test]
+fn merged_frontmatter_keeps_a_nested_reserved_name() {
+    let raw = "config:\n  imports: []\n";
+    let (mapping, spent) = parsed_mapping(raw);
+    let mut cache = virtual_cache(&[]);
+    let text = cache.serialize_merged_frontmatter(&mapping, spent).unwrap();
+    assert_eq!(text.as_deref(), Some(raw));
 }
 
 #[test]

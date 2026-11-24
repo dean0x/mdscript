@@ -292,6 +292,11 @@ impl ModuleCache {
         )
     }
 
+    /// Add the frontmatter prefix to the Markdown body.
+    ///
+    /// For a standalone module, `frontmatter` is the same raw text that the
+    /// parse-time proof used. The prefix uses the same deterministic strip.
+    /// For `@extends`, the serializer checks the merged map before this step.
     fn finalize_markdown(
         &mut self,
         body_raw: String,
