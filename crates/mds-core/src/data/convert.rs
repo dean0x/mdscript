@@ -8,6 +8,7 @@ use crate::value::Value;
 pub(crate) enum Accept {
     Json,
     Yaml,
+    #[cfg_attr(not(test), expect(dead_code, reason = "text is a response format"))]
     Text,
 }
 

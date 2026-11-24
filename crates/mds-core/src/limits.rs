@@ -283,7 +283,6 @@ pub(crate) const MAX_DATA_NODES_PER_FILE: usize = 200_000;
 /// Maximum distinct data files admitted in one compile, apart from modules.
 /// Many small files can reach this cap first. Dense files can reach a node or
 /// memory cap first. Large sparse files can reach a byte cap first.
-#[expect(dead_code, reason = "data resolution lands in a later phase")]
 pub(crate) const MAX_DATA_FILES: usize = 256;
 
 /// Maximum data entries admitted during declaration analysis in one module.
@@ -301,5 +300,4 @@ pub(crate) const MAX_DATA_LEVELS: usize = 16;
 /// Maximum total source bytes admitted for distinct data files in one compile.
 /// Large sparse files can reach this cap without reaching the node cap.
 /// Dense data can reach the compile memory budget before the byte aggregate.
-#[expect(dead_code, reason = "data resolution lands in a later phase")]
 pub(crate) const MAX_DATA_BYTES_PER_COMPILE: usize = 32 * 1024 * 1024;

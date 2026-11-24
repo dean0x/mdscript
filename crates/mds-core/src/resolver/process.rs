@@ -1,14 +1,140 @@
 //! Module processing, output evaluation, and source-map finalization.
 
+use super::charges::count_data_entries;
 use super::{
-    build_scope_from_frontmatter, bytes, evaluate_messages_seeded, evaluate_seeded,
-    evaluate_with_map_seeded, fragment_map_from, has_message_block, is_visible_export,
-    parse_frontmatter_mapping, seed_effective_blocks, spliced_regions, validate_exports, validator,
-    Arc, CollectedDefs, CompileOptions, ExtendsComponents, MapBuilder, MdsError, MemBudget, Module,
-    ModuleCache, ModuleCtx, Node, Origin, Part, PromptText, ResolvedModule, Scope,
-    MAX_SOURCES_CONTENT_BYTES,
+    bytes, evaluate_messages_seeded, evaluate_seeded, evaluate_with_map_seeded, fragment_map_from,
+    has_message_block, is_visible_export, parse_frontmatter_mapping, seed_effective_blocks,
+    spliced_regions, validate_exports, validator, Arc, CollectedDefs, CompileOptions,
+    ExtendsComponents, MapBuilder, MdsError, MemBudget, Module, ModuleCache, ModuleCtx, Node,
+    Origin, Part, PromptText, ResolvedModule, Scope, MAX_SOURCES_CONTENT_BYTES,
 };
+use super::{check_module_type, parse_frontmatter_imports_from_yaml, validate_import_path};
+use crate::ast::{ExportDirective, ImportDirective};
+use crate::data::resolve::Declarations;
 use crate::MarkdownFrontmatter;
+
+/// Check the static graph before the first data read. This pass uses the same
+/// immutable virtual sources as the compile pass and does not evaluate them.
+struct DataGraphWalk<'a> {
+    fs: &'a dyn super::FileSystem,
+    runtime: &'a super::VarLayer,
+    seen: super::HashSet<String>,
+    entries: usize,
+}
+
+impl DataGraphWalk<'_> {
+    fn visit(
+        &mut self,
+        module_ref: super::ModuleRef<'_>,
+        is_base: bool,
+        depth: usize,
+        mem: &mut MemBudget,
+    ) -> Result<(), MdsError> {
+        let key = module_ref.key;
+        if self.seen.contains(key) {
+            return Ok(());
+        }
+        if depth >= super::MAX_IMPORT_DEPTH {
+            return Err(MdsError::import_error(format!(
+                "import depth exceeds maximum of {} (possible deep chain)",
+                super::MAX_IMPORT_DEPTH
+            )));
+        }
+        if self.seen.len() > super::MAX_MODULE_COUNT {
+            return Err(crate::error::module_count_exceeded());
+        }
+        mem.charge(
+            Part::Buffers,
+            key.len().checked_add(2 * size_of::<String>()),
+        )?;
+        self.seen.insert(key.to_owned());
+        let mark = mem.mark();
+        let result = self.check_module(module_ref, is_base, depth, mem);
+        mem.release_to(mark);
+        result
+    }
+
+    fn check_module(
+        &mut self,
+        module_ref: super::ModuleRef<'_>,
+        is_base: bool,
+        depth: usize,
+        mem: &mut MemBudget,
+    ) -> Result<(), MdsError> {
+        let key = module_ref.key;
+        let source = self.fs.read(key)?;
+        mem.charge(Part::Temp, Some(source.capacity()))?;
+        check_module_type(module_ref, &source)?;
+        let display = crate::source_path::display_path_for(self.fs, key);
+        let tokens = super::tokenize(&source, &display)?;
+        mem.charge(Part::Temp, super::tree_estimate(&tokens, source.len()))?;
+        let module = super::parse_with_ctx(&tokens, &display, &source)?;
+        drop(tokens);
+        let (mapping, _) = parse_frontmatter_mapping(module.frontmatter.as_ref(), mem)?;
+        let imports = mapping
+            .as_ref()
+            .and_then(|m| m.get("imports"))
+            .map(parse_frontmatter_imports_from_yaml)
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(mapping) = mapping.as_ref().filter(|m| m.contains_key("data")) {
+            if is_base || module.extends.is_some() {
+                return Err(MdsError::data(
+                    &display,
+                    None,
+                    None,
+                    "data requires a standalone module",
+                    None,
+                ));
+            }
+            Declarations {
+                module: &display,
+                mapping,
+                imports: &imports,
+                body: &module.body,
+                runtime: self.runtime,
+                is_md: self.fs.is_markdown(key),
+            }
+            .with_graph(mem, |count, _, _| {
+                count_data_entries(&mut self.entries, count)
+            })?;
+        }
+        let dir = self.fs.parent_dir(key);
+        let mut follow = |path: &str, base| {
+            validate_import_path(path)?;
+            let key = self.fs.normalize_in_dir(&dir, path)?;
+            self.visit(
+                super::ModuleRef::keyed(&key).typed(path),
+                base,
+                depth + 1,
+                mem,
+            )
+        };
+        if let Some(ext) = module.extends.as_ref().filter(|_| !is_base) {
+            follow(&ext.path, true)?;
+        }
+        for import in &imports {
+            follow(import.path(), false)?;
+        }
+        for node in &module.body {
+            match node {
+                Node::Import(
+                    ImportDirective::Alias { path, .. }
+                    | ImportDirective::Merge { path, .. }
+                    | ImportDirective::Selective { path, .. },
+                )
+                | Node::Export(
+                    ExportDirective::ReExport { path, .. } | ExportDirective::Wildcard { path, .. },
+                ) => follow(path, false)?,
+                _ => {}
+            }
+        }
+        if let Some(ext) = module.extends.as_ref().filter(|_| is_base) {
+            follow(&ext.path, true)?;
+        }
+        Ok(())
+    }
+}
 
 /// Warning emitted when `source_map: true` is used with a messages-mode template.
 ///
@@ -26,6 +152,24 @@ type StandalonePrompt<'ctx> = (
 );
 
 impl ModuleCache {
+    pub(super) fn collect_compile_data_graphs(
+        &mut self,
+        runtime: &super::VarLayer,
+    ) -> Result<(), MdsError> {
+        let key = self.resolving.first().ok_or_else(MdsError::internal)?;
+        let mem = &mut self.budget.mem;
+        let before = mem.buffers;
+        let mut walk = DataGraphWalk {
+            fs: &*self.fs,
+            runtime,
+            seen: super::HashSet::new(),
+            entries: 0,
+        };
+        let result = walk.visit(super::ModuleRef::keyed(key).typed(key), false, 0, mem);
+        mem.release_buffers(mem.buffers - before);
+        result
+    }
+
     /// Common intrinsic processing: tokenize, parse, build scope, then dispatch on
     /// output shape.
     ///
@@ -188,14 +332,7 @@ impl ModuleCache {
         let (mut scope, fm_imports) = {
             let (mapping, spent) =
                 parse_frontmatter_mapping(module.frontmatter.as_ref(), &mut self.budget.mem)?;
-            build_scope_from_frontmatter(
-                module.frontmatter.as_ref(),
-                mapping.as_ref(),
-                spent,
-                is_md,
-                ctx.runtime_vars,
-                &mut self.budget.mem,
-            )?
+            self.build_scope_from_frontmatter(module, mapping.as_ref(), spent, is_md, ctx)?
         };
 
         self.resolve_frontmatter_imports(&fm_imports, &mut scope, ctx, warnings)?;
@@ -482,13 +619,12 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<(Scope, CollectedDefs), MdsError> {
         // Build scope from frontmatter + runtime vars; extract any frontmatter imports.
-        let (mut scope, fm_imports) = build_scope_from_frontmatter(
-            module.frontmatter.as_ref(),
+        let (mut scope, fm_imports) = self.build_scope_from_frontmatter(
+            module,
             frontmatter_values,
             frontmatter_bytes,
             is_md,
-            ctx.runtime_vars,
-            &mut self.budget.mem,
+            ctx,
         )?;
 
         // Resolve frontmatter imports BEFORE body imports (per spec: frontmatter imports

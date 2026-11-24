@@ -42,13 +42,6 @@
 pub(crate) mod arity;
 pub(crate) mod ast;
 pub(crate) mod builtins;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the data resolver calls the converter in a later phase"
-    )
-)]
 pub(crate) mod data;
 pub(crate) mod error;
 pub(crate) mod escape_class;
@@ -1648,7 +1641,7 @@ pub fn compile_virtual_fs(
     opts: CompileOptions,
 ) -> Result<CompileResult, MdsError> {
     let vars = runtime_vars.unwrap_or_default();
-    let mut cache = ModuleCache::with_fs(Box::new(fs));
+    let mut cache = ModuleCache::compiling_virtual(fs);
     let mut warnings = vec![];
     let (output, source_map) =
         cache.resolve_virtual_intrinsic_opts(entry, &vars, &opts, &mut warnings)?;

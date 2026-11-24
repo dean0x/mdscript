@@ -1,11 +1,13 @@
 //! Definition collection, scope construction, and export validation.
 
+use super::charges::{check_data_file_count, count_data_bytes, count_data_entries};
 use super::{
     has_type_mds_frontmatter_raw, parse_frontmatter_imports_from_yaml, Arc, BlockNode,
     CollectedDefs, DefineBlock, FrontmatterImport, FunctionDef, HashMap, HashSet, MdsError,
-    MemBudget, ModuleCache, ModuleCtx, Node, Part, Scope, Value, VarLayer, INDENTED_DIRECTIVES,
-    MAX_BLOCKS_PER_MODULE, MAX_DEFINES_PER_MODULE,
+    MemBudget, Module, ModuleCache, ModuleCtx, Node, Part, Scope, Value, VarLayer,
+    INDENTED_DIRECTIVES, MAX_BLOCKS_PER_MODULE, MAX_DEFINES_PER_MODULE,
 };
+use crate::data::{decl::Source, resolve, DataLabel};
 
 /// Return `true` when the AST body contains at least one `@message` block
 /// (possibly nested inside `@if` or `@for` — a shallow scan is enough for the
@@ -170,13 +172,29 @@ pub(super) fn build_scope_from_frontmatter(
     runtime_vars: &Arc<VarLayer>,
     mem: &mut MemBudget,
 ) -> Result<(Scope, Vec<FrontmatterImport>), MdsError> {
+    let is_mds = uses_mds_scope(is_md, frontmatter);
+    let (frontmatter_vars, fm_imports) =
+        frontmatter_layer(mapping, spent, is_md, is_mds, runtime_vars, mem)?;
+    Ok((
+        Scope::with_layers(Arc::clone(runtime_vars), Arc::new(frontmatter_vars)),
+        fm_imports,
+    ))
+}
+
+fn uses_mds_scope(is_md: bool, frontmatter: Option<&crate::ast::Frontmatter>) -> bool {
+    !is_md || frontmatter.is_some_and(|fm| has_type_mds_frontmatter_raw(&fm.raw))
+}
+
+fn frontmatter_layer(
+    mapping: Option<&serde_yaml_ng::Mapping>,
+    spent: usize,
+    is_md: bool,
+    is_mds: bool,
+    runtime_vars: &VarLayer,
+    mem: &mut MemBudget,
+) -> Result<(VarLayer, Vec<FrontmatterImport>), MdsError> {
     let mut frontmatter_vars = VarLayer::new();
     let mut fm_imports: Vec<FrontmatterImport> = Vec::new();
-
-    // A .mds file is always MDS; a .md file is MDS only when its frontmatter
-    // contains `type: mds`. Determine this early — it gates both frontmatter
-    // parsing and the runtime_vars guard below.
-    let is_mds = !is_md || frontmatter.is_some_and(|fm| has_type_mds_frontmatter_raw(&fm.raw));
 
     mem.charge(Part::Temp, Some(spent))?;
     for (key, val) in mapping.into_iter().flatten() {
@@ -185,6 +203,9 @@ pub(super) fn build_scope_from_frontmatter(
         };
         // SYNC POINT: audit the output, merge and lint reserved keys.
         if key_str == INDENTED_DIRECTIVES || (key_str == "type" && is_md) {
+            continue;
+        }
+        if key_str == "data" && is_mds {
             continue;
         }
         if key_str == "imports" && is_mds {
@@ -204,10 +225,99 @@ pub(super) fn build_scope_from_frontmatter(
         ));
     }
 
-    Ok((
-        Scope::with_layers(Arc::clone(runtime_vars), Arc::new(frontmatter_vars)),
-        fm_imports,
-    ))
+    Ok((frontmatter_vars, fm_imports))
+}
+
+impl ModuleCache {
+    /// Bind the module's own entries before it can capture or use the scope.
+    pub(super) fn build_scope_from_frontmatter(
+        &mut self,
+        module: &Module,
+        mapping: Option<&serde_yaml_ng::Mapping>,
+        spent: usize,
+        is_md: bool,
+        ctx: &ModuleCtx<'_>,
+    ) -> Result<(Scope, Vec<FrontmatterImport>), MdsError> {
+        let is_mds = uses_mds_scope(is_md, module.frontmatter.as_ref());
+        let (mut vars, imports) = frontmatter_layer(
+            mapping,
+            spent,
+            is_md,
+            is_mds,
+            ctx.runtime_vars,
+            &mut self.budget.mem,
+        )?;
+        if let Some(mapping) = mapping.filter(|m| is_mds && m.contains_key("data")) {
+            if self.data.mode == resolve::Mode::Collect {
+                self.collect_compile_data_graphs(ctx.runtime_vars)?;
+                self.data.mode = resolve::Mode::Read;
+            }
+            let declarations = resolve::Declarations {
+                module: ctx.file_str,
+                mapping,
+                imports: &imports,
+                body: &module.body,
+                runtime: ctx.runtime_vars,
+                is_md,
+            };
+            let before = self.budget.mem.buffers;
+            let fs = &*self.fs;
+            let data = &mut self.data;
+            let result = declarations.with_graph(&mut self.budget.mem, |count, graph, mem| {
+                count_data_entries(&mut data.entries, count)?;
+                if data.mode != resolve::Mode::Read {
+                    return Ok(());
+                }
+                if graph.frontier().next().is_some() {
+                    return Err(MdsError::network_denied(
+                        &graph.frontier().collect::<Vec<_>>(),
+                    ));
+                }
+                for node in graph.unreplayed() {
+                    let Source::File(written) = &node.entry.source else {
+                        return Err(MdsError::network_denied(&[(node.module, &node.entry.name)]));
+                    };
+                    let label = DataLabel {
+                        module: node.module,
+                        entry: &node.entry.name,
+                    };
+                    let (key, accept) = resolve::canonical_file(fs, ctx.base_dir, written, label)?;
+                    let value = if let Some(value) = data.files.get(&key) {
+                        Arc::clone(value)
+                    } else {
+                        check_data_file_count(data.files.len())?;
+                        let metadata = mem.charge(Part::Temp, data_memo_bytes(key.capacity()))?;
+                        let value = resolve::read_file(fs, &key, accept, label, mem, |len| {
+                            count_data_bytes(&mut data.bytes, len)
+                        })?;
+                        mem.transfer(Part::Temp, Part::Buffers, metadata);
+                        let value = Arc::new(value);
+                        data.files.insert(key, Arc::clone(&value));
+                        value
+                    };
+                    let binding_bytes = node
+                        .entry
+                        .name
+                        .len()
+                        .checked_add(2 * size_of::<(String, crate::scope::Slot)>());
+                    mem.charge(Part::Buffers, binding_bytes)?;
+                    vars.insert(node.entry.name.clone(), value);
+                }
+                Ok(())
+            });
+            self.commit_retained(self.budget.mem.buffers - before);
+            result?;
+        }
+        Ok((
+            Scope::with_layers(Arc::clone(ctx.runtime_vars), Arc::new(vars)),
+            imports,
+        ))
+    }
+}
+
+fn data_memo_bytes(key: usize) -> Option<usize> {
+    key.checked_add(2 * size_of::<(String, Arc<Value>, usize)>())?
+        .checked_add(2 * size_of::<usize>())
 }
 
 /// Check that each named export refers to a defined function or the special `"prompt"` export.
@@ -223,4 +333,91 @@ pub(super) fn validate_exports(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FileSystem, VirtualFs};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn plain_markdown_keeps_data_as_a_frontmatter_variable() {
+        let yaml = "data:\n  items: ordinary\n";
+        let mapping = super::super::parse_frontmatter_yaml(yaml).unwrap();
+        let (scope, imports) = build_scope_from_frontmatter(
+            None,
+            mapping.as_mapping(),
+            4096,
+            true,
+            &Arc::new(VarLayer::new()),
+            &mut MemBudget::default(),
+        )
+        .unwrap();
+        assert!(imports.is_empty());
+        assert_eq!(
+            scope.get_var("data"),
+            Some(&Value::Object(HashMap::from([(
+                "items".into(),
+                Value::from("ordinary")
+            ),])))
+        );
+    }
+
+    struct CountReads {
+        fs: VirtualFs,
+        data_reads: Arc<AtomicUsize>,
+    }
+
+    impl FileSystem for CountReads {
+        fn resolve_entry(&self, path: &str) -> Result<String, MdsError> {
+            self.fs.resolve_entry(path)
+        }
+        fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError> {
+            self.fs.normalize_in_dir(dir, relative)
+        }
+        fn parent_dir(&self, key: &str) -> String {
+            self.fs.parent_dir(key)
+        }
+        fn read(&self, key: &str) -> Result<String, MdsError> {
+            self.fs.read(key)
+        }
+        fn read_data(&self, key: &str) -> Result<String, MdsError> {
+            self.data_reads.fetch_add(1, Ordering::Relaxed);
+            self.fs.read_data(key)
+        }
+        fn is_markdown(&self, key: &str) -> bool {
+            self.fs.is_markdown(key)
+        }
+    }
+
+    #[test]
+    fn one_canonical_file_is_read_once_across_three_modules() {
+        let declarations = "---\ndata:\n  item: ./item.json\n---\n";
+        let main = format!("{declarations}@import \"./first.mds\" as first\n@import \"./second.mds\" as second\n@include first\n@include second\n{{{{item}}}}\n");
+        let first = format!("{declarations}{{{{item}}}}\n");
+        let second = first.replace("./item.json", "./alias.json");
+        let fs = VirtualFs::new(HashMap::from([
+            ("main.mds".into(), main),
+            ("first.mds".into(), first),
+            ("second.mds".into(), second),
+            ("item.json".into(), "42".into()),
+        ]))
+        .with_aliases(HashMap::from([("alias.json".into(), "item.json".into())]))
+        .unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut cache = ModuleCache::with_fs(Box::new(CountReads {
+            fs,
+            data_reads: Arc::clone(&reads),
+        }));
+        cache.data.mode = resolve::Mode::Collect;
+        let out = cache
+            .resolve_virtual_intrinsic("main.mds", &HashMap::new(), &mut vec![])
+            .unwrap();
+        assert!(
+            matches!(out, crate::CompiledOutput::Markdown(text) if text.ends_with("42\n42\n42\n"))
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.data.bytes, 2);
+    }
 }

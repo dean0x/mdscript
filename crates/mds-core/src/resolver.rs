@@ -167,6 +167,7 @@ pub struct ModuleCache {
     /// Zero-cost path: when false (the default), no `MapBuilder` is allocated
     /// for sub-modules (AC-PERF-01).
     source_map_mode: bool,
+    data: crate::data::resolve::State,
     budget: EvalBudget,
     retained: usize,
     kept: usize,
@@ -233,6 +234,7 @@ impl ModuleCache {
             modules: IndexMap::new(),
             resolving: IndexSet::new(),
             source_map_mode: false,
+            data: crate::data::resolve::State::default(),
             budget: EvalBudget::default(),
             retained: 0,
             kept: 0,
@@ -245,6 +247,13 @@ impl ModuleCache {
             #[cfg(test)]
             retained_transfer_seed: 0,
         }
+    }
+
+    /// Opt in only on the virtual compile path, where both passes see the same sources.
+    pub(crate) fn compiling_virtual(fs: VirtualFs) -> Self {
+        let mut cache = Self::with_fs(Box::new(fs));
+        cache.data.mode = crate::data::resolve::Mode::Collect;
+        cache
     }
 
     /// Returns normalized keys of all modules resolved during compilation,
