@@ -740,7 +740,9 @@ export interface BuildModulesMapResult {
   /**
    * Flat map of virtual filename → source for the entry file and all its
    * transitive imports, and the text of each local data file that a `data:` entry of
-   * one of them names, when the scan reads data. The entry file itself is included,
+   * one of them names, when the scan reads data (an empty text for a data file whose
+   * canonical key has no data extension, which the engine refuses unread). The entry
+   * file itself is included,
    * keyed by `entryFilename`. Callers that pass `modules` as extra dependencies to the
    * WASM `build_modules()` function MUST extract and remove the entry source
    * before the call — leaving the entry key present causes
@@ -1285,7 +1287,12 @@ async function readFile(
  *   that starts with `.` other than `.` and `..`, and no `node_modules` segment in any
  *   ASCII case;
  * - the path rules of a module import listed above, then the segment rule again on the
- *   canonical key below the project root, the key that the read uses;
+ *   canonical key below the project root, the key that the read uses. A canonical key
+ *   with no data extension (a case-insensitive volume can spell `./cfg.json` as
+ *   `CFG.JSON`) is not read: an alias gives the engine that key, with an empty text in
+ *   `modules`, and the engine refuses it as native does when the compile binds the entry
+ *   (`mds::data`, `resolved data file must have a .json, .yaml or .yml extension`), before
+ *   it reads the text;
  * - an O_NONBLOCK open, so a named pipe put in the file's place is refused by the check
  *   of the opened handle, never waited on, and a regular file of at most 10 MiB of
  *   UTF-8, checked by the engine's own `preflightData`;
@@ -1372,12 +1379,13 @@ async function readFile(
  * 10. The scan reads every local data file that a module lists, also the file of an
  *    entry that a runtime variable replays or that a child entry replaces, which native
  *    does not read. Such a file counts toward the 256-file and 32 MiB data bounds, so a
- *    project that lists more than those bounds can be refused where native passes. A
- *    data file whose canonical key has no data extension (a case-insensitive volume can
- *    spell `./cfg.json` as `CFG.JSON`) is not read, and the compile gives the engine's
- *    `mds::module_not_found` where native gives `mds::data`. Deliberate: the scan knows
- *    no runtime variable and no entry name, and native's `mds::data` message names the
- *    entry. Differences 1, 3, 6 and 9 apply to data files too.
+ *    project that lists more than those bounds can be refused where native passes. The
+ *    empty text of a canonical key with no data extension counts as a module in the
+ *    engine's bound of 257 module keys besides the entry, so a project whose modules
+ *    besides the entry and such keys are more than 257 together is refused there (the
+ *    scan admits at most 256 modules besides the entry). Deliberate: the scan
+ *    knows no runtime variable and no entry name. Differences 1, 3, 6 and 9 apply to data
+ *    files too.
  */
 export async function buildModulesMap(
   entryPath: string,
@@ -1669,8 +1677,15 @@ export async function buildModulesMap(
     try {
       const located = unwrap(ahead.located);
       const { key } = located;
-      // The engine gives its own error for this key when the compile binds the entry.
       if (!isDataPath(key)) {
+        // A canonical key with no data extension (a case-insensitive volume can spell
+        // `./cfg.json` as `CFG.JSON`). Native refuses it when the compile binds the entry,
+        // before any read: `mds::data`, naming the module and the entry. The file is not
+        // read. The alias gives the engine this key, and an empty text stands for the
+        // file, so the engine makes the same refusal at the same point and never reads
+        // that text.
+        checkAndRecordAlias(located, record.path);
+        modules[key] ??= '';
         return;
       }
       if (!dataKeys.has(key)) {

@@ -1,6 +1,6 @@
 /**
  * Data-file pre-scanner tests for @mdscript/mds (#405).
- * Tests: TP-20, TP-21, TP-23, TP-26, TP-27, TP-56, TP-112.
+ * Tests: TP-20, TP-21, TP-23, TP-26, TP-27, TP-56, TP-112, and the case-variant data key.
  *
  * The WASM backend's file pre-scanner reads the local data files of a compile with the
  * data path rules of the native backend. Each rule test compares the WASM backend with
@@ -19,6 +19,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   __dirname,
+  caseInsensitive,
   compileFileOutcomes,
   errorShape,
   loadEngines,
@@ -556,4 +557,36 @@ describe('WASM backend data pre-scanner (#405)', () => {
     });
   });
 
+  test('a data path whose canonical key has no data extension gives the native mds::data on the WASM backend', async (t) => {
+    if (!requireEngines(t, engines, 'case-variant data key')) return;
+    await withTemp('mds-casekey-', async (tmp) => {
+      if (!(await caseInsensitive(tmp))) {
+        t.skip('needs a case-insensitive volume, where ./cfg.json can name CFG.JSON (the macOS and Windows default)');
+        return;
+      }
+      const upper = await project(tmp, 'upper');
+      await put(upper, 'CFG.JSON', '{"name": "Ada"}');
+      // Control: the same fixture with the file spelled as the path spells it.
+      const lower = await project(tmp, 'lower');
+      await put(lower, 'cfg.json', '{"name": "Ada"}');
+      const files = [upper, lower].map((root) => path.join(root, 'main.mds'));
+      for (const file of files) await writeFile(file, dataModule({ cfg: './cfg.json' }, 'Hi {{cfg.name}}\n'));
+      const native = await nativeEqualsWasm(files);
+      assert.deepEqual(native, [
+        {
+          code: 'mds::data',
+          message: 'data error in "main.mds", entry "cfg": resolved data file must have a .json, .yaml or .yml extension',
+          help: null,
+          span: null,
+        },
+        { output: 'Hi Ada\n' },
+      ]);
+      // A runtime variable replaces the entry: native binds no file and refuses none.
+      const replayed = await nativeEqualsWasm(files.slice(0, 1), { vars: { cfg: { name: 'Bob' } } });
+      assert.deepEqual(replayed, [{ output: 'Hi Bob\n' }]);
+      // The scan reads no byte of the refused file; the control's file is read.
+      assert.deepEqual((await scanData(files[0])).preflighted, []);
+      assert.deepEqual((await scanData(files[1])).preflighted, ['cfg.json']);
+    });
+  });
 });
