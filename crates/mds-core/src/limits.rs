@@ -288,7 +288,6 @@ pub(crate) const MAX_DATA_FILES: usize = 256;
 
 /// Maximum data entries admitted during declaration analysis in one module.
 /// This cap applies before file reads, for both dense and sparse data.
-#[expect(dead_code, reason = "data declaration analysis lands in a later phase")]
 pub(crate) const MAX_DATA_ENTRIES_PER_MODULE: usize = 64;
 
 /// Maximum data entries admitted across modules in one compile.

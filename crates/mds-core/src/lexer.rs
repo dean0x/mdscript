@@ -214,6 +214,32 @@ pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
     Lexer::new(source, file).run()
 }
 
+/// Find the index of the first `}}` outside quotes, after an opening `{{`.
+/// The input supplies indices in the caller's units (bytes or characters).
+pub(crate) fn find_interpolation_close(
+    chars: impl Iterator<Item = (usize, char)>,
+) -> Option<usize> {
+    let mut chars = chars.peekable();
+    let mut quote = None;
+    let mut escaped = false;
+    while let Some((index, ch)) = chars.next() {
+        if escaped {
+            escaped = false;
+        } else if let Some(active) = quote {
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            }
+        } else if matches!(ch, '"' | '\'') {
+            quote = Some(ch);
+        } else if ch == '}' && chars.peek().is_some_and(|&(_, next)| next == '}') {
+            return Some(index);
+        }
+    }
+    None
+}
+
 /// Stateful lexer that converts MDS source text into a flat token stream.
 ///
 /// `run()` is the only public entry point. Each `scan_*` method advances
@@ -462,62 +488,10 @@ impl<'a> Lexer<'a> {
     /// Advances `self.pos` past the closing `}}`.
     fn scan_interpolation(&mut self) -> Result<(), MdsError> {
         let start = self.byte_pos(self.pos);
-        // Skip the opening `{{`
-        self.pos += 2;
-
-        let mut content = String::new();
-        let mut in_string = false;
-        let mut string_char = '"';
-        let mut escaped = false;
-        let mut found_close = false;
-
-        while self.pos < self.chars.len() {
-            let c = self.chars[self.pos];
-
-            if escaped {
-                content.push(c);
-                escaped = false;
-                self.pos += 1;
-                continue;
-            }
-
-            if in_string {
-                match c {
-                    '\\' => {
-                        escaped = true;
-                        content.push(c);
-                    }
-                    q if q == string_char => {
-                        content.push(c);
-                        in_string = false;
-                    }
-                    _ => content.push(c),
-                }
-                self.pos += 1;
-                continue;
-            }
-
-            // Outside a string: check for closing `}}`
-            if c == '}' && self.pos + 1 < self.chars.len() && self.chars[self.pos + 1] == '}' {
-                self.pos += 2; // skip `}}`
-                found_close = true;
-                break;
-            }
-
-            // Start of a string literal
-            if c == '"' || c == '\'' {
-                in_string = true;
-                string_char = c;
-                content.push(c);
-                self.pos += 1;
-                continue;
-            }
-
-            content.push(c);
-            self.pos += 1;
-        }
-
-        if !found_close {
+        let open_end = self.pos + 2;
+        let Some(relative_close) =
+            find_interpolation_close(self.chars[open_end..].iter().copied().enumerate())
+        else {
             return Err(MdsError::syntax_at(
                 "unclosed `{{` interpolation — to include a literal `{{` in output, escape it as `\\{{`",
                 self.file,
@@ -525,8 +499,11 @@ impl<'a> Lexer<'a> {
                 start,
                 2,
             ));
-        }
+        };
 
+        let close = open_end + relative_close;
+        let content = &self.source[self.byte_pos(open_end)..self.byte_pos(close)];
+        self.pos = close + 2;
         self.tokens
             .push(Token::Interpolation(content.trim().to_string(), start));
         Ok(())
@@ -1683,6 +1660,21 @@ mod tests {
             .collect();
         assert_eq!(interp.len(), 1, "exactly one interpolation expected");
         assert_eq!(interp[0], r#"fn("}}")"#);
+    }
+
+    #[test]
+    fn quote_aware_interpolation_preserves_tokens_and_byte_offsets() {
+        let src = r#"é{{ fn('a\'}}é', "}}") }}\{{{{x}}!"#;
+        assert_eq!(
+            tokenize(src, "test.mds").unwrap(),
+            [
+                Token::Text("é".into(), 0),
+                Token::Interpolation(r#"fn('a\'}}é', "}}")"#.into(), 2),
+                Token::EscapedBrace(27),
+                Token::Interpolation("x".into(), 30),
+                Token::Text("!".into(), 35),
+            ]
+        );
     }
 
     #[test]
