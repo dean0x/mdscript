@@ -70,6 +70,8 @@ input. The compiler enforces several defense-in-depth controls:
   it reads only the regular file that resolution found, at most 10 MiB of UTF-8
   (`crates/mds-core/src/data/path.rs`; tests in `crates/mds-core/src/data/path_tests.rs`
   and `crates/mds-core/tests/data_paths.rs`).
+  A template can output any `.json`, `.yaml` or `.yml` file that these rules allow below the
+  project root, the nearest directory with `.git` or `.mdsroot`.
   `mds check`, `mds lint`, `mds fmt` and the check and lint calls of the Rust API, the Python
   binding, the napi binding and the WASM binding read no data file (tests: `D-6` in
   `crates/mds-napi/__test__/index.spec.mjs`, `check_and_lint_read_no_data_file` in

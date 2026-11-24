@@ -1086,6 +1086,7 @@ The value of `data` is a mapping. Each key is an entry name. Each value has one 
 
 - A string that starts with `./` or `../` is a local file entry. The path rules are in §4.6
   "Filesystem constraints", row "Data file path".
+- Templates can output any `.json`, `.yaml` or `.yml` file that the path rules allow below the project root, the nearest directory with `.git` or `.mdsroot` (§5 Project Root).
 - A string with a URI scheme is a URL entry. The scheme must be the literal `https`
   (`expected the literal https scheme`). The authority is literal and has no trailing host dot.
   The URL has no backslash and no fragment. A query needs a path.
