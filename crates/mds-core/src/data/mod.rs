@@ -2,6 +2,8 @@
 
 mod convert;
 pub(crate) mod decl;
+#[cfg_attr(not(test), expect(dead_code, reason = "S8 and S9 call the data graph"))]
+pub(crate) mod graph;
 pub(crate) mod path;
 mod refs;
 

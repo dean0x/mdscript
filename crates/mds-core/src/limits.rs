@@ -292,12 +292,10 @@ pub(crate) const MAX_DATA_ENTRIES_PER_MODULE: usize = 64;
 
 /// Maximum data entries admitted across modules in one compile.
 /// This cap depends on declarations, not on whether the data is dense or sparse.
-#[expect(dead_code, reason = "data resolution lands in a later phase")]
 pub(crate) const MAX_DATA_ENTRIES_PER_COMPILE: usize = 256;
 
 /// Maximum dependency levels in the data graph, checked before reads.
 /// This cap depends on graph depth, not on whether the data is dense or sparse.
-#[expect(dead_code, reason = "data graph analysis lands in a later phase")]
 pub(crate) const MAX_DATA_LEVELS: usize = 16;
 
 /// Maximum total source bytes admitted for distinct data files in one compile.
