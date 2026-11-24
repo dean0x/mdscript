@@ -2181,13 +2181,13 @@ pub enum ResolveAs {
 /// index, and a module record of the same path stays a separate record. URL entries
 /// are not listed. The scan does not know the file type, so it also lists the
 /// entries of a plain `.md` file, which a compile keeps as a variable. A declaration
-/// error leaves out every data record of the module, for the compile to report.
+/// error, more entries than one module can declare included, leaves out every data
+/// record of the module and fails nothing: the compile reports it before any read.
 ///
 /// # Errors
 ///
-/// A syntax error in the source, a frontmatter over a resource limit, more data
-/// entries than one module can declare, or a source whose syntax tree estimate does
-/// not fit the compile memory budget — as [`scan_imports`].
+/// A syntax error in the source, a frontmatter over a resource limit, or a source whose
+/// syntax tree estimate does not fit the compile memory budget — as [`scan_imports`].
 ///
 /// # Examples
 ///
@@ -2248,8 +2248,8 @@ pub fn scan_import_records(
 
     // Frontmatter imports resolve before body imports. Best-effort: a plain parse or
     // validation error is left for the compile to report, but a resource limit
-    // (frontmatter size cap / node budget / too many imports or data entries) fails
-    // closed rather than return only the body's imports (#162).
+    // (frontmatter size cap / node budget / too many imports) fails closed rather than
+    // return only the body's imports (#162).
     let lenient = |error: MdsError| match error {
         MdsError::ResourceLimit { .. } => Err(error),
         _ => Ok(()),
@@ -2280,20 +2280,18 @@ pub fn scan_import_records(
             Some(Err(e)) => lenient(e)?,
             None => {}
         }
-        // The declaration parser reads the bounded tree and does no I/O.
+        // The declaration parser reads the bounded tree and does no I/O. Every
+        // declaration error, the entry cap included, is left for the compile: it
+        // refuses the module before any read, and only it knows the module name.
         let mut mem = evaluator::budget::MemBudget::default();
-        match mapping
+        if let Some(Ok(entries)) = mapping
             .and_then(|map| map.get("data"))
             .map(|field| data::decl::parse_declarations(field, "", &mut mem))
         {
-            Some(Ok(entries)) => {
-                data.extend(entries.into_iter().filter_map(|entry| match entry.source {
-                    data::decl::Source::File(path) => Some(path),
-                    data::decl::Source::Url(_) => None,
-                }));
-            }
-            Some(Err(e)) => lenient(e)?,
-            None => {}
+            data.extend(entries.into_iter().filter_map(|entry| match entry.source {
+                data::decl::Source::File(path) => Some(path),
+                data::decl::Source::Url(_) => None,
+            }));
         }
     }
 
@@ -3111,50 +3109,58 @@ mod tests {
         assert_eq!(paths, vec!["./x.mds".to_string()]);
     }
 
-    /// The data entries of one module at the cap give one record each. One more entry
-    /// fails the scan closed, as the compile does. A declaration error leaves out the
-    /// data records, and the module records stay.
+    /// The data entries of one module at the cap give one record each. A declaration
+    /// error, one entry past the cap included, leaves out the data records of the
+    /// module and keeps its module records. The compile refuses that module before any
+    /// read, with the module name, which a scan of source text does not know.
     #[test]
-    fn scan_import_records_bound_data_records_like_the_compile() {
+    fn scan_import_records_leave_data_declaration_errors_to_the_compile() {
         let source = |count: usize, extra: &str| {
             let entries: String = (0..count)
                 .map(|i| format!("  e{i}: ./d{i}.json\n"))
                 .collect();
             format!("---\ndata:\n{entries}{extra}---\n@import \"./m.mds\" as m\n")
         };
-        let kinds = |source: &str| -> Result<Vec<ImportKind>, MdsError> {
-            Ok(scan_import_records(source, ResolveAs::Standalone)?
+        let kinds = |source: &str| -> Vec<ImportKind> {
+            scan_import_records(source, ResolveAs::Standalone)
+                .expect("the source scans")
                 .into_iter()
                 .map(|record| record.kind)
-                .collect())
+                .collect()
+        };
+        let compile = |source: String| {
+            compile_virtual_collecting_warnings(
+                HashMap::from([("main.mds".into(), source), ("m.mds".into(), "M\n".into())]),
+                "main.mds",
+                None,
+            )
+            .expect_err("the compile reports the declaration error")
+            .serialize()
         };
         let cap = limits::MAX_DATA_ENTRIES_PER_MODULE;
-        let at_cap = kinds(&source(cap, "")).expect("the cap scans");
+        let at_cap = kinds(&source(cap, ""));
         assert_eq!(at_cap.len(), 1 + cap);
         assert_eq!(
             at_cap.iter().filter(|&&k| k == ImportKind::Data).count(),
             cap
         );
         assert_eq!(scan_imports(&source(cap, "")).unwrap(), ["./m.mds"]);
-        for over in [
-            scan_import_records(&source(cap + 1, ""), ResolveAs::Standalone).map(|_| ()),
-            scan_imports(&source(cap + 1, "")).map(|_| ()),
-        ] {
-            let error = over.expect_err("one entry past the cap").serialize();
-            assert_eq!(error.code, "mds::resource_limit");
-            assert!(error.message.contains("too many data entries"), "{error:?}");
-        }
+
+        let over = source(cap + 1, "");
+        assert_eq!(kinds(&over), [ImportKind::Import]);
+        assert_eq!(scan_imports(&over).unwrap(), ["./m.mds"]);
+        let error = compile(over);
+        assert_eq!(error.code, "mds::resource_limit");
+        assert!(
+            error
+                .message
+                .contains("\"main.mds\": too many data entries"),
+            "{error:?}"
+        );
         for invalid in ["  prompt: ./p.json\n", "  bad: plain\n"] {
             let source = source(2, invalid);
-            assert_eq!(kinds(&source).unwrap(), [ImportKind::Import], "{invalid}");
-            let error = compile_virtual_collecting_warnings(
-                HashMap::from([("main.mds".into(), source), ("m.mds".into(), "M\n".into())]),
-                "main.mds",
-                None,
-            )
-            .expect_err("the compile reports the declaration error")
-            .serialize();
-            assert_eq!(error.code, "mds::data", "{error:?}");
+            assert_eq!(kinds(&source), [ImportKind::Import], "{invalid}");
+            assert_eq!(compile(source).code, "mds::data");
         }
     }
 
