@@ -1000,6 +1000,33 @@ fn malformed_file_key_reports_a_fixed_message_and_a_safe_source_frame() {
     assert_eq!(error["span"]["length"], line.len());
 }
 
+#[test]
+fn lint_and_fix_refuse_quoted_imports_in_every_module_kind() {
+    common::with_imports_form_cases(|entry, rejected, case| {
+        for args in [
+            ["--format", "json"].as_slice(),
+            &["--format", "json", "--fix"],
+        ] {
+            let output = lint_path(entry, args);
+            let wire = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(if rejected { 2 } else { 0 }),
+                "{args:?}: {case}: {wire}"
+            );
+            if rejected {
+                let document: serde_json::Value = serde_json::from_str(&wire).unwrap();
+                assert_eq!(document["error"]["code"], "mds::yaml", "{args:?}: {case}");
+                assert_eq!(
+                    document["error"]["message"],
+                    common::IMPORTS_FORM_MESSAGE,
+                    "{args:?}: {case}"
+                );
+            }
+        }
+    });
+}
+
 // ── L-CLI-RESOURCE: exit code 3 for ResourceLimit (TEST-4) ──────────────────
 //
 // Verifies that a template causing a ResourceLimit in the RESOLVER causes

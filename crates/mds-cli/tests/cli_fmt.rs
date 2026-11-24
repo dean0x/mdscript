@@ -825,6 +825,29 @@ fn malformed_single_file_exits_one_with_diagnostic() {
 }
 
 #[test]
+fn fmt_refuses_quoted_imports_in_every_module_kind() {
+    common::with_imports_form_cases(|entry, rejected, case| {
+        let output = fmt_path(entry, &[]);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(rejected)),
+            "{case}: {stderr}"
+        );
+        if rejected {
+            assert!(stderr.contains("mds::yaml"), "{case}: {stderr}");
+            assert!(
+                stderr
+                    .lines()
+                    .any(|line| line.ends_with(common::IMPORTS_FORM_MESSAGE)),
+                "{case}: {stderr}"
+            );
+            assert!(output.stdout.is_empty(), "{case}");
+        }
+    });
+}
+
+#[test]
 fn unclosed_directive_block_exits_one_with_syntax_not_formatter_invariant() {
     // An unclosed `@message` (parse-level malformation, unlike the unclosed
     // code fence in fmt_malformed.mds which fails in the lexer) must be

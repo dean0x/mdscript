@@ -1185,6 +1185,27 @@ fn bomb_doc() -> String {
 }
 
 #[wasm_bindgen_test]
+fn compile_and_check_report_the_same_quoted_imports_error() {
+    let plain = wrap_fm("imports: []\n");
+    let quoted = wrap_fm("'imports': []\n");
+    let result = mds_wasm::compile(&plain, JsValue::NULL).unwrap();
+    assert_eq!(get_str(&result, "output"), "Hi\n");
+
+    for (api, result) in [
+        ("compile", mds_wasm::compile(&quoted, JsValue::NULL)),
+        ("check", mds_wasm::check(&quoted, JsValue::NULL)),
+    ] {
+        let error = result.expect_err(api);
+        assert_eq!(get_str(&error, "code"), "mds::yaml", "{api}");
+        assert_eq!(
+            get_str(&error, "message"),
+            "YAML parse error: write `imports:` at the start of a line",
+            "{api}"
+        );
+    }
+}
+
+#[wasm_bindgen_test]
 fn w1_compile_alias_bomb_is_resource_limit() {
     let err = mds_wasm::compile(&bomb_doc(), JsValue::NULL).unwrap_err();
     assert_eq!(get_str(&err, "code"), "mds::resource_limit");

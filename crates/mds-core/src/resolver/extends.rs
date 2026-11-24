@@ -176,10 +176,8 @@ impl ModuleCache {
     ///
     /// # Errors
     ///
-    /// Returns `Err(MdsError::YamlError)` if YAML serialization of the merged mapping fails.
-    /// This is not expected for well-formed mappings produced by `deep_merge_yaml`, but the
-    /// failure MUST propagate as a compile error rather than silently dropping the emitted
-    /// frontmatter fence from the output (no swallowed errors at boundaries).
+    /// Return `mds::internal` if the mapping has a reserved output key at the top level.
+    /// Return `mds::yaml` if YAML serialization fails. Do not omit the frontmatter on error.
     pub(super) fn serialize_merged_frontmatter(
         &mut self,
         mapping: &serde_yaml_ng::Mapping,
@@ -187,6 +185,12 @@ impl ModuleCache {
     ) -> Result<Option<String>, MdsError> {
         if mapping.is_empty() {
             return Ok(None);
+        }
+        if crate::RESERVED_OUTPUT_KEYS
+            .iter()
+            .any(|key| mapping.contains_key(key.name))
+        {
+            return Err(MdsError::internal());
         }
         let bound = self
             .budget

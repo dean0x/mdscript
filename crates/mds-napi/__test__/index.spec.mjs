@@ -1128,6 +1128,18 @@ describe('intrinsic output shape', () => {
 
 const { lint, lintFile, lintVirtual } = addon;
 
+test('compile, check and lint report the same quoted imports error', () => {
+  const plain = '---\nimports: []\n---\nBody\n';
+  const quoted = plain.replace('imports:', "'imports':");
+  assert.equal(compile(plain).output, 'Body\n');
+  for (const run of [compile, check, lint]) {
+    assert.throws(() => run(quoted), {
+      code: 'mds::yaml',
+      message: 'YAML parse error: write `imports:` at the start of a line',
+    }, run.name);
+  }
+});
+
 describe('lint', () => {
   // L-N-1: clean source returns canonical shape
   test('L-N-1: lint on clean source returns version:1, empty files, truncated:false', () => {

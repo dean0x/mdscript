@@ -221,5 +221,6 @@ pub(super) fn parse_frontmatter_mapping(
             return Err(MdsError::yaml_error(FILE_KEY_FORM));
         }
     }
+    crate::prove_reserved_strip(raw, map.as_ref(), mem)?;
     Ok((map, spent))
 }

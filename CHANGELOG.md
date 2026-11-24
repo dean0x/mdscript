@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### **BREAKING** — Plain reserved frontmatter keys (#405)
+
+- Write `imports`, `type: mds`, and `indented-directives` as plain top-level keys at the start of a line.
+  Use block-style frontmatter for these keys. Do not quote the key or put a space before its colon.
+  The rule applies to the entry, imported modules, and `@extends` bases.
+  If flow-style frontmatter contains one of these keys, MDS reports `mds::yaml`.
+- MDS refuses a block sequence under a reserved key if its list items start at column 0.
+- MDS refuses a top-level `<<` with a reserved output key in its mapping or sequence of mappings.
+
+### Changed
+
+- Emitted standalone frontmatter keeps the author's blank lines and trailing spaces exactly as written outside removed blocks.
+
+### Fixed
+
+- If a reserved output key is not plain, MDS reports an error and emits no compiled frontmatter (#405).
+
 ## [0.7.0] — 2026-11-23
 
 ### Changed

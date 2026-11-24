@@ -53,6 +53,50 @@ config:
 - Object values support dot-notation field access: `{{config.key}}`, `{{a.b.c}}`
 - Objects cannot be interpolated directly; access a specific field instead
 
+#### Reserved output keys
+
+Write `imports`, `type` (when its YAML value is `mds`), and `indented-directives` as plain top-level block keys.
+Put each key at the start of a line, without quotes or a space before the colon.
+Follow the colon with a space, a tab, or the end of the line.
+See [Indented directives](#indented-directives) for the Boolean value rule.
+`plain_reserved_keys_are_removed_without_changing_other_bytes` checks all three keys.
+`strip_reserved_keys_preserves_colons_in_plain_keys` checks keys such as `imports:label`.
+`frontmatter_without_reserved_keys_keeps_its_bytes` confirms that `type: post` stays in standalone output.
+
+MDS reports `mds::yaml` for a non-plain reserved key in parsed frontmatter.
+Examples include quoted keys, explicit YAML keys, and reserved keys in flow-style frontmatter.
+`reserved_keys_in_non_plain_forms_return_fixed_errors` checks `imports` and `type`.
+`flow_frontmatter_refuses_imports_even_when_the_strip_matches` checks the flow rule apart from the value comparison.
+A block mapping can have a flow mapping as its first key.
+`block_frontmatter_accepts_a_flow_mapping_as_its_first_key` checks this form.
+MDS refuses an unindented sequence under a reserved key.
+`column_zero_sequence_under_a_reserved_key_returns_the_key_form_error` checks this refusal.
+`indented_directives_yaml_agreement_covers_all_module_kinds` checks `indented-directives`.
+The [syntax errors for indented directives](#indented-directives) take precedence over the YAML form check.
+
+MDS does not apply `<<` merges.
+It treats `<<` as ordinary metadata (`merge_metadata_with_only_ordinary_keys_keeps_its_bytes`).
+A top-level `<<` whose mapping contains a reserved key gets the same form error (`merge_metadata_refuses_reserved_keys`).
+This rule also applies to sequences of mappings (`merge_metadata_refuses_reserved_keys_in_a_sequence`) and aliases to mappings (`merge_metadata_refuses_reserved_keys_in_an_alias`).
+
+The YAML that remains after removal must match the original mapping without its reserved output keys.
+If it does not, MDS reports `mds::yaml` and returns no compiled output.
+`reserved_keys_in_non_plain_forms_return_fixed_errors` checks the messages that name the key and show its plain form.
+`a_strip_that_changes_only_other_yaml_returns_a_generic_error` checks the general form message.
+
+The rule applies to entry modules, imported modules, and `@extends` bases, in Markdown and messages modes.
+`every_module_kind_reports_the_same_error_in_both_output_modes` checks this for `imports` with compile, check, and lint.
+
+- `build`, `check`, `lint`, `lint --fix`, and `fmt` report the form error. See
+  `build_and_check_refuse_quoted_imports_in_every_module_kind`,
+  `lint_and_fix_refuse_quoted_imports_in_every_module_kind`, and
+  `fmt_refuses_quoted_imports_in_every_module_kind`.
+- `fmt` returns the form error without a fallback. See `format_str_returns_the_same_frontmatter_form_error_as_compile`.
+- For a quoted `imports` key, Node.js and Python compile, check, and lint report the same code and message.
+  WASM compile and check also report them. See `compile, check and lint report the same quoted imports error`,
+  `test_compile_check_and_lint_report_the_same_quoted_imports_error`, and
+  `compile_and_check_report_the_same_quoted_imports_error`.
+
 **Resource limits:**
 
 | Limit | Value |
@@ -278,12 +322,13 @@ The key does not affect `>`-prefixed lines or unmarked fences. Other indented `@
 Markdown list structure does not affect these directives. Outside fences, an indented `@end` closes the innermost open MDS block of any kind.
 An indented conditional in an invalid form, such as `@else` without its colon, causes a syntax error under this opt-in.
 
-Write the key once, at the start of a frontmatter line, with an unquoted lowercase Boolean.
-Put at least one space or tab after the colon. Spaces and tabs can follow the value.
+Use the [reserved output key form](#reserved-output-keys) with an unquoted lowercase Boolean.
+Write the key only once. Put at least one space or tab after the colon. Spaces and tabs can follow the value.
 If you add a comment, put a space or tab before it.
 A quoted value, a blank before the colon or a repeated key line causes `mds::syntax` at that line.
-If the key in parsed YAML does not match the source line and Boolean value, the compiler reports `mds::yaml`.
-`mds check`, `mds lint` and `mds fmt` also report this YAML error.
+See `indented_directives_malformed_key_reports_the_original_line` and `indented_directives_duplicate_key_reports_the_second_line`.
+If the key in parsed YAML does not match the source line and Boolean value, MDS reports `mds::yaml`.
+See `indented_directives_yaml_agreement_covers_all_module_kinds`.
 
 The key does not pass through `@extends`, `@import` or `@include`. This also applies to imported `@define` bodies.
 This top-level key is reserved. It does not enter variable scope or appear in standalone or merged output frontmatter.
@@ -853,20 +898,26 @@ The blank lines between sections come from the base skeleton (the blank line bet
 
 - Frontmatter from all ancestors is deep-merged in order: base < intermediate < child < runtime vars
 - Nested mappings are merged key-by-key; arrays replace wholesale; scalars: child wins
-- The merged scope excludes reserved top-level keys (`imports`, `type`, `extends`, `indented-directives`).
+- The merge excludes top-level `imports`, `type`, `extends`, and `indented-directives`. See
+  `deep_merge_yaml_reserves_every_reserved_output_key`, `deep_merge_yaml_reserved_keys_excluded`,
+  and `indented_directives_never_merges_as_a_top_level_key`.
 - Per-file `imports:` entries in frontmatter are each resolved against their own file's location
-- The **deep-merged** frontmatter (base < child, reserved keys excluded) is emitted in the compiled output — not just the child's raw frontmatter. Both base-only and child-only keys appear; child wins on collisions
+- The compiled output contains the **deep-merged** frontmatter. It includes base-only and child-only keys.
+  The child wins when keys collide. See `f4_extends_emits_deep_merged_frontmatter`.
+- If the merged map still contains a reserved output key at the top level, MDS reports `mds::internal`.
+  A nested key of the same name can stay. See `merged_frontmatter_refuses_a_reserved_top_level_key`
+  and `merged_frontmatter_keeps_a_nested_reserved_name`.
 
-**Named asymmetry — `@extends` vs standalone:**
+**Standalone and `@extends` output:**
 
-`@extends` templates and standalone templates differ in how frontmatter is emitted:
+Each file follows the [reserved output key form](#reserved-output-keys) before MDS emits frontmatter.
 
 | Template type | Emitted frontmatter |
 |---------------|---------------------|
-| **Standalone** | Raw source YAML with reserved keys removed (comments and quoting preserved on retained lines) |
-| **`@extends` child** | Canonically re-serialized: serde-yaml output of the deep-merged mapping (comments and original quoting are normalized away; YAML structure is canonical) |
+| **Standalone** | Raw source YAML after removal of plain reserved output key blocks. See [Frontmatter Preservation](#frontmatter-preservation). |
+| **`@extends` child** | MDS emits the checked YAML from the serializer without further key removal. See `extends_emits_the_checked_merged_frontmatter_bytes`. |
 
-This asymmetry is intentional: standalone templates can round-trip YAML comments and non-canonical quoting, while `@extends` templates must emit a merged structure that has no single "source" YAML string. Runtime `--set`/`--set-string` variables do not alter the emitted frontmatter in either case — they affect only the compiled body.
+Runtime `--set`/`--set-string` variables do not alter the emitted frontmatter in either case — they affect only the compiled body.
 
 **Intrinsic output with inheritance:**
 
@@ -1090,14 +1141,23 @@ Two base directories are possible:
 
 ### Frontmatter Preservation
 
-When the input file has YAML frontmatter, the compiled output preserves it:
+For standalone Markdown output, MDS removes the [plain reserved output keys](#reserved-output-keys) and their blocks.
+MDS removes each key line and the indented and blank lines that follow it.
+A YAML-only line break (U+0085, U+2028, or U+2029) can end a removed key line.
+`reserved_keys_preserve_fields_after_yaml_only_line_breaks` checks that the next field stays.
+A YAML comment at the start of a line stays and does not end the block.
+`plain_reserved_keys_are_removed_without_changing_other_bytes` checks this rule.
+MDS reports `mds::yaml` if those lines cannot stay as comments without a change to the original mapping.
+`folded_import_path_cannot_leave_a_scalar_line_in_output` and
+`single_quoted_flow_import_path_cannot_leave_a_scalar_line_in_output` check this refusal.
+MDS keeps the remaining lines byte for byte. With no reserved keys, it keeps the original frontmatter content.
+See `reserved_strip_preserves_kept_line_bytes` and `frontmatter_without_reserved_keys_keeps_its_bytes`.
 
-- The original frontmatter content is prepended to the output between `---` fences
-- The `type: mds` key (used for `.md` file detection) is stripped from the output frontmatter
-- If stripping `type: mds` leaves the frontmatter empty, no fences are emitted
-- Runtime variable overrides affect the body but do not alter the output frontmatter
-- Only the root module's frontmatter appears in output; imported modules' frontmatter is not emitted
-- When `@extends` is used, the compiled output contains the **deep-merged** frontmatter (base keys + child keys, child wins on collision). Unlike standalone frontmatter — which is preserved byte-for-byte from the source — the merged result is serde-canonicalized: key order and quoting are normalized by the YAML serializer, and YAML comments are dropped.
+- MDS puts the retained YAML before the body, between `---` fences. See `frontmatter_preserved_in_str_output`.
+- If nothing but whitespace remains, MDS omits the fences. See `frontmatter_type_mds_only_no_fences`.
+- Runtime variable overrides affect the body but do not alter the output frontmatter. See `frontmatter_runtime_override_doesnt_alter_output`.
+- Only the root module contributes standalone output frontmatter. See `frontmatter_imported_module_not_emitted`.
+- For `@extends`, MDS emits the [deep-merged mapping](#411-template-inheritance-extends--block) instead. See `f4_extends_emits_deep_merged_frontmatter`.
 
 ### Error Format
 
@@ -1147,7 +1207,7 @@ and I/O failures are described below the table.
 | `mds::not_mds` | An entry file, or the target of an `@import`, `@export … from`, frontmatter import or `@extends`, is not an MDS file (neither a `.mds` file nor a `.md` file whose frontmatter declares `type: mds`). The message names the path as the caller typed it — the entry path as passed, or the string as written in the template — escaped, never the resolved absolute path (#417). A directive import's span points at the importer's directive line; an entry and a frontmatter `imports:` entry have no span (#423) | resolver; `mds fmt`/`mds lint` file-argument check; `@mdscript/mds`'s WASM-backend pre-scanner, through the resolver's own check (`preflightModule`) | 2 / 2 | all |
 | `mds::io` | Filesystem or I/O failure; a path or base directory that is not valid UTF-8; an entry path or virtual entry key that is empty or contains a NUL byte; an entry path, entry key, base directory, resolved canonical path or `lint_str_named` file name carrying a forbidden path character (§4.6); a `VirtualFs::with_aliases` alias refused — the alias, or the module key it names, not a normalized module key, the alias a module key itself, or the module key naming no module (`module alias "<alias>": <reason>`, #414); on the CLI also a `--vars` file that is a symlink, a directory argument that is a symlink or the filesystem root (#413), an output path that is the entry file itself, or an output that would replace an MDS module or a file the run reads — the entry, an imported module, the `--vars` file or the `mds.json` in force, and in directory mode the `mds.json` nearest the source (#425), a `-o`/`--out-dir`/`build.output_dir`/`mds init` path carrying a forbidden path character (for `-o`/`--out-dir`/`build.output_dir`, as written or as resolved), a `-o`/`--out-dir` value that is not valid UTF-8, a working directory that cannot be determined when a relative `-o`/`--out-dir`, a source map's base or `mds lint -`'s base needs it (`cannot determine current directory: <reason>`, the words mds-core uses when a string compile given no base directory cannot determine it, #390), a working directory that auto-detection cannot list (`cannot read directory .: <reason>`, #390), a `build.output_dir` that is absolute or contains `..`, a `lint --fix` rewrite refused by the compile-equivalence check, an `mds fmt` or `mds lint --fix` rewrite of a file that changed after it was read (`"<path>" changed since it was read; not written`, §7.4, #160), the stream and I/O failures listed below the table (#157), and an `mds watch` file-mode rebuild refused because the entry's path as typed now leads to a different file than the one being watched (a symlinked directory on it retargeted: `watched entry now resolves to a different file: "<path>"; restart mds watch to follow it`, #417), or a directory-mode rebuild refused because the directory argument, or a source below it, as typed now leads to a different directory or file than the one being watched (`watched directory now resolves to a different directory: "<dir>"; restart mds watch to follow it`, `watched file now resolves to a different file: "<dir>/<path below it>"; restart mds watch to follow it`; §7.2, #413), or a write below its out-dir refused because the out-dir as typed now leads to a different directory than the one the session started with (`cannot write <path>: the output directory now resolves to a different directory; restart mds watch to follow it`; §7.2, #160) | `mds-core` API boundary, resolver, `NativeFs`, `VirtualFs`, CLI, `@mdscript/mds` WASM-backend pre-scanner | 2 / 2 | all |
 | `mds::resource_limit` | A documented limit exceeded (§4.1 resource-limits table, `SECURITY.md`), CLI stdin over 10 MiB included; bindings also raise it before compilation for oversized sources, module and alias maps, and their counts (as `VirtualFs::with_aliases` does for an alias map); `@mdscript/mds`'s WASM-backend pre-scanner raises the native error for a path over the segment cap, a file over the size cap and a module over the module count, and one of its own for modules that together pass 10 MiB. The WASM file APIs also report this code if the resolved path of an alias target has more than 256 segments below the project root. This applies even to a short import path. | evaluator, resolver, `VirtualFs`, bindings, `@mdscript/mds` WASM-backend pre-scanner | 3 / 3 | all |
-| `mds::yaml` | Frontmatter YAML the parser itself refuses (syntax, duplicate keys, nesting beyond the parser's limits — §4.1) | resolver | 1 / 2 | all |
+| `mds::yaml` | Frontmatter YAML the parser refuses (syntax, duplicate keys, nesting beyond the parser's limits — §4.1), or a [reserved output key form error](#reserved-output-keys) | resolver | 1 / 2 | all |
 | `mds::json` | Malformed JSON, or a non-object root, in `load_vars_str` and other JSON sites | `mds-core` vars API | 1 / 2 | Rust, CLI |
 | `mds::invalid_vars` | `--vars` file is malformed JSON or not an object (`load_vars_file`) | `mds-core` vars API | 1 / 2 | CLI, Rust |
 | `mds::var_conflict` | Same key given to both `--set` and `--set-string` | CLI | 1 / 1 | CLI |

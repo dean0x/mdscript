@@ -115,6 +115,22 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Test reserved frontmatter in release mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/reserved-frontmatter-release.log"
+          cargo test --locked -p mds-core --lib --release --color never -- tests::reserved_strip_proof:: merged_frontmatter_ 2>&1 | tee "$log"
+          if ! grep -E '^test [^[:space:]]+ \.\.\. ok$' "$log" |
+            grep -F 'test tests::reserved_strip_proof::' >/dev/null; then
+            printf '%s\n' 'No reserved strip proof test passed.' >&2
+            exit 1
+          fi
+          if ! grep -Fxq 'test resolver::tests::merged_frontmatter_refuses_a_reserved_top_level_key ... ok' "$log"; then
+            printf '%s\n' 'The merged frontmatter refusal test did not pass.' >&2
+            exit 1
+          fi
+          grep -F 'test result: ok.' "$log"
       # Intra-doc link gate (AC-209-11 / OD-209-G): broken intra-doc links in
       # mds-core degrade silently to literal text without this check.
       # --no-deps excludes dependency crates; -p mds-core scopes the check to mds-core.
