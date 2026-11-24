@@ -294,6 +294,46 @@ fn virtual_aliases_must_not_hide_a_blocked_key() {
     assert_error(&error, "mds::import", "node_modules");
 }
 
+/// `read_data` applies the segment rule to the key it gets. The module normalizer
+/// does not apply that rule, so its key reaches the read-time check. Control: a key
+/// of a permitted directory from the same normalizer reads.
+#[test]
+fn read_data_checks_a_key_that_skipped_the_data_path_rule() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let fs = NativeFs::new();
+    let dir = anchor(&fs, root);
+    put(root, "modules/a.json", b"true");
+    put(root, ".hidden/a.json", b"false");
+    put(root, "NoDe_MoDuLeS/a.json", b"false");
+    let control = fs.normalize_in_dir(&dir, "./modules/a.json").unwrap();
+    assert_eq!(fs.read_data(&control).unwrap(), "true");
+    for (path, reason) in [
+        ("./.hidden/a.json", "dot-prefixed"),
+        ("./NoDe_MoDuLeS/a.json", "node_modules"),
+    ] {
+        assert!(fs.normalize_data_in_dir(&dir, path).is_err(), "{path}");
+        let key = fs.normalize_in_dir(&dir, path).unwrap();
+        let error = fs.read_data(&key).unwrap_err();
+        assert_error(&error, "mds::import", reason);
+    }
+
+    let virtual_fs = VirtualFs::new(HashMap::from([
+        ("modules/a.json".into(), "true".into()),
+        (".hidden/a.json".into(), "false".into()),
+        ("NoDe_MoDuLeS/a.json".into(), "false".into()),
+    ]));
+    assert_eq!(virtual_fs.read_data("modules/a.json").unwrap(), "true");
+    for (key, reason) in [
+        (".hidden/a.json", "dot-prefixed"),
+        ("NoDe_MoDuLeS/a.json", "node_modules"),
+        ("/modules/a.json", "escapes project directory"),
+    ] {
+        let error = virtual_fs.read_data(key).unwrap_err();
+        assert_error(&error, "mds::import", reason);
+    }
+}
+
 #[test]
 fn backend_without_data_support_never_falls_back_to_module_read() {
     struct ModuleOnly;

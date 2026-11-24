@@ -194,3 +194,40 @@ fn a_base_function_does_not_keep_its_standalone_data_value_in_a_child() {
     .unwrap();
     assert_eq!(output, "1\n2\n");
 }
+
+/// The check of an inheritance chain whose base functions read entries accepts the
+/// template that the compile accepts, reads no data file and warns once. Control: a
+/// replay of every entry evaluates and gives no warning.
+#[test]
+fn check_of_inherited_functions_over_data_matches_the_compile() {
+    let modules = |files: &[(&str, &str)]| -> std::collections::HashMap<String, String> {
+        files
+            .iter()
+            .map(|&(key, src)| (key.into(), src.into()))
+            .collect()
+    };
+    let captured = [
+        ("main.mds", "---\ndata:\n  item: ./item.json\nlabel: Child\n---\n@extends \"./base.mds\"\n"),
+        ("base.mds", "---\ndata:\n  item: ./unused.json\nlabel: Base\n---\n@define inner():\n{{label}} {{item}}\n@end\n@define outer():\n{{inner()}}\n@end\n@block body:\n{{outer()}}\n@end\n"),
+        ("item.json", "["),
+    ];
+    let rebuilt = [
+        ("main.mds", "@import \"./base.mds\" as base\n@import \"./leaf.mds\" as leaf\n@include base\n@include leaf\n"),
+        ("base.mds", "---\ndata:\n  item: ./base.json\n---\n@define show():\n{{item}}\n@end\n@block body:\n{{show()}}\n@end\n"),
+        ("leaf.mds", "---\ndata:\n  item: ./leaf.json\n---\n@extends \"./base.mds\"\n"),
+        ("base.json", "["),
+        ("leaf.json", "["),
+    ];
+    for files in [&captured[..], &rebuilt[..]] {
+        let ((), warnings) =
+            mds::check_virtual_collecting_warnings(modules(files), "main.mds", None).unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("\"item\""), "{warnings:?}");
+        let replay = Some([("item".to_owned(), Value::from("replayed"))].into());
+        let ((), warnings) =
+            mds::check_virtual_collecting_warnings(modules(files), "main.mds", replay).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let error = compile(files).unwrap_err();
+        assert_eq!(error.serialize().code, "mds::yaml", "{error}");
+    }
+}
