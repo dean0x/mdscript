@@ -172,6 +172,11 @@ pub struct ModuleCache {
     data: crate::data::resolve::State,
     analyze_data: bool,
     source_snapshot: Option<process::SourceSnapshot>,
+    /// The refusal of the whole-graph check, kept until the root closes. The compile
+    /// then runs without a snapshot, so the fault that it meets first is reported.
+    /// A data bind returns this refusal and reads nothing, and a compile that meets
+    /// no fault of its own fails with it at the root.
+    graph_refusal: Option<MdsError>,
     budget: EvalBudget,
     retained: usize,
     kept: usize,
@@ -241,6 +246,7 @@ impl ModuleCache {
             data: crate::data::resolve::State::default(),
             analyze_data: false,
             source_snapshot: None,
+            graph_refusal: None,
             budget: EvalBudget::default(),
             retained: 0,
             kept: 0,
@@ -830,11 +836,16 @@ impl ModuleCache {
     }
 
     // Call even on error. Only propagate the pop error if the module result is Ok.
+    // At the root, a kept graph refusal becomes the pop error, so a module error
+    // that the compile met first still wins.
     fn pop_resolving(&mut self, key: &str) -> Result<(), MdsError> {
         let result = Self::check_lifo_pop(self.resolving.pop(), key);
         if self.resolving.is_empty() {
             if let Some(snapshot) = self.source_snapshot.take() {
                 self.budget.mem.release_buffers(snapshot.charge);
+            }
+            if let Some(refusal) = self.graph_refusal.take() {
+                return result.and(Err(refusal));
             }
         }
         result

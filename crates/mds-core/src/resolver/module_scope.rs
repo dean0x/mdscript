@@ -303,6 +303,10 @@ impl ModuleCache {
         if !resolve::Declarations::contains_data(chain) {
             return Ok(Default::default());
         }
+        // No data is read unless the whole graph passed its check.
+        if let Some(refusal) = &self.graph_refusal {
+            return Err(refusal.clone());
+        }
         let before = self.budget.mem.buffers;
         let fs = &*self.fs;
         let data = &mut self.data;

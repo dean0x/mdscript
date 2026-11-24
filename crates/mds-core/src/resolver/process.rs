@@ -434,7 +434,16 @@ impl ModuleCache {
         if !self.analyze_data || self.resolving.len() != 1 {
             return Ok(());
         }
-        let preflight = self.collect_data_preflight(root)?;
+        // The walk reads every module before any evaluates, so a fault that it finds
+        // can sit after a fault that the compile meets first. Keep the refusal: the
+        // compile runs on, reports its own first fault, and binds no data.
+        let preflight = match self.collect_data_preflight(root) {
+            Ok(preflight) => preflight,
+            Err(refusal) => {
+                self.graph_refusal = Some(refusal);
+                return Ok(());
+            }
+        };
         if self.data.compile {
             let frontier: Vec<_> = preflight.frontier().collect();
             if !frontier.is_empty() {
