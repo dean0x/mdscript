@@ -16,7 +16,7 @@ MDS (Markdown Script) is a domain-specific language for composing, reusing, and 
 1. Looks like Markdown, not code
 2. Minimal new syntax: leverage existing conventions (YAML frontmatter, `@` directives)
 3. Composable: imports, functions, modules
-4. Deterministic: same input always produces same output
+4. Deterministic: same input always produces same output. The input includes the sources, the runtime variables and the local data files that `data:` entries name (§4.12). This release sends no network request.
 5. Fail fast: clear errors with file:line:col, no partial output
 
 ---
@@ -52,16 +52,20 @@ config:
 - Runtime vars (CLI `--vars vars.json`) override frontmatter values
 - Object values support dot-notation field access: `{{config.key}}`, `{{a.b.c}}`
 - Objects cannot be interpolated directly; access a specific field instead
+- The top-level key `data` declares local data entries in an MDS module (§4.12). It is not a variable there.
 
 #### Reserved output keys
 
-Write `imports`, `type` (when its YAML value is `mds`), and `indented-directives` as plain top-level block keys.
+Write `imports`, `type` (when its YAML value is `mds`), `indented-directives`, and `data` as plain top-level block keys.
 Put each key at the start of a line, without quotes or a space before the colon.
 Follow the colon with a space, a tab, or the end of the line.
 See [Indented directives](#indented-directives) for the Boolean value rule.
-`plain_reserved_keys_are_removed_without_changing_other_bytes` checks all three keys.
+`plain_reserved_keys_are_removed_without_changing_other_bytes` checks `imports`, `type` and `indented-directives`.
 `strip_reserved_keys_preserves_colons_in_plain_keys` checks keys such as `imports:label`.
 `frontmatter_without_reserved_keys_keeps_its_bytes` confirms that `type: post` stays in standalone output.
+For `data`, `plain_data_headers_do_not_reach_output` checks a block value, a block value with a column-0 comment, and a one-line flow value.
+`non_plain_data_key_forms_return_the_fixed_form_error` checks the form message `` write `data:` at the start of a line ``.
+Both tests are in `crates/mds-core/tests/data_output.rs`.
 
 MDS reports `mds::yaml` for a non-plain reserved key in parsed frontmatter.
 Examples include quoted keys, explicit YAML keys, and reserved keys in flow-style frontmatter.
@@ -136,7 +140,25 @@ Sparse data, such as a few long strings, can reach a byte cap before the node ca
 Each file read needs an entry, and the entry cap counts entries before reads. Thus many
 small files reach the entry cap first, at the same count as the file cap
 (`crates/mds-core/tests/data_limits.rs`).
+`MAX_DATA_FILES` cannot bind before the 256 entry cap in a compile.
+`distinct_file_cap_passes_and_the_entry_cap_binds_before_the_file_cap` in `data_limits.rs` shows this.
+The unit test `data_file_cap_refuses_a_new_file_past_the_cap` in `crates/mds-core/src/resolver/module_scope.rs` checks the file cap itself.
 The entry and level caps depend on declarations, not on data density.
+
+Each limit fails with `mds::resource_limit` (exit 3). After the prefix `resource limit exceeded: `, the messages are:
+`file too large (<n> bytes, max 10485760 bytes): <file>`,
+`data file JSON node count exceeds maximum of 200000`
+(YAML: `data file YAML node count exceeds maximum of 200000 (anchors expanded by aliases count once per expansion)`),
+`"<module>": too many data entries (max 64 per module)`,
+`too many data entries (max 256 per compile)`,
+`too many data files (max 256 per compile)`,
+`data dependency graph exceeds 16 levels` and
+`data files exceed 33554432 bytes per compile`.
+`crates/mds-core/tests/data_limits.rs` has an at-cap and an over-cap test for each limit.
+For the file count, the over-cap case is the unit test above.
+A YAML data file also has the flow-nesting guard of frontmatter (1024 levels, `mds::resource_limit`).
+A data value nested deeper than 64 levels fails with `mds::data`
+(`data_value_depth_accepts_the_cap_and_refuses_one_more_level` in `crates/mds-core/src/data/convert_tests.rs`).
 
 ---
 
@@ -522,6 +544,7 @@ code shown.
 | Root containment | After resolution the canonical path must lie inside the project root (§5 Project Root). A `..` sequence or a symlinked parent that leads outside the root is refused; on the virtual backend, `..` above the virtual root is refused. | `mds::import` — `import path escapes project directory: "<path>"` |
 | Path encoding | An entry path or base directory that is not valid UTF-8 is refused at the public API boundary rather than converted lossily. On the native filesystem a resolved canonical path that is not valid UTF-8 — an entry, import or base directory reached through a symbolic link into a directory whose name is not — is refused as well, never keyed by its lossy form (which would name a different file). On the CLI this is exit 2 (§7.9), and a `-o` or `--out-dir` (`mds build`, `mds watch`) that is not valid UTF-8 is refused before any input is read or anything is created (#390). | `mds::io` — `path is not valid UTF-8` (entry path), `base_dir path is not valid UTF-8` (base directory), `resolved path is not valid UTF-8: "<path as written>"` (resolved path), or `-o/--output is not valid UTF-8: "<value>"` and `--out-dir is not valid UTF-8: "<value>"` (CLI; U+FFFD for each invalid sequence) |
 | Segment count | An import path of more than 256 segments is refused on both backends (on the virtual backend it is counted after it resolves against the importing directory), as is an entry file path resolved through `FileSystem::resolve_entry`. | `mds::resource_limit` — `import path exceeds maximum segment count (256)` |
+| Data file path | The path of a `data:` file entry (§4.12) follows the import path rules above: empty path, NUL bytes, forbidden characters, symlink rejection, root containment and segment count. It also starts with `./` or `../`, ends with exactly `.json`, `.yaml` or `.yml` (ASCII lower case), and holds no `{{`. No segment starts with `.` other than `.` and `..`, and no segment is `node_modules` in any ASCII case. The segment rules run again on the resolved key below the project root. On Windows a trailing dot or space of a segment does not hide `node_modules`. The native read opens the file without a wait on a named pipe, checks that the open file is the regular file that resolution found, and reads at most 10 MiB of UTF-8. The shared vector table `crates/mds-core/tests/fixtures/data-path-vectors.json` drives `native_paths_follow_the_shared_portable_table` in `crates/mds-core/tests/data_paths.rs`. The Windows forms run only in the Windows CI job (`windows_data_refuses_trailing_dot_and_short_name_forms`). | `mds::import` — `data path "<path>": <reason>`, for example `must start with './' or '../'`, `expected the .json, .yaml or .yml extension`, `dot-prefixed segments are not allowed` or `node_modules segments are not allowed`. The rules shared with imports keep the messages of their rows. A `{{` in a file path fails before this check, at declaration: `mds::data`, field `path`, `` file paths cannot contain `{{` `` (`file_paths_do_not_accept_references_or_their_escape` in `crates/mds-core/src/data/decl_tests.rs`). An absent native file is `mds::file_not_found`; a virtual miss is `mds::module_not_found` (`data file '<key>' is not in the virtual module map`) |
 
 Enforced by `validate_relative_import`, `validate_entry_path`, `check_segment_count`,
 `NativeFs::check_symlink`, `NativeFs::anchor_base_dir` and `NativeFs::check_path_traversal`
@@ -919,10 +942,20 @@ The blank lines between sections come from the base skeleton (the blank line bet
 
 - Frontmatter from all ancestors is deep-merged in order: base < intermediate < child < runtime vars
 - Nested mappings are merged key-by-key; arrays replace wholesale; scalars: child wins
-- The merge excludes top-level `imports`, `type`, `extends`, and `indented-directives`. See
+- The merge excludes top-level `imports`, `type`, `extends`, `indented-directives`, and `data`. See
   `deep_merge_yaml_reserves_every_reserved_output_key`, `deep_merge_yaml_reserved_keys_excluded`,
   and `indented_directives_never_merges_as_a_top_level_key`.
 - Per-file `imports:` entries in frontmatter are each resolved against their own file's location
+- `data:` entries (§4.12) merge by name, in chain order. A child entry replaces the whole base entry
+  of the same name, and MDS does not read the file of the replaced entry
+  (`child_replaces_the_whole_entry_and_the_base_file_is_not_read`).
+  Each file path resolves against the directory of the file that declares it
+  (`inherited_files_use_the_directory_of_each_declaration`).
+  References, the graph checks and the name collision checks use the merged scope
+  (`inherited_references_see_the_child_scope_before_any_data_read`,
+  `collisions_use_frontmatter_and_import_aliases_from_the_chain`).
+  These tests are in `crates/mds-core/tests/data_extends.rs`.
+  The output has no `data` key (`extends_merges_info_but_omits_both_data_headers` in `crates/mds-core/tests/data_output.rs`).
 - The compiled output contains the **deep-merged** frontmatter. It includes base-only and child-only keys.
   The child wins when keys collide. See `f4_extends_emits_deep_merged_frontmatter`.
 - If the merged map still contains a reserved output key at the top level, MDS reports `mds::internal`.
@@ -1016,6 +1049,340 @@ For the base skeleton:
 
 ---
 
+### 4.12 Data Sources (`data:`)
+
+The top-level frontmatter key `data` declares data entries in an MDS module: a `.mds` file, or a
+`.md` file with `type: mds`. Each entry binds one name in the file scope of its module (§6).
+In a plain `.md` file, `data` stays an ordinary frontmatter variable
+(`plain_markdown_keeps_data_as_a_frontmatter_variable` in `crates/mds-core/src/resolver/module_scope.rs`,
+`typed_markdown_uses_the_mds_data_scope` in `crates/mds-core/tests/data_resolve.rs`).
+
+```mds
+---
+data:
+  settings: ./settings.json
+  rows: ../shared/rows.yml
+---
+Hello {{settings.name}}!
+@for row in rows:
+- {{row.title}}
+@end
+```
+
+`build_binds_json_and_yaml_entries_to_the_expected_bytes` in `crates/mds-cli/tests/cli_data.rs`
+compiles `.json`, `.yaml` and `.yml` entries.
+
+#### Entry forms
+
+The value of `data` is a mapping. Each key is an entry name. Each value has one of three forms:
+
+| Form | Example | In this release |
+|------|---------|-----------------|
+| Local file | `./settings.json`, `../shared/rows.yml` | MDS reads and converts the file. |
+| URL | `https://example.com/items/{{id}}` | MDS checks the declaration. It does not fetch the URL. |
+| Request map | `{url: "https://example.com/items", method: POST, body: {id: 1}}` | MDS checks the declaration. It does not fetch the URL. |
+
+- A string that starts with `./` or `../` is a local file entry. The path rules are in §4.6
+  "Filesystem constraints", row "Data file path".
+- A string with a URI scheme is a URL entry. The scheme must be the literal `https`
+  (`expected the literal https scheme`). The authority is literal and has no trailing host dot.
+  The URL has no backslash and no fragment. A query needs a path.
+- A request map has the fields `url` (required), `method`, `headers`, `body`, `cache` and `accept`.
+  `method` is `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` or `OPTIONS`. `accept` is `json`,
+  `yaml` or `text`. `cache` is a count with the unit `s`, `m`, `h` or `d`, or `forever`, or `off`.
+  A header name is a literal token. A header value is a string, or a map of `secret` (an
+  identifier) and `prefix` (a literal string). A `body` is a mapping or a literal string, with no
+  YAML tags. Another field fails (`unknown request field`).
+- Any other value fails with `mds::data`: `expected a dot-relative path, an HTTPS URL or a request map`.
+  The help is `` `data` is reserved for data sources; rename the variable ``. A `data` value that
+  is not a mapping fails with the same help (`expected a mapping of data entries`).
+
+Tests: `unknown_forms_have_rename_help`, `both_url_forms_require_a_literal_https_origin`,
+`exact_method_accept_and_cache_grammars` and `header_grammar_keeps_names_and_secret_parts_literal`
+in `crates/mds-core/src/data/decl_tests.rs`.
+
+#### Entry names
+
+An entry name is an identifier (`data entry name must be an identifier`). The names `prompt`,
+`imports`, `type`, `extends`, `data` and `indented-directives` are reserved
+(`data entry name is reserved`). An entry name that is also a frontmatter variable or an import
+alias in scope fails with `mds::name_collision`. This applies also when a runtime variable replays
+the entry (`names_must_be_non_reserved_identifiers` and `names_cannot_hide_frontmatter_or_aliases`
+in `decl_tests.rs`, `declarations_cannot_claim_frontmatter_or_import_alias_names_even_with_replay`
+in `data_resolve.rs`). A runtime variable named `data` is legal. It is a variable, not a
+declaration (`runtime_data_mapping_is_not_a_declaration` in `data_resolve.rs`,
+`a_runtime_data_variable_defines_no_entry` in `crates/mds-cli/tests/cli_data.rs`).
+
+#### References and the data graph
+
+A URL, a header value or a body string can contain references: `{{name}}` or `{{name.field}}`.
+A reference names an entry, a frontmatter variable or a runtime variable. It is an identifier or
+a dotted path of at most 32 segments. `\{{` writes a literal `{{`. A file path cannot contain `{{`
+(`` file paths cannot contain `{{` ``). An unquoted `{{…}}` in YAML is a flow map with one map key
+and a null value. MDS refuses that shape with the help `` quote the value that contains `{{…}}` ``.
+Tests: `references_accept_only_identifier_paths_within_the_segment_limit`,
+`bare_flow_reference_shape_gets_quote_help` and `file_paths_do_not_accept_references_or_their_escape`
+in `decl_tests.rs`.
+
+The references make a graph of entries. MDS checks the graph of every module before it reads a
+local data file (`graph_errors_precede_local_data_reads` in `crates/mds-core/tests/data_graph.rs`,
+`graph_errors_in_a_later_module_precede_local_data_reads` in `data_resolve.rs`):
+
+- An unknown name fails with `mds::data` (`unknown data reference name "<name>"`,
+  `graph_refuses_an_unknown_root_in_the_declaring_module` in `crates/mds-core/src/data/graph_tests.rs`).
+- A cycle fails with `mds::data` (`blocked by a data dependency cycle`,
+  `graph_refuses_self_and_two_node_cycles`).
+- A graph deeper than 16 levels fails with `mds::resource_limit`
+  (`public_check_accepts_sixteen_levels_and_refuses_seventeen` in `data_graph.rs`).
+
+MDS inserts a data value once and does not scan it again. Thus a `{{unknown}}` in a data value
+is literal text in the output, and a data value adds no module edge
+(`data_values_are_text_and_do_not_add_module_edges` in `data_resolve.rs`).
+
+#### Replay and network access
+
+A runtime variable with the name of an entry replays that entry: `--vars`, `--set`,
+`--set-string`, or the `vars` of a binding. The replay value replaces the entry in every module of
+the compile, and MDS reads nothing for it (`replay_replaces_the_entry_in_the_root_and_in_imported_modules`
+in `data_resolve.rs`, `replay_through_vars_file_set_and_set_string_reads_no_file` in `cli_data.rs`).
+The declaration checks above still apply to a replayed entry (`replay_cannot_skip_static_validation`
+in `graph_tests.rs`), and so do the type checks of the body (`replay_keeps_static_type_checks` in
+`crates/mds-core/tests/data_tooling.rs`). The data rules below apply only to a file that MDS reads.
+
+This release sends no network request. A URL entry with no replay value fails with
+`mds::network_denied` (exit 2), for example:
+
+```text
+network access denied for data entries: "main.mds", entry "web"; "main.mds", entry "api"
+```
+
+The help is `provide a runtime value for each entry to replay it without network access`. The
+list holds each URL entry with no replay value once: modules in the order they first resolve, and
+entries in declaration order. The denial comes before any local data read
+(`url_frontier_precedes_local_reads_and_follows_module_then_declaration_order` in `data_tooling.rs`,
+`frontier_lists_a_shared_base_entry_once_in_declaring_module_order` in `data_tooling.rs`,
+`frontier_keeps_module_and_declaration_order` in `graph_tests.rs`,
+`build_denies_network_entries_without_replay_and_opens_no_connection` in `cli_data.rs`).
+
+#### Conversion
+
+The extension of the resolved file selects the parser.
+
+- `.json`: the strict JSON parser `serde_json`. It accepts JSON syntax only. A YAML comment in a
+  `.json` file is a syntax error. A key can be longer than 1,024 characters. Escaped surrogate
+  pairs decode to one character. `-0` keeps its sign. `1e400` fails with `mds::data`, because it is
+  not a finite number.
+  Tests: `syntax_errors_name_the_data_file_and_entry_without_source_text` in
+  `crates/mds-core/tests/data_convert.rs`; `json_key_past_1024_characters_preserves_the_value`,
+  `json_surrogate_pair_preserves_the_value`, `json_minus_zero_preserves_the_sign` and
+  `both_parsers_refuse_a_json_exponent_out_of_range` in `crates/mds-core/src/data/corpus_tests.rs`.
+- `.yaml` and `.yml`: the bounded YAML parser of frontmatter (§4.1), with the same flow-nesting and
+  alias bounds. It accepts YAML syntax, tags included. A tag does not change the value:
+  `!local 42` is the number 42 (`one_document_only_and_yaml_tags_are_accepted` in
+  `crates/mds-core/src/data/convert_tests.rs`, `data_uses_bounded_format_parsers` in `data_convert.rs`).
+
+Then one conversion applies the data rules to both formats:
+
+- The file is UTF-8. MDS removes one leading BOM (U+FEFF). A second BOM fails
+  (`utf8_and_one_leading_bom_apply_to_every_format`).
+- A file holds one value. A second YAML document fails (`one_document_only_and_yaml_tags_are_accepted`).
+- A duplicate key fails, also after JSON escapes decode (`duplicate JSON object key`,
+  `data_json_refuses_duplicate_decoded_keys` in `corpus_tests.rs`).
+- Numbers past ±2^53 are refused, of any type: an integer or a float below -2^53 or above 2^53 fails
+  with `number exceeds the allowed range of -2^53 to 2^53`. -2^53 and 2^53 pass. MDS checks the
+  value before it rounds it
+  (`data_numbers_refuse_integers_past_the_limit_before_rounding`, `data_numbers_refuse_finite_floats_past_the_limit`,
+  `data_numbers_refuse_integers_outside_the_64_bit_range` and
+  `data_numbers_refuse_integers_that_parse_as_floats_in_both_formats` in `convert_tests.rs`).
+  Frontmatter keeps its own number rule: `9007199254740993` in frontmatter becomes
+  `9007199254740992` (`frontmatter_keeps_its_number_policy` in `data_convert.rs`,
+  `frontmatter_numbers_past_the_data_limit_keep_their_values` in `convert_tests.rs`).
+- A number that is not finite fails: JSON `1e400`, YAML `.inf`, `-.inf` and `.nan`
+  (`non_finite_yaml_numbers_fail`).
+- A CRLF in a string value becomes LF. A lone CR fails, and so does a CR in a key
+  (`only_crlf_in_values_normalizes_to_lf`, `converts_crlf_only_in_string_values` in `data_convert.rs`).
+- A key or a string value that contains a character of the diagnostic escape class of §7.5 after
+  decode fails. The class is a C0 control other than TAB and LF, DEL, a C1 control, U+061C,
+  U+200E, U+200F, U+2028, U+2029, U+202A to U+202E, U+2066 to U+2069 and U+FEFF. The tests use
+  U+001B, U+202E and U+2028. The message names the entry and the escaped key path (`forbidden character in a data string or key`,
+  `class_checks_use_decoded_keys_and_values`, `decoded_keys_and_values_refuse_disallowed_characters`
+  in `data_convert.rs`).
+- A value nested deeper than 64 levels fails
+  (`data_value_depth_accepts_the_cap_and_refuses_one_more_level`).
+
+These rules apply to the text of a data file only. A runtime value keeps the rules of runtime
+variables. The rules do not remove zero-width or tag characters. They make no claim about the
+meaning of the text in a prompt.
+
+#### Errors
+
+A data file that does not parse fails with `mds::yaml`, for JSON too. The message names the file
+below the project root and the entry, escaped. It shows no source text and has no span:
+
+```text
+YAML parse error: data file "settings.json", entry "settings": invalid JSON data
+```
+
+A YAML file gives `invalid YAML data` in the same form
+(`syntax_errors_name_the_data_file_and_entry_without_source_text` in `data_convert.rs`,
+`syntax_diagnostic_wire_escapes_the_file_and_entry_labels` in `convert_tests.rs`).
+
+A value that breaks a data rule, and an invalid declaration, fail with `mds::data`. The message is
+`data error in "<module>", entry "<entry>", field "<field>": <reason>`, without the parts that do
+not apply (`diagnostics_escape_names_and_fields_but_do_not_show_values` in `decl_tests.rs`). The
+YAML parser also reports a duplicate key, a raw control character, a second document and its
+recursion limits. MDS reports these as `mds::data` with the reason `invalid YAML data`
+(`decoded_keys_and_values_refuse_disallowed_characters`). The limits in §4.1 "Local data limits"
+fail with `mds::resource_limit`.
+
+#### Reads and the per-compile memo
+
+MDS reads, parses and converts each canonical data file once per compile. All entries that name
+the same file, through any module or alias, share the one value. A second use charges no data bytes
+again (`one_canonical_file_is_read_once_across_three_modules` in
+`crates/mds-core/src/resolver/module_scope.rs`,
+`canonical_memo_does_not_charge_data_bytes_again_for_an_alias_or_another_module` in `data_resolve.rs`).
+The native backend opens the file without a wait on a named pipe. It checks that the open file is
+the regular file that resolution found before it reads the first byte
+(`data_open_refuses_a_pipe_after_the_pre_open_type_check` in `crates/mds-core/src/fs.rs`,
+`native_data_refuses_final_links_and_directory_links_outside_the_root` in
+`crates/mds-core/tests/data_paths.rs`). A native file that does not exist fails with
+`mds::file_not_found`. A key that is not in a virtual module map fails with `mds::module_not_found`:
+`data file '<key>' is not in the virtual module map`, with the help
+``add the data file to `options.modules` or use the native backend``
+(`native_and_virtual_data_misses_name_the_file` in `data_paths.rs`). A `FileSystem` backend that
+does not implement `read_data` refuses every data read with `mds::io`:
+`this file system does not read data files`. It never reads a data file as a module
+(`backend_without_data_support_never_falls_back_to_module_read` in `data_paths.rs`).
+
+#### The `@message` role
+
+A `@message` role must not depend on a data entry. A role that does fails with `mds::data`:
+
+```text
+data error in "main.mds": @message role must not depend on a data entry
+```
+
+The help is `write a literal role, or select a literal role with @if`. The message names the file
+that contains the role, which is the base file for a role in an `@extends` base. The rule is
+conservative. It applies in a scope that declares data entries, or that binds a function, a
+namespace or a prompt that can return data. In such a scope, these roles count as data:
+
+- a variable or field of a data entry, also when a runtime value replays the entry;
+- a loop variable over a data value, as an item, a key or a value;
+- a built-in call with an argument that counts as data;
+- any call of a `@define` function or an imported function, and any qualified call such as
+  `{{roles.make()}}`, whatever the function returns;
+- the `prompt` of a module that declares data, from `@import { prompt } from "…"`.
+
+A literal role passes. Tests in
+`crates/mds-core/tests/data_role.rs`: `a_data_field_cannot_supply_a_role`,
+`a_replayed_entry_keeps_its_provenance`, `an_array_item_keeps_the_iterables_provenance`,
+`a_builtin_call_keeps_argument_provenance`, `a_function_from_a_module_with_data_cannot_supply_a_role`,
+`an_imported_prompt_from_a_module_with_data_cannot_supply_a_role` and
+`an_extends_base_function_over_data_cannot_supply_a_role`.
+
+#### Dependencies and import records
+
+`CompileResult.dependencies` lists the imported modules first, in the order they first resolve.
+Then it lists the data files that the compile read, in first-read order. The entry binds its own
+entries before it resolves its imports. Each file occurs once. A replayed entry and a URL entry
+add nothing. A virtual compile lists keys, and a native compile lists absolute paths. For example:
+`["a.mds", "b.mds", "shared.json", "own.yml", "parts/a.json"]`
+(`dependencies_list_modules_then_data_files_in_first_read_order` in `data_resolve.rs`,
+`native_dependencies_list_data_files_after_modules` in `crates/mds-core/tests/api_surface.rs`,
+`test_d8_dependencies_list_modules_then_data_files_in_first_read_order` in
+`crates/mds-python/tests/test_data.py`).
+
+`scan_import_records` lists data files as records of the kind `ImportKind::Data`
+(`name()` is `"data"`). The data records come last, in both `ResolveAs` orders. Each record is the
+file path as written, once per path, in declaration order, with no span and no frontmatter index.
+A module record of the same path stays a separate record. URL entries are not listed. The scan does
+not know the file type, so it also lists the entries of a plain `.md` file. A declaration error
+leaves out every data record of the module and fails nothing; the compile reports the error
+(`scan_import_records_list_local_data_files_as_a_separate_kind` in `api_surface.rs`,
+`scan_import_records_leave_data_declaration_errors_to_the_compile` in `crates/mds-core/src/lib.rs`).
+`scan_imports` lists modules only (`test_d9_scan_imports_lists_modules_only` in `test_data.py`).
+
+#### Check, lint and format read no data
+
+`check`, `lint`, `lint --fix` and `fmt` read no data file, on the CLI and in the Rust API.
+The same applies to `check_virtual`, `lint_virtual` and the other check and lint calls of the
+Python binding. An entry that no runtime value replays is pending: the checks treat it as defined,
+with an unknown type. When any entry is pending, the check evaluates no module of the compile. It
+returns one warning that names the pending entries:
+
+```text
+data pending; output was not evaluated: "main.mds", entry "rows"; "main.mds", entry "other"
+```
+
+`mds check` prints this line to stderr with no `warning:` prefix, and exits 0. A data file that is
+absent or does not parse does not fail a check or a lint. An undefined variable still fails.
+`mds fmt` formats the file through its structural gate (§7.4).
+Tests: `tooling_reads_no_data_file` in `cli_data.rs`; `tooling_checks_pending_variables_without_opening_data`,
+`pending_data_suppresses_evaluation_even_in_earlier_imports` and
+`selective_prompt_import_has_unknown_value_until_replay` in `data_tooling.rs`;
+`test_d5_check_calls_read_no_data_file_and_warn_once` and `test_d6_lint_calls_read_no_data_file`
+in `test_data.py`. The evaluator refuses a read of a pending entry with `mds::internal`
+(`evaluator_refuses_pending_variable_reads` in `crates/mds-core/src/evaluator.rs`).
+For `@mdscript/mds`, `checkFile` on the WASM backend gives the same result as the native backend
+(U-WCF15 in `packages/mds/__test__/wasm-compileFile.spec.mjs`).
+
+#### Virtual module maps
+
+`compile_virtual`, `check_virtual` and `lint_virtual` in Python, the WASM `options.modules` map, and
+the napi `lintVirtual` map hold module text and data text. A key is a data file when
+`mds::is_data_path` accepts it: the key ends in exactly `.json`, `.yaml` or `.yml`
+(`data_paths_are_named_by_their_exact_extension` in `api_surface.rs`). Every other key is a module.
+The bindings check the map in this order, with `mds::resource_limit`:
+
+1. More than 257 module keys, the entry included:
+   `<field> exceeds maximum module count of 257 (<n> provided)`.
+2. More than 256 data keys (`mds::MAX_DATA_FILES`), counted before any value check:
+   `<field> exceeds maximum data file count of 256 (<n> provided)`.
+3. Each value, one at a time: at most 10 MiB
+   (`<field>["<key>"] exceeds maximum size of 10485760 bytes (<n> bytes provided)`).
+   MDS then adds the value to the total of its kind. The module text is at most 10 MiB in total
+   (`<field> aggregate size exceeds maximum of 10485760 bytes`). The data text is at most 32 MiB in
+   total (`mds::MAX_DATA_BYTES`, `<field> data aggregate size exceeds maximum of 33554432 bytes`).
+
+`<field>` is `options.modules` for the WASM compile and check calls, and `modules` for the napi
+`lintVirtual`, the WASM `lintVirtual` and the Python calls. A Python `dict` with more than 513 keys
+gets the count error before MDS converts any value
+(`test_d17_a_large_dict_is_refused_before_any_value_is_converted`).
+Tests: `virtual_map_counts_modules_and_data_files_apart` and
+`virtual_map_bounds_module_and_data_bytes_apart` in `crates/mds-wasm/tests/web.rs`;
+'lintVirtual counts modules and data files apart (#405)' and
+'lintVirtual bounds module and data bytes apart (#405)' in `crates/mds-napi/__test__/index.spec.mjs`;
+`test_d15_map_holds_the_entry_256_modules_and_256_data_files` to
+`test_d18_map_bounds_module_and_data_text_apart` in `test_data.py`.
+
+The WASM export `preflightData(bytes, display)` checks the bytes of one data file as the native
+backend does, and returns its text. More than 10 MiB fails with `mds::resource_limit`
+(`file too large (<n> bytes, max 10485760 bytes): <display>`). Bytes that are not UTF-8 fail with
+`mds::io` (`invalid UTF-8 in <display>: <reason>`). It runs no file type check
+(`preflight_data_returns_the_text_or_the_native_error` in `web.rs`).
+
+Until a later release, the WASM backend of `@mdscript/mds` (`compileFile`) refuses a data entry with
+`mds::module_not_found` and names the data file. The WASM `scanImportRecords` leaves out data
+records for now (U-WCF15 in `packages/mds/__test__/wasm-compileFile.spec.mjs`,
+`scan_import_records_leave_out_data_records` in `web.rs`). The native backend of `@mdscript/mds`
+reads the data file (the control in U-WCF15). The napi `compile` and `compileFile`, and the WASM
+`compile` with an `options.modules` map, bind data
+('D-1: compile and compileFile bind .json, .yaml and .yml data to the same output' in
+`index.spec.mjs`, `compile_binds_json_and_yaml_data_from_the_modules_map` in `web.rs`).
+
+#### Known limits
+
+- A `.json` file and a `.yaml` or `.yml` file use different parsers. The same text can give a
+  value in one format and an error in the other. For example, a YAML comment is valid in a `.yaml`
+  file and a syntax error in a `.json` file.
+- This release fetches no URL. A URL entry needs a replay value.
+- A data file counts toward the compile memory budget (§5). Dense data can reach that budget before
+  the 32 MiB data limit (`assert_data_items_share_one_limit` in `crates/mds-core/tests/memory_bound.rs`).
+
+---
+
 ## 5. Compilation Model
 
 | Phase | Description | Errors |
@@ -1038,6 +1405,13 @@ counts these parts:
 - values that evaluation makes: call and built-in results, argument copies, computed
   loop iterables, loop and call frames, and rendered interpolations;
 - the text of each module that the compile reads, while that module resolves;
+- local data (§4.12): the data declarations of each module, the text of each data file while
+  it converts, and the converted value of each distinct data file, once per compile
+  (`conversion_releases_temporary_bytes_and_keeps_only_value_bytes` in
+  `crates/mds-core/src/data/convert_tests.rs`). A second use of the same file does not charge
+  its data bytes again
+  (`canonical_memo_does_not_charge_data_bytes_again_for_an_alias_or_another_module` in
+  `crates/mds-core/tests/data_resolve.rs`);
 - an estimate of the syntax tree of each module that the compile parses: a cached
   import, an `@extends` base, the file entry and the string entry ("Syntax tree
   estimate" below);
@@ -1126,6 +1500,8 @@ The budget does not count these stages:
 - the caller's own map of runtime variables (the compiler's copy is counted);
 - the line table of a source map;
 - the YAML event buffer of one frontmatter parse, whose input is at most 1 MiB;
+- the YAML event buffer of one YAML data file parse, whose input the 10 MiB data file cap
+  bounds;
 - the conversion of a result into the host types of a binding (napi, WASM, Python);
 - the old buffer that a reallocation holds for one instant when it moves a buffer;
 - resolver warnings, the message and warning lists, and the call stack, which their
@@ -1139,7 +1515,8 @@ output pass for a compile that writes output. A module of the densest syntax who
 estimate does not fit grows the heap by at most 56 bytes per source byte, because the
 compiler does not build its tree. The test's `assert_syntax_tree_peaks` checks the estimate
 against the 62 source shapes, and the lexer stage against the 56-byte bound for the
-densest syntax, two tokens for each four source bytes.
+densest syntax, two tokens for each four source bytes. Its data case,
+`assert_data_items_share_one_limit`, reads JSON data files only.
 
 ### Project Root
 
@@ -1179,6 +1556,7 @@ See `reserved_strip_preserves_kept_line_bytes` and `frontmatter_without_reserved
 - Runtime variable overrides affect the body but do not alter the output frontmatter. See `frontmatter_runtime_override_doesnt_alter_output`.
 - Only the root module contributes standalone output frontmatter. See `frontmatter_imported_module_not_emitted`.
 - For `@extends`, MDS emits the [deep-merged mapping](#411-template-inheritance-extends--block) instead. See `f4_extends_emits_deep_merged_frontmatter`.
+- A `data` header never reaches the output: not in a standalone module, not in a `.md` file with `type: mds`, and not in a merged `@extends` mapping. A column-0 comment in its block stays, as for the other reserved keys. See `plain_data_headers_do_not_reach_output`, `markdown_with_mds_type_strips_data` and `extends_merges_info_but_omits_both_data_headers` in `crates/mds-core/tests/data_output.rs`.
 
 ### Error Format
 
@@ -1222,19 +1600,19 @@ and I/O failures are described below the table.
 | `mds::type_error` | `@for` over a value that is not an array | evaluator | 1 / 2 | all |
 | `mds::type_mismatch` | Cross-type `==` / `!=` comparison | evaluator | 1 / 2 | all |
 | `mds::circular_import` | Import graph contains a cycle | resolver | 1 / 2 | all |
-| `mds::file_not_found` | Entry file or import target does not exist, or a directory above it does not, or the path cannot otherwise be resolved — a symlink loop, a name too long, a directory that cannot be searched (native filesystem) | `NativeFs`, CLI input check; `@mdscript/mds`'s WASM-backend file pre-scanner, with the native message | 2 / 2 | CLI, Rust, napi, Python, `@mdscript/mds` |
-| `mds::import` | An `@import` the resolver refuses: not `./`/`../`-relative, empty, NUL byte, a forbidden path character, symlinked final component, escapes the project root, or another import-directive violation (§4.6 "Filesystem constraints"). The `@mdscript/mds` WASM backend also reports this code if one virtual name would refer to two different files. | resolver, `NativeFs`, `VirtualFs`, `@mdscript/mds` WASM-backend pre-scanner | 1 / 2 | all |
-| `mds::name_collision` | A merge import or definition redefines a name already in scope | resolver | 1 / 2 | all |
+| `mds::file_not_found` | Entry file, import target or local data file (§4.12) does not exist, or a directory above it does not, or the path cannot otherwise be resolved — a symlink loop, a name too long, a directory that cannot be searched (native filesystem) | `NativeFs`, CLI input check; `@mdscript/mds`'s WASM-backend file pre-scanner, with the native message | 2 / 2 | CLI, Rust, napi, Python, `@mdscript/mds` |
+| `mds::import` | An `@import` the resolver refuses: not `./`/`../`-relative, empty, NUL byte, a forbidden path character, symlinked final component, escapes the project root, or another import-directive violation (§4.6 "Filesystem constraints"). Also a local data file path that breaks the data path rules (`data path "<path>": <reason>`, §4.6 row "Data file path"). The `@mdscript/mds` WASM backend also reports this code if one virtual name would refer to two different files. | resolver, `NativeFs`, `VirtualFs`, `@mdscript/mds` WASM-backend pre-scanner | 1 / 2 | all |
+| `mds::name_collision` | A merge import or definition redefines a name already in scope; a data entry has the name of a frontmatter variable or an import alias in scope, also under replay (§4.12) | resolver | 1 / 2 | all |
 | `mds::not_mds` | An entry file, or the target of an `@import`, `@export … from`, frontmatter import or `@extends`, is not an MDS file (neither a `.mds` file nor a `.md` file whose frontmatter declares `type: mds`). The message names the path as the caller typed it — the entry path as passed, or the string as written in the template — escaped, never the resolved absolute path (#417). A directive import's span points at the importer's directive line; an entry and a frontmatter `imports:` entry have no span (#423) | resolver; `mds fmt`/`mds lint` file-argument check; `@mdscript/mds`'s WASM-backend pre-scanner, through the resolver's own check (`preflightModule`) | 2 / 2 | all |
-| `mds::io` | Filesystem or I/O failure; a path or base directory that is not valid UTF-8; an entry path or virtual entry key that is empty or contains a NUL byte; an entry path, entry key, base directory, resolved canonical path or `lint_str_named` file name carrying a forbidden path character (§4.6); a `VirtualFs::with_aliases` alias refused — the alias, or the module key it names, not a normalized module key, the alias a module key itself, or the module key naming no module (`module alias "<alias>": <reason>`, #414); on the CLI also a `--vars` file that is a symlink, a directory argument that is a symlink or the filesystem root (#413), an output path that is the entry file itself, or an output that would replace an MDS module or a file the run reads — the entry, an imported module, the `--vars` file or the `mds.json` in force, and in directory mode the `mds.json` nearest the source (#425), a `-o`/`--out-dir`/`build.output_dir`/`mds init` path carrying a forbidden path character (for `-o`/`--out-dir`/`build.output_dir`, as written or as resolved), a `-o`/`--out-dir` value that is not valid UTF-8, a working directory that cannot be determined when a relative `-o`/`--out-dir`, a source map's base or `mds lint -`'s base needs it (`cannot determine current directory: <reason>`, the words mds-core uses when a string compile given no base directory cannot determine it, #390), a working directory that auto-detection cannot list (`cannot read directory .: <reason>`, #390), a `build.output_dir` that is absolute or contains `..`, a `lint --fix` rewrite refused by the compile-equivalence check, an `mds fmt` or `mds lint --fix` rewrite of a file that changed after it was read (`"<path>" changed since it was read; not written`, §7.4, #160), the stream and I/O failures listed below the table (#157), and an `mds watch` file-mode rebuild refused because the entry's path as typed now leads to a different file than the one being watched (a symlinked directory on it retargeted: `watched entry now resolves to a different file: "<path>"; restart mds watch to follow it`, #417), or a directory-mode rebuild refused because the directory argument, or a source below it, as typed now leads to a different directory or file than the one being watched (`watched directory now resolves to a different directory: "<dir>"; restart mds watch to follow it`, `watched file now resolves to a different file: "<dir>/<path below it>"; restart mds watch to follow it`; §7.2, #413), or a write below its out-dir refused because the out-dir as typed now leads to a different directory than the one the session started with (`cannot write <path>: the output directory now resolves to a different directory; restart mds watch to follow it`; §7.2, #160) | `mds-core` API boundary, resolver, `NativeFs`, `VirtualFs`, CLI, `@mdscript/mds` WASM-backend pre-scanner | 2 / 2 | all |
-| `mds::resource_limit` | A documented limit exceeded (§4.1 resource-limits table, `SECURITY.md`), CLI stdin over 10 MiB included; bindings also raise it before compilation for oversized sources, module and alias maps, and their counts (as `VirtualFs::with_aliases` does for an alias map); `@mdscript/mds`'s WASM-backend pre-scanner raises the native error for a path over the segment cap, a file over the size cap and a module over the module count, and one of its own for modules that together pass 10 MiB. The WASM file APIs also report this code if the resolved path of an alias target has more than 256 segments below the project root. This applies even to a short import path. | evaluator, resolver, `VirtualFs`, bindings, `@mdscript/mds` WASM-backend pre-scanner | 3 / 3 | all |
+| `mds::io` | Filesystem or I/O failure; a path or base directory that is not valid UTF-8; an entry path or virtual entry key that is empty or contains a NUL byte; an entry path, entry key, base directory, resolved canonical path or `lint_str_named` file name carrying a forbidden path character (§4.6); a `VirtualFs::with_aliases` alias refused — the alias, or the module key it names, not a normalized module key, the alias a module key itself, or the module key naming no module (`module alias "<alias>": <reason>`, #414); a `FileSystem` backend with no data support asked for a data file (`this file system does not read data files`, §4.12); on the CLI also a `--vars` file that is a symlink, a directory argument that is a symlink or the filesystem root (#413), an output path that is the entry file itself, or an output that would replace an MDS module or a file the run reads — the entry, an imported module, a data file that the compile read (§4.12), the `--vars` file or the `mds.json` in force, and in directory mode the `mds.json` nearest the source (#425), a `-o`/`--out-dir`/`build.output_dir`/`mds init` path carrying a forbidden path character (for `-o`/`--out-dir`/`build.output_dir`, as written or as resolved), a `-o`/`--out-dir` value that is not valid UTF-8, a working directory that cannot be determined when a relative `-o`/`--out-dir`, a source map's base or `mds lint -`'s base needs it (`cannot determine current directory: <reason>`, the words mds-core uses when a string compile given no base directory cannot determine it, #390), a working directory that auto-detection cannot list (`cannot read directory .: <reason>`, #390), a `build.output_dir` that is absolute or contains `..`, a `lint --fix` rewrite refused by the compile-equivalence check, an `mds fmt` or `mds lint --fix` rewrite of a file that changed after it was read (`"<path>" changed since it was read; not written`, §7.4, #160), the stream and I/O failures listed below the table (#157), and an `mds watch` file-mode rebuild refused because the entry's path as typed now leads to a different file than the one being watched (a symlinked directory on it retargeted: `watched entry now resolves to a different file: "<path>"; restart mds watch to follow it`, #417), or a directory-mode rebuild refused because the directory argument, or a source below it, as typed now leads to a different directory or file than the one being watched (`watched directory now resolves to a different directory: "<dir>"; restart mds watch to follow it`, `watched file now resolves to a different file: "<dir>/<path below it>"; restart mds watch to follow it`; §7.2, #413), or a write below its out-dir refused because the out-dir as typed now leads to a different directory than the one the session started with (`cannot write <path>: the output directory now resolves to a different directory; restart mds watch to follow it`; §7.2, #160) | `mds-core` API boundary, resolver, `NativeFs`, `VirtualFs`, CLI, `@mdscript/mds` WASM-backend pre-scanner | 2 / 2 | all |
+| `mds::resource_limit` | A documented limit exceeded (§4.1 resource-limits table, `SECURITY.md`), CLI stdin over 10 MiB included; bindings also raise it before compilation for oversized sources, module and alias maps, and their counts (as `VirtualFs::with_aliases` does for an alias map), with separate counts and totals for the data files of a module map (§4.12 "Virtual module maps"); `@mdscript/mds`'s WASM-backend pre-scanner raises the native error for a path over the segment cap, a file over the size cap and a module over the module count, and one of its own for modules that together pass 10 MiB. The WASM file APIs also report this code if the resolved path of an alias target has more than 256 segments below the project root. This applies even to a short import path. | evaluator, resolver, `VirtualFs`, bindings, `@mdscript/mds` WASM-backend pre-scanner | 3 / 3 | all |
 | `mds::yaml` | Frontmatter YAML the parser refuses (syntax, duplicate keys, nesting beyond the parser's limits — §4.1), or a [reserved output key form error](#reserved-output-keys). Also, a syntax error in a YAML or JSON data file. For a data file, the message names the project-relative file and the entry, escaped, without source text. | resolver | 1 / 2 | all |
 | `mds::json` | Malformed JSON, or a non-object root, in `load_vars_str` and other JSON sites except data files | `mds-core` vars API | 1 / 2 | Rust, CLI |
 | `mds::data` | Invalid data declaration or a data value that violates the data rules, such as a duplicate key or a number outside the supported range. The message names the project-relative module and, where applicable, the entry and field. These labels are escaped. The error has no source span. | resolver | 1 / 2 | CLI, Rust, napi, WASM, Python |
 | `mds::network_denied` | A compile needs a network data entry with no replay value. The message names the entries and their project-relative modules, escaped, with no source span. | resolver | 2 / 2 | CLI, Rust, napi, WASM, Python |
 | `mds::invalid_vars` | `--vars` file is malformed JSON or not an object (`load_vars_file`) | `mds-core` vars API | 1 / 2 | CLI, Rust |
 | `mds::var_conflict` | Same key given to both `--set` and `--set-string` | CLI | 1 / 1 | CLI |
-| `mds::module_not_found` | Virtual backend: a key absent from the module map | `VirtualFs` | 1 / 2 | napi, WASM, Python, Rust |
+| `mds::module_not_found` | Virtual backend: a key absent from the module map. For a data file: `data file '<key>' is not in the virtual module map` (§4.12). Until a later release, the WASM backend of `@mdscript/mds` (`compileFile`) gives this error for a data entry and names the data file | `VirtualFs`, `@mdscript/mds` WASM backend | 1 / 2 | napi, WASM, Python, Rust, `@mdscript/mds` |
 | `mds::recursion` | A `@define` calls itself, directly or indirectly | evaluator | 1 / 2 | all |
 | `mds::export` | `@export` of a name that is not defined, or an invalid re-export | resolver | 1 / 2 | all |
 | `mds::extends` | Template inheritance error (E1–E10, §4.11) | resolver | 1 / 2 | all |
@@ -1242,7 +1620,7 @@ and I/O failures are described below the table.
 | `mds::expected_markdown` | Rust API only: `CompileResult::into_markdown()` on a messages result | `mds-core` API | n/a | Rust |
 | `mds::expected_messages` | Rust API only: `CompileResult::into_messages()` on a markdown result | `mds-core` API | n/a | Rust |
 | `mds::formatter_invariant` | The formatter's rewrite failed the compile-equivalence gate — a formatter defect; nothing is written | formatter | 1 / n/a | CLI (`fmt`), Rust |
-| `mds::internal` | A lexer step that does not advance or a failed memory-counter check at the end of a compile (§5 "Compile memory budget"). Both give `internal compiler error` with no help and no span. Also: a panic caught at a binding boundary, or a result that could not be serialised; the raw payload is attached as `detail` only under the off-by-default `debug-panics` feature (`SECURITY.md`). On the CLI, also the error `mds lint --format json` records for an input whose analysis panicked, with the fixed message `internal compiler error` and nothing of the panic (§5 "Panics on the CLI") | lexer (the progress check); resolver (the counter check); napi, WASM, Python; `mds lint` | 101 / 101 | all |
+| `mds::internal` | A lexer step that does not advance or a failed memory-counter check at the end of a compile (§5 "Compile memory budget"), or an evaluator read of a pending data entry, which the check calls never do (§4.12). Each gives `internal compiler error` with no help and no span. Also: a panic caught at a binding boundary, or a result that could not be serialised; the raw payload is attached as `detail` only under the off-by-default `debug-panics` feature (`SECURITY.md`). On the CLI, also the error `mds lint --format json` records for an input whose analysis panicked, with the fixed message `internal compiler error` and nothing of the panic (§5 "Panics on the CLI") | lexer (the progress check); resolver (the counter check); napi, WASM, Python; `mds lint` | 101 / 101 | all |
 | `mds::invalid_options` | Malformed or type-incorrect options: unknown keys, wrong types, `basePath` on file methods or on the WASM backend, source-map options on `check`, an empty `basePath`, a WASM `moduleAliases` entry that is not a normalized module key or names no module (`options.moduleAliases["<alias>"]: <reason>`) | napi, WASM, Python, `@mdscript/mds` | n/a | napi, WASM, Python, `@mdscript/mds` |
 | `mds::filename_collision` | `options.modules` already contains the entry `filename` | WASM (surfaced through `@mdscript/mds`) | n/a | WASM, `@mdscript/mds` |
 | `mds::invalid_backend_result` | The selected backend returned a result of an unexpected shape | `@mdscript/mds` | n/a | `@mdscript/mds` |
@@ -1368,8 +1746,8 @@ by the bindings and do not exist in `mds-core`.
 
 ## 6. Scoping Rules
 
-1. **File scope**: frontmatter vars visible everywhere in that file
-2. **Runtime override**: `--vars` JSON values override frontmatter vars of the same name
+1. **File scope**: frontmatter vars visible everywhere in that file. The entries of a `data:` mapping (§4.12) are in file scope too.
+2. **Runtime override**: `--vars` JSON values override frontmatter vars of the same name. A runtime value with the name of a data entry replays that entry in every module of the compile, and MDS reads nothing for it (§4.12 "Replay and network access").
 3. **Block scope**: `@for` loop vars scoped to their `@for...@end` block
 4. **Function scope**: params scoped to function body, shadow outer vars
 5. **Import scope**: namespaced (aliased) or merged (unaliased), never implicit leaking
@@ -1456,7 +1834,7 @@ A route that fails to resolve — route 5 with a `build.output_dir` that is abso
 
 Whichever route resolves it, an output that is the entry file itself is refused before anything is written or any directory created — `mds::io`, exit 2, `output would overwrite the entry file: "<entry>"; write it elsewhere with -o <file> or --out-dir <dir>`, the entry named as typed (#425) — and without the `-o` extension-mismatch warning, which announces a write. The two paths are compared as the files they name, canonical with canonical, so another spelling of the entry — through `..`, a case variant on a case-insensitive volume, or a symlinked directory leading back to it — is the entry too. An output whose directory does not exist yet is resolved as the write will create it: a created directory is a plain one, so `-o newdir/../page.md` is `page.md`, and a symlink after the `..` is followed; a symlink at the output path itself is refused by the write (below), and a hard link to the entry is another name for it, not the entry's path: one to a `.md` entry that declares `type: mds` names an MDS module, and either is a file the run reads, which the write refuses (below) — on Windows, which compares paths, one to a `.mds` entry is replaced by the rename, so it is written and the entry keeps its content. Route 6 reaches the entry for a `.md` entry that declares `type: mds` and compiles to Markdown, as do routes 4 and 5 naming the entry's directory; route 2 can name any entry. `mds watch` in file mode refuses the same output at startup (exit 2) and, on a rebuild, reports the refusal and keeps watching. Directory mode compiles only `.mds` files, whose outputs are `.md` or `.json`, so no output there is its own entry.
 
-**An output never replaces an MDS module or a file the run reads (#425).** `mds build` and `mds watch` never write a compiled output, or a `.map` sidecar, over an MDS module — a `.mds` file, or a `.md` file whose frontmatter declares `type: mds` (§10.2), either of which a template can import — nor over a file the run reads: the entry, the modules its compile imported, the `--vars` file and the `mds.json` in force — and, in directory mode, also the `mds.json` nearest each source, the one `mds build <source>` would hold in force, which a directory run never reads but never writes over either (so `mds build .` refuses `sub/mds.mds`'s messages output `sub/mds.json` as `mds build sub/mds.mds` does). In directory mode, this input rule applies per source: its own compile's entry and imported modules. The `--vars` file and the `mds.json` files named above count too. So `mds build chat.mds --vars chat.json`, whose messages output is `chat.json`, and `mds.mds` beside `mds.json` are refused, as is `-o` naming a module the template imports and `-o` naming any `.mds` file, imported or not (only `-o` can name one: no other route ends in `.mds`). An output whose own frontmatter declares `type: mds` — a template that generates a module — is a module itself and may replace one: it rewrites its own output in `mds build` and `mds watch` alike, and replaces a module written by hand at its output path the same way. It is judged by its text, as the file at the output path is, and is still never written over a file the run reads. A generator may replace a module that another source of the same directory run imports. A source compiled before the generator reads the module as it was. Just before the rename (below), the file at the output path is looked at in the directory the write is in, without following a symlink. A regular `.mds` file there is a module by its name alone — mds-core imports any `.mds` file — and is never read. A regular `.md` file there (each extension taken in any case: on a case-insensitive volume `-o LIB.MD` names the file `lib.md`, and `-o LIB.MDS` the file `lib.mds`) is read as opened in that directory — on Unix from the descriptor the write walked to, never by path; on Windows by path — past its first line only when that line is a frontmatter fence, and then no further than the end of its frontmatter (the first `---` after it that begins a line — all the module check looks at), nor than 10 MiB: a fence that does not close by then is no module; one that cannot be read is refused (`cannot write <path>: cannot tell whether it is an MDS module: <cause>`, the read's cause last), since nothing tells it is no module. Any regular file there is compared with each file the run reads, looked up by its path at that moment, so a file an editor has replaced since it was read is the one compared: on Unix by device and inode, so a hard link to one of them is that file; on Windows, whose standard library gives no file index, by canonical path, so a hard link to one is another file there and is written over by the rename (the other name keeps its content); a target whose canonical path cannot be had, but that is not gone, is refused there with the cause, as a look that fails is on Unix. On Windows the file at the output path is judged by the name of the file it opens: Windows drops the dots and spaces a path's last component ends in, so `-o "lib.md."` and `-o "lib.md "` write `lib.md` and are judged as `lib.md`; an output whose file name holds a `:` — NTFS stream syntax, so `-o "lib.mds::$DATA"` names the file `lib.mds` itself and `-o "lib.md:x"` a stream of `lib.md` — is refused there before anything is written (`cannot write <path>: invalid filename`), as is any write, rewrite or removal of such a name (on Unix a `:` is an ordinary character). A module is refused `cannot write <path>: refusing to replace an MDS module (an output that declares type: mds is a generated module, and is rebuilt from its source)` — the way out, which an `mds::io` error has no help line of its own to carry, ends the cause — a file the run reads `cannot write <path>: refusing to replace a file this run reads` — `mds::io`, the path as its `Compiled to` line would name it — and the file is left as it is, with no temporary file left behind. The refusal comes at the write, after the directories the write needs have been made, and removes none: `-o nd/../lib.md`, with `nd` not there yet and `lib.md` a module or a file the run reads, is refused and leaves an empty `nd`, except on Windows, which resolves `..` in a path by its text, so that `nd` is never made (the entry's refusal, above, comes before any directory is made). `mds build` given a file exits 2; given a directory it goes on with the other sources and exits 2; `mds watch` reports the refusal at startup or on the rebuild, in file and directory mode, and keeps watching — a refused write is retried by the next rebuild of that source, and does not change how the session ends (§5 "Streams and I/O failures"). The refusal comes at the write, after the `-o` extension-mismatch warning, which is printed as before. A `.md` file that declares no `type: mds` — no frontmatter, another `type`, a `type: mds` below another key — is written over as before, as is any other file the run does not read. The check errs toward keeping a file: a `.md` file whose frontmatter declares `type: mds` is refused even when no import could load it — its frontmatter is not valid YAML, its closing line is `----`, it is larger than the 10 MiB a module may be, or it is not valid UTF-8 (judged with each invalid byte replaced) — since it declares itself a module, and replacing it would lose it. A module or a file the run reads put at the output path in the instant between that look and the rename is replaced.
+**An output never replaces an MDS module or a file the run reads (#425).** `mds build` and `mds watch` never write a compiled output, or a `.map` sidecar, over an MDS module — a `.mds` file, or a `.md` file whose frontmatter declares `type: mds` (§10.2), either of which a template can import — nor over a file the run reads: the entry, the modules its compile imported, the data files its compile read (§4.12), the `--vars` file and the `mds.json` in force — and, in directory mode, also the `mds.json` nearest each source, the one `mds build <source>` would hold in force, which a directory run never reads but never writes over either (so `mds build .` refuses `sub/mds.mds`'s messages output `sub/mds.json` as `mds build sub/mds.mds` does). In directory mode, this input rule applies per source: its own compile's entry and imported modules. The `--vars` file and the `mds.json` files named above count too. So `mds build chat.mds --vars chat.json`, whose messages output is `chat.json`, a messages template `chat.mds` whose data entry reads `./chat.json`, and `mds.mds` beside `mds.json` are refused (for data files: `build_never_writes_over_a_data_file_it_reads` in `crates/mds-cli/tests/cli_data.rs`, with the default output and with `-o`; `watch_never_writes_over_a_data_file_its_entry_reads` in `crates/mds-cli/tests/cli_watch.rs`), as is `-o` naming a module the template imports and `-o` naming any `.mds` file, imported or not (only `-o` can name one: no other route ends in `.mds`). An output whose own frontmatter declares `type: mds` — a template that generates a module — is a module itself and may replace one: it rewrites its own output in `mds build` and `mds watch` alike, and replaces a module written by hand at its output path the same way. It is judged by its text, as the file at the output path is, and is still never written over a file the run reads. A generator may replace a module that another source of the same directory run imports. A source compiled before the generator reads the module as it was. Just before the rename (below), the file at the output path is looked at in the directory the write is in, without following a symlink. A regular `.mds` file there is a module by its name alone — mds-core imports any `.mds` file — and is never read. A regular `.md` file there (each extension taken in any case: on a case-insensitive volume `-o LIB.MD` names the file `lib.md`, and `-o LIB.MDS` the file `lib.mds`) is read as opened in that directory — on Unix from the descriptor the write walked to, never by path; on Windows by path — past its first line only when that line is a frontmatter fence, and then no further than the end of its frontmatter (the first `---` after it that begins a line — all the module check looks at), nor than 10 MiB: a fence that does not close by then is no module; one that cannot be read is refused (`cannot write <path>: cannot tell whether it is an MDS module: <cause>`, the read's cause last), since nothing tells it is no module. Any regular file there is compared with each file the run reads, looked up by its path at that moment, so a file an editor has replaced since it was read is the one compared: on Unix by device and inode, so a hard link to one of them is that file; on Windows, whose standard library gives no file index, by canonical path, so a hard link to one is another file there and is written over by the rename (the other name keeps its content); a target whose canonical path cannot be had, but that is not gone, is refused there with the cause, as a look that fails is on Unix. On Windows the file at the output path is judged by the name of the file it opens: Windows drops the dots and spaces a path's last component ends in, so `-o "lib.md."` and `-o "lib.md "` write `lib.md` and are judged as `lib.md`; an output whose file name holds a `:` — NTFS stream syntax, so `-o "lib.mds::$DATA"` names the file `lib.mds` itself and `-o "lib.md:x"` a stream of `lib.md` — is refused there before anything is written (`cannot write <path>: invalid filename`), as is any write, rewrite or removal of such a name (on Unix a `:` is an ordinary character). A module is refused `cannot write <path>: refusing to replace an MDS module (an output that declares type: mds is a generated module, and is rebuilt from its source)` — the way out, which an `mds::io` error has no help line of its own to carry, ends the cause — a file the run reads `cannot write <path>: refusing to replace a file this run reads` — `mds::io`, the path as its `Compiled to` line would name it — and the file is left as it is, with no temporary file left behind. The refusal comes at the write, after the directories the write needs have been made, and removes none: `-o nd/../lib.md`, with `nd` not there yet and `lib.md` a module or a file the run reads, is refused and leaves an empty `nd`, except on Windows, which resolves `..` in a path by its text, so that `nd` is never made (the entry's refusal, above, comes before any directory is made). `mds build` given a file exits 2; given a directory it goes on with the other sources and exits 2; `mds watch` reports the refusal at startup or on the rebuild, in file and directory mode, and keeps watching — a refused write is retried by the next rebuild of that source, and does not change how the session ends (§5 "Streams and I/O failures"). The refusal comes at the write, after the `-o` extension-mismatch warning, which is printed as before. A `.md` file that declares no `type: mds` — no frontmatter, another `type`, a `type: mds` below another key — is written over as before, as is any other file the run does not read. The check errs toward keeping a file: a `.md` file whose frontmatter declares `type: mds` is refused even when no import could load it — its frontmatter is not valid YAML, its closing line is `----`, it is larger than the 10 MiB a module may be, or it is not valid UTF-8 (judged with each invalid byte replaced) — since it declares itself a module, and replacing it would lose it. A module or a file the run reads put at the output path in the instant between that look and the rename is replaced.
 
 **Output writing.** Compiled outputs and `.map` sidecars written by `mds build` and `mds watch`, `.mds` sources rewritten by `mds fmt` and `mds lint --fix`, and the starter file written by `mds init`, are written to a temporary file in the target's directory and then renamed over the target: on a local filesystem a crash or kill of the run, or a full disk, never leaves a truncated file behind (excepted, on a filesystem without hard links: `mds init` without `--force`, §7.6, and `mds watch`'s write of a source's output after a change of kind, below — each is written in place into a file created exclusively, which a crash or kill while it is written can leave partly written; a write that fails, a full disk included, removes that file again while its name is still the file it created). A network or FUSE filesystem can report a full disk only when the file is closed, which the write does not check: there a compiled output, a sidecar or the starter file — which are not synced (below) — can be renamed into place truncated. Every write is made below an **anchor** — the parent of a file argument or of `-o`, `--out-dir`, a directory argument's root, or, for `build.output_dir`, the directory that contains `mds.json` — which is resolved by path, so a symlinked anchor the user named is followed (a symlinked directory argument is refused before anything is written). The parent of a file argument or of `-o`, and a single file's `--out-dir`, are resolved as typed; a directory-mode `--out-dir`, and the entry's directory or the directory argument of `mds watch`, are resolved once, when the run starts, so a symlink among them is followed to where it pointed then. `mds watch` holds its out-dir — `--out-dir`, or `build.output_dir` below the directory that contains `mds.json` — to the directory it resolved at startup: before each write below it, the path as typed (for `build.output_dir`, the directory `mds.json` was reached by) is resolved again as the write would create it, and when it now leads to a different directory — a symlink on it retargeted, or the out-dir replaced by a link — the write is refused (`cannot write <path>: the output directory now resolves to a different directory; restart mds watch to follow it`), nothing is written, and watching continues (#160). The check goes by path, and so does the write's open of its anchor, so the check also finds the directory the write is anchored at — the out-dir, the nearest directory above it once it has been deleted (the out-dir is then created below that one without following a symlink), or, for `build.output_dir`, the directory that contains `mds.json`, below which `build.output_dir`'s own directories lie, where a link, one put in place of the out-dir included, is refused as below — and the write refuses an anchor it opens that is another directory, and one gone by then, which it does not make again, in the same words: on Unix it compares the directory it opened, so a link swapped onto the path between the check and the write is refused, not followed. A deleted out-dir is created again by the next write below it, and another directory made in its place is written into; neither holds the outputs the session wrote, so a rebuild writes its output there even when it has not changed (a directory made where the old one was can be taken for it: on Windows, which tells the two apart by their creation time alone, one made under the same name moments after the old one moved away, and on a Unix filesystem that keeps no birth time, one given the deleted directory's inode number). `build.output_dir` is the repository's, not a path the user typed: its own directories lie below the anchor. Nothing below the anchor is followed (#160): a directory between the anchor and the target that is a symlink — planted before the run, swapped in while it runs, or committed as `build.output_dir` — is refused, naming the file as the user knows it and, after the cause, that directory (`cannot write out/sub/x.md: refusing to follow a symlink at out/sub`), and so is a symlink at the target, live or dangling (`cannot write <path>: refusing to replace a symlink`); nothing is written through either, and the link is left in place. A symlink that appears at the target while the write runs is replaced by the rename, never written through. `mds build` and `mds watch` create a missing anchor, by path — one that is a symlink leading nowhere is reported as a missing directory, and nothing is created — and the directories below it; `mds fmt`, `mds lint --fix` and `mds init` create no directory. On Unix the walk below the anchor goes from one open directory to the next without following a symlink, and the temporary file is created, given a replaced file's permission bits (below) and renamed in the last one. On Linux each directory on the way, the anchor included, is opened for search alone, so a directory the user may write to and search but not list (mode `-wx`, a drop box) takes a write, as it did before #160; other Unix systems, which offer mds no such open, open each to read, so there such a directory refuses the write (`cannot write <path>: Permission denied (os error 13)`). **Windows residual:** Windows has no such walk in the standard library: each directory below the anchor is checked and refused when it is a symlink or a junction (another reparse point, such as a cloud-sync placeholder, is written to), and the write then goes by path, so a directory replaced by a link between that check and the write — by another process, during the write — is followed; the anchor `mds watch` checked is compared by path there, just before that walk, so a link swapped onto the out-dir's path after the comparison is followed too. Because the output is created as a sibling temporary file and renamed into place, the destination must be a regular-file path inside a writable directory: on Unix a device file such as `/dev/null`, a FIFO or a socket at the target is refused without being opened (`cannot write <path>: not a regular file`) and left in place — write to stdout instead — and a target that names a directory, an existing one or a path ending in a separator such as `-o dist/`, is refused, leaving nothing behind. Source rewrites (`fmt`, `lint --fix`) are additionally fsynced before the rename — on Apple platforms with a full flush of the drive's cache (`F_FULLFSYNC`), and with a plain `fsync` on a filesystem that refuses that, such as some network volumes — and on Unix their directory after it, where the filesystem can sync a directory (one that refuses it does not fail a rewrite that landed). A file argument's rewrite syncs its directory as it lands; a directory run — `mds fmt <dir>`, `mds lint --fix <dir>` — syncs each directory once, when it is past the last of its files there, and shows the `Formatted:` or `Fixed:` lines of the rewrites in it only after that sync, so a status line shown still means the rewrite is durable (§7.4, §7.5). A directory that cannot be synced otherwise — its sync fails, or it cannot be opened to read for it, as a directory the user may write to but not list cannot, so on Linux a rewrite there always comes to this — leaves the rewrite landed and said so: `<path> written, but its directory could not be synced: <cause>` is reported, `mds::io`, exit 2 — in place of the `Formatted:` or `Fixed:` line that names the file, for a file argument as in a directory run, once for each rewrite in that directory — and a directory run counts the file as what it now holds (#160). Compiled outputs, sidecars and the starter file rely on the rename alone — they are regenerable, and an unconditional fsync made directory-mode startup several times slower on macOS. Because the rename gives the target a new inode, a pre-existing target's hard links (other links keep the old content), ACLs, extended attributes, and owner/group are not preserved; permission bits are preserved on Unix — the read, write and execute bits alone, never a setuid, setgid or sticky bit, and only from a file the user running mds owns: a file another user owns, in a shared directory say, lends none, and the new file has the mode a new file is created with (`0666` narrowed by the umask) (#160). This is enforced for the CLI's write sites by `crates/mds-cli/tests/write_funnel.rs`. A write that fails is `mds::io`, exit 2 (#157), worded `cannot write <path>: <cause>` whichever step failed — an output directory that cannot be created included — with the path as the output's `Compiled to` line names it and the operating system's cause; so are the refusals above and a stale `.map` sidecar that cannot be read or removed. Output to stdout (`-o -`, or stdin input with no `-o`) is written and flushed at once: a reader that has gone away (a closed pipe) ends it without an error and the exit code stands; any other stdout failure is `mds::io`, exit 2.
 
@@ -1468,6 +1846,8 @@ Whichever route resolves it, an output that is the entry file itself is refused 
 
 **When a watched file is momentarily empty.** An editor that saves by truncating a file and then writing it leaves the file empty in between, and a rebuild in that moment would publish an empty output nobody wrote (#380). So at every `--debounce`, a rebuild that finds a watched file — the entry, a file it imports or includes, the `--vars` file, in directory mode any source of the directory or a dependency of one — empty where it last saw bytes is held: nothing is compiled, written or printed, and in directory mode the whole batch waits, other sources changed meanwhile included. The hold ends at the first rebuild that finds the file written, which then rebuilds once for what was written, or one second after the rebuild that first found the file empty, whatever events, truncations or ticks came meanwhile — that deadline never moves, and is kept under `--poll-interval 0` too; it is that hold's alone: once the hold has ended, a file found emptied again — by a later rebuild's look, or after the look of the rebuild that found the file written — starts a hold of its own, with a deadline of its own, one second after the rebuild that found it; a debounce window already collecting events when it comes finishes first, so the held rebuild can run later by at most that window's cap. A file emptied after a rebuild looked, and read empty by its compile or its `--vars` load where the watcher last saw bytes, holds that rebuild the same way, whether that read then failed or not — in directory mode the one source that read it, or for the `--vars` file the whole batch — unless the deadline ended the hold in that rebuild, so a save that truncates a file while a rebuild is reading it is neither published nor reported as an error. The byte count that the read gave decides, not the file as it is when the rebuild checks: a save that ends between the read and the check is held too. A file the watcher has not seen with bytes — one the failing edit itself starts to import, say — holds nothing, and the failure is reported; and in directory mode a file the hold finds emptied is rebuilt with the batch that ends it, whether or not its own events came. A file that a held rebuild read empty stays among the files each rebuild looks at while the hold lasts, so the rebuild its own truncation event starts is held too, a file outside the directory that the source imported for the first time included. A source that drops an import of a file that is still empty waits as well, for that file to be written or for the deadline. A file truncated while a rebuild runs, after it looked — read whole before the truncation, or in directory mode not read by the batch — is still found emptied by the next rebuild, which is held; so is, in directory mode, the `--vars` file truncated while the session starts, after the startup read it. What the watcher compares with is taken before the files it describes are read, so no rebuild takes the empty file for the one it saw. A file still empty then is compiled as it is: an entry left empty is published as an empty output, an emptied `--vars` file is reported as the error it is, and an emptied import is compiled as it is — an `@include`d module gives an empty string with a warning (§4.8), and an import that no longer defines what the source uses is reported as any error is. A rebuild that writes an output empty over the non-empty one the session wrote there prints `Wrote an empty output: <output>` once (not under `--quiet`). A file empty when the session starts is compiled at once, and a file left empty after its hold is compiled at once on its next change.
 
+**Data files in `mds watch`.** A data file that a compile reads (§4.12) is in its `dependencies`, and `mds watch` watches it as it watches an imported module. One edit of it gives one rebuild of each source that reads it, and a data file has no output of its own (`watch_rebuilds_once_when_a_data_file_changes` in `crates/mds-cli/tests/cli_watch.rs`).
+
 ### 7.3 `mds check`
 
 ```bash
@@ -1478,7 +1858,7 @@ echo "@if flag:" | mds check -             # Validate from stdin
 mds check src/                             # Validate every non-partial .mds in the tree
 ```
 
-Exits 0 if all templates are valid, non-zero on any error. Same `--vars`/`--set`/`--set-string`/`--quiet` options as `mds build`. Directory mode follows the same semantics as `mds build <dir>` (partial skipping, symlink rejection, continue-on-error, and the three nothing-to-process exits — empty tree, all-excluded, and partials-only — which exit 1 with `…; nothing was checked`) but does not write any output files. In directory mode the summary line is `N passed, N failed`, emitted under the same `--quiet` rule as `mds build <dir>` (§7.2): suppressed on a fully-successful run, emitted when any file fails.
+Exits 0 if all templates are valid, non-zero on any error. `mds check` reads no data file (§4.12). For a template with a data entry that no runtime value replays, it evaluates no output and prints one line to stderr before its `OK:` line, with no `warning:` prefix: `data pending; output was not evaluated: "main.mds", entry "rows"; "main.mds", entry "other"`. It then exits 0 (`tooling_reads_no_data_file` in `crates/mds-cli/tests/cli_data.rs`). Same `--vars`/`--set`/`--set-string`/`--quiet` options as `mds build`. Directory mode follows the same semantics as `mds build <dir>` (partial skipping, symlink rejection, continue-on-error, and the three nothing-to-process exits — empty tree, all-excluded, and partials-only — which exit 1 with `…; nothing was checked`) but does not write any output files. In directory mode the summary line is `N passed, N failed`, emitted under the same `--quiet` rule as `mds build <dir>` (§7.2): suppressed on a fully-successful run, emitted when any file fails.
 
 ### 7.4 `mds fmt`
 
@@ -1492,7 +1872,7 @@ mds fmt template.mds --diff               # Print unified diff without writing
 
 Formats `.mds` templates: normalizes CRLF to LF (everywhere, including inside frontmatter and code fences), strips trailing whitespace on directive lines, and ensures exactly one trailing newline. An empty or whitespace-only source formats to 0 bytes (an empty output file). Interior blank lines and blank-line structure within frontmatter and code fences are left verbatim (blank-line collapsing was removed in v0.4.0 to preserve the interior-verbatim whitespace contract). Body-text trailing whitespace (Markdown hard breaks) and the byte-for-byte content of `@message`/`@define` bodies are left untouched.
 
-Every rewrite is **safety-gated**: the formatter re-compiles both the original and formatted sources and refuses to write if compiled output would change (`mds::formatter_invariant`), so a formatting bug can never corrupt a template. The base directory the gate compiles against (the file's directory; the working directory for stdin) is resolved first, as `mds check` resolves it: one that is refused (§4.6) or cannot be resolved fails `mds fmt` with that error (`mds::io`, exit 2).
+Every rewrite is **safety-gated**: the formatter re-compiles both the original and formatted sources and refuses to write if compiled output would change (`mds::formatter_invariant`), so a formatting bug can never corrupt a template. The gate reads no data file (§4.12). For a template with a data entry, the gate has no output to compare, so it compares the structure of the two sources (`pending_output_requires_structural_equivalence` in `crates/mds-core/src/formatter.rs`). A data file that is absent or does not parse thus does not stop a format (`tooling_reads_no_data_file` in `crates/mds-cli/tests/cli_data.rs`). The base directory the gate compiles against (the file's directory; the working directory for stdin) is resolved first, as `mds check` resolves it: one that is refused (§4.6) or cannot be resolved fails `mds fmt` with that error (`mds::io`, exit 2).
 
 A rewrite that fails is `mds::io`, exit 2; in directory mode the other files are still formatted, the file counts as failed, and the run exits 2, as it does for a source that cannot be read (§7.2 continue-on-error). `--diff` output and stdin filter-mode output follow §5 "Streams and I/O failures": into a closed pipe they end without an error and the exit code stands (`--check` still exits 1 when a file would change), and any other stdout failure is `mds::io`, exit 2 (#157). In directory mode that failure is reported once while stdout keeps failing, and every file whose diff it lost counts as failed.
 
@@ -1526,6 +1906,8 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 - `--format json` output → **stdout**: exactly one JSON document, with one trailing newline, on every exit but a usage error the argument parser reports or a panic that ends the run (exit 101; see "One JSON document on every exit" below).
 - Directory-mode summary → **stderr** (in both human and JSON format modes; stdout remains a single clean JSON document in JSON mode, except under `--fix --diff` which also writes the unified diff to stdout).
 - `--quiet` suppresses warning-severity and info human diagnostics, NOT errors.
+
+**Data files.** `mds lint` and `mds lint --fix` read no data file (§4.12). A data file that is absent or does not parse fails no lint and no `--fix` run (`tooling_reads_no_data_file` in `crates/mds-cli/tests/cli_data.rs`). The rules see each data entry as a declaration of its own kind (§8 "Data entries").
 
 **Options:**
 
@@ -1832,7 +2214,8 @@ neutralization — in every one of these positions:
   every entry of `sources`, and every entry of `sourcesContent`;
 - the `sourceMap` object embedded in `CompileResult::to_canonical_json()`, and hence in
   the napi / WASM / Python compile results;
-- the `dependencies` array of `CompileResult::to_canonical_json()`.
+- the `dependencies` array of `CompileResult::to_canonical_json()`, which lists the imported
+  modules and then the data files that the compile read (§4.12).
 
 Emitted verbatim means not escaped. It does not mean byte-identical to the internal
 module key: on Windows a native `dependencies` entry is the conventional spelling of the
@@ -1975,7 +2358,9 @@ Maximum config file size: 1 MiB (1,048,576 bytes).
 | `101` | Internal compiler error: a panic (§5 "Panics on the CLI", #389), or a failed memory-counter check under `mds build` or `mds check` (`mds::internal`, §5 "Compile memory budget") — wins over every other code |
 
 For data sources, `mds::data` is a content error (exit 1).
+A data file that does not parse is `mds::yaml` (exit 1, `tooling_reads_no_data_file` in `crates/mds-cli/tests/cli_data.rs`).
 `mds::network_denied` has exit 2. A data limit has exit 3 (`mds::resource_limit`).
+An output refused over a data file that the run reads is `mds::io`, exit 2 (§7.2, `build_never_writes_over_a_data_file_it_reads`).
 
 A closed stdout or stderr pipe never changes any of these codes (§5 "Streams and I/O failures").
 
@@ -2056,10 +2441,10 @@ Rules default to the severities shown below — **not all rules default to `warn
 
 | Rule | Default Severity | Fixable | Tier | Description |
 |------|-----------------|---------|------|-------------|
-| `unused-variable` | warn | no | C | A frontmatter variable is defined but never referenced in the template body. |
+| `unused-variable` | warn | no | C | A frontmatter variable or a data entry (§4.12) is defined but never referenced in the template body. |
 | `unused-import` | warn | suggestion¹ | B | An `@import` statement imports a name that is never used in the file. |
 | `unused-function` | warn | suggestion¹ | B | A `@define` function is defined but never called in the file. |
-| `shadow-variable` | info (default-off²) | no | C | A variable declared in an inner scope (e.g. `@for`) shadows an outer-scope variable of the same name. |
+| `shadow-variable` | info (default-off²) | no | C | A variable declared in an inner scope (e.g. `@for`) shadows an outer-scope variable or data entry of the same name. |
 | `empty-block` | warn | yes (A)³ | A | A control-flow block (`@if`, `@elseif`, `@else`, `@for`, `@define`, `@message`) has an empty or whitespace-only body. |
 | `redundant-else` | warn | no | C | An `@else` block whose body is structurally identical to the preceding `@if`/`@elseif` then-body (detected via structural equality). Tier C — never auto-fixed. |
 | `unreachable-branch` | **error** | yes (A)³ | A | A branch condition (`@if`/`@elseif`) is always-true (with later branches) or always-false, making some code dead. |
@@ -2080,6 +2465,11 @@ Rules default to the severities shown below — **not all rules default to `warn
 - **Compile-clean** (gates the output-equality reverify for Tier B): a file that compiles successfully without any runtime `--vars`. The reverify checks that removing the unused import or function produces byte-identical compiled output.
 
 **Tier A** fixes always apply (`--fix`) and are gated by a post-fix reverify (recompile-success + no-new-diagnostics + output byte-equality). The reverify lints the fixed source under the file's own name, so a partial's fixed source is checked as a partial and its findings compare with the original's (#309). **Tier B** fixes apply only when the file is structural-standalone. **Tier C** rules are report-only — never auto-fixed.
+
+**Data entries.** The lint rules see each `data:` entry (§4.12) as a declaration of its own kind, not as a frontmatter variable. No lint reads a data file.
+
+- `unused-variable` skips the frontmatter keys `imports`, `type`, `extends`, `prompt`, `data` and `indented-directives` (`data_entries_are_facts_of_their_own_kind_with_key_offsets` in `crates/mds-core/src/lint/facts.rs`). For an entry that the body never references, it reports `Data entry '<name>' is declared in frontmatter but never referenced in the body.`, with the help `Remove the data entry or reference it in the template body.` A partial and a file with `@extends` do not get this finding. A reference in a URL, a header or a body of another entry counts as a use (`lint_reports_an_unused_data_entry_with_partial_and_extends_exemptions` and `lint_counts_a_data_reference_as_a_use` in `crates/mds-core/tests/data_role.rs`).
+- `shadow-variable` reports a `@for` loop variable, a `@for` key variable or a `@define` parameter with the name of a data entry, for example `Variable 'settings' (@for loop variable) shadows an outer data entry with the same name.` For a parameter, the kind text is `@define parameter` (`lint_reports_a_loop_variable_that_shadows_a_data_entry` in `data_role.rs`, `a_define_param_named_like_a_data_entry_is_a_shadow_pair` in `facts.rs`).
 
 ---
 
@@ -2239,7 +2629,7 @@ These are intentionally deferred to keep the language simple and the compiler fo
 - TypeScript/JS *language* features (note: runtime bindings for calling the compiler from JS/TS *are* provided via the `@mdscript/mds` npm package; this item refers to in-template scripting, which is out of scope)
 - Unbounded recursion: direct recursion is rejected; indirect chains are capped at depth 128 (see §4.5)
 - Macros, async functions, streaming
-- URL-based imports (remote modules)
+- URL-based imports (remote modules). A `data:` URL entry (§4.12) names data, not a module. This release does not fetch it: a URL entry needs a replay value.
 - Function calls in `@if` conditions (e.g. `@if length(items) == 0:`) — not supported
 - Function calls in `@for` iterables (e.g. `@for item in split(csv, ","):`) — not supported
 - Parenthesized sub-expressions in conditions (e.g. `@if (a || b) && c:`) — not supported
@@ -2255,6 +2645,13 @@ file            := frontmatter? extends? (directive | text)*
 frontmatter     := "---\n" yaml_content "---\n"
 indented_key    := "indented-directives:" [ \t]+ ("true" | "false") ([ \t]+ "#" <rest of line>)? [ \t]*
                    (* optional top-level line in yaml_content; see §4.3 *)
+data_key        := "data:" <YAML mapping of entry names to sources>
+                   (* optional top-level key in yaml_content of an MDS module; see §4.12 *)
+data_entry      := identifier ":" (data_path | data_url | request_map)
+data_path       := ("./" | "../") <path with no "{{"> (".json" | ".yaml" | ".yml")
+data_url        := "https://" <literal authority> <path and query; can contain data_ref>
+request_map     := <YAML mapping with "url" and the other request fields of §4.12>
+data_ref        := "{{" ws dot_path ws "}}"   (* at most 32 segments; "\{{" is a literal "{{" *)
 extends         := "@extends" quoted_path
 directive       := import | export | define | include | if_block | for_block | message_block | block
 

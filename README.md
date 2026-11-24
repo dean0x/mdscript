@@ -64,6 +64,28 @@ imports from cross-directory libraries are rejected with a containment error, se
 
 Unlike general-purpose template engines, MDS is Markdown-native: no delimiters to escape, no runtime to configure. The compiler catches undefined variables, import cycles, and arity mismatches at build time, not in production.
 
+### Local data files
+
+The frontmatter key `data:` binds the content of a local `.json`, `.yaml` or `.yml` file to a
+name:
+
+```mds
+---
+data:
+  team: ./team.json
+---
+@for member in team.members:
+- {{member.name}}
+@end
+```
+
+Each path starts with `./` or `../` and stays inside the [project root](#project-root). A runtime
+variable with the same name (`--set team=...`, `--vars`) replaces the entry, and then MDS reads
+no file. `mds check`, `mds lint` and `mds fmt` read no data file. In this release, MDS does not
+fetch a URL entry: give it a runtime value. In `@mdscript/mds`, the WASM backend of `compileFile`
+does not read data files yet. See [spec §4.12](spec.md#412-data-sources-data) for the forms, the
+conversion rules and the limits.
+
 ## Features
 
 - **Variables**: YAML frontmatter or runtime `--set KEY=VALUE` flags
@@ -74,6 +96,7 @@ Unlike general-purpose template engines, MDS is Markdown-native: no delimiters t
 - **Loops**: `@for item in list:` iteration over arrays and objects
 - **Functions**: `@define` reusable blocks with parameters
 - **Imports/Exports**: modular prompt libraries with alias, merge, and selective imports
+- **Local data**: bind `.json`, `.yaml` or `.yml` files to names with a `data:` frontmatter mapping (see [Local data files](#local-data-files))
 - **Messages**: `@message role: … @end` blocks compile to a JSON `[{role, content}]` array (`.json`); all other templates compile to Markdown (`.md`) — output format is intrinsic to the template content
 - **Security**: path traversal guards, symlink rejection, file size limits
 - **Rich errors**: source-span diagnostics with line/column context
@@ -182,7 +205,7 @@ stderr).
 
 **Never over an MDS module or an input** (changed in v0.5.0; previously such an output replaced the file and exited 0): `mds build` and `mds watch` never write an
 output over an MDS module a template can import — a `.mds` file, or a `.md` file whose
-frontmatter declares `type: mds` — nor over a file the run reads: the entry, a module it imports, the `--vars` file or the
+frontmatter declares `type: mds` — nor over a file the run reads: the entry, a module it imports, a data file it reads, the `--vars` file or the
 `mds.json` in force (`mds build chat.mds --vars chat.json`, a messages template whose output is
 `chat.json`) — in directory mode also the `mds.json` nearest each source, which `mds build
 <source>` would hold in force. In directory mode, this input rule applies per source: its own compile's entry and imported modules.
@@ -233,6 +256,9 @@ shared partial rebuilds **all transitive importers** automatically.
 
 - `_`-prefixed files are **partials**: tracked in the dependency graph and their importers
   are rebuilt when edited, but the partial itself never emits its own `.md` output.
+- **Data files**: a `.json`, `.yaml` or `.yml` file that a `data:` entry reads is a dependency
+  too, in both modes. One edit of it rebuilds each source that reads it once. A data file never
+  gets an output of its own.
 - **Cross-root imports**: if a file imports a partial located outside the watched root
   (e.g. `../shared/_x.mds`), editing that external partial rebuilds its in-root importers.
   The external file is never compiled to its own output.

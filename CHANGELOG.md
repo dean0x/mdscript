@@ -16,6 +16,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MDS refuses a block sequence under a reserved key if its list items start at column 0.
 - MDS refuses a top-level `<<` with a reserved output key in its mapping or sequence of mappings.
 
+### **BREAKING** — `data` is a reserved frontmatter key (#405)
+
+- In an MDS module (a `.mds` file, or a `.md` file with `type: mds`), the top-level frontmatter
+  key `data` now declares local data entries. It is no longer a frontmatter variable.
+  Rename a frontmatter variable named `data`. A `data` value that is not a valid data mapping
+  fails with `mds::data` and the help `` `data` is reserved for data sources; rename the variable ``.
+- Write `data` as a plain top-level key at the start of a line, as the other reserved keys.
+  A quoted or flow-style `data` key fails with `mds::yaml`: `` write `data:` at the start of a line ``.
+- Standalone output and the merged `@extends` frontmatter do not contain the `data` key.
+- A runtime variable named `data` stays legal. It declares nothing.
+
+### Added
+
+- Local data sources (#405). A `data:` entry binds the content of a `.json`, `.yaml` or `.yml`
+  file to a name in file scope. The path starts with `./` or `../` and stays inside the project
+  root. It has no dot-prefixed segment and no `node_modules` segment. A `.json` file uses a
+  strict JSON parser. A `.yaml` or `.yml` file uses the bounded frontmatter parser. Then one
+  conversion refuses duplicate keys, numbers past ±2^53, numbers that are not finite, a second
+  YAML document, and control characters in keys and strings. It changes CRLF in strings to LF.
+  Each canonical data file is read once per compile. See spec §4.12.
+- A runtime variable with the name of an entry replaces that entry, and MDS reads no file for it.
+- URL entries (`https://…` strings and request maps) are checked, but this release does not
+  fetch them. A URL entry with no runtime value fails with the new code `mds::network_denied`
+  (exit 2).
+- The new code `mds::data` (exit 1) reports an invalid declaration or data value. A data file
+  that does not parse gives `mds::yaml`, which names the file and the entry and shows no source text.
+- New limits (`mds::resource_limit`, exit 3): 10 MiB and 200,000 nodes per data file; 256 data
+  files and 32 MiB of data text per compile; 64 entries per module and 256 per compile; 16 levels
+  of references between entries.
+- `mds check`, `mds lint` and `mds fmt`, and the check and lint calls of the Rust API and the
+  Python binding, read no data file. For an entry with no runtime value, `mds check` prints
+  `data pending; output was not evaluated: …` and exits 0.
+- A `@message` role that depends on a data entry fails with `mds::data`.
+- `CompileResult.dependencies` lists the data files that a compile read, after the modules.
+  `mds watch` rebuilds when one of them changes.
+- `mds build` and `mds watch` do not write an output over a data file that the run reads
+  (`mds::io`, exit 2).
+- Lint: `unused-variable` reports a data entry that the body never uses. `shadow-variable`
+  reports a loop variable or a `@define` parameter with the name of a data entry.
+- Rust API: `mds::is_data_path`, `mds::MAX_DATA_FILES`, `mds::MAX_DATA_BYTES`, the
+  `ImportKind::Data` kind of `scan_import_records` (data records come last; `scan_imports` stays
+  modules-only), the `MdsError::Data` and `MdsError::NetworkDenied` variants with the
+  constructors `MdsError::data` and `MdsError::network_denied`, and the `FileSystem` methods
+  `normalize_data_in_dir` and `read_data`. The default `read_data` fails with `mds::io`.
+- Bindings: the virtual module maps of the Python `compile_virtual`, `check_virtual` and
+  `lint_virtual`, of the WASM `options.modules` and `lintVirtual`, and of the napi `lintVirtual`
+  hold data files. A key that ends in exactly `.json`, `.yaml` or `.yml` is a data file. Data
+  files have their own bounds: 256 files and 32 MiB of text, apart from the module bounds.
+- WASM: the export `preflightData(bytes, display)` checks the bytes of a data file and returns
+  its text.
+
+### Known limits — local data in `@mdscript/mds` (#405)
+
+- Until a later release, the WASM backend of `@mdscript/mds` (`compileFile`) refuses a data entry
+  with `mds::module_not_found` and names the data file. The native backend reads data files.
+- The WASM `scanImportRecords` leaves out data records for now. The TypeScript `kind` type of an
+  import record gets the `data` kind in a later release.
+
 ### Changed
 
 - Emitted standalone frontmatter keeps the author's blank lines and trailing spaces exactly as written outside removed blocks.

@@ -27,7 +27,8 @@ only; please upgrade to the newest release before reporting.
 
 ## Security model & built-in controls
 
-MDS treats template sources, imported modules, and runtime variables as untrusted
+MDS treats template sources, imported modules, local data files (`data:` entries,
+[spec §4.12](spec.md#412-data-sources-data)), and runtime variables as untrusted
 input. The compiler enforces several defense-in-depth controls:
 
 ### Filesystem boundary (`crates/mds-core/src/fs.rs`, `resolver/import_paths.rs`, `resolver/imports.rs`, `resolver/extends.rs`)
@@ -61,6 +62,17 @@ input. The compiler enforces several defense-in-depth controls:
   another directory. On Windows, a replacement regular file at the same path is still read.
   Some overlay or network filesystems report different identities and refuse the read.
   A source open can still wait indefinitely for a named pipe.
+- **Local data files**: a `data:` file path must start with `./` or `../` and end in exactly
+  `.json`, `.yaml` or `.yml`. It must stay inside the project root, and its final component
+  must not be a symbolic link. No segment of it may start with `.` (other than `.` and `..`)
+  or be `node_modules`, in any ASCII case. MDS checks these segment rules again on the
+  resolved path below the project root. The native read does not wait on a named pipe, and
+  it reads only the regular file that resolution found, at most 10 MiB of UTF-8
+  (`crates/mds-core/src/data/path.rs`; tests in `crates/mds-core/tests/data_paths.rs`).
+  `mds check`, `mds lint`, `mds fmt` and the check and lint calls of the Rust API and the
+  Python binding read no data file. This release sends no network request: a URL entry fails
+  with `mds::network_denied` unless a runtime value replaces it. `mds build` and `mds watch`
+  never write an output over a data file that the run reads (`mds::io`, exit 2).
 - **Directory and watch entries**: a directory build, check, lint or fmt compares each
   entry with its walked canonical path, plus the walk's device and inode on Unix.
   `mds watch` compares the directory argument with its watched canonical directory before each rebuild.
@@ -278,6 +290,16 @@ place each check runs, and the tests that pin them — in `spec.md` §4.6
 | Max @elseif branches per @if | 256 | `limits.rs` (`MAX_ELSEIF_BRANCHES`) |
 | Max value (YAML/JSON) nesting depth | 64 | `value.rs` (`MAX_VALUE_DEPTH`) |
 | Max dot-path segments | 32 | `limits.rs` (`MAX_DOT_SEGMENTS`) |
+| Max data file size | 10 MiB (10,485,760 bytes) per local data file | `limits.rs` (`MAX_DATA_FILE_BYTES`) |
+| Max data file nodes | 200,000 per data file (YAML alias expansion counted) | `limits.rs` (`MAX_DATA_NODES_PER_FILE`) |
+| Max data files | 256 distinct data files per compile | `limits.rs` (`MAX_DATA_FILES`) |
+| Max data entries | 64 per module, 256 per compile | `limits.rs` (`MAX_DATA_ENTRIES_PER_MODULE`, `MAX_DATA_ENTRIES_PER_COMPILE`) |
+| Max data graph depth | 16 levels of references between data entries | `limits.rs` (`MAX_DATA_LEVELS`) |
+| Max data text | 32 MiB (33,554,432 bytes) of data file text per compile, and of data text in a binding's virtual module map | `limits.rs` (`MAX_DATA_BYTES_PER_COMPILE`) |
+
+The data limits and their messages are in [spec §4.1](spec.md#41-variables-yaml-frontmatter)
+"Local data limits". A data file also counts toward the compile memory budget: the budget
+keeps the converted value of each distinct data file once per compile.
 
 These limits apply to the quantities and scopes in the table. They do not bound
 elapsed time.
@@ -327,6 +349,8 @@ The compile memory budget does not count these stages:
 - the caller's own map of runtime variables (the compiler's copy is counted);
 - the line table of a source map;
 - the YAML event buffer of one frontmatter parse, whose input the 1 MiB frontmatter cap
+  bounds;
+- the YAML event buffer of one YAML data file parse, whose input the 10 MiB data file cap
   bounds;
 - the conversion of a result into the host types of a binding (napi, WASM, Python);
 - the old buffer that a reallocation holds for one instant when it moves a buffer;

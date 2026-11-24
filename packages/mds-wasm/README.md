@@ -26,13 +26,16 @@ records: the directive each is written in (`"extends"`, `"frontmatter"`, `"impor
 `@import` the `span` a `mds::file_not_found` error for the path points at, in the order the resolver
 resolves them: the `@extends` base first for a module compiled for itself (`asBase` false), after the
 imports for one reached as the base of another template (`asBase` true); the base is recorded on its
-own, even when an import names it too — and
+own, even when an import names it too. For now, `scanImportRecords` gives no record for the local
+data files of a `data:` mapping; the native kind `data` comes in a later release —
 `preflightModule(bytes, display, typed)` — a module file's text from its bytes (a `Uint8Array`),
 checked as the native backend checks every file it reads: over 10 MiB is `mds::resource_limit` and
 bytes that are not valid UTF-8 are `mds::io`, naming the file by `display` (its path below the project
 root); then a file that is neither `.mds` nor a `.md` declaring `type: mds` is `mds::not_mds`, naming
-it by `typed` (the path as typed). The bytes are copied into WebAssembly memory before any check
-runs, so a caller bounds what it passes: `@mdscript/mds` reads at most 10 MiB and one byte of a file.
+it by `typed` (the path as typed) — and `preflightData(bytes, display)` — a local data file's text
+from its bytes, with the same size and UTF-8 checks and no file type check. The bytes are copied
+into WebAssembly memory before any check runs, so a caller bounds what it passes: `@mdscript/mds`
+reads at most 10 MiB and one byte of a file.
 
 ### Options
 
@@ -43,6 +46,9 @@ runs, so a caller bounds what it passes: `@mdscript/mds` reads at most 10 MiB an
 //   you want a meaningful name to appear in source maps or import paths.
 // options.modules — { [key: string]: string }: additional virtual modules for
 //   @import resolution. The entry source is inserted under options.filename.
+//   A key that ends in exactly .json, .yaml or .yml is a local data file that a data:
+//   entry can read. The map holds at most 257 module keys and 10 MiB of module text,
+//   and at most 256 data files and 32 MiB of data text: mds::resource_limit otherwise.
 // options.moduleAliases — { [key: string]: string }: other keys an import may reach a
 //   module by — the key an import resolves to → the key of the module (in modules, or
 //   options.filename) it names, which is then the module's name in dependencies,
