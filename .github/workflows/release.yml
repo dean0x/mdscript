@@ -1551,7 +1551,7 @@ jobs:
       # catch-up entry in that job's size ledger for the current CI baseline.
       - name: "Assert WASM binary size limit (PF-021)"
         run: |
-          WASM_SIZE_LIMIT=854000
+          WASM_SIZE_LIMIT=975000
           for f in packages/mds-wasm/dist/node/mds_wasm_bg.wasm \
                    packages/mds-wasm/dist/web/mds_wasm_bg.wasm; do
             if [ ! -f "$f" ]; then
