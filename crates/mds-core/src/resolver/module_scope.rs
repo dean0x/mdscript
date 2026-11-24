@@ -252,8 +252,10 @@ impl ModuleCache {
         } else {
             None
         };
-        let pending = self.bind_data(&data, mapping, is_md, ctx.runtime_vars, &mut vars)?;
+        let (names, pending) =
+            self.bind_data(&data, mapping, is_md, ctx.runtime_vars, &mut vars)?;
         let mut scope = Scope::with_layers(Arc::clone(ctx.runtime_vars), Arc::new(vars));
+        scope.set_data_names(names);
         scope.set_pending_data(pending);
         Ok((scope, imports, data))
     }
@@ -288,6 +290,8 @@ impl ModuleCache {
         Ok(data)
     }
 
+    /// Bind the winning entries of `chain` into `vars`. Return the names of all
+    /// winning entries, replayed entries included, and the names that stay pending.
     pub(super) fn bind_data(
         &mut self,
         chain: &resolve::Chain,
@@ -295,7 +299,7 @@ impl ModuleCache {
         is_md: bool,
         runtime: &VarLayer,
         vars: &mut VarLayer,
-    ) -> Result<std::collections::HashSet<String>, MdsError> {
+    ) -> Result<(HashSet<String>, HashSet<String>), MdsError> {
         if !resolve::Declarations::contains_data(chain) {
             return Ok(Default::default());
         }
@@ -310,7 +314,17 @@ impl ModuleCache {
             &mut self.budget.mem,
             |count, graph, mem| {
                 count_data_entries(&mut data.entries, count)?;
-                let mut pending = std::collections::HashSet::new();
+                // The role check reads these names, so a replayed entry keeps its source.
+                let mut names = HashSet::new();
+                for node in graph.nodes() {
+                    let name = &node.entry.name;
+                    mem.charge(
+                        Part::Buffers,
+                        name.len().checked_add(2 * size_of::<String>()),
+                    )?;
+                    names.insert(name.clone());
+                }
+                let mut pending = HashSet::new();
                 if !data.compile {
                     for node in graph.unreplayed() {
                         if !analyze_data {
@@ -326,7 +340,7 @@ impl ModuleCache {
                         )?;
                         pending.insert(name.clone());
                     }
-                    return Ok(pending);
+                    return Ok((names, pending));
                 }
                 if graph.frontier().next().is_some() {
                     return Err(MdsError::internal());
@@ -362,7 +376,7 @@ impl ModuleCache {
                     mem.charge(Part::Buffers, binding_bytes)?;
                     vars.insert(node.entry.name.clone(), value);
                 }
-                Ok(pending)
+                Ok((names, pending))
             },
         );
         self.commit_retained(self.budget.mem.buffers - before);

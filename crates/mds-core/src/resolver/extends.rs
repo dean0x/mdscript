@@ -143,7 +143,7 @@ impl ModuleCache {
             &child_fm_imports,
             &[],
         )?;
-        let pending = self.bind_data(
+        let (names, pending) = self.bind_data(
             &data_chain,
             Some(&merged_mapping),
             false,
@@ -151,6 +151,7 @@ impl ModuleCache {
             &mut vars,
         )?;
         let mut scope = Scope::with_layers(Arc::clone(ctx.runtime_vars), Arc::new(vars));
+        scope.set_data_names(names);
         scope.set_pending_data(pending);
 
         // 3d-iv: Resolve base frontmatter imports against base_key (frontmatter-first ordering,
@@ -542,6 +543,7 @@ impl ModuleCache {
             frontmatter_values: Some(merged_mapping),
             frontmatter_bytes: merged_mapping_bytes,
             data_chain,
+            data: scope.reaches_data(),
             is_skeleton: false,
         })
     }
@@ -828,6 +830,8 @@ impl ModuleCache {
             skeleton_origin,
             frontmatter_values,
             frontmatter_bytes,
+            data: scope.reaches_data()
+                || crate::data::resolve::Declarations::contains_data(&data_chain),
             data_chain,
             is_skeleton: true,
         })

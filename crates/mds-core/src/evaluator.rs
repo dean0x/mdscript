@@ -1338,6 +1338,8 @@ where
 {
     let mark = ctx.budget.mem.mark();
     let result = (|| {
+        // The loop variables of an iterable from data hold data too.
+        let data = scope.reaches_data() && expr_reads_data(&block.iterable, scope)?;
         // The iterable gives the items; the text of a call in it is not output.
         let slot = evaluate_held(&block.iterable, scope, ctx)?;
         let iterable = slot.get().ok_or_else(invalid_projection)?;
@@ -1389,6 +1391,9 @@ where
                     .and_then(|(key_entry, value_entry)| key_entry.checked_add(value_entry));
                 ctx.budget.mem.charge(Part::Temp, entries)?;
                 scope.push();
+                if data {
+                    scope.mark_frame_data();
+                }
                 scope.set_var(key_var, Value::String(key.clone()));
                 scope.set_slot(&block.var, slot.project(PathStep::Key(key.clone())));
                 let result = body(scope, ctx);
@@ -1434,6 +1439,9 @@ where
                 entry_bytes(&block.var, Some(Slot::PROJECTION_BYTES)),
             )?;
             scope.push();
+            if data {
+                scope.mark_frame_data();
+            }
             scope.set_slot(&block.var, slot.project(PathStep::Index(i)));
             let result = body(scope, ctx);
             let result = prefer_first_error(result, scope.pop());
@@ -1666,6 +1674,16 @@ fn collect_single_message(
     ctx: &mut EvalContext,
     out: &mut Vec<EvalMessage>,
 ) -> Result<(), MdsError> {
+    // A data source must not choose the role. A scope that reaches no data skips the check.
+    if scope.reaches_data() && expr_reads_data(&block.role, scope)? {
+        return Err(MdsError::data(
+            ctx.file,
+            None,
+            None,
+            "@message role must not depend on a data entry",
+            Some("write a literal role, or select a literal role with @if".into()),
+        ));
+    }
     let mark = ctx.budget.mem.mark();
     let result = (|| {
         // Evaluate the role expression to a string.
@@ -1742,6 +1760,57 @@ fn collect_single_message(
     })();
     ctx.budget.mem.release_to(mark);
     result
+}
+
+/// Return `true` when the value of `expr` can come from data. Call this only
+/// for a scope that reaches data.
+///
+/// The check is conservative. A variable counts by the binding it resolves to.
+/// A built-in call counts when an argument counts. A user function call always
+/// counts: its body can read data through its own scope or through the caller.
+fn expr_reads_data(expr: &Expr, scope: &Scope) -> Result<bool, MdsError> {
+    match expr {
+        Expr::Var(name) | Expr::MemberAccess { object: name, .. } => {
+            Ok(scope.is_data_binding(name))
+        }
+        Expr::Call { name, args } => call_reads_data(name, args, scope, 0),
+        Expr::QualifiedCall { .. } => Ok(true),
+        Expr::StringLiteral(_)
+        | Expr::NumberLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NullLiteral => Ok(false),
+    }
+}
+
+/// The argument depth bound is the bound of [`resolve_args`].
+fn call_reads_data(
+    name: &str,
+    args: &[Arg],
+    scope: &Scope,
+    depth: usize,
+) -> Result<bool, MdsError> {
+    if depth > MAX_CALL_DEPTH {
+        return Err(MdsError::recursion(format!(
+            "argument expression depth exceeds {MAX_CALL_DEPTH}"
+        )));
+    }
+    if scope.get_function(name).is_some() {
+        return Ok(true);
+    }
+    for arg in args {
+        let data = match arg {
+            Arg::Var(name) | Arg::MemberAccess { object: name, .. } => scope.is_data_binding(name),
+            Arg::Call { name, args } => call_reads_data(name, args, scope, depth + 1)?,
+            Arg::StringLiteral(_)
+            | Arg::NumberLiteral(_)
+            | Arg::BooleanLiteral(_)
+            | Arg::NullLiteral => false,
+        };
+        if data {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn collect_messages_from_if(

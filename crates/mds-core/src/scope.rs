@@ -18,6 +18,8 @@ pub struct CapturedScope {
     pub(crate) runtime: Option<Arc<VarLayer>>,
     frontmatter: Option<Arc<VarLayer>>,
     pending_data: Option<Arc<HashSet<String>>>,
+    /// The definition scope reached data, so a call can return data.
+    pub(crate) data: bool,
     head: Option<Arc<CaptureLink>>,
 }
 
@@ -381,6 +383,10 @@ pub struct Scope {
     frontmatter: Option<Arc<VarLayer>>,
     pending_data: Option<Arc<HashSet<String>>>,
     pending_prompt: bool,
+    /// The data entry names of this scope, replayed entries included.
+    data_names: Option<Arc<HashSet<String>>>,
+    /// A function, namespace or prompt bound in this scope can return data.
+    bound_data: bool,
     vars_generation: u64,
     own_vars_snapshot: Option<OwnVarsSnapshot>,
     pending_functions: HashMap<String, Arc<FunctionDef>>,
@@ -401,6 +407,8 @@ struct Frame {
     functions: HashMap<String, Arc<FunctionDef>>,
     namespaces: HashMap<String, Arc<NamespaceScope>>,
     callee: Option<Arc<FunctionDef>>,
+    /// The variables of this frame can hold data.
+    data: bool,
 }
 
 impl Frame {
@@ -483,6 +491,8 @@ impl Scope {
             frontmatter: None,
             pending_data: None,
             pending_prompt: false,
+            data_names: None,
+            bound_data: false,
             vars_generation: 0,
             own_vars_snapshot: None,
             pending_functions: HashMap::new(),
@@ -560,6 +570,46 @@ impl Scope {
         self.pending_prompt = true;
     }
 
+    /// Record the names of all data entries of this scope, replayed entries included.
+    pub(crate) fn set_data_names(&mut self, names: HashSet<String>) {
+        self.data_names = (!names.is_empty()).then(|| Arc::new(names));
+    }
+
+    /// Mark the variables of the innermost frame as data, and the scope as one
+    /// that reaches data.
+    pub(crate) fn mark_frame_data(&mut self) {
+        self.bound_data = true;
+        self.frames
+            .last_mut()
+            .expect("BUG: scope has no frames")
+            .data = true;
+    }
+
+    /// Return `true` when this scope declares data entries or binds a function,
+    /// namespace or prompt that can return data. Otherwise no binding of the
+    /// scope can hold data.
+    pub(crate) fn reaches_data(&self) -> bool {
+        self.data_names.is_some() || self.bound_data
+    }
+
+    /// Return `true` when the binding that `name` resolves to can hold data.
+    /// The lookup order is the order of [`Self::get_slot`].
+    pub(crate) fn is_data_binding(&self, name: &str) -> bool {
+        for frame in self.frames.iter().rev() {
+            if frame.vars.contains_key(name) {
+                return frame.data;
+            }
+            if let Some(captured) = frame.capture() {
+                if captured.get_slot(name).is_some() {
+                    return captured.data;
+                }
+            }
+        }
+        self.data_names
+            .as_ref()
+            .is_some_and(|names| names.contains(name))
+    }
+
     pub(crate) fn is_pending_data(&self, name: &str) -> bool {
         if self.pending_prompt && name == "prompt" {
             return true;
@@ -604,6 +654,7 @@ impl Scope {
 
     /// Define a function in the current frame.
     pub fn set_function(&mut self, name: &str, func: Arc<FunctionDef>) {
+        self.bound_data |= func.captured.data;
         if self.frames.len() == 1 {
             self.pending_functions
                 .insert(name.to_string(), Arc::clone(&func));
@@ -632,6 +683,9 @@ impl Scope {
     /// Register a namespace (for aliased imports).
     pub fn set_namespace(&mut self, alias: &str, ns: impl Into<Arc<NamespaceScope>>) {
         let ns = ns.into();
+        if !self.bound_data {
+            self.bound_data = ns.functions.values().any(|func| func.captured.data);
+        }
         if self.frames.len() == 1 {
             self.pending_namespaces
                 .insert(alias.to_string(), Arc::clone(&ns));
@@ -731,6 +785,7 @@ impl Scope {
             runtime: self.runtime.clone(),
             frontmatter: self.frontmatter.clone(),
             pending_data: self.pending_data.clone(),
+            data: self.reaches_data(),
             head: self.head.clone(),
         })
     }

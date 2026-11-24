@@ -897,6 +897,7 @@ impl ModuleCache {
             frontmatter_values,
             frontmatter_bytes,
             data_chain,
+            data: scope.reaches_data(),
             is_skeleton: false,
         })
     }

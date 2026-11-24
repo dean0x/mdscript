@@ -114,6 +114,8 @@ pub struct ResolvedModule {
     /// The bytes charged for `frontmatter_values`, part of this entry's kept bytes.
     pub(crate) frontmatter_bytes: usize,
     pub(super) data_chain: crate::data::resolve::Chain,
+    /// The module scope reached data, so the exported prompt can hold data.
+    pub(super) data: bool,
     /// `true` when this entry was produced by `process_module_skeleton` (resolved as an
     /// `@extends` base: collect-only, NO standalone validate/evaluate, `prompt_body = None`).
     ///
@@ -159,6 +161,7 @@ impl Clone for ResolvedModule {
             frontmatter_values: self.frontmatter_values.clone(),
             frontmatter_bytes: self.frontmatter_bytes,
             data_chain: self.data_chain.clone(),
+            data: self.data,
             is_skeleton: self.is_skeleton,
         }
     }

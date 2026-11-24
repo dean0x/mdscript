@@ -33,6 +33,10 @@ impl ModuleCache {
     fn import_prompt(&self, resolved: &ResolvedModule, scope: &mut Scope) -> bool {
         if let Some(prompt) = resolved.shared_prompt_value() {
             scope.set_var_shared("prompt", prompt);
+            if resolved.data {
+                // Imports bind the global frame, so its variables can now hold data.
+                scope.mark_frame_data();
+            }
             true
         } else if self.data.pending && resolved.is_exported("prompt") {
             scope.mark_pending_prompt();

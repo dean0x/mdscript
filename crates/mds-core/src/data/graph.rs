@@ -32,6 +32,11 @@ pub(crate) struct Graph<'a> {
 }
 
 impl<'a> Graph<'a> {
+    /// All winning entries in declaration order, replayed entries included.
+    pub(crate) fn nodes(&self) -> impl Iterator<Item = Node<'a>> + '_ {
+        self.nodes.iter().copied()
+    }
+
     /// Keep declaration order. Do not read entries that replay satisfies.
     pub(crate) fn unreplayed(&self) -> impl Iterator<Item = Node<'a>> + '_ {
         self.nodes
