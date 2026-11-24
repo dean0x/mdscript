@@ -640,6 +640,7 @@ fn constants_have_expected_values() {
     assert_eq!(mds::MAX_MODULE_ALIASES, 65_536);
     assert_eq!(mds::MAX_DATA_FILES, 256);
     assert_eq!(mds::MAX_DATA_BYTES, 32 * 1024 * 1024);
+    assert_eq!(mds::MAX_DATA_REFS_PER_ENTRY, 256);
     const _: () = assert!(MAX_TRAVERSAL_DEPTH > 0);
     const _: () = assert!(MAX_TRAVERSAL_DEPTH <= 1000);
 }

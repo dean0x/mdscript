@@ -297,6 +297,7 @@ place each check runs, and the tests that pin them — in `spec.md` §4.6
 | Max data file nodes | 200,000 per data file (YAML alias expansion counted) | `limits.rs` (`MAX_DATA_NODES_PER_FILE`) |
 | Max data files | 256 distinct data files per compile | `limits.rs` (`MAX_DATA_FILES`) |
 | Max data entries | 64 per module, 256 per compile | `limits.rs` (`MAX_DATA_ENTRIES_PER_MODULE`, `MAX_DATA_ENTRIES_PER_COMPILE`) |
+| Max data references | 256 per data entry, in its URL, headers and body together, before the data graph check | `limits.rs` (`MAX_DATA_REFS_PER_ENTRY`) |
 | Max data graph depth | 16 levels of references between data entries | `limits.rs` (`MAX_DATA_LEVELS`) |
 | Max data text | 32 MiB (33,554,432 bytes) of data file text per compile, and of data text in a binding's virtual module map | `limits.rs` (`MAX_DATA_BYTES_PER_COMPILE`) |
 

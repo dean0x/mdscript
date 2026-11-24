@@ -11,6 +11,7 @@ const FILE_BYTES: usize = 10 * MIB;
 const NODES_PER_FILE: usize = 200_000;
 const ENTRIES_PER_MODULE: usize = 64;
 const ENTRIES_PER_COMPILE: usize = 256;
+const REFS_PER_ENTRY: usize = 256;
 
 fn compile(files: HashMap<String, String>) -> Result<CompileResult, MdsError> {
     compile_virtual_fs(
@@ -185,6 +186,35 @@ fn level_cap_passes_the_cap_before_url_denial_and_refuses_one_more_level() {
     assert_eq!(
         limit_message(compile(chain(17))),
         "resource limit exceeded: data dependency graph exceeds 16 levels"
+    );
+}
+
+#[test]
+fn reference_cap_counts_the_fields_of_one_entry_and_binds_before_the_graph_check() {
+    // An entry puts its references in the URL, a header and the body, and the cap
+    // counts them together. Each entry has its own count. The reference past the cap
+    // names nothing in scope, so only a refusal before the graph check gives the limit.
+    let entry = |name: &str, extra: &str| {
+        let body = "{{k}}".repeat(REFS_PER_ENTRY - 2) + extra;
+        format!(
+            "  {name}:\n    url: 'https://example.com/{{{{k}}}}'\n    headers:\n      X-Key: '{{{{k}}}}'\n    body:\n      text: '{body}'\n"
+        )
+    };
+    let files = |extra: &str| {
+        let data = entry("a", "") + &entry("b", extra);
+        HashMap::from([(
+            "main.mds".to_owned(),
+            format!("---\nk: v\ndata:\n{data}---\nHello.\n"),
+        )])
+    };
+    // At the cap the graph passes, and the unreplayed URL entries reach the denial.
+    let error = compile(files("")).unwrap_err().serialize();
+    assert_eq!(error.code, "mds::network_denied", "{}", error.message);
+    assert_eq!(
+        limit_message(compile(files("{{missing}}"))),
+        format!(
+            "resource limit exceeded: \"main.mds\", entry \"b\": too many references (max {REFS_PER_ENTRY} per entry)"
+        )
     );
 }
 

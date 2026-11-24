@@ -295,6 +295,13 @@ pub(crate) const MAX_DATA_ENTRIES_PER_MODULE: usize = 64;
 /// This cap depends on declarations, not on whether the data is dense or sparse.
 pub(crate) const MAX_DATA_ENTRIES_PER_COMPILE: usize = 256;
 
+/// Maximum references (`{{…}}`) in the URL, headers and body of one data entry,
+/// counted during declaration analysis, before the graph check.
+/// The graph check does a name lookup for each reference, in each scope check and
+/// through each `@extends` link. This cap and the entry caps bound that work. The
+/// frontmatter byte cap does not.
+pub(crate) const MAX_DATA_REFS_PER_ENTRY: usize = 256;
+
 /// Maximum dependency levels in the data graph, checked before reads.
 /// This cap depends on graph depth, not on whether the data is dense or sparse.
 pub(crate) const MAX_DATA_LEVELS: usize = 16;

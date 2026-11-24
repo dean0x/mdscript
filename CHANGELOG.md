@@ -43,8 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The new code `mds::data` (exit 1) reports an invalid declaration or data value. A data file
   that does not parse gives `mds::yaml`, which names the file and the entry and shows no source text.
 - New limits (`mds::resource_limit`, exit 3): 10 MiB and 200,000 nodes per data file; 256 data
-  files and 32 MiB of data text per compile; 64 entries per module and 256 per compile; 16 levels
-  of references between entries.
+  files and 32 MiB of data text per compile; 64 entries per module and 256 per compile; 256
+  references in the URL, headers and body of one entry; 16 levels of references between entries.
 - `mds check`, `mds lint` and `mds fmt`, and the check and lint calls of the Rust API, the
   Python binding, the napi binding and the WASM binding, read no data file. For an entry with no runtime value, `mds check` prints
   `data pending; output was not evaluated: …` and exits 0.
@@ -55,7 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`mds::io`, exit 2).
 - Lint: `unused-variable` reports a data entry that the body never uses. `shadow-variable`
   reports a loop variable or a `@define` parameter with the name of a data entry.
-- Rust API: `mds::is_data_path`, `mds::MAX_DATA_FILES`, `mds::MAX_DATA_BYTES`, the
+- Rust API: `mds::is_data_path`, `mds::MAX_DATA_FILES`, `mds::MAX_DATA_BYTES`,
+  `mds::MAX_DATA_REFS_PER_ENTRY`, the
   `ImportKind::Data` kind of `scan_import_records` (data records come last; `scan_imports` stays
   modules-only), the `MdsError::Data`, `MdsError::NetworkDenied` and `MdsError::DataFileNotFound`
   variants with the constructors `MdsError::data`, `MdsError::network_denied` and

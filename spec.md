@@ -130,6 +130,7 @@ than 64 levels. The frontmatter bounds are pinned by the `parse_frontmatter_yaml
 | `MAX_DATA_FILES` | 256 distinct data files per compile, at input admission |
 | `MAX_DATA_ENTRIES_PER_MODULE` | 64 entries per module, during declaration analysis |
 | `MAX_DATA_ENTRIES_PER_COMPILE` | 256 entries across modules per compile, at declaration admission |
+| `MAX_DATA_REFS_PER_ENTRY` | 256 references in the URL, headers and body of one entry, during declaration analysis |
 | `MAX_DATA_LEVELS` | 16 levels in the data dependency graph, before file reads |
 | `MAX_DATA_BYTES_PER_COMPILE` | 32 MiB of source text across distinct data files, at input admission |
 
@@ -143,7 +144,7 @@ small files reach the entry cap first, at the same count as the file cap
 `MAX_DATA_FILES` cannot bind before the 256 entry cap in a compile.
 `distinct_file_cap_passes_and_the_entry_cap_binds_before_the_file_cap` in `data_limits.rs` shows this.
 The unit test `data_file_cap_refuses_a_new_file_past_the_cap` in `crates/mds-core/src/resolver/module_scope.rs` checks the file cap itself.
-The entry and level caps depend on declarations, not on data density.
+The entry, reference and level caps depend on declarations, not on data density.
 
 Each limit fails with `mds::resource_limit` (exit 3). After the prefix `resource limit exceeded: `, the messages are:
 `file too large (<n> bytes, max 10485760 bytes): <file>`,
@@ -151,6 +152,7 @@ Each limit fails with `mds::resource_limit` (exit 3). After the prefix `resource
 (YAML: `data file YAML node count exceeds maximum of 200000 (anchors expanded by aliases count once per expansion)`),
 `"<module>": too many data entries (max 64 per module)`,
 `too many data entries (max 256 per compile)`,
+`"<module>", entry "<entry>": too many references (max 256 per entry)`,
 `too many data files (max 256 per compile)`,
 `data dependency graph exceeds 16 levels` and
 `data files exceed 33554432 bytes per compile`.
@@ -1120,6 +1122,10 @@ A reference names an entry, a frontmatter variable or a runtime variable. It is 
 a dotted path of at most 32 segments. `\{{` writes a literal `{{`. A file path cannot contain `{{`
 (`` file paths cannot contain `{{` ``). An unquoted `{{…}}` in YAML is a flow map with one map key
 and a null value. MDS refuses that shape with the help `` quote the value that contains `{{…}}` ``.
+One entry holds at most 256 references in its URL, headers and body together. One more fails
+with `mds::resource_limit` before the graph check below
+(`reference_cap_counts_the_fields_of_one_entry_and_binds_before_the_graph_check` in
+`crates/mds-core/tests/data_limits.rs`).
 Tests: `references_accept_only_identifier_paths_within_the_segment_limit`,
 `bare_flow_reference_shape_gets_quote_help` and `file_paths_do_not_accept_references_or_their_escape`
 in `decl_tests.rs`.

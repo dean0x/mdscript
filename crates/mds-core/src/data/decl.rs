@@ -5,8 +5,9 @@ use std::mem::size_of;
 use serde_yaml_ng::{Mapping, Value};
 
 use super::{refs::references, DataLabel};
+use crate::error::data_location;
 use crate::evaluator::budget::{MemBudget, Part};
-use crate::limits::MAX_DATA_ENTRIES_PER_MODULE;
+use crate::limits::{MAX_DATA_ENTRIES_PER_MODULE, MAX_DATA_REFS_PER_ENTRY};
 use crate::parser::is_valid_identifier;
 use crate::value::MAX_VALUE_DEPTH;
 use crate::{escape_path_for_message, MdsError};
@@ -26,7 +27,8 @@ const RENAME_HELP: &str = "`data` is reserved for data sources; rename the varia
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Source {
     File(String),
-    /// The paths that the declaration references, in URL, header, then body order.
+    /// The paths that the declaration references, in URL, header, then body order:
+    /// at most `MAX_DATA_REFS_PER_ENTRY`.
     Url(Vec<String>),
 }
 
@@ -346,6 +348,13 @@ impl DataLabel<'_> {
         mem: &mut MemBudget,
     ) -> Result<(), MdsError> {
         for path in references(text) {
+            // The graph check does work for each reference, so refuse here, before it.
+            if refs.len() == MAX_DATA_REFS_PER_ENTRY {
+                return Err(MdsError::resource_limit(format!(
+                    "{}: too many references (max {MAX_DATA_REFS_PER_ENTRY} per entry)",
+                    data_location(self.module, Some(self.entry), None)
+                )));
+            }
             let path = path.map_err(|reason| self.error(Some(field), reason))?;
             if refs.len() == refs.capacity() {
                 let extra = refs.capacity().max(4);

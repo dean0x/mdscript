@@ -413,6 +413,13 @@ pub const MAX_DATA_FILES: usize = limits::MAX_DATA_FILES;
 /// the total of its module text.
 pub const MAX_DATA_BYTES: usize = limits::MAX_DATA_BYTES_PER_COMPILE;
 
+/// Maximum number of references (`{{…}}`) in the URL, headers and body of one data
+/// entry: 256.
+///
+/// One more fails with `mds::resource_limit` during declaration analysis, before the
+/// data graph check.
+pub const MAX_DATA_REFS_PER_ENTRY: usize = limits::MAX_DATA_REFS_PER_ENTRY;
+
 /// Whether `path` names a local data file: it ends with `.json`, `.yaml` or `.yml`,
 /// compared byte for byte, so `a.JSON` is not a data path.
 ///
