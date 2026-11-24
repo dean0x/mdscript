@@ -437,6 +437,52 @@ mod tests {
         );
     }
 
+    /// Each reserved output key has a decision for an `.mds` module scope, so a new
+    /// key in the shared table fails here until this site decides it.
+    /// Control: an ordinary key stays a frontmatter variable.
+    #[test]
+    fn mds_module_scope_decides_every_reserved_output_key() {
+        for key in crate::RESERVED_OUTPUT_KEYS {
+            // Each arm gives a value of the key's YAML shape, and states if the key
+            // stays a scope variable in an `.mds` module.
+            let (value, stays_variable) = match key.name {
+                // Only a `.md` file uses `type` as a file marker.
+                // An `.mds` file keeps it as an ordinary variable.
+                "type" => ("mds", true),
+                // The declarations go to the import list of the module.
+                "imports" => ("\n  - path: ./other.mds\n    as: other", false),
+                // The entries bind later as data, not as one variable.
+                "data" => ("\n  item: ./item.json", false),
+                // A lexer setting, never a variable.
+                crate::lexer::INDENTED_DIRECTIVES => ("true", false),
+                name => panic!("decide if `{name}` is a scope variable in an .mds module"),
+            };
+            let yaml = format!("{}: {value}\ninfo: ordinary\n", key.name);
+            let mapping = super::super::parse_frontmatter_yaml(&yaml).unwrap();
+            let (scope, _) = build_scope_from_frontmatter(
+                None,
+                mapping.as_mapping(),
+                4096,
+                false,
+                &Arc::new(VarLayer::new()),
+                &mut MemBudget::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                scope.get_var(key.name).is_some(),
+                stays_variable,
+                "{}",
+                key.name
+            );
+            assert_eq!(
+                scope.get_var("info"),
+                Some(&Value::from("ordinary")),
+                "{}",
+                key.name
+            );
+        }
+    }
+
     struct CountReads {
         fs: VirtualFs,
         data_reads: Arc<AtomicUsize>,

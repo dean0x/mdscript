@@ -272,6 +272,19 @@ pub(super) fn collect_facts(
     Ok(ctx)
 }
 
+// Reserved keys per Appendix A (unused-variable skip-set).
+// SYNC POINT: audit `RESERVED_OUTPUT_KEYS` in lib.rs (stripper and proof),
+// `RESERVED_MERGE_KEYS` in resolver/frontmatter.rs, `build_scope_from_frontmatter` in
+// resolver/module_scope.rs, `is_scope_key` in data/resolve.rs and `RESERVED_NAMES` in data/decl.rs.
+const RESERVED: &[&str] = &[
+    "imports",
+    "type",
+    "extends",
+    "prompt",
+    "data",
+    crate::lexer::INDENTED_DIRECTIVES,
+];
+
 /// Collect frontmatter variable keys from the raw YAML string.
 ///
 /// Reserved keys are excluded.
@@ -281,19 +294,6 @@ fn collect_frontmatter_vars(
     source: &str,
     ctx: &mut AnalysisContext,
 ) -> Result<(), MdsError> {
-    // Reserved keys per Appendix A (unused-variable skip-set).
-    // SYNC POINT: audit `RESERVED_OUTPUT_KEYS` in lib.rs (stripper and proof),
-    // `RESERVED_MERGE_KEYS` in resolver/frontmatter.rs, `build_scope_from_frontmatter` in
-    // resolver/module_scope.rs, `is_scope_key` in data/resolve.rs and `RESERVED_NAMES` in data/decl.rs.
-    const RESERVED: &[&str] = &[
-        "imports",
-        "type",
-        "extends",
-        "prompt",
-        "data",
-        crate::lexer::INDENTED_DIRECTIVES,
-    ];
-
     // Route through the bounded choke point (#162). A resource limit (size cap / node
     // budget) propagates so the lint pass fails closed on an amplification attack; a plain
     // YAML syntax error stays swallowed (lenient) — the resolver surfaces the diagnostic.
@@ -1066,6 +1066,19 @@ mod tests {
             assert!(
                 !ctx.frontmatter_vars.iter().any(|v| &v.name == reserved),
                 "should exclude reserved key '{reserved}'"
+            );
+        }
+    }
+
+    /// A reserved output key is never an unused-variable fact, so a new reserved
+    /// key cannot become a lint finding.
+    #[test]
+    fn lint_reserves_every_reserved_output_key() {
+        for key in crate::RESERVED_OUTPUT_KEYS {
+            assert!(
+                RESERVED.contains(&key.name),
+                "`{}` must be reserved in the lint",
+                key.name,
             );
         }
     }
