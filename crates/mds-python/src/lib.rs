@@ -324,7 +324,8 @@ impl CompileResult {
         json_str_array(&self.value, "warnings")
     }
 
-    /// Imported module keys in depth-first resolution order (entry excluded).
+    /// Imported modules in depth-first resolution order, then the local data files
+    /// that the compile read, in first-read order (entry excluded).
     #[getter]
     fn dependencies(&self) -> Vec<String> {
         json_str_array(&self.value, "dependencies")
