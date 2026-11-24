@@ -11,6 +11,8 @@ use crate::parser::is_valid_identifier;
 use crate::value::MAX_VALUE_DEPTH;
 use crate::{escape_path_for_message, MdsError};
 
+// SYNC POINT: each reserved frontmatter key is a reserved entry name. Audit
+// `RESERVED_OUTPUT_KEYS` in lib.rs and the sites that it names.
 const RESERVED_NAMES: [&str; 6] = [
     "prompt",
     "imports",

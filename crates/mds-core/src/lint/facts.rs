@@ -283,7 +283,8 @@ fn collect_frontmatter_vars(
 ) -> Result<(), MdsError> {
     // Reserved keys per Appendix A (unused-variable skip-set).
     // SYNC POINT: audit `RESERVED_OUTPUT_KEYS` in lib.rs (stripper and proof),
-    // `RESERVED_MERGE_KEYS` in resolver/frontmatter.rs, and `build_scope_from_frontmatter` in resolver/module_scope.rs.
+    // `RESERVED_MERGE_KEYS` in resolver/frontmatter.rs, `build_scope_from_frontmatter` in
+    // resolver/module_scope.rs, `is_scope_key` in data/resolve.rs and `RESERVED_NAMES` in data/decl.rs.
     const RESERVED: &[&str] = &[
         "imports",
         "type",

@@ -245,6 +245,8 @@ impl Declarations {
     }
 }
 
+// SYNC POINT: a reserved frontmatter key is not a scope name. Audit
+// `RESERVED_OUTPUT_KEYS` in lib.rs and the sites that it names.
 fn is_scope_key(name: &str, is_md: bool) -> bool {
     !(matches!(name, "data" | "imports" | crate::lexer::INDENTED_DIRECTIVES)
         || is_md && name == "type")
@@ -319,6 +321,24 @@ pub(crate) fn read_file(
 mod tests {
     use super::*;
     use crate::NativeFs;
+
+    /// A reserved output key is not a frontmatter name that an entry can collide
+    /// with or reference. `type` is reserved only for a `.md` file, where its value
+    /// must be `mds`. Control: an ordinary key is a name in both file types.
+    #[test]
+    fn reserved_output_keys_are_not_data_scope_names() {
+        for key in crate::RESERVED_OUTPUT_KEYS {
+            assert!(!is_scope_key(key.name, true), "{}", key.name);
+            let reserved_in_mds = key.only_value.is_none();
+            assert_eq!(
+                is_scope_key(key.name, false),
+                !reserved_in_mds,
+                "{}",
+                key.name
+            );
+        }
+        assert!(is_scope_key("info", true) && is_scope_key("info", false));
+    }
 
     #[test]
     fn native_data_parse_error_names_the_project_relative_file() {

@@ -49,7 +49,8 @@ impl FrontmatterImport {
 
 // Exclude these keys at depth 0 only. Nested keys are user data.
 // SYNC POINT: also audit `RESERVED_OUTPUT_KEYS` in lib.rs (stripper and proof),
-// `build_scope_from_frontmatter` in resolver/module_scope.rs, and `RESERVED` in lint/facts.rs.
+// `build_scope_from_frontmatter` in resolver/module_scope.rs, `RESERVED` in lint/facts.rs,
+// `is_scope_key` in data/resolve.rs and `RESERVED_NAMES` in data/decl.rs.
 // The merge reserves `extends` in addition to the reserved output keys.
 pub(crate) const RESERVED_MERGE_KEYS: &[&str] = &[
     "imports",

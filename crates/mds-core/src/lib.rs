@@ -951,7 +951,8 @@ pub(crate) struct ReservedOutputKey {
 /// Keys to remove from standalone output. Order sets form-message priority.
 ///
 /// SYNC POINT: also audit `RESERVED_MERGE_KEYS` in `resolver/frontmatter.rs`,
-/// `build_scope_from_frontmatter` in `resolver/module_scope.rs`, and `RESERVED` in `lint/facts.rs`.
+/// `build_scope_from_frontmatter` in `resolver/module_scope.rs`, `RESERVED` in `lint/facts.rs`,
+/// `is_scope_key` in `data/resolve.rs` and `RESERVED_NAMES` in `data/decl.rs`.
 /// The stripper and its proof share this table. The merge also reserves `extends`.
 pub(crate) const RESERVED_OUTPUT_KEYS: &[ReservedOutputKey] = &[
     ReservedOutputKey {

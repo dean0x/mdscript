@@ -75,6 +75,18 @@ fn names_must_be_non_reserved_identifiers() {
     assert_eq!(parse("{_name42: ../info.yml}").unwrap()[0].name, "_name42");
 }
 
+/// A reserved output or merge key is a reserved entry name, so a new reserved key
+/// cannot become an entry name. Control: an ordinary key is not reserved.
+#[test]
+fn reserved_frontmatter_keys_are_reserved_entry_names() {
+    let output = crate::RESERVED_OUTPUT_KEYS.iter().map(|key| key.name);
+    let merge = crate::resolver::RESERVED_MERGE_KEYS.iter().copied();
+    for name in output.chain(merge) {
+        assert!(RESERVED_NAMES.contains(&name), "{name}");
+    }
+    assert!(!RESERVED_NAMES.contains(&"info"));
+}
+
 #[test]
 fn names_cannot_hide_frontmatter_or_aliases() {
     let entries = parse("{item: ./info.json}").unwrap();
