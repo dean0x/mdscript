@@ -423,3 +423,39 @@ fn build_never_writes_over_a_data_file_it_reads() {
     assert_eq!(out.status.code(), Some(0), "control: {}", stderr_of(&out));
     assert!(text("out.json").contains("Hi Dean"), "{}", text("out.json"));
 }
+
+/// A directory build applies the same rule per source: the messages template `chat.mds`
+/// reads `./chat.json`, its default output, so that write is refused (`mds::io`, exit 2)
+/// and the data file is left as it was. Control: the run goes on and writes the output
+/// of the other source, `main.mds`.
+#[test]
+fn directory_build_never_writes_over_a_data_file_its_source_reads() {
+    const CHAT: &str =
+        "---\ndata:\n  cfg: ./chat.json\n---\n@message user:\nHi {{cfg.name}}\n@end\n";
+    const CHAT_DATA: &str = "{\"name\": \"Dean\"}\n";
+    let mut files = DATA_FILES.to_vec();
+    files.extend([
+        ("main.mds", DATA_FIXTURE),
+        ("chat.mds", CHAT),
+        ("chat.json", CHAT_DATA),
+    ]);
+    let dir = project(&files);
+
+    let out = run(dir.path(), &["build", "."]);
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("mds::io") && squash(&stderr).contains(&squash(INPUT_CAUSE)),
+        "{stderr}"
+    );
+    assert!(squash(&stderr).contains("chat.json"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("chat.json")).unwrap(),
+        CHAT_DATA
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("main.md")).unwrap(),
+        RENDERED,
+        "control: {stderr}"
+    );
+}
