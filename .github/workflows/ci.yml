@@ -115,6 +115,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Test reserved frontmatter in release mode
+        run: cargo test --locked -p mds-core --lib --release -- reserved_strip_proof_ merged_frontmatter_
       # Intra-doc link gate (AC-209-11 / OD-209-G): broken intra-doc links in
       # mds-core degrade silently to literal text without this check.
       # --no-deps excludes dependency crates; -p mds-core scopes the check to mds-core.
