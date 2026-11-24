@@ -82,8 +82,7 @@ data:
 Each path starts with `./` or `../` and stays inside the [project root](#project-root). A runtime
 variable with the same name (`--set team=...`, `--vars`) replaces the entry, and then MDS reads
 no file. `mds check`, `mds lint` and `mds fmt` read no data file. In this release, MDS does not
-fetch a URL entry: give it a runtime value. In `@mdscript/mds`, the WASM backend of `compileFile`
-does not read data files yet. See [spec §4.12](spec.md#412-data-sources-data) for the forms, the
+fetch a URL entry: give it a runtime value. See [spec §4.12](spec.md#412-data-sources-data) for the forms, the
 conversion rules and the limits.
 
 ## Features

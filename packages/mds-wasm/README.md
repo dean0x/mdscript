@@ -26,8 +26,8 @@ records: the directive each is written in (`"extends"`, `"frontmatter"`, `"impor
 `@import` the `span` a `mds::file_not_found` error for the path points at, in the order the resolver
 resolves them: the `@extends` base first for a module compiled for itself (`asBase` false), after the
 imports for one reached as the base of another template (`asBase` true); the base is recorded on its
-own, even when an import names it too. For now, `scanImportRecords` gives no record for the local
-data files of a `data:` mapping; the native kind `data` comes in a later release —
+own, even when an import names it too. After these records, `scanImportRecords` lists the local data
+file of each `data:` entry, as written, with the kind `"data"`, no frontmatter index and no span —
 `preflightModule(bytes, display, typed)` — a module file's text from its bytes (a `Uint8Array`),
 checked as the native backend checks every file it reads: over 10 MiB is `mds::resource_limit` and
 bytes that are not valid UTF-8 are `mds::io`, naming the file by `display` (its path below the project
