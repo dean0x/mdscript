@@ -431,4 +431,32 @@ describe('WASM backend — compileFile/checkFile', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  test('U-WCF15: a data entry fails closed on the WASM backend, naming the data file (#405)', async (t) => {
+    const engines = await loadEngines();
+    if (!requireEngines(t, engines, 'U-WCF15')) return;
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'mds-wcf15-'));
+    try {
+      await writeFile(path.join(dir, '.mdsroot'), '');
+      await writeFile(path.join(dir, 'main.mds'), '---\ndata:\n  cfg: ./cfg.json\n---\nHi {{cfg.name}}\n');
+      await writeFile(path.join(dir, 'cfg.json'), '{"name": "Ada"}\n');
+      const files = [path.join(dir, 'main.mds')];
+      // Control: the native backend reads the data file.
+      assert.deepEqual(await compileFileOutcomes('native', files), [{ output: 'Hi Ada\n' }]);
+      // The WASM backend does not read data files yet: its compile refuses the entry,
+      // naming the data file, and never reads that file as a module.
+      assert.deepEqual(await compileFileOutcomes('wasm', files), [{
+        code: 'mds::module_not_found',
+        message: "data file 'cfg.json' is not in the virtual module map",
+        help: 'add the data file to `options.modules` or use the native backend',
+        span: null,
+      }]);
+      // A check reads no data file, so both backends pass the same entry.
+      const checks = await compileFileOutcomes('native', files, { method: 'checkFile' });
+      assert.deepEqual(await compileFileOutcomes('wasm', files, { method: 'checkFile' }), checks);
+      assert.ok(!('code' in checks[0]), JSON.stringify(checks));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
