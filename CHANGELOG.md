@@ -45,8 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - New limits (`mds::resource_limit`, exit 3): 10 MiB and 200,000 nodes per data file; 256 data
   files and 32 MiB of data text per compile; 64 entries per module and 256 per compile; 16 levels
   of references between entries.
-- `mds check`, `mds lint` and `mds fmt`, and the check and lint calls of the Rust API and the
-  Python binding, read no data file. For an entry with no runtime value, `mds check` prints
+- `mds check`, `mds lint` and `mds fmt`, and the check and lint calls of the Rust API, the
+  Python binding, the napi binding and the WASM binding, read no data file. For an entry with no runtime value, `mds check` prints
   `data pending; output was not evaluated: …` and exits 0.
 - A `@message` role that depends on a data entry fails with `mds::data`.
 - `CompileResult.dependencies` lists the data files that a compile read, after the modules.

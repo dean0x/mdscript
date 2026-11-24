@@ -69,8 +69,10 @@ input. The compiler enforces several defense-in-depth controls:
   resolved path below the project root. The native read does not wait on a named pipe, and
   it reads only the regular file that resolution found, at most 10 MiB of UTF-8
   (`crates/mds-core/src/data/path.rs`; tests in `crates/mds-core/tests/data_paths.rs`).
-  `mds check`, `mds lint`, `mds fmt` and the check and lint calls of the Rust API and the
-  Python binding read no data file. This release sends no network request: a URL entry fails
+  `mds check`, `mds lint`, `mds fmt` and the check and lint calls of the Rust API, the Python
+  binding, the napi binding and the WASM binding read no data file (tests: `D-6` in
+  `crates/mds-napi/__test__/index.spec.mjs`, `check_and_lint_read_no_data_file` in
+  `crates/mds-wasm/tests/web.rs`). This release sends no network request: a URL entry fails
   with `mds::network_denied` unless a runtime value replaces it. `mds build` and `mds watch`
   never write an output over a data file that the run reads (`mds::io`, exit 2).
 - **Directory and watch entries**: a directory build, check, lint or fmt compares each

@@ -1308,7 +1308,9 @@ leaves out every data record of the module and fails nothing; the compile report
 
 `check`, `lint`, `lint --fix` and `fmt` read no data file, on the CLI and in the Rust API.
 The same applies to `check_virtual`, `lint_virtual` and the other check and lint calls of the
-Python binding. An entry that no runtime value replays is pending: the checks treat it as defined,
+Python binding. It also applies to `check`, `checkFile`, `lint`, `lintFile` and `lintVirtual` of
+the napi binding, and to `check`, `lint` and `lintVirtual` of the WASM binding. An entry that no
+runtime value replays is pending: the checks treat it as defined,
 with an unknown type. When any entry is pending, the check evaluates no module of the compile. It
 returns one warning that names the pending entries:
 
@@ -1323,7 +1325,9 @@ Tests: `tooling_reads_no_data_file` in `cli_data.rs`; `tooling_checks_pending_va
 `pending_data_suppresses_evaluation_even_in_earlier_imports` and
 `selective_prompt_import_has_unknown_value_until_replay` in `data_tooling.rs`;
 `test_d5_check_calls_read_no_data_file_and_warn_once` and `test_d6_lint_calls_read_no_data_file`
-in `test_data.py`. The evaluator refuses a read of a pending entry with `mds::internal`
+in `test_data.py`; `D-6: check, checkFile, lint, lintFile and lintVirtual read no data file` in
+`crates/mds-napi/__test__/index.spec.mjs`; `check_and_lint_read_no_data_file` in
+`crates/mds-wasm/tests/web.rs`. The evaluator refuses a read of a pending entry with `mds::internal`
 (`evaluator_refuses_pending_variable_reads` in `crates/mds-core/src/evaluator.rs`).
 For `@mdscript/mds`, `checkFile` on the WASM backend gives the same result as the native backend
 (U-WCF15 in `packages/mds/__test__/wasm-compileFile.spec.mjs`).
