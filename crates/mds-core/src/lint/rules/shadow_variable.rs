@@ -25,6 +25,7 @@
 //! 3. nested `@for var` over an outer `@for var`
 //! 4. `@define param` over a `@for var` in the enclosing scope
 //! 5. `@for var` over an import alias
+//! 6. `@for var/key_var` or `@define param` over a data entry
 //!
 //! @block cannot nest (it is not a loop/define) — excluded.
 //!
@@ -98,6 +99,7 @@ fn kind_desc(kind: &ShadowKind) -> &'static str {
         ShadowKind::ImportAlias => "import alias",
         ShadowKind::ForVar => "@for loop variable",
         ShadowKind::DefineParam => "@define parameter",
+        ShadowKind::DataEntry => "data entry",
     }
 }
 

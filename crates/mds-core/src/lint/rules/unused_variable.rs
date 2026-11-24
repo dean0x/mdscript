@@ -2,26 +2,28 @@
 //!
 //! **Severity**: Warn (default) | **Tier**: C (never auto-fixed)
 //!
-//! A frontmatter variable key that is never referenced in the template body
-//! contributes nothing to the compiled output. It may be a leftover from
-//! template refactoring or an accidental typo.
+//! A frontmatter variable key or a data entry that is never referenced in the
+//! template body contributes nothing to the compiled output. It may be a
+//! leftover from template refactoring or an accidental typo.
 //!
 //! ## What counts as a "use"
 //!
-//! A frontmatter key is "used" when it appears as any of:
+//! A frontmatter key or data entry is "used" when it appears as any of:
 //! - `Expr::Var(key)` — `{key}` interpolation
 //! - `Expr::MemberAccess { object: key, .. }` — `{key.field}`
 //! - `Arg::Var(key)` — `func(key)` argument
 //! - `Arg::MemberAccess { object: key, .. }` — `func(key.field)` argument
+//! - a reference in a data declaration — `{{key}}` in a URL, header or body
 //!
 //! This covers ALL recursive bodies including `@if` conditions, `@for` iterables,
 //! and nested `@define`/`@message` bodies.
 //!
 //! ## Reserved skip-set
 //!
-//! The following keys are NEVER flagged: `imports`, `type`, `extends`, `prompt`.
-//! These are either structural keys consumed by the resolver/compiler or
-//! automatically injected by merge imports.
+//! The following keys are NEVER flagged: `imports`, `type`, `extends`, `prompt`,
+//! `data`. These are either structural keys consumed by the resolver/compiler or
+//! automatically injected by merge imports. The entries of the `data` mapping
+//! are checked one by one, with "data entry" text.
 //!
 //! ## Tier C: report-only
 //!
@@ -39,7 +41,7 @@ use crate::ast::Module;
 use crate::error::SerializedSpan;
 use crate::lint::config::LintConfig;
 use crate::lint::diagnostic::{LintDiagnostic, LintResultBuilder, Severity};
-use crate::lint::facts::AnalysisContext;
+use crate::lint::facts::{AnalysisContext, FmVarKind};
 
 pub(crate) const RULE: &str = "unused-variable";
 
@@ -64,18 +66,29 @@ pub(crate) fn check(
     for fv in &ctx.frontmatter_vars {
         // A key is "used" if it appears in any body expression as a variable or member object.
         let is_used = ctx.used_vars.contains(&fv.name);
+        let (message, help) = match fv.kind {
+            FmVarKind::Key => (
+                format!(
+                    "Variable '{}' is defined in frontmatter but never referenced in the body.",
+                    fv.name
+                ),
+                "Remove the frontmatter key or reference it in the template body.",
+            ),
+            FmVarKind::DataEntry => (
+                format!(
+                    "Data entry '{}' is declared in frontmatter but never referenced in the body.",
+                    fv.name
+                ),
+                "Remove the data entry or reference it in the template body.",
+            ),
+        };
 
         if !is_used
             && !builder.push(LintDiagnostic {
                 rule: RULE.to_string(),
                 severity,
-                message: format!(
-                    "Variable '{}' is defined in frontmatter but never referenced in the body.",
-                    fv.name
-                ),
-                help: Some(
-                    "Remove the frontmatter key or reference it in the template body.".to_string(),
-                ),
+                message,
+                help: Some(help.to_string()),
                 span: fv.approx_offset.map(|off| SerializedSpan {
                     offset: off,
                     length: fv.name.len(),
