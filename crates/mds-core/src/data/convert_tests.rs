@@ -66,28 +66,72 @@ fn only_crlf_in_values_normalizes_to_lf() {
     data_error(read("a\rb", Accept::Text));
 }
 
+const NUMBER_RANGE: &str = "-2^53 to 2^53";
+const ABOVE_U128: &str = "340282366920938463463374607431768211457";
+const BELOW_I128: &str = "-170141183460469231731687303715884105729";
+
 #[test]
-fn integer_limits_apply_before_rounding_but_not_to_frontmatter() {
-    const AT: &str = "9007199254740992";
-    const OVER: &str = "9007199254740993";
+fn data_numbers_refuse_integers_past_the_limit_before_rounding() {
     for accept in [Accept::Yaml, Accept::Json] {
-        for sign in ["", "-"] {
-            let at = format!("{sign}{AT}");
-            assert_eq!(
-                read(&at, accept).unwrap(),
-                Value::Number(at.parse().unwrap())
-            );
-            data_error(read(&format!("{sign}{OVER}"), accept));
+        for (raw, expected) in [
+            ("9007199254740992", 9_007_199_254_740_992.0),
+            ("-9007199254740992", -9_007_199_254_740_992.0),
+        ] {
+            assert_eq!(read(raw, accept).unwrap(), Value::Number(expected));
         }
-        assert_eq!(read("1e308", accept).unwrap(), Value::Number(1e308));
+        for raw in ["9007199254740993", "-9007199254740993"] {
+            let message = data_error(read(raw, accept));
+            assert!(message.contains(NUMBER_RANGE), "{message}");
+        }
     }
-    let frontmatter = crate::resolver::parse_frontmatter_yaml(OVER).unwrap();
-    assert_eq!(
-        Value::from_yaml_ref(&frontmatter).unwrap(),
-        Value::Number(9_007_199_254_740_992.0)
-    );
-    for raw in ["18446744073709551616", "-9223372036854775809"] {
-        data_error(read(raw, Accept::Json));
+}
+
+#[test]
+fn data_numbers_refuse_integers_outside_the_64_bit_range() {
+    for raw in ["18446744073709551617", "-9223372036854775809"] {
+        // The YAML visitor refuses 128-bit integers before conversion.
+        data_error(read(raw, Accept::Yaml));
+        let message = data_error(read(&format!(r#"{{"amount":{raw}}}"#), Accept::Json));
+        assert!(message.contains("amount"), "{message}");
+        assert!(message.contains(NUMBER_RANGE), "{message}");
+    }
+}
+
+#[test]
+fn data_numbers_refuse_finite_floats_past_the_limit() {
+    for accept in [Accept::Yaml, Accept::Json] {
+        assert_eq!(read("1.5", accept).unwrap(), Value::Number(1.5));
+        for raw in ["1e300", "-1e300"] {
+            let message = data_error(read(raw, accept));
+            assert!(message.contains(NUMBER_RANGE), "{message}");
+        }
+    }
+}
+
+#[test]
+fn data_numbers_refuse_integers_that_parse_as_floats_in_both_formats() {
+    for accept in [Accept::Yaml, Accept::Json] {
+        for raw in [ABOVE_U128, BELOW_I128] {
+            let message = data_error(read(raw, accept));
+            assert!(message.contains(NUMBER_RANGE), "{raw}: {message}");
+        }
+    }
+}
+
+#[test]
+fn frontmatter_numbers_past_the_data_limit_keep_their_values() {
+    for (raw, expected) in [
+        ("9007199254740993", 9_007_199_254_740_992.0),
+        (ABOVE_U128, 2.0_f64.powi(128)),
+        (BELOW_I128, -2.0_f64.powi(127)),
+        ("1e300", 1e300),
+    ] {
+        let frontmatter = crate::resolver::parse_frontmatter_yaml(raw).unwrap();
+        assert_eq!(
+            Value::from_yaml_ref(&frontmatter).unwrap(),
+            Value::Number(expected),
+            "{raw}"
+        );
     }
 }
 

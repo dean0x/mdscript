@@ -19,8 +19,7 @@ use crate::limits::{
 };
 use crate::parser::is_valid_identifier;
 use crate::scope::{Scope, VarLayer};
-use crate::value::Value;
-use crate::value::{DATA_INTEGER_ERROR, MAX_VALUE_DEPTH};
+use crate::value::{Value, MAX_VALUE_DEPTH};
 use crate::vars_json::{check_data_json, DataScanError};
 
 use super::import_path_violation;
@@ -241,7 +240,6 @@ pub(crate) fn parse_data_json_with(
             DataScanError::Invalid => label.error(None, "invalid JSON data"),
         },
     };
-    check_json_integer_overflow(raw, label)?;
     check_data_json(raw, &|len| budget.charge::<serde_json::Error>(len).is_ok())
         .map_err(|reason| error(&budget, reason))?;
 
@@ -256,50 +254,6 @@ pub(crate) fn parse_data_json_with(
     .and_then(|tree| de.end().map(|()| tree))
     .map_err(|_| error(&tree_budget, DataScanError::Invalid))?;
     Ok((tree, available - tree_budget.bytes.get()))
-}
-
-/// Refuse integer spellings that would reach the converter as floats. The
-/// deserializer still checks the document syntax.
-fn check_json_integer_overflow(raw: &str, label: DataLabel<'_>) -> Result<(), MdsError> {
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut start = None;
-    for (i, b) in raw.bytes().chain([b' ']).enumerate() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match b {
-            b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E' => {
-                if start.is_none() && (b.is_ascii_digit() || b == b'-') {
-                    start = Some(i);
-                }
-            }
-            _ => {
-                if let Some(from) = start.take() {
-                    let token = &raw[from..i];
-                    if token.len() >= 19 && !token.contains(['.', 'e', 'E']) {
-                        let overflow = if token.starts_with('-') {
-                            token.parse::<i64>().is_err()
-                        } else {
-                            token.parse::<u64>().is_err()
-                        };
-                        if overflow {
-                            return Err(label.error(None, DATA_INTEGER_ERROR));
-                        }
-                    }
-                }
-                in_string = b == b'"';
-            }
-        }
-    }
-    Ok(())
 }
 
 #[derive(Clone, Copy)]

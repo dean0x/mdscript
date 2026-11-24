@@ -5,8 +5,8 @@ use crate::data::DataLabel;
 use crate::error::MdsError;
 use crate::escape_class::is_control_char;
 
-pub(crate) const DATA_INTEGER_LIMIT: u64 = 1 << 53;
-pub(crate) const DATA_INTEGER_ERROR: &str = "integer exceeds the exact range of -2^53 to 2^53";
+const DATA_NUMBER_LIMIT: u64 = 1 << 53;
+const DATA_NUMBER_ERROR: &str = "number exceeds the allowed range of -2^53 to 2^53";
 
 type DataPolicy<'a> = Option<DataContext<'a>>;
 
@@ -78,14 +78,20 @@ impl DataContext<'_> {
     }
 
     fn number(self, n: &serde_yaml_ng::Number) -> Result<Value, MdsError> {
+        // Check integer magnitudes before a cast can round them to the limit.
         let magnitude = n.as_i64().map(i64::unsigned_abs).or_else(|| n.as_u64());
-        if magnitude.is_some_and(|n| n > DATA_INTEGER_LIMIT) {
-            return Err(self.error(DATA_INTEGER_ERROR));
+        if magnitude.is_some_and(|n| n > DATA_NUMBER_LIMIT) {
+            return Err(self.error(DATA_NUMBER_ERROR));
         }
-        n.as_f64()
+        let n = n
+            .as_f64()
             .filter(|n| n.is_finite())
-            .map(Value::Number)
-            .ok_or_else(|| self.error("data numbers must be finite"))
+            .ok_or_else(|| self.error("data numbers must be finite"))?;
+        // A parser can report a large integer as a float.
+        if n.abs() > DATA_NUMBER_LIMIT as f64 {
+            return Err(self.error(DATA_NUMBER_ERROR));
+        }
+        Ok(Value::Number(n))
     }
 }
 
