@@ -9050,7 +9050,9 @@ fn stdin_under_fix_in_json_is_refused_with_one_error_document() {
 fn tooling_checks_and_fixes_without_evaluation_until_data_is_replayed() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let source = "---\ndata:\n  pending: ./bad.yml\nobject: {}\n---\n@if 1 == 1:\n{{object.missing}}\n@else:\n{{pending}}\n@end\n";
+    // The entry is also used after the branch. If the fix removed its only use, the
+    // fix gate would refuse the new unused-variable finding for the entry.
+    let source = "---\ndata:\n  pending: ./bad.yml\nobject: {}\n---\n@if 1 == 1:\n{{object.missing}}\n@else:\n{{pending}}\n@end\n{{pending}}\n";
     fs::write(root.join("main.mds"), source).unwrap();
     fs::write(root.join("bad.yml"), "[").unwrap();
     for args in [vec!["check", "main.mds"], vec!["fmt", "main.mds"]] {
