@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Use block-style frontmatter for these keys. Do not quote the key or put a space before its colon.
   The rule applies to the entry, imported modules, and `@extends` bases.
   If flow-style frontmatter contains one of these keys, MDS reports `mds::yaml`.
+- MDS refuses a block sequence under a reserved key if its list items start at column 0.
+
+### Changed
+
+- Emitted standalone frontmatter keeps the author's blank lines and trailing spaces exactly as written outside removed blocks.
 
 ### Fixed
 
