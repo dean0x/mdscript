@@ -1424,6 +1424,12 @@ on a case-insensitive volume, a resolved key with no data extension
   data key with no project root. The native backend reads these files ('known limit: the WASM
   backend refuses the POSIX data files named \x.json and a:b.json, which native reads' in
   `packages/mds/__test__/data-scanner.spec.mjs`).
+- On Windows, the WASM backend of `@mdscript/mds` compares the volume serial number and the file
+  index of each opened module or data file with those of the located file. The native backend
+  compares the final path of the opened handle. Thus, if a regular file replaces the file at the
+  same path between the lookup and the open, the WASM backend refuses it with `mds::io` (`the file
+  changed while it was opened`), and the native backend reads it. The WASM backend never reads
+  another file.
 
 ---
 

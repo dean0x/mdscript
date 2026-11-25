@@ -92,6 +92,7 @@ WASM file APIs (`compileFile`, `checkFile`, and `lintFile`) differ from native i
 - WASM refuses a non-UTF-8 directory before it checks the file. Native checks the file first. To match native order, each path check would need both string and byte forms.
 - WASM reads each local data file that a module lists before the compile starts. This includes the file of an entry that a runtime variable or a child entry replaces, which native does not read. Such a file counts toward the 256-file and 32 MiB data limits.
 - On POSIX, WASM refuses a local data file whose name starts with `\` or has `:` as its second byte, for example `./\x.json` or `./a:b.json`. Native reads these files. The WASM engine checks a data key with no project root.
+- On Windows, WASM compares the volume serial number and the file index of each opened file with those of the located file. Native compares the final path of the opened handle. If a regular file replaces the file at the same path between the lookup and the open, WASM refuses it as changed, and native reads it.
 
 ## Error handling
 
