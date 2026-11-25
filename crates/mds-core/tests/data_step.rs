@@ -198,6 +198,33 @@ fn a_transport_failure_enters_as_a_fixed_kind() {
     }
 }
 
+/// The value depth cap of the data values.
+const DEPTH_CAP: usize = 64;
+
+/// An envelope puts the body one level deeper. Thus a body with a value at the depth cap
+/// fails with a data error, not with an internal error. Control: the same body with no
+/// envelope binds.
+#[test]
+fn an_envelope_over_a_body_at_the_depth_cap_fails_with_a_data_error() {
+    let ctx = context(&["a.example"]);
+    let body = format!("{}1{}", r#"{"n":"#.repeat(DEPTH_CAP), "}".repeat(DEPTH_CAP));
+    let wrapped =
+        "---\ndata:\n  a: {url: 'https://a.example/a', envelope: true}\n---\n{{a.status}}\n";
+    let requests = need(step(wrapped, &ctx, &FetchState::new()));
+    let err = step(wrapped, &ctx, &answered(&requests, &body)).unwrap_err();
+    assert!(!matches!(err, MdsError::Internal), "{err}");
+    assert_eq!(code(&err), "mds::data", "{err}");
+    assert_eq!(
+        err.to_string(),
+        r#"data error in "main.mds", entry "a", field "body": value nesting exceeds maximum depth of 64"#
+    );
+
+    let plain = "---\ndata:\n  a: https://a.example/a\n---\n@if a.n:\nbound\n@end\n";
+    let requests = need(step(plain, &ctx, &FetchState::new()));
+    let result = done(step(plain, &ctx, &answered(&requests, &body)));
+    assert_eq!(result.into_markdown().unwrap(), "bound\n");
+}
+
 /// A data file that changes between two steps is read again: each step is a fresh
 /// compile that keeps no value of the step before it.
 #[test]

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use super::envelope::envelope;
 use super::{DataInput, DataLabel};
 use crate::evaluator::budget::MemBudget;
+use crate::value::MAX_VALUE_DEPTH;
 use crate::{MdsError, Value};
 
 const LABEL: DataLabel<'static> = DataLabel {
@@ -49,6 +50,22 @@ fn the_envelope_holds_the_status_the_headers_and_the_body() {
         ("body".to_owned(), text("gone")),
     ]));
     assert_eq!(value, expected);
+}
+
+/// The envelope puts the body one level deeper. Thus a body with a value at the depth
+/// cap fails with a data error of the field `body`. Control: a body one level less deep
+/// builds.
+#[test]
+fn a_body_at_the_depth_cap_fails_with_a_data_error() {
+    let nested =
+        |depth: usize| (0..depth).fold(Value::Number(0.0), |inner, _| Value::Array(vec![inner]));
+    let err = build(200, &[], nested(MAX_VALUE_DEPTH)).unwrap_err();
+    assert_eq!(err.serialize().code, "mds::data");
+    assert_eq!(
+        err.to_string(),
+        r#"data error in "main.mds", entry "a", field "body": value nesting exceeds maximum depth of 64"#
+    );
+    assert!(build(200, &[], nested(MAX_VALUE_DEPTH - 1)).is_ok());
 }
 
 /// A header name becomes lower case with `-` changed to `_`. Control: a name that is

@@ -15,7 +15,7 @@ use super::DataLabel;
 use crate::escape_class::is_control_char;
 use crate::evaluator::budget::{value_bytes, MemBudget, Part};
 use crate::parser::is_valid_identifier;
-use crate::value::Value;
+use crate::value::{Value, MAX_VALUE_DEPTH};
 use crate::MdsError;
 
 /// The response headers that the envelope never holds: they set client state.
@@ -24,6 +24,10 @@ const DROPPED: [&str; 2] = ["set-cookie", "set-cookie2"];
 /// The envelope of a response with `status`, `headers` in received order and the
 /// converted `body` (`Value::Null` for a HEAD request). The caller has checked the
 /// header byte cap. The header values are charged as `Buffers` once the value exists.
+///
+/// The envelope puts the body one level deeper. Thus a body with a value at
+/// `MAX_VALUE_DEPTH` fails with a data error of the field `body`, so that the envelope
+/// stays in the value depth cap.
 pub(crate) fn envelope(
     status: u16,
     headers: &[(String, Vec<u8>)],
@@ -31,6 +35,15 @@ pub(crate) fn envelope(
     label: DataLabel<'_>,
     mem: &mut MemBudget,
 ) -> Result<Value, MdsError> {
+    if reaches_depth(&body, MAX_VALUE_DEPTH) {
+        return Err(MdsError::data(
+            label.module,
+            Some(label.entry),
+            Some("body"),
+            &format!("value nesting exceeds maximum depth of {MAX_VALUE_DEPTH}"),
+            None,
+        ));
+    }
     let text_bytes = headers.iter().try_fold(0usize, |sum, (name, value)| {
         sum.checked_add(name.len())?.checked_add(value.len())
     });
@@ -89,6 +102,19 @@ pub(crate) fn envelope(
         ("headers".to_owned(), headers),
         ("body".to_owned(), body),
     ])))
+}
+
+/// Whether `value` holds a value `levels` or more levels below its root. The walk goes
+/// at most `levels` levels down, so its depth has a bound for any value.
+fn reaches_depth(value: &Value, levels: usize) -> bool {
+    let Some(next) = levels.checked_sub(1) else {
+        return true;
+    };
+    match value {
+        Value::Array(items) => items.iter().any(|item| reaches_depth(item, next)),
+        Value::Object(fields) => fields.values().any(|item| reaches_depth(item, next)),
+        _ => false,
+    }
 }
 
 /// The text of one header value: UTF-8 with no character of the escape class of data
