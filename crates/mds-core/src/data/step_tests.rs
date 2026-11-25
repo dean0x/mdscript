@@ -709,11 +709,20 @@ fn a_host_secret_is_only_a_header_value() {
 
     let echo_value = format!("{{\"echo\": \"{PLANTED}\"}}");
     let echo_key = format!("{{\"x-{PLANTED}\": 1}}");
+    let in_array = format!("{{\"a\": [\"x\", \"{PLANTED}\"]}}");
+    let in_top_array = format!("[{{\"b\": \"{PLANTED}\"}}]");
     for (response, refused) in [
         (ok(&echo_value), true),
         (ok(&echo_key), true),
         (moved(&format!("/next?k={PLANTED}")), true),
+        (ok(&in_array), true),
+        (ok(&in_top_array), true),
         (ok(r#"{"n": 4}"#), false),
+        // Control: the same array shapes without the value bind.
+        (
+            ok(r#"{"n": 4, "a": ["x", "plain"], "c": [{"b": "plain"}]}"#),
+            false,
+        ),
     ] {
         let mut responses = Responses::new();
         answer(&first, &mut responses, &[("https://a.example/x", response)]);
