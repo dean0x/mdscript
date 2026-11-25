@@ -344,10 +344,6 @@ pub(crate) const MAX_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
 /// the chain on each derive, before it returns the next hop request. Each hop is also a
 /// request identity, so `MAX_REQUESTS_PER_COMPILE` can bind first when many entries
 /// redirect.
-#[expect(
-    dead_code,
-    reason = "the hop check of the step engine is its first caller"
-)]
 pub(crate) const MAX_REDIRECTS: usize = 5;
 
 /// Maximum time of one request, from the connect to the end of the response read: 10 s.
@@ -369,13 +365,11 @@ pub(crate) const MAX_PARALLEL_SENDS: usize = 8;
 /// The unit is one secret name. The core counts the names that the request headers
 /// declare and the secret values that the host supplies, before it derives a request.
 /// The reference cap of an entry does not count secrets.
-#[expect(dead_code, reason = "the request policy is its first caller")]
 pub(crate) const MAX_SECRETS: usize = 16;
 
 /// Maximum items of one network allow list: 64.
 /// The unit is one origin item. The core counts the items as it parses the list,
 /// before it matches a request against it, so the match work of each request is bounded.
-#[expect(dead_code, reason = "the request policy is its first caller")]
 pub(crate) const MAX_ALLOW_ITEMS: usize = 64;
 
 /// Maximum bytes of one URL: 8 KiB.

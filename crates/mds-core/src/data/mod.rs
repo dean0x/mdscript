@@ -14,12 +14,9 @@ pub(crate) mod digest;
 pub(crate) mod encode;
 pub(crate) mod graph;
 pub(crate) mod path;
+pub(crate) mod policy;
 mod refs;
 pub(crate) mod resolve;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the step engine is the first caller")
-)]
 pub(crate) mod url;
 
 pub(crate) use convert::{convert, Accept, DataLabel};
@@ -32,5 +29,7 @@ mod corpus_tests;
 mod digest_tests;
 #[cfg(test)]
 mod encode_tests;
+#[cfg(test)]
+mod policy_tests;
 #[cfg(test)]
 mod url_tests;

@@ -18,14 +18,20 @@ const MAX_LABEL_BYTES: usize = 63;
 /// The maximum digits of a port.
 const MAX_PORT_DIGITS: usize = 5;
 
+/// The scheme of a request URL.
+///
+/// This enum is `#[non_exhaustive]`: new schemes may be added in minor releases.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Scheme {
+pub enum Scheme {
     Https,
     Http,
 }
 
 impl Scheme {
-    pub(crate) fn as_str(self) -> &'static str {
+    /// The scheme name: `https` or `http`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
         match self {
             Scheme::Https => "https",
             Scheme::Http => "http",
@@ -40,8 +46,13 @@ impl Scheme {
     }
 }
 
+/// The host of a request URL. A URL holds a host only after the strict URL parser
+/// checked it.
+///
+/// This enum is `#[non_exhaustive]`: new host forms may be added in minor releases.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Host {
+pub enum Host {
     /// A lower-case name of letter, digit and hyphen labels.
     Name(String),
     V4(Ipv4Addr),
@@ -83,11 +94,33 @@ impl CheckedUrl {
 }
 
 /// The scheme, host and port of a URL. The default port and no port are the same origin.
+///
+/// Obtain an origin from [`AllowItem::origin`](crate::AllowItem::origin). This type is
+/// `#[non_exhaustive]` and cannot be built with a struct literal.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct Origin {
+pub struct Origin {
     pub(crate) scheme: Scheme,
     pub(crate) host: Host,
     pub(crate) port: u16,
+}
+
+impl Origin {
+    #[must_use]
+    pub fn scheme(&self) -> Scheme {
+        self.scheme
+    }
+
+    #[must_use]
+    pub fn host(&self) -> &Host {
+        &self.host
+    }
+
+    /// The port. The default port of the scheme when the URL names none.
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        self.port
+    }
 }
 
 impl fmt::Display for Origin {
@@ -194,6 +227,13 @@ pub(crate) fn parse_absolute(text: &str) -> Result<CheckedUrl, UrlRefusal> {
 /// Parse a redirect `location`: an absolute URL, or an absolute path on the origin of
 /// `base`. Every other form is refused, and both forms go through [`parse_absolute`].
 #[must_use = "a location can be refused"]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the redirect step of the step engine is the first caller"
+    )
+)]
 pub(crate) fn parse_location(base: &CheckedUrl, text: &str) -> Result<CheckedUrl, UrlRefusal> {
     if text.len() > MAX_URL_BYTES {
         return Err(UrlRefusal::TooLong);

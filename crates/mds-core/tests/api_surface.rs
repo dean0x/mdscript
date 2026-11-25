@@ -2967,3 +2967,45 @@ fn text_edit_and_fix_edits_public_api() {
     assert_eq!(arr[0]["end"], 12);
     assert_eq!(arr[0]["new_text"], "{{name}}");
 }
+
+/// #405: the network policy is reachable from the crate root and built through its
+/// named constructors. A secret value is absent from `Debug`, the refusals are fixed
+/// text, and a match on `Layer` or `Scheme` needs a wildcard arm, as a new kind may be
+/// added.
+#[test]
+fn network_policy_api_exists() {
+    let local = mds::AllowItem::parse("http://127.0.0.1:8080").unwrap();
+    let origin: mds::Origin = mds::AllowItem::parse("api.example").unwrap().origin();
+    assert_eq!(
+        (origin.scheme().as_str(), origin.port(), origin.to_string()),
+        ("https", 443, "https://api.example".to_owned())
+    );
+    assert!(matches!(origin.host(), mds::Host::Name(name) if name == "api.example"));
+    let value = mds::SecretValue::new("planted-value".into()).unwrap();
+    assert_eq!(value.expose_for_send(), "planted-value");
+    let secret = mds::Secret::new("token", value, origin).unwrap();
+    let policy = mds::NetworkPolicy::new(vec![local.clone()])
+        .unwrap()
+        .with_imports(true)
+        .with_secret(secret)
+        .unwrap();
+    assert!(!format!("{policy:?}").contains("planted-value"));
+
+    let narrowed = policy.narrow(vec![local.clone()], false).unwrap();
+    assert!(narrowed
+        .check_address("127.0.0.1:8080".parse().unwrap())
+        .is_ok());
+    let refusal: mds::Refusal = narrowed
+        .check_address("10.0.0.1:443".parse().unwrap())
+        .unwrap_err();
+    assert_eq!(refusal.reason(), "the address is in a refused range");
+    match refusal.layer() {
+        mds::Layer::TransportAddress => {}
+        other => panic!("unexpected layer {}", other.name()),
+    }
+    let error: mds::NarrowError = narrowed.narrow(vec![local], true).unwrap_err();
+    assert_eq!(error, mds::NarrowError::ImportsNotAllowed);
+    let error: mds::PolicyError = mds::NetworkPolicy::new(Vec::new()).unwrap_err();
+    let error: &dyn std::error::Error = &error;
+    assert_eq!(error.to_string(), "an allow list needs at least one item");
+}
