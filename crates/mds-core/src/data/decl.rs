@@ -368,7 +368,7 @@ impl DataLabel<'_> {
     }
 }
 
-fn has_scheme(text: &str) -> bool {
+pub(super) fn has_scheme(text: &str) -> bool {
     text.split_once(':').is_some_and(|(scheme, _)| {
         let mut chars = scheme.bytes();
         chars.next().is_some_and(|b| b.is_ascii_alphabetic())

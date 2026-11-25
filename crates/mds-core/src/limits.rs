@@ -383,7 +383,6 @@ pub(crate) const MAX_ALLOW_ITEMS: usize = 64;
 /// redirect `location`. Expansion checks it before each append, and the strict URL
 /// parser checks it before any other rule. For a `location` value it binds before the
 /// response header cap.
-#[expect(dead_code, reason = "the strict URL parser is its first caller")]
 pub(crate) const MAX_URL_BYTES: usize = 8 * 1024;
 
 /// Maximum addresses that the fetcher takes from one name lookup: 64.
