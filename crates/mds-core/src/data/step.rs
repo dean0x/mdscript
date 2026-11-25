@@ -329,7 +329,9 @@ pub(crate) enum Outcome {
 }
 
 impl StepCtx {
-    pub(crate) fn new(
+    /// The only place that sets the engine pointer. Code outside `data` reaches it
+    /// through [`FetchContext::start`].
+    pub(super) fn new(
         policy: Arc<NetworkPolicy>,
         key: Arc<RunKey>,
         responses: Arc<IndexMap<RequestId, Response>>,
@@ -432,7 +434,7 @@ pub(crate) struct RequestLabel<'a> {
 
 /// The message site of a request to `origin` for the URL entry of `node`. Every message
 /// about a URL entry request is built from it.
-pub(crate) fn request_label<'a>(
+fn request_label<'a>(
     node: Node<'a>,
     template: &'a RequestTemplate,
     origin: &'a Origin,
@@ -926,10 +928,7 @@ fn bind_value(
 /// object key, as an exact byte match. A changed form of the value (base64, percent
 /// encoding, a split over two strings) is not found. The walk is bounded by
 /// `MAX_VALUE_DEPTH`; a deeper value fails closed.
-pub(crate) fn scan_secrets<'p>(
-    value: &Value,
-    policy: &'p NetworkPolicy,
-) -> Result<Option<&'p str>, MdsError> {
+fn scan_secrets<'p>(value: &Value, policy: &'p NetworkPolicy) -> Result<Option<&'p str>, MdsError> {
     fn walk<'p>(
         value: &Value,
         policy: &'p NetworkPolicy,

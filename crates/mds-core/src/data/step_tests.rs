@@ -1,6 +1,8 @@
 //! The step engine through real compiles: each `run_step` call is one round.
 
 use std::collections::HashMap;
+use std::ops::Range;
+use std::path::Path;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -1385,4 +1387,339 @@ fn each_redirect_status_runs_the_hop_checks() {
             "{err}"
         );
     }
+}
+
+/// The names that only the step engine may use. A use outside the engine files links
+/// engine code into a build that never starts a step compile, such as the WASM build.
+const ENGINE_NAMES: [&str; 12] = [
+    "StepCtx::new",
+    "bind_with_engine",
+    "scan_secrets",
+    "request_label",
+    "encode::expand",
+    "envelope::envelope",
+    "Request::new",
+    "parse_location",
+    ".check_hop(",
+    ".check_method(",
+    ".check_origin(",
+    ".keeps_header(",
+];
+
+/// The files of the step engine, relative to `src/`.
+const ENGINE_FILES: [&str; 6] = [
+    "data/step.rs",
+    "data/policy.rs",
+    "data/url.rs",
+    "data/encode.rs",
+    "data/envelope.rs",
+    "data/request.rs",
+];
+
+/// The findings of one source file at `path` (relative to `src/`, with `/` between parts):
+/// each place where code outside the engine reaches the engine other than through the
+/// `StepCtx.bind` pointer. Comments and literals are not code.
+fn engine_reach_findings(path: &str, text: &str) -> Vec<String> {
+    let code = code_only(text);
+    let mut findings = Vec::new();
+    if path == "data/step.rs" {
+        let mut pointer_site = 0..0;
+        match fn_body(&code, "pub(crate) fn bind_url_entry(") {
+            Some((lines, body)) => {
+                if !body.contains("ctx.bind") || has_name(&body, "bind_with_engine") {
+                    findings.push(format!(
+                        "{path}: bind_url_entry must reach the engine through ctx.bind only"
+                    ));
+                }
+                pointer_site = lines;
+            }
+            None => findings.push(format!("{path}: bind_url_entry is missing")),
+        }
+        for (index, line) in code.lines().enumerate() {
+            let allowed = line.trim_start().starts_with("fn bind_with_engine(")
+                || line.trim() == "bind: bind_with_engine,";
+            if !pointer_site.contains(&index) && !allowed && has_name(line, "bind_with_engine") {
+                findings.push(format!("{path}:{}: bind_with_engine", index + 1));
+            }
+        }
+    }
+    if !ENGINE_FILES.contains(&path) {
+        for (index, line) in code.lines().enumerate() {
+            let names = ENGINE_NAMES
+                .iter()
+                .chain(Some(&"ctx.start(").filter(|_| path != "lib.rs"));
+            for name in names {
+                if has_name(line, name) {
+                    findings.push(format!("{path}:{}: {name}", index + 1));
+                }
+            }
+        }
+    }
+    findings
+}
+
+/// The line range and the text of the function whose line starts with `head`, to the
+/// next line that starts with `}`.
+fn fn_body(code: &str, head: &str) -> Option<(Range<usize>, String)> {
+    let lines: Vec<&str> = code.lines().collect();
+    let start = lines.iter().position(|line| line.starts_with(head))?;
+    let end = start
+        + lines[start..]
+            .iter()
+            .position(|line| line.starts_with('}'))?;
+    Some((start..end + 1, lines[start..=end].join("\n")))
+}
+
+/// `line` names `name`: an identifier character is not next to an identifier edge of
+/// the name.
+fn has_name(line: &str, name: &str) -> bool {
+    let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    line.match_indices(name).any(|(at, _)| {
+        let before = line[..at].chars().next_back().is_some_and(ident);
+        let after = line[at + name.len()..].chars().next().is_some_and(ident);
+        let joined_before = before && name.starts_with(ident);
+        let joined_after = after && name.ends_with(ident);
+        !joined_before && !joined_after
+    })
+}
+
+/// `text` with each comment and each string or char literal made blank. Each char gives
+/// one char and each line break stays, so the line numbers stay.
+fn code_only(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let blank = |out: &mut String, chars: &[char]| {
+        for &ch in chars {
+            out.push(if ch == '\n' { '\n' } else { ' ' });
+        }
+    };
+    let at = |i: usize, pattern: &str| {
+        pattern
+            .chars()
+            .enumerate()
+            .all(|(k, ch)| chars.get(i + k) == Some(&ch))
+    };
+    let ident = |i: usize| {
+        chars
+            .get(i)
+            .is_some_and(|&ch| ch.is_alphanumeric() || ch == '_')
+    };
+    // A raw string starts with `r`, or `br`, that ends no identifier.
+    let raw_start = |i: usize| {
+        let start = if i > 0 && chars[i - 1] == 'b' {
+            i - 1
+        } else {
+            i
+        };
+        chars[i] == 'r' && !(start > 0 && ident(start - 1)) && (at(i, "r\"") || at(i, "r#"))
+    };
+    let mut i = 0;
+    // Each turn moves `i` on by one char or more, so the bound is never reached first.
+    for _ in 0..=chars.len() {
+        let Some(&ch) = chars.get(i) else { break };
+        let end = if at(i, "//") {
+            chars[i..]
+                .iter()
+                .position(|&c| c == '\n')
+                .map_or(chars.len(), |n| i + n)
+        } else if at(i, "/*") {
+            let mut depth = 0usize;
+            let mut j = i;
+            for _ in 0..chars.len() {
+                if j >= chars.len() {
+                    break;
+                }
+                if at(j, "/*") {
+                    depth += 1;
+                    j += 2;
+                } else if at(j, "*/") {
+                    depth -= 1;
+                    j += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    j += 1;
+                }
+            }
+            j.min(chars.len())
+        } else if ch == '"' || raw_start(i) {
+            let hashes = if ch == 'r' {
+                chars[i + 1..].iter().take_while(|&&c| c == '#').count()
+            } else {
+                0
+            };
+            let open = if ch == 'r' { i + 1 + hashes } else { i };
+            if chars.get(open) != Some(&'"') {
+                // A raw identifier such as `r#type`.
+                out.push(ch);
+                i += 1;
+                continue;
+            }
+            let close: String = std::iter::once('"')
+                .chain("#".repeat(hashes).chars())
+                .collect();
+            let mut j = open + 1;
+            for _ in 0..chars.len() {
+                if j >= chars.len() || at(j, &close) {
+                    break;
+                }
+                j += if ch == '"' && chars[j] == '\\' { 2 } else { 1 };
+            }
+            (j + close.chars().count()).min(chars.len())
+        } else if ch == '\'' && chars.get(i + 1) == Some(&'\\') {
+            // An escape char literal: the closing quote comes after the escaped char.
+            chars
+                .get(i + 3..)
+                .and_then(|rest| rest.iter().position(|&c| c == '\''))
+                .map_or(chars.len(), |n| i + 4 + n)
+        } else if ch == '\'' && chars.get(i + 2) == Some(&'\'') {
+            i + 3
+        } else {
+            out.push(ch);
+            i += 1;
+            continue;
+        };
+        blank(&mut out, &chars[i..end]);
+        i = end;
+    }
+    out
+}
+
+/// The `.rs` files below `root` that are not `*_tests.rs` files, as paths relative to
+/// `root` with `/` between parts, with their text, and the directories that the walk read.
+/// Every loop is bounded, and the walk must read every directory.
+fn source_files(root: &Path) -> (Vec<String>, Vec<(String, String)>) {
+    let relative = |path: &Path| {
+        let parts: Vec<String> = path
+            .strip_prefix(root)
+            .unwrap()
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        parts.join("/")
+    };
+    let mut dirs = vec![root.to_path_buf()];
+    let mut visited = Vec::new();
+    let mut files = Vec::new();
+    for _ in 0..1024 {
+        let Some(dir) = dirs.pop() else { break };
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().take(4096).collect();
+        assert!(
+            entries.len() < 4096,
+            "a source directory has too many entries"
+        );
+        for entry in entries {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let kind = entry.file_type().unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if kind.is_dir() {
+                dirs.push(path);
+            } else if kind.is_file() && name.ends_with(".rs") && !name.ends_with("_tests.rs") {
+                files.push((relative(&path), std::fs::read_to_string(&path).unwrap()));
+            }
+        }
+        visited.push(relative(&dir));
+    }
+    assert!(dirs.is_empty(), "the walk must read every source directory");
+    (visited, files)
+}
+
+/// Resolver code reaches the step engine only through the `StepCtx.bind` pointer, so a
+/// build that never starts a step compile keeps no engine code. The scan pins the code
+/// shape; the WASM size limit of CI stays the measure of the linked code.
+#[test]
+fn code_outside_the_engine_reaches_it_through_the_bind_pointer_only() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let (dirs, files) = source_files(&root);
+    for dir in ["data", "resolver", "evaluator", "lint"] {
+        assert!(
+            dirs.iter().any(|read| read == dir),
+            "the walk must read {dir}"
+        );
+    }
+    let read = |path: &str| {
+        files
+            .iter()
+            .find(|(known, _)| known == path)
+            .map(|(_, text)| text.as_str())
+            .unwrap_or_else(|| panic!("the walk must read {path}"))
+    };
+    for path in ["data/step.rs", "resolver/process.rs", "lib.rs"] {
+        assert!(!read(path).is_empty(), "{path} must hold code");
+    }
+    let module_scope = code_only(read("resolver/module_scope.rs"));
+    for call in ["step::bind_url_entry", "step::check_secret_module"] {
+        assert!(
+            module_scope.contains(call),
+            "resolver/module_scope.rs must call {call}"
+        );
+    }
+    let findings: Vec<String> = files
+        .iter()
+        .flat_map(|(path, text)| engine_reach_findings(path, text))
+        .collect();
+    assert_eq!(
+        findings,
+        Vec::<String>::new(),
+        "code outside the engine must reach it through StepCtx.bind only"
+    );
+}
+
+/// Each planted reach of the engine gives exactly its own finding: a direct call at the
+/// pointer site, a call in a planted child module and a hop check in resolver code. The
+/// walk reads a planted child directory and skips a test file. Control: comments and
+/// literals that name the engine give no finding.
+#[test]
+fn the_engine_scan_reports_each_planted_reach() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let step = std::fs::read_to_string(root.join("data/step.rs")).unwrap();
+    let process = std::fs::read_to_string(root.join("resolver/process.rs")).unwrap();
+    let quiet = "// scan_secrets(v, p)\n/* a /* nested */ policy.check_hop(a, b, 1) */\nconst A: &str = \"StepCtx::new\";\nconst B: &str = r#\"envelope::envelope\"#;\nconst C: char = '\\'';\nfn f<'a>(x: &'a str) -> &'a str { x }\n";
+    assert_eq!(
+        engine_reach_findings("resolver/quiet.rs", quiet),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        engine_reach_findings("data/step.rs", &step),
+        Vec::<String>::new()
+    );
+
+    let pointer = step.replacen("    bind(node,", "    bind_with_engine(node,", 1);
+    assert_ne!(pointer, step, "the plant must change the pointer site");
+    assert_eq!(
+        engine_reach_findings("data/step.rs", &pointer),
+        ["data/step.rs: bind_url_entry must reach the engine through ctx.bind only"]
+    );
+
+    let planted = "pub(super) fn leak(v: &Value, p: &NetworkPolicy) {\n    let _ = crate::data::step::scan_secrets(v, p);\n}\n";
+    assert_eq!(
+        engine_reach_findings("resolver/nested/planted.rs", planted),
+        ["resolver/nested/planted.rs:2: scan_secrets"]
+    );
+
+    let hop = format!("{process}\nfn planted(policy: &NetworkPolicy) {{\n    let _ = policy.check_hop(a, b, 1);\n}}\n");
+    let line = hop
+        .lines()
+        .position(|text| text.contains(".check_hop("))
+        .unwrap()
+        + 1;
+    assert_eq!(
+        engine_reach_findings("resolver/process.rs", &hop),
+        [format!("resolver/process.rs:{line}: .check_hop(")]
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("resolver").join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("planted.rs"), planted).unwrap();
+    std::fs::write(nested.join("planted_tests.rs"), planted).unwrap();
+    let (dirs, files) = source_files(dir.path());
+    assert!(dirs.iter().any(|read| read == "resolver/nested"));
+    let findings: Vec<String> = files
+        .iter()
+        .flat_map(|(path, text)| engine_reach_findings(path, text))
+        .collect();
+    assert_eq!(findings, ["resolver/nested/planted.rs:2: scan_secrets"]);
 }
