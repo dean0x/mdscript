@@ -60,7 +60,7 @@ impl NetRun {
     /// `mds::invalid_options` for a flag or a `network` key that the narrowing rule
     /// refuses, and `mds::io` or `mds::resource_limit` for a root file that can not be
     /// read.
-    pub(crate) fn start(
+    pub(crate) fn from_flags(
         flags: &NetFlags,
         config: Option<&ProjectConfig>,
     ) -> Result<Option<Self>, MdsError> {
@@ -106,7 +106,7 @@ impl NetRun {
                 ),
             };
             self.reserve(requests.len())?;
-            let responses = self.send_round(&requests, deadline);
+            let responses = self.send_round(&requests, deadline)?;
             for (request, response) in requests.iter().zip(responses) {
                 state = state.with_response(request.id(), response)?;
             }
@@ -129,7 +129,17 @@ impl NetRun {
 
     /// Send the requests of one round, at most [`MAX_PARALLEL_SENDS`] at a time, and give
     /// their responses in request order.
-    fn send_round(&self, requests: &[Request], deadline: Instant) -> Vec<Response> {
+    ///
+    /// # Errors
+    ///
+    /// `MdsError::Internal` when a send thread panics. In `mds` the panic hook ends the
+    /// process with the internal code first, as on any thread that catches nothing, so
+    /// the error is the way out only where no hook is set.
+    fn send_round(
+        &self,
+        requests: &[Request],
+        deadline: Instant,
+    ) -> Result<Vec<Response>, MdsError> {
         let mut responses = Vec::with_capacity(requests.len());
         for group in requests.chunks(MAX_PARALLEL_SENDS) {
             thread::scope(|scope| {
@@ -143,24 +153,23 @@ impl NetRun {
                     .collect();
                 for send in sends {
                     responses.push(match send {
-                        // A panic of a send thread ends the run with the internal code:
-                        // the panic hook reported it.
-                        Ok(handle) => handle
-                            .join()
-                            .unwrap_or_else(|payload| std::panic::resume_unwind(payload)),
+                        // Each thread is joined, so the scope itself never panics.
+                        Ok(handle) => handle.join().map_err(|_| MdsError::Internal),
                         // With no thread for it, the request is sent on this thread.
-                        Err(request) => self.send(request, deadline),
+                        Err(request) => Ok(self.send(request, deadline)),
                     });
                 }
             });
         }
-        responses
+        responses.into_iter().collect()
     }
 
     /// Send one request before `deadline`. With no time left, it is not sent.
     fn send(&self, request: &Request, deadline: Instant) -> Response {
         if Instant::now() >= deadline {
-            return Response::failed(TransportFailure::Timeout);
+            // The `mds::` path keeps this call apart from the `failed` methods of
+            // mds-cli's lint sinks, which tests/panic_hook.rs follows by name.
+            return mds::Response::failed(TransportFailure::Timeout);
         }
         self.fetcher.send(request, deadline)
     }
@@ -193,7 +202,7 @@ pub(crate) fn compile_native(
 
 /// Compile `source` (stdin) with the working directory as its base, as
 /// [`compile_native`] compiles a file.
-pub(crate) fn compile_source(
+pub(crate) fn compile_source_text(
     source: &str,
     runtime_vars: Option<HashMap<String, Value>>,
     opts: CompileOptions,
@@ -428,10 +437,10 @@ mod tests {
         )
         .unwrap();
         let config = super::super::load_config(dir.path()).unwrap();
-        assert!(NetRun::start(&flags(&[]), config.as_ref())
+        assert!(NetRun::from_flags(&flags(&[]), config.as_ref())
             .unwrap()
             .is_none());
-        let control = NetRun::start(
+        let control = NetRun::from_flags(
             &NetFlags {
                 allow_imports: true,
                 ..flags(&["api.example"])
@@ -448,7 +457,7 @@ mod tests {
     /// before it is sent. Control: 512 pass.
     #[test]
     fn the_run_cap_refuses_request_513() {
-        let run = NetRun::start(&flags(&["api.example"]), None)
+        let run = NetRun::from_flags(&flags(&["api.example"]), None)
             .unwrap()
             .unwrap();
         assert!(

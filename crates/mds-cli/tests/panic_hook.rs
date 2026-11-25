@@ -2052,9 +2052,9 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
         (
             replaced(
                 "build.rs",
-                "compile_native_to_content(fs, file, runtime_vars.clone(), quiet, opts)",
-                "{ fail_count += 1; compile_native_to_content(fs, file, \
-                 runtime_vars.clone(), quiet, opts) }",
+                "compile_pinned_to_content(fs, file, runtime_vars.clone(), quiet, opts, net)",
+                "{ fail_count += 1; compile_pinned_to_content(fs, file, \
+                 runtime_vars.clone(), quiet, opts, net) }",
             ),
             "more than one call",
             "a state change beside the compile",
@@ -2080,8 +2080,8 @@ fn each_catch_wraps_one_compile_call_and_nothing_else() {
         (
             replaced(
                 "build.rs",
-                "compile_native_to_content(fs, file, runtime_vars.clone(), quiet, opts)",
-                "compile_native_to_content(fs, file, runtime_vars.clone(), quiet, &mut opts)",
+                "compile_pinned_to_content(fs, file, runtime_vars.clone(), quiet, opts, net)",
+                "compile_pinned_to_content(fs, file, runtime_vars.clone(), quiet, &mut opts, net)",
             ),
             "changes state",
             "a mutable borrow",
@@ -2698,6 +2698,9 @@ const COMPILE_CATCHES: &[(&str, &str)] = &[
 const COMPILE_CALLS: &[(&str, Option<&str>)] = &[
     ("compile_to_content", Some("build.rs")),
     ("compile_native_to_content", Some("build.rs")),
+    // The compile of one file of an `mds build` directory run: each network round compiles
+    // the file again through the walk's pin, and the sends of a round run inside it.
+    ("compile_pinned_to_content", Some("build.rs")),
     ("mds::check_native_fs", None),
     ("format_source_named", Some("fmt.rs")),
     ("mds::lint_native_fs", None),

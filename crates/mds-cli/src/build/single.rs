@@ -7,7 +7,7 @@ use miette::Result;
 use super::admit::{admit_output, EntryPaths};
 use super::config::{compile_inputs, load_config, run_reads, ProjectConfig};
 use super::flags::{effective_build_flags, warn_build_flags};
-use super::net::{compile_source, NetFlags, NetRun};
+use super::net::{compile_source_text, NetFlags, NetRun};
 use super::out_paths::{resolve_output_path_for_kind, warn_output_extension_mismatch, OutputKind};
 use super::source_map::{
     apply_source_map_file_label, compute_source_map_base, embed_map_in_content, file_name_of,
@@ -56,11 +56,11 @@ pub(super) fn run_build_stdin(input: PathBuf, vars: RuntimeVars, run: &BuildRun)
         .with_source_map_base(source_map_base);
 
     // Stdin has no project config, so only the flags grant the network.
-    let net = NetRun::start(net, None)?;
+    let net = NetRun::from_flags(net, None)?;
     let source = read_stdin()?;
     // AD-211-1 / AD-211-5: same stdin relabel as `compile_to_content`; `None` is the
     // working directory, shown as "." (see `read_stdin`).
-    let result = compile_source(&source, vars.vars, opts, net.as_ref())
+    let result = compile_source_text(&source, vars.vars, opts, net.as_ref())
         .map_err(|e| crate::output::relabel_stdin_error(&e, &source))?;
     if !quiet {
         for w in &result.warnings {
@@ -162,7 +162,7 @@ pub(super) fn run_build_file(input: PathBuf, vars: RuntimeVars, run: &BuildRun) 
         .with_include_sources_content(flags.use_embed_sources)
         .with_source_map_base(source_map_base);
 
-    let net = NetRun::start(net, config.as_ref())?;
+    let net = NetRun::from_flags(net, config.as_ref())?;
     let compiled = compile_to_content(&input, vars.vars, quiet, opts, net.as_ref())?;
     let inputs = compile_inputs(
         Some(&input),

@@ -54,7 +54,7 @@ pub(super) fn build_directory_mode(
     );
     warn_build_flags(&flags, false, quiet);
     // One network grant for the whole run: its request count covers every file.
-    let net = NetRun::start(&net, dir_config.as_ref())?;
+    let net = NetRun::from_flags(&net, dir_config.as_ref())?;
 
     let write = WriteFlags {
         quiet,

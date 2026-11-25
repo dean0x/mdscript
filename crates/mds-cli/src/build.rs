@@ -198,7 +198,7 @@ pub(crate) fn compile_to_content(
         // AD-211-1 / AD-211-5: a string-source compile labels its errors `<source>`
         // (resolver's SOURCE_LABEL). Relabel to the uniform CLI sentinel here, at the
         // boundary that knows the input was stdin.
-        let result = net::compile_source(&source, runtime_vars, opts, net)
+        let result = net::compile_source_text(&source, runtime_vars, opts, net)
             .map_err(|e| crate::output::relabel_stdin_error(&e, &source))?;
         return compiled_content(result, quiet);
     }
