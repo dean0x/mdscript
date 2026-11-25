@@ -16,7 +16,7 @@ MDS (Markdown Script) is a domain-specific language for composing, reusing, and 
 1. Looks like Markdown, not code
 2. Minimal new syntax: leverage existing conventions (YAML frontmatter, `@` directives)
 3. Composable: imports, functions, modules
-4. Deterministic: same input always produces same output. The input includes the sources, the runtime variables and the local data files that `data:` entries name (§4.12). This release sends no network request.
+4. Deterministic: same input always produces same output. The input includes the sources, the runtime variables and the local data files that `data:` entries name (§4.12). With `mds build --allow-net` (§7.2) the input also includes the responses of URL entries, so the same responses give the same output.
 5. Fail fast: clear errors with file:line:col, no partial output
 
 ---
@@ -177,6 +177,49 @@ Each fails with `mds::resource_limit`:
 `"<module>", entry "<entry>", field "<header>": header value exceeds the maximum length of 8192 bytes`
 (`header_count_cap_admits_exactly_the_cap` in `crates/mds-core/src/data/decl_tests.rs`,
 `the_header_value_cap_admits_exactly_the_cap` in `crates/mds-core/src/data/encode_tests.rs`).
+
+**Network limits** (§4.12 "Network access"):
+
+| Limit | Value and stage |
+|-------|-----------------|
+| `MAX_REQUESTS_PER_COMPILE` | 64 request identities per compile, counted on each derive, before the compile returns a request. Thus a compile has at most 65 rounds |
+| `MAX_REQUESTS_PER_RUN` | 512 sent requests per `mds build` run, over all of its compiles, counted before each round sends |
+| `MAX_REDIRECTS` | 5 redirects per entry, counted on each derive, before the next hop request |
+| `MAX_URL_BYTES` | 8 KiB (8192 bytes) per expanded URL and per redirect `location` |
+| `MAX_RESPONSE_HEADER_BYTES` | 16 KiB of status line and headers per response, counted as they arrive |
+| `MAX_RESPONSE_BYTES` | 10 MiB of body per response, as received. The sender reads at most one byte more |
+| `REQUEST_TIMEOUT` | 10 s per request, from the name lookup to the end of the body |
+| `COMPILE_DEADLINE` | 30 s of network work per compile, from its first send |
+| `MAX_PARALLEL_SENDS` | 8 requests in flight at one time in one compile |
+| `MAX_RESOLVED_ADDRS` | 64 addresses per name lookup |
+| `MAX_ALLOW_ITEMS` | 64 items per allow list, when the host makes the policy |
+| `MAX_SECRETS` | 16 host secrets per policy, when the host makes the policy |
+
+These bounds bind in this order:
+
+- In one compile, the per-compile request cap binds before the per-run cap. A directory build of
+  many files can reach the per-run cap.
+- Each redirect hop is also a request identity. Thus the per-compile cap can bind before the
+  redirect cap when many entries redirect.
+- The header cap binds before the body cap, because the headers come first. For a `location`
+  value, the URL cap binds before the header cap. A dense body can reach the node cap or the
+  compile memory budget before the body cap, as a data file can.
+- When less than 10 s of the compile deadline is left, the deadline binds before the request
+  timeout. With no time left, the request is not sent and fails as a timeout.
+
+The request caps and the redirect cap fail with `mds::resource_limit` (exit 3):
+`too many requests (max 64 per compile)`, `<request>: too many redirects (max 5 per entry)` and
+`one run sends at most 512 requests`. `<request>` is the request location of §4.12 "Errors of a
+request". A response past a byte cap, a timeout and a lookup past the address cap fail the
+request with `mds::network` (exit 2): `the response body exceeds 10485760 bytes`,
+`the response headers exceed 16384 bytes`, `the request timed out` and `the connection failed`.
+An allow list or a secret list past its cap is a host input error: `mds build` reports it as
+`mds::invalid_options` (exit 2). Tests: `the_request_cap_binds_before_a_new_request_is_added` and
+`redirect_chains_take_the_hop_cap` in `crates/mds-core/src/data/`,
+`the_run_cap_refuses_request_513` in `crates/mds-cli/src/build/net.rs`, and
+`the_body_cap_passes_at_the_cap_and_fails_one_byte_over`,
+`response_headers_past_the_cap_fail`, `a_lookup_answer_past_the_cap_fails` and
+`a_silent_server_times_out_at_the_narrowed_deadline` in `crates/mds-fetch/tests/plain.rs`.
 
 ---
 
@@ -1097,8 +1140,8 @@ The value of `data` is a mapping. Each key is an entry name. Each value has one 
 | Form | Example | In this release |
 |------|---------|-----------------|
 | Local file | `./settings.json`, `../shared/rows.yml` | MDS reads and converts the file. |
-| URL | `https://example.com/items/{{id}}` | MDS checks the declaration. It does not fetch the URL. |
-| Request map | `{url: "https://example.com/items", method: POST, body: {id: 1}}` | MDS checks the declaration. It does not fetch the URL. |
+| URL | `https://example.com/items/{{id}}` | MDS checks the declaration. `mds build --allow-net` and the Rust step API send a `GET` request. |
+| Request map | `{url: "https://example.com/items", method: HEAD, envelope: true}` | MDS checks the declaration. `mds build --allow-net` and the Rust step API send a `GET` or `HEAD` request. Other methods are refused. |
 
 - A string that starts with `./` or `../` is a local file entry. The path rules are in §4.6
   "Filesystem constraints", row "Data file path".
@@ -1112,7 +1155,9 @@ The value of `data` is a mapping. Each key is an entry name. Each value has one 
   upper-case letter), a bad port, or a URL longer than 8192 bytes (`mds::resource_limit`) fails
   at declaration. These rules also apply to an entry that replay satisfies.
 - A request map has the fields `url` (required), `method`, `headers`, `body`, `cache`, `accept`
-  and `envelope`. The `url` of a request map can also have the literal `http` scheme. `method` is
+  and `envelope`. The `url` of a request map can also have the literal `http` scheme. Such a URL
+  passes the declaration check and reaches the policy, which sends it only when an
+  `http://host:port` allow item names its origin ("Network access" below). `method` is
   `GET` (the default), `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` or `OPTIONS`. `accept` is `json`
   (the default), `yaml` or `text`. `cache` is a count with the unit `s`, `m`, `h` or `d`, or
   `forever`, or `off`. `envelope` is `true` or `false` (the default).
@@ -1187,7 +1232,7 @@ The declaration checks above still apply to a replayed entry (`replay_cannot_ski
 in `graph_tests.rs`), and so do the type checks of the body (`replay_keeps_static_type_checks` in
 `crates/mds-core/tests/data_tooling.rs`). The data rules below apply only to a file that MDS reads.
 
-This release sends no network request. A URL entry with no replay value fails with
+Without a network grant, a URL entry with no replay value fails with
 `mds::network_denied` (exit 2), for example:
 
 ```text
@@ -1202,6 +1247,136 @@ entries in declaration order. The denial comes before any local data read
 `frontier_keeps_module_and_declaration_order` in `graph_tests.rs`,
 `build_denies_network_entries_without_replay_and_opens_no_connection` in `cli_data.rs`).
 
+In this release, only `mds build --allow-net` (§7.2) and the Rust step API ("Step compiles"
+below) give a network grant. The napi, WASM and Python bindings, `@mdscript/mds`, the Rust
+compile functions, `mds watch`, `mds check`, `mds lint` and `mds fmt` send no request: they
+refuse a URL entry with no replay value with `mds::network_denied`, as above.
+
+#### Network access
+
+A host gives a network grant as a `NetworkPolicy`: an allow list, the import opt-in and the
+host secrets. The core checks each request against it before the request leaves the compile:
+
+- **Allow list.** It has 1 to 64 items. An item is `host`, `host:port`, `https://host[:port]` or
+  `http://host:port`. An item with no scheme is `https`. The host follows the strict URL parser:
+  a lower-case name or a canonical IP address, with no trailing dot. An item has no path, no
+  query, no fragment and no wildcard. An `http` item needs its scheme and a port. An item allows
+  exactly one origin: the same scheme, host and port. The default port and no port are equal. A
+  name never matches a subdomain (`allow_items_name_one_exact_origin`,
+  `allow_items_refuse_every_other_form` and `allow_items_match_the_exact_host_scheme_and_port`
+  in `crates/mds-core/src/data/policy_tests.rs`).
+- **Import opt-in.** A URL entry of an imported module or of an `@extends` base sends only with
+  the import opt-in. The allow list applies first
+  (`origins_need_the_allow_list_then_the_import_opt_in`,
+  `a_url_entry_of_an_imported_module_needs_the_import_opt_in` in `step_tests.rs`).
+- **Methods.** This release sends `GET` and `HEAD` only. Another method fails with
+  `mds::network_denied` (`method`) (`only_get_and_head_pass_the_method_check`).
+- **Narrowing.** A host can make a narrower policy from a wider one. Each item must permit no
+  request that the wider list refuses, and the import opt-in can be on only when the wider
+  policy has it. An IP address item with a port can open a refused address (below), so it needs
+  a port in the wider item too (`narrowing_never_widens_a_policy`,
+  `narrowing_cannot_add_the_port_that_opens_an_address`).
+- **Secrets.** A host secret has a name (an identifier), a value (one or more visible ASCII
+  characters) and one `https` origin. A policy has at most 16, each with its own name. A secret
+  header of the entry module (`{secret: NAME, prefix: …}`) binds only to a secret of that name
+  and of that exact origin. Else the request fails with `mds::network_denied`
+  (`secret-binding`). A secret value fills a header value only, never a URL, a body or the
+  output (`secrets_bind_to_their_name_and_origin_only`, `a_host_secret_is_only_a_header_value`).
+- **Response check.** A response that holds the exact bytes of a host secret value, in a string
+  or a key of the converted value, in an envelope header or in a redirect `location`, fails with
+  `mds::network_denied` (`response-check`, `the response holds the value of a host secret`).
+  The check finds exact bytes only: a changed form of the value, such as base64, percent
+  encoding or a value split over two strings, is not found
+  (`a_secret_value_in_an_envelope_header_fails_the_response_check`).
+
+The sender checks each address that a name lookup gives before it connects. An address in a
+refused range fails the request with `mds::network_denied` (`transport-address`). The refused
+IPv4 ranges are `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`,
+`172.16.0.0/12`, `192.0.0.0/24`, `192.168.0.0/16`, `198.18.0.0/15`, `224.0.0.0/4`,
+`240.0.0.0/4` and `255.255.255.255/32`. The refused IPv6 ranges are `::/128`, `::1/128`,
+`::ffff:0:0/96`, `2002::/16`, `64:ff9b::/96`, `fc00::/7`, `fe80::/10` and `ff00::/8`. An
+address in a refused range passes only when an allow item is that exact IP address with that
+exact port. Thus a name can never open such an address (`address_table_refuses_both_edges_of_each_range`,
+`only_an_exact_ip_item_with_its_port_opens_a_refused_address`).
+
+#### Requests
+
+The core expands the URL and the header values of an entry in one pass over the literal
+template. The place of each reference comes from the template, never from a value. A value is
+inserted once and never scanned again. A reference value becomes text by this table:
+
+| Value | Text |
+|-------|------|
+| String | The string |
+| `true`, `false` | `true`, `false` |
+| An integer from -2^53 to 2^53 | Its decimal digits, with no exponent and no fraction |
+| Another number, `null`, an array, an object | Fails with `mds::type_error` |
+
+Then the text goes through the encoder of its place:
+
+| Place | Rule |
+|-------|------|
+| URL path segment (before the first literal `?`) | Each byte outside `A-Z`, `a-z`, `0-9`, `-`, `.`, `_` and `~` becomes `%XX` (upper-case hex). Empty text, `.` and `..` fail with `mds::data` |
+| URL query (after the first literal `?`) | The same byte rule, so `&`, `=`, `+` and `#` cannot add or cut a parameter |
+| Header value | Bytes 0x20 to 0x7E only. Other text fails with `mds::data`. It is never encoded |
+
+Tests: `scalars_become_text_only_as_strings_booleans_and_exact_integers`,
+`each_placement_encoder_gives_the_exact_bytes_or_its_refusal` and
+`placement_comes_from_the_literal_template_never_from_a_value` in
+`crates/mds-core/src/data/encode_tests.rs`, and `each_value_source_gives_the_same_request_bytes_or_refusal`
+in `step_tests.rs`.
+
+The strict URL parser then reads the expanded URL. A request carries the method, the URL, the
+`accept` format and the headers in declaration order. The native sender adds
+`User-Agent: mds-fetch/<version>`, `Accept: application/json, application/yaml, text/plain` and
+`Accept-Encoding: identity`.
+
+**Request identity.** Each request has a `RequestId`: the SHA-256 digest of a canonical text,
+written as 64 lower-case hex digits. The text is a sequence of fields, each its byte length as
+a u64 big-endian number and then its bytes: the version tag `mds-request-1`, the method, the
+URL, the format (`json`, `yaml` or `text`), the header count, each header key in byte order, and
+an empty body. A text header key is its lower-case name, NUL, `t`, and then the name and the text
+as netstrings. A secret header key has `s`, the name, the secret name, the prefix and the hex
+HMAC-SHA-256 of the secret value under the `RunKey` of the run. Thus equal requests share one
+ID, any change of a part changes it, and the ID never shows a secret value
+(`the_id_is_the_digest_of_the_canonical_text`, `each_request_part_changes_the_id` and
+`the_run_key_changes_only_secret_request_ids` in `crates/mds-core/src/data/request_tests.rs`).
+
+**Redirects.** The sender follows no redirect. A `301`, `302`, `303`, `307` or `308` answer
+goes back to the core, which checks the hop and derives the next request:
+
+- The answer has exactly one `location` header. It is an absolute URL or an absolute path, and
+  the strict URL parser reads it. Else the request fails with `mds::network_denied`
+  (`redirect-check` or `url-parser`).
+- A chain has at most 5 hops (`mds::resource_limit`). A hop from `https` to `http` fails, and so
+  does a hop to an origin that the allow list does not name (`redirect-check`).
+- A hop to another origin drops every secret header and the headers `Authorization`,
+  `Proxy-Authorization`, `Cookie` and `X-Api-Key`. A hop keeps the method.
+- Each hop is a new request with its own identity, so the request cap counts it.
+
+Tests: `redirect_hops_stay_on_the_allow_list_and_never_drop_to_http`,
+`cross_origin_hops_drop_secret_and_credential_headers` in `policy_tests.rs`, and
+`each_redirect_hop_passes_the_hop_checks` and `a_hop_to_another_origin_drops_the_secret_header`
+in `step_tests.rs`.
+
+#### Errors of a request
+
+A refused request fails with `mds::network_denied`, and a failed send with `mds::network`, both
+exit 2. The message starts with the request location: the module, the entry, the URL as
+declared and the origin, escaped. A refusal then names the check and its reason:
+
+```text
+network access denied for data entries: "main.mds", entry "u", URL "https://api.example/items/{{id}}", origin "https://api.example": allow-list: the origin is not in the allow list
+```
+
+The checks are `allow-list`, `import-opt-in`, `url-parser`, `redirect-check`,
+`secret-binding`, `transport-address`, `response-check` and `method`. Each check has its own
+fixed help. A `response-check` refusal ends with the secret name, as ` (secret "NAME")`. A
+transport failure gives `network error in <request>: <reason>`. The message never holds
+the expanded URL, a header value, a secret value or response text
+(`layer_names_are_distinct_kebab_case_words` in `policy_tests.rs`,
+`a_response_value_in_a_failed_url_never_reaches_stderr` in `crates/mds-cli/tests/cli_net.rs`).
+
 #### Step compiles
 
 The Rust API sends requests through a host loop: `compile_step_native_fs`, `compile_step_virtual_fs`
@@ -1209,6 +1384,10 @@ and `compile_step_str`. Each takes the arguments of its compile function plus a 
 (the `NetworkPolicy` and a per-run `RunKey`) and a `FetchState`. It returns `Step::Done` with the
 `CompileResult`, or `Step::Need` with the requests that the compile needs:
 
+- A host starts with an empty `FetchState::new()`. On `Step::Need` it sends each request once,
+  adds each answer with `FetchState::with_response(id, response)` and calls the same function
+  again with the new state. A chain of entries needs one round per level and one more
+  (`a_two_level_chain_needs_one_round_per_level_and_one_more` in `step_tests.rs`).
 - Each call is a fresh compile with a fresh budget. It derives every request again and runs every
   check again, so a narrower policy on a later call takes effect.
 - An imported module and an `@extends` base are modules other than the entry module, so their URL
@@ -1757,7 +1936,7 @@ and I/O failures are described below the table.
 | `mds::expected_messages` | Rust API only: `CompileResult::into_messages()` on a markdown result | `mds-core` API | n/a | Rust |
 | `mds::formatter_invariant` | The formatter's rewrite failed the compile-equivalence gate — a formatter defect; nothing is written | formatter | 1 / n/a | CLI (`fmt`), Rust |
 | `mds::internal` | A lexer step that does not advance or a failed memory-counter check at the end of a compile (§5 "Compile memory budget"), or an evaluator read of a pending data entry, which the check calls never do (§4.12). Each gives `internal compiler error` with no help and no span. Also: a panic caught at a binding boundary, or a result that could not be serialised; the raw payload is attached as `detail` only under the off-by-default `debug-panics` feature (`SECURITY.md`). On the CLI, also the error `mds lint --format json` records for an input whose analysis panicked, with the fixed message `internal compiler error` and nothing of the panic (§5 "Panics on the CLI") | lexer (the progress check); resolver (the counter check); napi, WASM, Python; `mds lint` | 101 / 101 | all |
-| `mds::invalid_options` | Malformed or type-incorrect options: unknown keys, wrong types, `basePath` on file methods or on the WASM backend, source-map options on `check`, an empty `basePath`, a WASM `moduleAliases` entry that is not a normalized module key or names no module (`options.moduleAliases["<alias>"]: <reason>`). In the core, a step compile whose fetch state holds a response that the compile did not request (`invalid options: the fetch state holds a response that this compile did not request`), and a second response for one request ID in a fetch state (`invalid options: the fetch state already holds a response for this request`), fixed text with no source span (§4.12 "Step compiles") | napi, WASM, Python, `@mdscript/mds`; resolver (step compile) | 2 / n/a | napi, WASM, Python, `@mdscript/mds`, Rust |
+| `mds::invalid_options` | Malformed or type-incorrect options: unknown keys, wrong types, `basePath` on file methods or on the WASM backend, source-map options on `check`, an empty `basePath`, a WASM `moduleAliases` entry that is not a normalized module key or names no module (`options.moduleAliases["<alias>"]: <reason>`). In the core, a step compile whose fetch state holds a response that the compile did not request (`invalid options: the fetch state holds a response that this compile did not request`), and a second response for one request ID in a fetch state (`invalid options: the fetch state already holds a response for this request`), fixed text with no source span (§4.12 "Step compiles"). In `mds build`, a network flag or a `network` key of `mds.json` that the policy refuses: an allow item, a `--secret` value, a `--tls-root` file that is not a PEM list of valid roots, or a `network` section that is wider than the flags (§7.2, §7.8). The message names the flag or the field, never a secret value | napi, WASM, Python, `@mdscript/mds`; resolver (step compile); CLI (`mds build`) | 2 / n/a | napi, WASM, Python, `@mdscript/mds`, Rust, CLI |
 | `mds::filename_collision` | `options.modules` already contains the entry `filename` | WASM (surfaced through `@mdscript/mds`) | n/a | WASM, `@mdscript/mds` |
 | `mds::invalid_backend_result` | The selected backend returned a result of an unexpected shape | `@mdscript/mds` | n/a | `@mdscript/mds` |
 
@@ -1952,6 +2131,34 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 | `--inline` | Embed the source map as a data-URI comment in the compiled output instead of a sidecar. Requires `--source-map`. |
 | `--embed-sources` | Embed source file contents in `sourcesContent[]`. Ships full source text — use with care. Requires `--source-map`. |
 | `-q, --quiet` | Suppress status messages on stderr on a successful run. The directory-mode summary is suppressed on a fully-successful run; it is still emitted when any file fails. (The directory-depth warning is emitted regardless of `--quiet`. `--quiet` suppresses the warning that keeps a stale output or sidecar; one that cannot be read or removed is an error, and `--quiet` never suppresses an error.) |
+| `--allow-net <ORIGINS>` | Send the requests of URL data entries to these origins (§4.12 "Network access"). A comma-separated list of 1 to 64 allow items: `host`, `host:port`, `https://host[:port]` or `http://host:port`. Without this flag the network stays off, whatever `mds.json` holds, and a URL entry with no runtime value fails with `mds::network_denied`. A refused item fails with `mds::invalid_options` (exit 2) before the compile starts: `--allow-net item "<item>": <reason>`. |
+| `--allow-net-imports` | Let the URL entries of imported modules and `@extends` bases send. Requires `--allow-net`. |
+| `--secret NAME=env:VAR@ORIGIN` | Give the host secret `NAME` with the value of the environment variable `VAR`, for requests to the `https` origin `ORIGIN` only (§4.12 "Network access"). Repeatable, at most 16. Requires `--allow-net`. A message names the index, `NAME` and `VAR`, never the value or the flag text: for example `--secret[0] "TOKEN": the environment variable API_TOKEN is not set` (`mds::invalid_options`, exit 2). |
+| `--tls-root <FILE>` | Add the certificates of a PEM file to the trust roots. Repeatable. Requires `--allow-net`. A forbidden path character and a final symlink are refused, and the file must be a regular file of at most 1 MiB (`mds::io`, exit 2; a larger file is `mds::resource_limit`, exit 3). A file that is not PEM, holds no certificate or holds a root that is not a valid trust anchor fails with `mds::invalid_options` (exit 2) and names the file. |
+
+**Network access** (`--allow-net`):
+
+- `mds build` sends the requests of URL data entries only with `--allow-net`. The `network`
+  section of `mds.json` (§7.8) can only narrow the flags. `mds watch`, `mds check`, `mds lint`
+  and `mds fmt` have no network flags, so the parser refuses them there, and they send nothing.
+- Each compile runs step compiles (§4.12 "Step compiles"). A round sends its requests in groups
+  of at most 8 at a time. Each request is sent once, with no retry. One 30 s deadline binds the
+  network work of a compile from its first send, and one run sends at most 512 requests over all
+  of its files (§4.1 "Network limits"). A directory build uses one grant and one count for all of
+  its files. Stdin builds send too.
+- The sender ignores the proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+  `NO_PROXY`, in upper or lower case). It uses TLS 1.2 or 1.3 and always checks the certificate. The
+  trust roots are the Mozilla list and the `--tls-root` files, never the roots of the system or
+  of the environment.
+- A refused request fails with `mds::network_denied`, and a failed send with `mds::network`, both
+  exit 2 (§4.12 "Errors of a request"). The run prints no request text.
+
+Tests: `crates/mds-cli/tests/cli_net.rs` (`no_flag_opens_no_connection_whatever_mds_json_allows`,
+`mds_json_can_only_narrow_the_flag`, `a_redirect_to_an_unlisted_origin_fails_with_no_connection`,
+`an_echoed_secret_stops_the_chain_and_tls_needs_the_host_root`,
+`an_unlisted_origin_is_denied_and_no_answer_is_a_network_failure`,
+`an_imported_url_entry_needs_the_import_opt_in`, `proxy_variables_change_no_target`,
+`stdin_and_directory_builds_send` and `tooling_never_sends_and_refuses_the_network_flags`).
 
 **Output path resolution** (precedence order, highest first):
 
@@ -2478,6 +2685,12 @@ Place `mds.json` in the repository root or any ancestor directory of the input f
 | `build.embed_sources` | bool | Embed source file contents in `sourcesContent[]` (equivalent to `--embed-sources`). Has no effect when `build.source_map` is `false`. Default: `false`. |
 | `lint.rules` | object | Per-rule severity overrides for `mds lint`. Keys are rule names; values are `"off"`, `"info"`, `"warn"`, or `"error"`. Any other value fails config loading (exit 1; under `mds lint` an `mds::io` error, exit 2, §5), naming the rule and the value as the bindings name a `rules` value — `lint.rules["<name>"]: unknown severity "<value>"; expected "off", "info", "warn", or "error"`, or `lint.rules["<name>"] must be a severity string, got <type>` for a value that is not a string — each WIRE-escaped (§7.5). An unknown rule name emits a warning naming it and listing the rules this build recognises, the config still loads, and lint continues — the unknown rule is not enforced (forward compat: a config naming a rule added in a newer release warns instead of failing on an older binary). Under `mds lint`, the warning goes to stderr, names `mds.json` as the run reached it (`warning: in ./mds.json: …`, `sub/../mds.json`, as a config error names it) and is suppressed by `--quiet`; `mds build`, `mds watch` and directory-mode `mds fmt` also read this file but do not emit the unknown-rule warning, and `mds check` does not read it. On the `lint` API surfaces it is returned in `lint_warnings`. |
 | `fmt.sort_frontmatter_keys` | bool | **Reserved — accepted, currently inert.** The key is parsed and type-checked (a non-boolean value is a hard config-load error, like any other field) so that `{"fmt": {"sort_frontmatter_keys": true}}` is valid today, but it drives no formatting behaviour in this version: `mds fmt` does not sort frontmatter keys and there is no matching CLI flag. Frontmatter key sorting is deferred to a future version; when it ships, this key will control it without a breaking `mds.json` schema change. Default: `true`. Pinned by `fmt_config_valid_section_loads_cleanly` and `fmt_config_malformed_bool_field_fails_loading` in `crates/mds-cli/src/build/config.rs`. |
+| `network.allow` | array of strings | A narrower allow list for `mds build --allow-net` (§7.2). Each item has the grammar of `--allow-net` and is parsed when the config loads; a refused item fails config loading (exit 1, `network.allow[<index>]: <reason>`). Each item must permit no request that the `--allow-net` list refuses; else `mds build` fails with `mds::invalid_options`, exit 2, before the compile starts (`./mds.json network.allow[<index>]: the item permits a request that the --allow-net list refuses`). Default: the `--allow-net` list. |
+| `network.allow_imports` | bool | The import opt-in for `mds build --allow-net`. `true` needs `--allow-net-imports`; else `mds build` fails with `mds::invalid_options`, exit 2 (`./mds.json network.allow_imports: true needs --allow-net-imports`). `false` turns the opt-in off. Default: the value of `--allow-net-imports`. |
+
+The `network` section can only narrow the flags. Without `--allow-net`, the network stays off,
+whatever the section holds. Another key in `network` fails config loading (exit 1). `mds watch`,
+`mds check`, `mds lint` and `mds fmt` send nothing, so the section has no effect on them.
 
 Maximum config file size: 1 MiB (1,048,576 bytes).
 
@@ -2495,7 +2708,8 @@ Maximum config file size: 1 MiB (1,048,576 bytes).
 
 For data sources, `mds::data` is a content error (exit 1).
 A data file that does not parse is `mds::yaml` (exit 1, `tooling_reads_no_data_file` in `crates/mds-cli/tests/cli_data.rs`).
-`mds::network_denied` and `mds::network` have exit 2. A data limit has exit 3 (`mds::resource_limit`).
+`mds::network_denied` and `mds::network` have exit 2. A data limit or a network limit has exit 3 (`mds::resource_limit`).
+A network flag of `mds build`, or a `network` key of `mds.json`, that the policy refuses is `mds::invalid_options`, exit 2 (§7.2, §7.8).
 An output refused over a data file that the run reads is `mds::io`, exit 2 (§7.2, `build_never_writes_over_a_data_file_it_reads`).
 
 A closed stdout or stderr pipe never changes any of these codes (§5 "Streams and I/O failures").
@@ -2767,7 +2981,7 @@ These are intentionally deferred to keep the language simple and the compiler fo
 - TypeScript/JS *language* features (note: runtime bindings for calling the compiler from JS/TS *are* provided via the `@mdscript/mds` npm package; this item refers to in-template scripting, which is out of scope)
 - Unbounded recursion: direct recursion is rejected; indirect chains are capped at depth 128 (see §4.5)
 - Macros, async functions, streaming
-- URL-based imports (remote modules). A `data:` URL entry (§4.12) names data, not a module. This release does not fetch it: a URL entry needs a replay value.
+- URL-based imports (remote modules). A `data:` URL entry (§4.12) names data, not a module. Only `mds build --allow-net` and the Rust step API fetch it; elsewhere a URL entry needs a replay value.
 - Function calls in `@if` conditions (e.g. `@if length(items) == 0:`) — not supported
 - Function calls in `@for` iterables (e.g. `@for item in split(csv, ","):`) — not supported
 - Parenthesized sub-expressions in conditions (e.g. `@if (a || b) && c:`) — not supported

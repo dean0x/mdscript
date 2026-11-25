@@ -37,8 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   YAML document, and control characters in keys and strings. It changes CRLF in strings to LF.
   Each canonical data file is read once per compile. See spec §4.12.
 - A runtime variable with the name of an entry replaces that entry, and MDS reads no file for it.
-- URL entries (`https://…` strings and request maps) are checked, but this release does not
-  fetch them. A URL entry with no runtime value fails with the new code `mds::network_denied`
+- URL entries (`https://…` strings and request maps) are checked. Without a network grant, a URL
+  entry with no runtime value fails with the new code `mds::network_denied`
   (exit 2).
 - The new code `mds::data` (exit 1) reports an invalid declaration or data value. A data file
   that does not parse gives `mds::yaml`, which names the file and the entry and shows no source text.
@@ -78,10 +78,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counts toward the 256-file and 32 MiB data limits. On POSIX, two data paths with one key can
   name two files, for example `./a.json` and `./sub/../a.json` through a linked `sub`. Then the
   WASM backend refuses the second path, as it refuses two such module imports.
+- HTTP `GET` and `HEAD` URL entries in `mds build` (#405). `mds build --allow-net <origins>`
+  sends the requests of URL entries to the listed origins only. Without the flag the network
+  stays off. Each allow item names one exact origin: `host`, `host:port`,
+  `https://host[:port]` or `http://host:port`. `--allow-net-imports` lets the URL entries of
+  imported modules and `@extends` bases send. `--secret NAME=env:VAR@ORIGIN` gives a header
+  value for one `https` origin, and `--tls-root <file>` adds trust roots. The `network` section
+  of `mds.json` (`allow`, `allow_imports`) can only narrow the flags. A refused flag or
+  `network` key fails with `mds::invalid_options` (exit 2). See spec §4.12 and §7.2.
+- `mds build --allow-net` follows redirects through the allow list, up to 5 per entry. It
+  ignores the proxy environment variables and uses TLS 1.2 or 1.3 with the Mozilla roots and the
+  `--tls-root` files. Stdin and directory builds send too. `mds watch`, `mds check`, `mds lint`
+  and `mds fmt` have no network flags and send nothing. The napi, WASM and Python bindings and
+  `@mdscript/mds` do not send in this release: a URL entry with no runtime value fails with
+  `mds::network_denied`, as before.
+- A request map can set `envelope: true` to bind `{status, headers, body}` for a final status
+  from 200 to 599. Without it, a status that is not 2xx fails.
+- The new code `mds::network` (exit 2) reports a failed send or a status that is not 2xx. A
+  refused request fails with `mds::network_denied` (exit 2) and names the check. A data value in
+  a request URL or header that is not a string, a boolean or an exact integer fails with
+  `mds::type_error`. Messages show the URL as declared and the origin only.
+- New network limits: 64 requests per compile and 512 per `mds build` run (`mds::resource_limit`,
+  exit 3); 16 KiB of response headers, 10 MiB of response body, 10 s per request and 30 s of
+  network work per compile (`mds::network`, exit 2). See spec §4.1 "Network limits".
+- Lint: `insecure-data-origin` reports a request map with an `http://` URL.
+  `literal-credential-header` reports a header with literal text when its name contains
+  `token`, `secret`, `api-key`, `apikey` or `password`. Both warn by default and are never fixed.
+- Rust API: the step compiles `compile_step_native_fs`, `compile_step_virtual_fs` and
+  `compile_step_str`, with `FetchContext`, `FetchState`, `Step`, `Request`, `RequestId`,
+  `Response`, `TransportFailure`, `NetworkPolicy`, `AllowItem`, `Secret`, `SecretValue` and the
+  network limit constants. `CompileResult.remote_inputs` lists the bound URL entries in template
+  form. The canonical JSON writes `remoteInputs` only when the list is not empty.
+- The new crate `mds-fetch` holds the native sender of URL entries. `mds-cli` depends on it,
+  and `mds-core` and the WASM build depend on no network crate.
 
 ### Changed
 
 - Emitted standalone frontmatter keeps the author's blank lines and trailing spaces exactly as written outside removed blocks.
+- A request map with an `http://` URL passes the declaration check and reaches the network
+  policy. It sends only when an `http://host:port` allow item names its origin (#405).
+- A `GET` or `HEAD` request map with a `body` fails with `mds::data`. A `HEAD` request needs
+  `envelope: true` (#405).
 
 ### Fixed
 

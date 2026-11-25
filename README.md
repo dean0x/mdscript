@@ -81,9 +81,10 @@ data:
 
 Each path starts with `./` or `../` and stays inside the [project root](#project-root). A runtime
 variable with the same name (`--set team=...`, `--vars`) replaces the entry, and then MDS reads
-no file. `mds check`, `mds lint` and `mds fmt` read no data file. In this release, MDS does not
-fetch a URL entry: give it a runtime value. See [spec §4.12](spec.md#412-data-sources-data) for the forms, the
-conversion rules and the limits.
+no file. `mds check`, `mds lint` and `mds fmt` read no data file. A URL entry sends a `GET` or
+`HEAD` request only with `mds build --allow-net <origins>`, to the listed origins only. Elsewhere,
+give it a runtime value. See [spec §4.12](spec.md#412-data-sources-data) for the forms, the
+conversion rules, the network rules and the limits.
 
 ## Features
 
