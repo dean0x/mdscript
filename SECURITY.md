@@ -102,7 +102,9 @@ input. The compiler enforces several defense-in-depth controls:
     certificate check always on. The trust roots are the Mozilla list and the `--tls-root`
     files, never the system or environment roots.
   - A host secret (`--secret NAME=env:VAR@ORIGIN`) binds to one `https` origin and fills a
-    header value only. A message, a request ID and a `Debug` view never show its value. A
+    header value only. In a directory build, each `.mds` file of the tree that is not a
+    partial is its own entry module with the same network flags, so each such file can use
+    the host secret. A message, a request ID and a `Debug` view never show its value. A
     response that holds the exact value fails the request. **Residual:** this check finds
     exact bytes only, so a server that returns the value in a changed form (for example
     base64 or percent encoding) is not detected.
