@@ -162,6 +162,22 @@ A YAML data file also has the flow-nesting guard of frontmatter (1024 levels, `m
 A data value nested deeper than 64 levels fails with `mds::data`
 (`data_value_depth_accepts_the_cap_and_refuses_one_more_level` in `crates/mds-core/src/data/convert_tests.rs`).
 
+**Request header limits:**
+
+| Limit | Value and stage |
+|-------|-----------------|
+| `MAX_REQUEST_HEADERS` | 32 headers in the request map of one entry, during declaration analysis |
+| `MAX_HEADER_VALUE_BYTES` | 8 KiB (8192 bytes) per request header value: the expanded text, or the literal prefix and the secret value, checked before each append |
+
+These two values are choices of this release. 32 headers is above the header count of usual
+API requests. 8 KiB is the header field limit of usual HTTP servers, so a longer value
+fails at the server. Together they bound the header text of one request to 256 KiB.
+Each fails with `mds::resource_limit`:
+`"<module>", entry "<entry>", field "headers": too many headers (max 32 per request)` and
+`"<module>", entry "<entry>", field "<header>": header value exceeds the maximum length of 8192 bytes`
+(`header_count_cap_admits_exactly_the_cap` in `crates/mds-core/src/data/decl_tests.rs`,
+`the_header_value_cap_admits_exactly_the_cap` in `crates/mds-core/src/data/encode_tests.rs`).
+
 ---
 
 ### 4.2 Interpolation

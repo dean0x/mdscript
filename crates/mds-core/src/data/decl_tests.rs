@@ -548,3 +548,27 @@ fn literal_url_at_the_length_cap_passes_and_one_byte_over_fails() {
         "{error:?}"
     );
 }
+
+/// Declaration analysis counts the header map before it keeps a header: 32 headers pass,
+/// and one more is a resource limit that names the entry.
+#[test]
+fn header_count_cap_admits_exactly_the_cap() {
+    let entry = |count: usize| {
+        let headers: Vec<String> = (0..count).map(|i| format!("x-h{i}: v")).collect();
+        format!(
+            "{{item: {{url: '{URL}', headers: {{{}}}}}}}",
+            headers.join(", ")
+        )
+    };
+    let cap = crate::limits::MAX_REQUEST_HEADERS;
+    assert_eq!(template(&entry(cap)).headers.len(), cap);
+    let error = parse(&entry(cap + 1)).unwrap_err().serialize();
+    assert_eq!(error.code, "mds::resource_limit", "{error:?}");
+    assert_eq!(
+        error.message,
+        format!(
+            "resource limit exceeded: \"sub/main.mds\", entry \"item\", field \"headers\": \
+             too many headers (max {cap} per request)"
+        )
+    );
+}

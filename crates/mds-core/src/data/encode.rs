@@ -9,7 +9,7 @@ use std::borrow::Cow;
 
 use super::refs::{pieces, Piece};
 use crate::error::{data_location, MdsError};
-use crate::limits::MAX_URL_BYTES;
+use crate::limits::{MAX_HEADER_VALUE_BYTES, MAX_URL_BYTES};
 use crate::value::Value;
 
 /// The largest integer up to which an `f64` holds every integer exactly: 2^53.
@@ -167,7 +167,8 @@ fn hex_digit(nibble: u8) -> char {
 
 /// Expand `template` for `target` in one pass over its original text. `lookup` gives the
 /// value of each reference path, whatever its source. A URL that would grow past
-/// `MAX_URL_BYTES` fails with `mds::resource_limit` before the append.
+/// `MAX_URL_BYTES`, or a header value past `MAX_HEADER_VALUE_BYTES`, fails with
+/// `mds::resource_limit` before the append.
 #[must_use = "expansion can fail"]
 pub(crate) fn expand<'v>(
     template: &str,
@@ -204,17 +205,23 @@ impl FieldLabel<'_> {
     fn fault(self, fault: Fault) -> MdsError {
         match fault {
             Fault::Refused(refusal) => self.data_error(refusal.reason()),
-            Fault::TooLong => MdsError::resource_limit(format!(
-                "{}: URL exceeds the maximum length of {MAX_URL_BYTES} bytes",
-                data_location(self.module, Some(self.entry), Some(self.field))
-            )),
+            Fault::UrlTooLong => self.limit("URL", MAX_URL_BYTES),
+            Fault::HeaderTooLong => self.limit("header value", MAX_HEADER_VALUE_BYTES),
         }
+    }
+
+    fn limit(self, what: &str, max: usize) -> MdsError {
+        MdsError::resource_limit(format!(
+            "{}: {what} exceeds the maximum length of {max} bytes",
+            data_location(self.module, Some(self.entry), Some(self.field))
+        ))
     }
 }
 
 enum Fault {
     Refused(EncodeRefusal),
-    TooLong,
+    UrlTooLong,
+    HeaderTooLong,
 }
 
 impl From<EncodeRefusal> for Fault {
@@ -285,11 +292,14 @@ impl Writer {
         Ok(())
     }
 
-    /// A URL holds at most `MAX_URL_BYTES`. Header text has no cap here.
+    /// A URL holds at most `MAX_URL_BYTES`, and a header value `MAX_HEADER_VALUE_BYTES`.
     fn room_for(&self, bytes: usize) -> Result<(), Fault> {
-        let url = self.placement != Placement::HeaderValue;
-        if url && self.out.len().saturating_add(bytes) > MAX_URL_BYTES {
-            Err(Fault::TooLong)
+        let (max, fault) = match self.placement {
+            Placement::HeaderValue => (MAX_HEADER_VALUE_BYTES, Fault::HeaderTooLong),
+            Placement::PathSegment | Placement::Query => (MAX_URL_BYTES, Fault::UrlTooLong),
+        };
+        if self.out.len().saturating_add(bytes) > max {
+            Err(fault)
         } else {
             Ok(())
         }

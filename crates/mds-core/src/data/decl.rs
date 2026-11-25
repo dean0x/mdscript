@@ -10,7 +10,9 @@ use super::url::{self, UrlRefusal};
 use super::{Accept, DataLabel};
 use crate::error::data_location;
 use crate::evaluator::budget::{MemBudget, Part};
-use crate::limits::{MAX_DATA_ENTRIES_PER_MODULE, MAX_DATA_REFS_PER_ENTRY, MAX_URL_BYTES};
+use crate::limits::{
+    MAX_DATA_ENTRIES_PER_MODULE, MAX_DATA_REFS_PER_ENTRY, MAX_REQUEST_HEADERS, MAX_URL_BYTES,
+};
 use crate::parser::is_valid_identifier;
 use crate::value::MAX_VALUE_DEPTH;
 use crate::{escape_path_for_message, MdsError};
@@ -474,6 +476,12 @@ impl DataLabel<'_> {
         let Value::Mapping(headers) = headers else {
             return Err(self.error(Some("headers"), "expected a header mapping"));
         };
+        if headers.len() > MAX_REQUEST_HEADERS {
+            return Err(MdsError::resource_limit(format!(
+                "{}: too many headers (max {MAX_REQUEST_HEADERS} per request)",
+                data_location(self.module, Some(self.entry), Some("headers"))
+            )));
+        }
         mem.charge(
             Part::Temp,
             headers.len().checked_mul(size_of::<HeaderTemplate>()),

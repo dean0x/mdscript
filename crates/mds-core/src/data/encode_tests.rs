@@ -6,7 +6,7 @@ use super::encode::{
     FieldLabel, Placement, Target,
 };
 use crate::error::MdsError;
-use crate::limits::MAX_URL_BYTES;
+use crate::limits::{MAX_HEADER_VALUE_BYTES, MAX_URL_BYTES};
 use crate::value::Value;
 
 const LABEL: FieldLabel<'static> = FieldLabel {
@@ -311,5 +311,40 @@ fn other_numbers_null_arrays_and_objects_fail_with_the_type_error_code() {
     assert_eq!(
         through_expand.unwrap_err().serialize().code,
         "mds::type_error"
+    );
+}
+
+/// A header value holds at most 8 KiB: the cap counts literal and inserted text, admits
+/// exactly the cap and refuses one more byte before the append.
+#[test]
+fn the_header_value_cap_admits_exactly_the_cap() {
+    let label = FieldLabel {
+        field: "x-trace",
+        ..LABEL
+    };
+    let header = |value: &str| {
+        let values = one("v", value);
+        expand("Bearer {{v}}", Target::Header, label, |path| {
+            Ok(&values[path])
+        })
+    };
+    let fits = "a".repeat(MAX_HEADER_VALUE_BYTES - "Bearer ".len());
+    assert_eq!(header(&fits).unwrap().len(), MAX_HEADER_VALUE_BYTES);
+    match header(&format!("{fits}a")) {
+        Err(err @ MdsError::ResourceLimit { .. }) => assert_eq!(
+            err.to_string(),
+            format!(
+                "resource limit exceeded: \"entry.mds\", entry \"users\", field \"x-trace\": \
+                 header value exceeds the maximum length of {MAX_HEADER_VALUE_BYTES} bytes"
+            )
+        ),
+        other => panic!("expected mds::resource_limit, got {other:?}"),
+    }
+    let literal = format!("{}{{{{v}}}}", "a".repeat(MAX_HEADER_VALUE_BYTES + 1));
+    let values = one("v", "");
+    let refused = expand(&literal, Target::Header, label, |path| Ok(&values[path]));
+    assert!(
+        matches!(refused, Err(MdsError::ResourceLimit { .. })),
+        "{refused:?}"
     );
 }

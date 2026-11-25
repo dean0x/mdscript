@@ -379,6 +379,22 @@ pub(crate) const MAX_ALLOW_ITEMS: usize = 64;
 /// response header cap.
 pub(crate) const MAX_URL_BYTES: usize = 8 * 1024;
 
+/// Maximum headers that one data entry declares for its request: 32.
+/// The unit is one declared header. Declaration analysis counts the header map before it
+/// keeps any header, so this cap binds before the value cap and before the reference
+/// cap of the entry. The value is a choice of this release: it is above the header count
+/// of usual API requests, and with `MAX_HEADER_VALUE_BYTES` it bounds the header text of
+/// one request to 256 KiB.
+pub(crate) const MAX_REQUEST_HEADERS: usize = 32;
+
+/// Maximum bytes of one request header value: 8 KiB.
+/// The unit is one byte that the request sends as the value: the expanded text, or the
+/// literal prefix and the secret value. Expansion checks it before each append, and the
+/// step engine checks a secret header before it builds the request. The value is a
+/// choice of this release: it is the header field limit of usual HTTP servers, so a
+/// longer value fails at the server, and it equals `MAX_URL_BYTES`.
+pub(crate) const MAX_HEADER_VALUE_BYTES: usize = 8 * 1024;
+
 /// Maximum addresses that the fetcher takes from one name lookup: 64.
 /// The unit is one resolved address. The fetcher checks each address against the
 /// address table before it connects. A lookup with more addresses fails the request, so
