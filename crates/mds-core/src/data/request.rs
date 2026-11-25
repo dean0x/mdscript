@@ -106,17 +106,31 @@ impl fmt::Display for RequestIdError {
 
 impl Error for RequestIdError {}
 
-/// The value of a request header.
+/// The value of a request header. Its `Debug` shows the secret name and the prefix of a
+/// secret value, and never the text of a text value.
 ///
 /// This enum is `#[non_exhaustive]`: new value kinds may be added in minor releases.
 #[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum HeaderValue {
     /// The final header text.
     Text(String),
     /// A host secret: the secret name and the literal prefix, never the value. The
     /// sender writes the prefix and then the value of the bound secret.
     Secret { name: String, prefix: String },
+}
+
+impl fmt::Debug for HeaderValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HeaderValue::Text(_) => f.write_str("Text(..)"),
+            HeaderValue::Secret { name, prefix } => f
+                .debug_struct("Secret")
+                .field("name", name)
+                .field("prefix", prefix)
+                .finish(),
+        }
+    }
 }
 
 /// One header of a request.
@@ -150,15 +164,32 @@ impl RequestHeader {
 
 /// A request that the core needs and that passed every policy check.
 ///
+/// Its `Debug` shows the ID, the method, the URL as declared, the origin and the header
+/// names, never the expanded path or query or a header value.
+///
 /// This type is `#[non_exhaustive]`: obtain requests from the core.
 #[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Request {
     id: RequestId,
     method: Method,
+    /// The URL as declared, with its `{{…}}` text.
+    template: String,
     url: CheckedUrl,
     accept: Accept,
     headers: Vec<RequestHeader>,
+}
+
+impl fmt::Debug for Request {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Request")
+            .field("id", &self.id)
+            .field("method", &self.method)
+            .field("template", &self.template)
+            .field("origin", &format_args!("{}", self.url.origin()))
+            .field("headers", &self.headers)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Request {
@@ -170,6 +201,13 @@ impl Request {
     #[must_use]
     pub fn method(&self) -> Method {
         self.method
+    }
+
+    /// The URL as declared, with its `{{…}}` text. A message about the request shows
+    /// this text and the origin, never the URL of [`Request::url`].
+    #[must_use]
+    pub fn template(&self) -> &str {
+        &self.template
     }
 
     #[must_use]
@@ -185,10 +223,12 @@ impl Request {
 }
 
 impl Request {
-    /// A request with its ID. Each secret header must name a host secret that is bound
-    /// to the origin of `url`; else the request fails the secret binding.
+    /// A request with its ID. `template` is the URL as declared, for messages only: it is
+    /// not part of the identity. Each secret header must name a host secret that is
+    /// bound to the origin of `url`; else the request fails the secret binding.
     pub(crate) fn new(
         method: Method,
+        template: &str,
         url: CheckedUrl,
         accept: Accept,
         headers: Vec<RequestHeader>,
@@ -211,6 +251,7 @@ impl Request {
         Ok(Self {
             id: identity(method, &url, accept, keys),
             method,
+            template: template.to_owned(),
             url,
             accept,
             headers,

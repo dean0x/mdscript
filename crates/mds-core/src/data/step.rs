@@ -617,8 +617,17 @@ fn new_request(
     label: &RequestLabel<'_>,
 ) -> Result<Request, MdsError> {
     mem.charge(Part::Temp, identity_bytes(&url, &headers))?;
-    Request::new(method, url, accept, headers, &ctx.key, &ctx.policy)
-        .map_err(|refusal| label.refused(refusal, None))
+    mem.charge(Part::Temp, Some(label.template.len()))?;
+    Request::new(
+        method,
+        label.template,
+        url,
+        accept,
+        headers,
+        &ctx.key,
+        &ctx.policy,
+    )
+    .map_err(|refusal| label.refused(refusal, None))
 }
 
 /// Bind `value` for the entry of `node`: keep it for each request ID of the chain and
@@ -769,6 +778,7 @@ fn retained_bytes(request: &Request) -> Option<usize> {
     };
     let mut bytes = host
         .checked_add(url.path().len())?
+        .checked_add(request.template().len())?
         .checked_add(url.query().map_or(0, str::len))?
         .checked_add(2 * size_of::<(RequestId, Request, usize)>())?;
     for header in request.headers() {

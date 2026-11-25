@@ -6,6 +6,7 @@ use super::Accept;
 
 const PLANTED: &str = "planted-secret-value";
 const URL: &str = "https://api.example/items?q=1";
+const TEMPLATE: &str = "https://api.example/{{kind}}?q={{query}}";
 
 fn key(byte: u8) -> RunKey {
     RunKey::from_bytes([byte; 32])
@@ -35,7 +36,16 @@ fn secret(name: &str, secret: &str) -> RequestHeader {
 
 fn request(url: &str, headers: Vec<RequestHeader>, key: &RunKey) -> Request {
     let url = parse_absolute(url).unwrap();
-    Request::new(Method::Get, url, Accept::Json, headers, key, &policy()).unwrap()
+    Request::new(
+        Method::Get,
+        TEMPLATE,
+        url,
+        Accept::Json,
+        headers,
+        key,
+        &policy(),
+    )
+    .unwrap()
 }
 
 fn id(url: &str, headers: Vec<RequestHeader>) -> RequestId {
@@ -63,6 +73,7 @@ fn each_request_part_changes_the_id() {
     let other = |method, accept| {
         Request::new(
             method,
+            TEMPLATE,
             url.clone(),
             accept,
             headers.clone(),
@@ -130,6 +141,7 @@ fn secret_headers_bind_to_the_secret_origin() {
         let url = parse_absolute(url).unwrap();
         let refused = Request::new(
             Method::Get,
+            TEMPLATE,
             url,
             Accept::Json,
             vec![secret("Authorization", name)],
@@ -148,7 +160,7 @@ fn secret_headers_bind_to_the_secret_origin() {
 }
 
 /// `Debug` of a request with a secret header shows the descriptor, never the value.
-/// Control: the same text in a plain header is in `Debug`.
+/// Control: the descriptor parts are in `Debug`.
 #[test]
 fn debug_output_of_a_secret_request_has_no_secret_value() {
     let bound = request(URL, vec![secret("Authorization", "token")], &key(1));
@@ -159,8 +171,34 @@ fn debug_output_of_a_secret_request_has_no_secret_value() {
         "{debug}"
     );
     assert!(!debug.contains("[7, 7"), "{debug}");
-    let plain = request(URL, vec![text("X-Echo", PLANTED)], &key(1));
-    assert!(format!("{plain:?}").contains(PLANTED));
+}
+
+/// `Debug` of a request and of its URL shows the URL as declared, the origin and the
+/// header names, never the expanded path or query or a header value. Control: the
+/// template, the origin and the header name are in `Debug`.
+#[test]
+fn debug_output_of_a_request_has_no_expanded_url_or_header_value() {
+    let markers = ["marker-path", "marker-query", "marker-header"];
+    let planted = request(
+        "https://api.example/marker-path?q=marker-query",
+        vec![text("X-Echo", "marker-header")],
+        &key(1),
+    );
+    assert_eq!(planted.url().path(), "/marker-path");
+    let request = format!("{planted:?}");
+    let url = format!("{:?}", planted.url());
+    let headers = format!("{:?}", planted.headers());
+    for debug in [&request, &url, &headers] {
+        for marker in markers {
+            assert!(!debug.contains(marker), "{marker} in {debug}");
+        }
+    }
+    for debug in [&request, &url] {
+        assert!(debug.contains(r#"origin: https://api.example"#), "{debug}");
+    }
+    assert!(request.contains(TEMPLATE), "{request}");
+    assert!(headers.contains("X-Echo"), "{headers}");
+    assert_eq!(planted.template(), TEMPLATE);
 }
 
 /// The ID is the SHA-256 digest of the documented canonical text, with the HMAC of the

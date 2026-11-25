@@ -3020,6 +3020,7 @@ fn network_policy_api_exists() {
 fn request_identity_api_exists() {
     fn accessors(request: &mds::Request) -> (mds::RequestId, mds::Method, String) {
         let url: &mds::CheckedUrl = request.url();
+        let _: &str = request.template();
         let _: (mds::Origin, &str, Option<&str>) = (url.origin(), url.path(), url.query());
         for header in request.headers() {
             let _: &str = header.name();

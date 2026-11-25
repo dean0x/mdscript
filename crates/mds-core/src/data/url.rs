@@ -69,13 +69,13 @@ impl fmt::Display for Host {
     }
 }
 
-/// A URL that passed the strict parser. It has no `Display`, so a message can not show
-/// its path or query by accident: a message shows the [`Origin`] only.
+/// A URL that passed the strict parser. It has no `Display`, and its `Debug` shows the
+/// [`Origin`] only, so a message can not show its path or query by accident.
 ///
 /// Obtain a URL from [`Request::url`](crate::Request::url). This type is
 /// `#[non_exhaustive]` and cannot be built with a struct literal.
 #[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CheckedUrl {
     pub(crate) scheme: Scheme,
     pub(crate) host: Host,
@@ -85,6 +85,14 @@ pub struct CheckedUrl {
     pub(crate) path: String,
     /// The text after the first `?`, if the URL has one.
     pub(crate) query: Option<String>,
+}
+
+impl fmt::Debug for CheckedUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CheckedUrl")
+            .field("origin", &format_args!("{}", self.origin()))
+            .finish_non_exhaustive()
+    }
 }
 
 impl CheckedUrl {
