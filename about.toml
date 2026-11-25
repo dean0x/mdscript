@@ -1,5 +1,6 @@
 # List the policy allow list first, then exception licenses in deny.toml order (#136).
-accepted = ["MIT", "Apache-2.0", "ISC", "CC0-1.0", "Unicode-3.0", "Zlib", "Apache-2.0 WITH LLVM-exception", "CDLA-Permissive-2.0", "BSD-3-Clause"]
+# The crate tables below accept their exception license for that one crate only.
+accepted = ["MIT", "Apache-2.0", "ISC", "CC0-1.0", "Unicode-3.0", "Zlib", "Apache-2.0 WITH LLVM-exception"]
 # Include the native addon targets and the WASM target (#136).
 targets = [
     "aarch64-apple-darwin",
@@ -21,3 +22,11 @@ ignore = false
 [miniz_oxide.clarify]
 license = "MIT"
 files = [{ path = "LICENSE-MIT.md", checksum = "799e9ca9d179295ef372f25d3769cdda7d25bb2668add6a6a1e22d1e4c678b8d" }]
+
+# Accept the permissive data license for the Mozilla root list of the sender only.
+[webpki-root-certs]
+accepted = ["CDLA-Permissive-2.0"]
+
+# Accept BSD-3-Clause terms for the constant-time crate of the TLS library only.
+[subtle]
+accepted = ["BSD-3-Clause"]

@@ -81,7 +81,11 @@ const ABOUT = {
     license: 'MIT',
     files: [{ path: 'LICENSE-MIT.md', checksum: '799e9ca9d179295ef372f25d3769cdda7d25bb2668add6a6a1e22d1e4c678b8d' }],
   },
+  'webpki-root-certs': { accepted: SHAPE },
+  subtle: { accepted: SHAPE },
 };
+// The notice config accepts the exception license of these crates in a crate table only.
+const ABOUT_SCOPED = ['webpki-root-certs', 'subtle'];
 
 const BARE = /^[A-Za-z0-9_-]+$/;
 const BASIC = /^"[^"\\\x00-\x1f]*"$/;
@@ -235,9 +239,10 @@ function checkAbout(text, denyText) {
   const tables = readPolicy(text, ABOUT);
   exactSet(tables.keys(), Object.keys(ABOUT), 'about.toml tables');
   const licenses = readPolicy(denyText).get('licenses');
-  const accepted = new Set([
+  const exceptions = licenses.get('exceptions').map(({ value }) => value);
+  const global = new Set([
     ...licenses.get('allow').map(({ value }) => value),
-    ...licenses.get('exceptions').flatMap(({ value }) => value.allow),
+    ...exceptions.filter(({ crate }) => !ABOUT_SCOPED.includes(crate)).flatMap(({ allow }) => allow),
   ]);
   for (const [name, table] of tables) {
     exactSet(table.keys(), Object.keys(ABOUT[name]), `about.toml ${name || 'root'} keys`);
@@ -245,7 +250,13 @@ function checkAbout(text, denyText) {
       const actual = Array.isArray(value) ? value.map(row => row.value) : value;
       if (key === 'accepted') {
         assert.ok(Array.isArray(actual), 'about.toml accepted must be an array');
-        exactSet(actual, accepted, 'about.toml accepted licenses');
+        if (name === '') {
+          exactSet(actual, global, 'about.toml accepted licenses');
+        } else {
+          const scoped = exceptions.find(({ crate }) => crate === name);
+          assert.ok(scoped, `about.toml ${name} needs a deny.toml exception`);
+          exactSet(actual, scoped.allow, `about.toml ${name} accepted licenses`);
+        }
       } else {
         assert.deepEqual(actual, ABOUT[name][key], `about.toml ${key}`);
       }
@@ -533,6 +544,9 @@ test('the notice config matches the dependency license policy (#136)', () => {
 for (const [name, from, to, message] of [
   ['an extra accepted license', 'accepted = [', 'accepted = ["MPL-2.0", ', /^about\.toml accepted licenses/],
   ['a missing accepted license', '"CC0-1.0", ', '', /^about\.toml accepted licenses/],
+  ['a crate license in the global list', 'accepted = ["MIT", ', 'accepted = ["MIT", "BSD-3-Clause", ', /^about\.toml accepted licenses/],
+  ['a crate license for another crate', 'accepted = ["BSD-3-Clause"]', 'accepted = ["CDLA-Permissive-2.0"]', /^about\.toml subtle accepted licenses/],
+  ['a missing crate table', '[subtle]\naccepted = ["BSD-3-Clause"]\n', '', /^about\.toml tables/],
   ['a quoted key', 'accepted =', '"accepted" =', /^expected a bare key$/],
   ['a missing target', '    "wasm32-unknown-unknown",\n', '', /^about\.toml targets/],
   ['the alternate miniz license file', 'path = "LICENSE-MIT.md"', 'path = "LICENSE"', /^about\.toml files/],
