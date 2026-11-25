@@ -1934,7 +1934,8 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       const realReadFile = FileHandle.readFile;
       FileHandle.stat = async function stat(...args) {
         const stats = await realStat.apply(this, args);
-        stats.size = Math.min(stats.size, 100);
+        // The scanner asks for `bigint` stats, which give the file's identity exactly.
+        stats.size = typeof stats.size === 'bigint' ? (stats.size < 100n ? stats.size : 100n) : Math.min(stats.size, 100);
         return stats;
       };
       // What the scanner itself reads: the bytes each open file gives it, and the largest
@@ -2099,10 +2100,15 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
       const files = 35;
       let stats = 0;
       let grow = false;
+      let shrunk = 0;
       FileHandle.stat = async function stat(...args) {
         const fstat = await realStat.apply(this, args);
         stats += 1;
-        if (grow && fstat.size === grownSize) fstat.size = 1;
+        // The scanner asks for `bigint` stats, which give the file's identity exactly.
+        if (grow && Number(fstat.size) === grownSize) {
+          fstat.size = typeof fstat.size === 'bigint' ? 1n : 1;
+          shrunk += 1;
+        }
         return fstat;
       };
       try {
@@ -2115,6 +2121,7 @@ describe('buildModulesMap — each refusal and its order match native (#414)', (
         stats = 0;
         grow = true;
         const err = await rejectionOf(buildModulesMap(entry, scanImports, { maxAggregateSize }), 'grown');
+        assert.ok(shrunk > 0, 'every fstat of m0 must report one byte');
         assert.deepEqual(errorShape(err), aggregateError);
         assert.equal(stats, files + 1, 'm0 is charged the bytes read, so one read ahead is declined');
       } finally {
@@ -2613,6 +2620,63 @@ test('U-SM57: file handle refusals use the display path for entries and imports'
           const expected = readIoShape('sub/z.mds', reason);
           if (!isDeepStrictEqual(errorShape(err), expected)) {
             mismatches.push({ method, actual: errorShape(err), expected });
+          }
+        }
+      } finally {
+        fs.promises.open = realOpen;
+        syncBuiltinESMExports();
+      }
+    }
+    assert.deepEqual(mismatches, []);
+  });
+});
+
+test('U-SM65: an open that gives a handle of another file gets the native changed-file refusal; control: the file is read', async () => {
+  await withNestedProject(async (proj) => {
+    await mkdir(path.join(proj, 'sub'));
+    const file = await writeFixture(proj, 'sub/z.mds', 'OK\n');
+    const main = await writeFixture(proj, 'sub/main.mds', importLine(plainZ) + '@include z\n');
+    const target = await realpath(file);
+    // The other file of the open: a valid module, which a read would take for z.mds, and a
+    // file of invalid UTF-8, whose bytes native never checks before it compares the files.
+    const others = [
+      await writeFixture(proj, 'sub/other.mds', 'OTHER\n'),
+      await writeFixture(proj, 'sub/bad.mds', Buffer.from([0xff])),
+    ];
+    const entries = [file, main];
+    // Control: both backends read z.mds, as the entry and as an import.
+    const native = await compileFileOutcomes('native', entries);
+    assert.deepEqual(native, [{ output: 'OK\n' }, { output: 'OK\n' }]);
+    assert.deepEqual(await compileFileOutcomes('wasm', entries), native);
+    for (const entry of entries) {
+      const read = await buildModulesMap(entry, scanImports);
+      assert.equal(read.modules['sub/z.mds'], 'OK\n');
+    }
+
+    // The test swaps the file under the open, never the scanner's check: the open of
+    // z.mds gives a handle of another file of the same directory.
+    const realOpen = fs.promises.open;
+    let swaps = 0;
+    const mismatches = [];
+    for (const other of others) {
+      fs.promises.open = async function swappingOpen(name, ...args) {
+        if (String(name) === target) {
+          swaps += 1;
+          return realOpen.call(this, other, ...args);
+        }
+        return realOpen.call(this, name, ...args);
+      };
+      syncBuiltinESMExports();
+      try {
+        for (const entry of entries) {
+          swaps = 0;
+          const err = await rejectionOf(buildModulesMap(entry, scanImports), `U-SM65 ${path.basename(other)}`);
+          assert.ok(swaps > 0, 'the open of z.mds must give the other file');
+          // NativeFs's refusal of an opened file that is not the file it resolved
+          // (`native_read_reports_a_changed_file_before_its_size_or_bytes` in fs.rs).
+          const expected = readIoShape('sub/z.mds', 'the file changed while it was opened');
+          if (!isDeepStrictEqual(errorShape(err), expected)) {
+            mismatches.push({ other: path.basename(other), entry: path.basename(entry), actual: errorShape(err) });
           }
         }
       } finally {

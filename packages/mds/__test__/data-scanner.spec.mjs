@@ -1,7 +1,8 @@
 /**
  * Data-file pre-scanner tests for @mdscript/mds (#405).
  * Tests: TP-20 (with its Windows rows), TP-21, TP-23, TP-26, TP-27, TP-56, TP-112, the data
- * key conflict, a refused data key that a later path resolves to, the data file count and
+ * key conflict, a data file whose open gives another file, a refused data key that a later
+ * path resolves to, the data file count and
  * byte bounds, the case-variant data key, and the data keys that the engine checks with no
  * project root.
  *
@@ -403,6 +404,48 @@ describe('WASM backend data pre-scanner (#405)', () => {
       // for a pipe at the path (the test above).
       assert.deepEqual([...raced.dataRefusals.values()].map(errorShape), [
         { code: 'mds::io', message: 'cannot read pipe.json: not a regular file', help: null, span: null },
+      ]);
+    });
+  });
+
+  test('an open of a data file that gives a handle of another file gets the native changed-file refusal; control: the file is read', async (t) => {
+    if (!requireEngines(t, engines, 'changed data file')) return;
+    await withTemp('mds-dchanged-', async (tmp) => {
+      const root = await project(tmp, 'p');
+      const target = await put(root, 'd.json', '"real"');
+      const other = await put(root, 'other.json', '"other"');
+      const entry = await put(root, 'main.mds', dataModule({ d: './d.json' }, '{{d}}\n'));
+      // Control: both backends read the data file.
+      assert.deepEqual(await nativeEqualsWasm([entry]), [{ output: 'real\n' }]);
+      let swap = false;
+      let swaps = 0;
+      // The test swaps the file under the open, never the scanner's check: the open of
+      // d.json gives a handle of another data file of the same directory.
+      const scan = () =>
+        withOpen(
+          (realOpen) =>
+            async function swappingOpen(name, ...args) {
+              if (swap && String(name) === target) {
+                swaps += 1;
+                return realOpen.call(this, other, ...args);
+              }
+              return realOpen.call(this, name, ...args);
+            },
+          () => scanData(entry),
+        );
+      const read = await scan();
+      assert.equal(read.modules['d.json'], '"real"');
+      assert.deepEqual(read.preflighted, ['d.json']);
+      assert.equal(read.dataRefusals.size, 0);
+      swap = true;
+      const changed = await scan();
+      assert.ok(swaps > 0, 'the open of d.json must give the other file');
+      assert.equal(Object.hasOwn(changed.modules, 'd.json'), false);
+      assert.deepEqual(changed.preflighted, []);
+      // The refusal that the compile gives back when it binds the entry: NativeFs's refusal
+      // of an opened file that is not the file it resolved (`file_changed` in fs.rs).
+      assert.deepEqual([...changed.dataRefusals.values()].map(errorShape), [
+        { code: 'mds::io', message: 'cannot read d.json: the file changed while it was opened', help: null, span: null },
       ]);
     });
   });

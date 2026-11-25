@@ -3,7 +3,7 @@
 // its on-disk spelling.
 import { isUtf8 } from 'node:buffer';
 import { lstat, open, realpath } from 'node:fs/promises';
-import { constants, existsSync } from 'node:fs';
+import { constants, existsSync, type BigIntStats } from 'node:fs';
 import { resolve, dirname, basename, join, relative, isAbsolute, parse, sep } from 'node:path';
 import { isMdsError, type MdsError } from '../types.js';
 import type { ImportRecord, WasmModule } from '../backend/wasm.js';
@@ -342,6 +342,14 @@ function notRegularFileError(display: string): PathError {
   return cannotReadError(display, 'not a regular file');
 }
 
+/**
+ * `cannotReadError` for a file whose opened handle is not the file located — NativeFs's
+ * `file_changed`: another file took the place of the located one before the open.
+ */
+function fileChangedError(display: string): PathError {
+  return cannotReadError(display, 'the file changed while it was opened');
+}
+
 /** `cannotReadError` for a failed Node call, with its errno name as the reason. */
 function readError(display: string, err: unknown): PathError {
   const errno = (err as NodeJS.ErrnoException | undefined)?.code;
@@ -381,7 +389,7 @@ function moduleCountError(): PathError {
 }
 
 /** NativeFs's refusal of a module over `MAX_FILE_SIZE`, naming its root-relative path. */
-function fileTooLargeError(size: number, display: string): PathError {
+function fileTooLargeError(size: number | bigint, display: string): PathError {
   return resourceLimitError(
     `file too large (${size} bytes, max ${MAX_FILE_SIZE} bytes): ${escapePathForMessage(display)}`,
   );
@@ -875,20 +883,31 @@ function keyOf(root: string, path: string): string {
 }
 
 /**
+ * The identity of a file as the OS reports it: its device and inode — on Windows, its
+ * volume serial number and file index. Exact, as `bigint`.
+ */
+interface FileIdentity {
+  readonly dev: bigint;
+  readonly ino: bigint;
+}
+
+/**
  * NativeFs's `symlink_metadata` step: a final component that does not resolve is
  * not found; one whose own file type is a symlink — a junction too, on Windows —
- * is refused. Nothing is opened.
+ * is refused. Nothing is opened. The identity of the file found is returned from the
+ * same lookup, as NativeFs keeps it for the read to compare with the opened file.
  */
-async function assertFileNotSymlink(path: string, shown: string): Promise<void> {
-  let isSymlink: boolean;
+async function lookupFile(path: string, shown: string): Promise<FileIdentity> {
+  let stats: BigIntStats;
   try {
-    isSymlink = (await lstat(path)).isSymbolicLink();
+    stats = await lstat(path, { bigint: true });
   } catch {
     throw fileNotFoundError(shown);
   }
-  if (isSymlink) {
+  if (stats.isSymbolicLink()) {
     throw symlinkError(shown);
   }
+  return { dev: stats.dev, ino: stats.ino };
 }
 
 /**
@@ -927,6 +946,8 @@ interface Located {
   readonly dir: string;
   /** Its canonical path. */
   readonly resolved: string;
+  /** The identity of the file found when it was located: a read refuses another file. */
+  readonly id: FileIdentity;
 }
 
 /** A module file or data file opened, checked and read. */
@@ -1005,7 +1026,7 @@ export function _unwrapWalkFinishedForTesting(): never {
  * then canonicalized, and refused when its canonical path carries a forbidden path
  * character.
  */
-async function locateEntry(entryPath: string): Promise<{ path: string; dir: string; resolved: string }> {
+async function locateEntry(entryPath: string): Promise<Omit<Located, 'key' | 'aliasKey'>> {
   const entryErr = entryPathError(entryPath) ?? segmentCountError(entryPath);
   if (entryErr !== undefined) {
     throw entryErr;
@@ -1016,13 +1037,13 @@ async function locateEntry(entryPath: string): Promise<{ path: string; dir: stri
   }
   const dir = await canonicalPath(parent, entryPath);
   const path = join(dir, name);
-  await assertFileNotSymlink(path, entryPath);
+  const id = await lookupFile(path, entryPath);
   const resolved = await canonicalFile(path, dir, entryPath);
   const hostileErr = resolvedPathError(resolved, entryPath);
   if (hostileErr !== undefined) {
     throw hostileErr;
   }
-  return { path, dir, resolved };
+  return { path, dir, resolved, id };
 }
 
 function hasDotDotAfterName(shown: string): boolean {
@@ -1111,7 +1132,7 @@ async function locateImport(projectRoot: string, importer: Located, importPath: 
   if (!isWithinRoot(projectRoot, path)) {
     throw escapesProjectError(importPath);
   }
-  await assertFileNotSymlink(path, importPath);
+  const id = await lookupFile(path, importPath);
   const resolved = await canonicalFile(path, dir, importPath);
   // Security (#265): a directory the import never named, reached through a
   // symlink, can carry a forbidden path character — and so can the on-disk name of
@@ -1121,7 +1142,7 @@ async function locateImport(projectRoot: string, importer: Located, importPath: 
     throw hostileErr;
   }
   const key = name === undefined ? '' : keyOf(projectRoot, resolved);
-  return { key, aliasKey, path, dir, resolved };
+  return { key, aliasKey, path, dir, resolved, id };
 }
 
 /**
@@ -1187,6 +1208,13 @@ function dataAliasKey(importerKey: string, path: string): string | undefined {
  * path with the path as written: on a case-insensitive volume realpath returns the
  * on-disk spelling, so `Entry.mds` for `entry.mds` differs from its canonical form
  * without being a symlink (#408).
+ *
+ * The path checks above name the file at the path, not the file the handle holds: a
+ * directory of the path can change and change back between the open and the checks. So
+ * the opened file's device and inode are compared with those found when it was located
+ * (`Located.id`), before a byte or its size is checked, as NativeFs compares the opened
+ * file with its resolve record; another file is refused with NativeFs's text (`mds::io`,
+ * `cannot read <root-relative path>: the file changed while it was opened`).
  */
 async function readFile(
   projectRoot: string,
@@ -1226,7 +1254,7 @@ async function readFile(
     // stat and canonicalize steps (file-not-found), the fd-based `stat` is part of
     // reading the file.
     const [stats, linkStats, resolution] = await Promise.all([
-      handle.stat().catch((err: unknown) => {
+      handle.stat({ bigint: true }).catch((err: unknown) => {
         throw readError(display, err);
       }),
       lstat(located.path).catch(() => {
@@ -1246,21 +1274,26 @@ async function readFile(
     if (!stats.isFile()) {
       throw notRegularFileError(display);
     }
+    if (stats.dev !== located.id.dev || stats.ino !== located.id.ino) {
+      throw fileChangedError(display);
+    }
     // Checked on the fstat size too, before a byte is read, so a file over the cap
     // when it is opened is never read into memory; one that grows past it while it
     // is read is read to one byte past the cap and no further (#428), and refused by
     // the engine's own check below. A data file has the same cap
     // (`MAX_DATA_FILE_BYTES` is `MAX_FILE_SIZE`).
-    if (stats.size > MAX_FILE_SIZE) {
+    if (stats.size > BigInt(MAX_FILE_SIZE)) {
       throw fileTooLargeError(stats.size, display);
     }
-    if (budget !== undefined && !budget.admit(stats.size)) {
+    // At most the cap, so the number is exact.
+    const size = Number(stats.size);
+    if (budget !== undefined && !budget.admit(size)) {
       return undefined;
     }
-    const bytes = await readAtMost(handle, MAX_FILE_SIZE + 1, stats.size).catch((err: unknown) => {
+    const bytes = await readAtMost(handle, MAX_FILE_SIZE + 1, size).catch((err: unknown) => {
       throw readError(display, err);
     });
-    budget?.charge(bytes.length - stats.size);
+    budget?.charge(bytes.length - size);
     return { resolved: located.resolved, size: bytes.length, content: rule.check(bytes, display, shown) };
   } finally {
     await closeModule(handle, display);
@@ -1315,6 +1348,10 @@ async function readFile(
  *   before the open (`mds::io`, `cannot read <root-relative path>: not a regular
  *   file`, #428), and one that cannot be read (`mds::io`,
  *   `cannot read <root-relative path>: <errno name>`);
+ * - a module whose opened file is not the file located — its device and inode differ,
+ *   because another file took its place before the open — checked before its size and
+ *   its bytes (`mds::io`, `cannot read <root-relative path>: the file changed while it
+ *   was opened`);
  * - a file over the engine's 10 MiB per-file cap (`mds::resource_limit`) or whose
  *   bytes are not valid UTF-8 (`mds::io`), then a file that is neither a `.mds` file
  *   nor a `.md` file declaring `type: mds` (`mds::not_mds`, `not an MDS file: <path as
@@ -1360,7 +1397,7 @@ async function readFile(
  * native's error when the compile binds the entry. Every other refusal is kept in
  * `dataRefusals` with the context the resolver adds to it, and the file stays out of
  * `modules`. So a compile fails for a data file only where native fails for it, and with
- * native's error, except as differences 10 and 11 list. Native binds the data of an
+ * native's error, except as differences 10, 11 and 12 list. Native binds the data of an
  * `@extends` base in the scope of its child, so a refusal there has the context of the
  * child, not of the `@extends` directive. A refused key stays out of `modules` also when
  * a later path resolves to it, for example `./missing/../a.json` and then `./lnk/a.json`
@@ -1449,6 +1486,11 @@ async function readFile(
  *    which native reads (`mds::import`, `data path "<path>": escapes project directory`).
  *    The engine checks a data key with no project root (`rootlessDataKeyRefusal`), and an
  *    alias cannot help where the key is the file's own canonical key.
+ * 12. On Windows, the scanner compares the volume serial number and file index of the
+ *    opened file with those of the located file, where native compares the final path of
+ *    the opened handle. So a regular file put at the same path between the lookup and the
+ *    open is refused as changed on the WASM backend, and native reads it. Deliberate: Node
+ *    gives no final path of a handle, and the stricter check never reads another file.
  */
 export async function buildModulesMap(
   entryPath: string,
