@@ -122,7 +122,14 @@ pub(crate) const CREDENTIAL_HEADERS: [&str; 4] = [
 pub(crate) fn is_credential_header(name: &str) -> bool {
     CREDENTIAL_HEADERS
         .iter()
-        .any(|known| name.eq_ignore_ascii_case(known))
+        .any(|known| same_name(name, known))
+}
+
+/// `a` and `b` are equal in any ASCII letter case. It is not inlined, so the WASM build
+/// carries one copy of the compare loop for all the names of the list.
+#[inline(never)]
+fn same_name(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
 }
 
 /// The declaration form of a URL. Only a request map can name `http://`.
