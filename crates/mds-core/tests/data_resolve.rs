@@ -203,6 +203,29 @@ fn request_map_rules_run_before_replay() {
     assert!(rendered(compile_map("url: 'http://example.com/path'")).ends_with("replayed\n"));
 }
 
+/// Replay does not lift the secret header rule in a plain compile: a replayed URL entry
+/// with a secret header fails in an imported module and in an `@extends` base. Control:
+/// the same replayed entry in the entry module renders the replayed value.
+#[test]
+fn a_replayed_secret_header_is_allowed_in_the_entry_module_only() {
+    let module = "---\ndata:\n  remote: {url: 'https://example.com/', headers: {Authorization: {secret: token, prefix: 'Bearer '}}}\n---\n{{remote}}\n";
+    for main in [
+        "@import \"./part.mds\" as part\n@include part\n",
+        "@extends \"./part.mds\"\n",
+    ] {
+        let files = [("main.mds", main), ("part.mds", module)];
+        let err = compile(&files, replay("remote")).unwrap_err();
+        assert_eq!(err.serialize().code, "mds::data", "{main}: {err}");
+        let message = err.to_string();
+        assert!(message.contains("part.mds"), "{message}");
+        assert!(
+            message.ends_with("a secret header is allowed in the entry module only"),
+            "{message}"
+        );
+    }
+    assert!(rendered(compile(&[("main.mds", module)], replay("remote"))).ends_with("replayed\n"));
+}
+
 #[test]
 fn data_values_are_text_and_do_not_add_module_edges() {
     let main = "---\ndata:\n  settings: ./value.json\n---\n@import \"./part.mds\" as part\n{{settings}}\n@include part\n";

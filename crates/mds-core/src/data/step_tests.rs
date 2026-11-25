@@ -875,6 +875,40 @@ fn an_extends_base_cannot_use_a_secret_header() {
     assert_eq!(urls(&requests), ["https://a.example/x"]);
 }
 
+/// Replay does not lift the secret header rule: a replayed URL entry with a secret
+/// header fails in an imported module and in an `@extends` base, and no request exists.
+/// Control: the same replayed entry in the entry module renders the runtime value.
+#[test]
+fn a_replayed_secret_header_is_allowed_in_the_entry_module_only() {
+    let entry = "a:\n    url: https://a.example/x\n    headers:\n      Authorization: {secret: TOKEN, prefix: 'Bearer '}\n";
+    let module = format!("---\ndata:\n  {entry}---\n{{{{a}}}}\n");
+    let runtime = Runtime::from([("a".to_owned(), Value::String("replayed".into()))]);
+    let net = with_secret(policy(&["a.example"]), "TOKEN", PLANTED, "a.example").with_imports(true);
+    for main in [
+        "@import \"./lib.mds\" as lib\n@include lib\n",
+        "@extends \"./lib.mds\"\n",
+    ] {
+        let files = [("main.mds", main), ("lib.mds", module.as_str())];
+        let (result, needed) = run_round(&files, &runtime, &net, &Responses::new());
+        let err = result.unwrap_err();
+        assert_eq!(code(&err), "mds::data", "{main}");
+        let message = err.to_string();
+        assert!(message.contains("lib.mds"), "{message}");
+        assert!(
+            message.ends_with("a secret header is allowed in the entry module only"),
+            "{message}"
+        );
+        assert!(needed.is_empty(), "{main}");
+    }
+    let text = done(run_step(
+        &[("main.mds", &module)],
+        &runtime,
+        &net,
+        &Responses::new(),
+    ));
+    assert!(text.ends_with("replayed\n"), "{text}");
+}
+
 /// TP-97: a URL entry of an imported module needs the import opt-in. Control: with it.
 #[test]
 fn a_url_entry_of_an_imported_module_needs_the_import_opt_in() {

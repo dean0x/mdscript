@@ -1403,6 +1403,9 @@ and `compile_step_str`. Each takes the arguments of its compile function plus a 
   (`mds::data`, `a secret header is allowed in the entry module only`)
   (`a_base_url_entry_reads_a_child_frontmatter_variable` and
   `an_extends_base_cannot_use_a_secret_header` in `crates/mds-core/src/data/step_tests.rs`).
+  The secret header rule also applies to an entry that replay satisfies, in a step compile and in
+  a plain compile (`a_replayed_secret_header_is_allowed_in_the_entry_module_only` in
+  `step_tests.rs` and in `crates/mds-core/tests/data_resolve.rs`).
 - The state holds responses only, keyed by `RequestId` (64 lower-case hex digits). A second
   response for one ID fails with `mds::invalid_options`
   (`the fetch state already holds a response for this request`). More than 64 responses fail

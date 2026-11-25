@@ -321,8 +321,16 @@ impl ModuleCache {
             |count, graph, mem| {
                 count_data_entries(&mut data.entries, count)?;
                 // The role check reads these names, so a replayed entry keeps its source.
+                // Replay does not lift the secret header rule, so check every URL entry.
                 let mut names = HashSet::new();
                 for node in graph.nodes() {
+                    if let Source::Url(template) = &node.entry.source {
+                        step::check_secret_module(
+                            node,
+                            template,
+                            Some(node.position.0) == entry_key,
+                        )?;
+                    }
                     let name = &node.entry.name;
                     mem.charge(
                         Part::Buffers,

@@ -484,6 +484,30 @@ fn bind_with_engine(
     bound
 }
 
+/// Refuse a URL entry of `node` that has a secret header when the entry is not in the
+/// module that the compile starts from. Every compile runs this on every URL entry,
+/// replayed or not, so replay cannot lift the rule.
+pub(crate) fn check_secret_module(
+    node: Node<'_>,
+    template: &RequestTemplate,
+    entry_module: bool,
+) -> Result<(), MdsError> {
+    let has_secret = template
+        .headers
+        .iter()
+        .any(|header| matches!(header.value, HeaderSource::Secret { .. }));
+    if has_secret && !entry_module {
+        return Err(MdsError::data(
+            node.module,
+            Some(&node.entry.name),
+            Some("headers"),
+            "a secret header is allowed in the entry module only",
+            None,
+        ));
+    }
+    Ok(())
+}
+
 fn derive(
     node: Node<'_>,
     template: &RequestTemplate,
@@ -494,19 +518,7 @@ fn derive(
 ) -> Result<Bound, MdsError> {
     let module = node.module;
     let entry = node.entry.name.as_str();
-    let has_secret = template
-        .headers
-        .iter()
-        .any(|header| matches!(header.value, HeaderSource::Secret { .. }));
-    if has_secret && !scope.entry_module {
-        return Err(MdsError::data(
-            module,
-            Some(entry),
-            Some("headers"),
-            "a secret header is allowed in the entry module only",
-            None,
-        ));
-    }
+    check_secret_module(node, template, scope.entry_module)?;
     if let Some(header) = template
         .headers
         .iter()
