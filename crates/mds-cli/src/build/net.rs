@@ -282,11 +282,12 @@ fn parse_secret(index: usize, text: &str) -> Result<(&str, Secret), MdsError> {
             safe_inline(name)
         ))
     };
+    // A text that is not a variable name can be a value typed in place of VAR, so the
+    // message does not show it.
     if !is_env_name(var) {
-        return Err(at(format!(
-            "\"{}\" is not an environment variable name",
-            safe_inline(var)
-        )));
+        return Err(at(
+            "the text after env: is not an environment variable name".to_owned(),
+        ));
     }
     let origin = AllowItem::parse(origin)
         .map_err(|reason| at(format!("the origin: {reason}")))?
@@ -500,6 +501,21 @@ mod tests {
         let text = error.to_string();
         assert!(
             text.contains("--secret[0]: expected NAME=env:VAR@ORIGIN"),
+            "{text}"
+        );
+        assert!(!text.contains("planted-secret-value"), "{text}");
+
+        let value_as_var = NetFlags {
+            secrets: vec!["TOKEN=env:planted-secret-value@https://api.example".into()],
+            ..flags(&["api.example"])
+        };
+        let error = effective_policy(&value_as_var, None).unwrap_err();
+        assert_eq!(code(&error), "mds::invalid_options");
+        let text = error.to_string();
+        assert!(
+            text.contains(
+                "--secret[0] \"TOKEN\": the text after env: is not an environment variable name"
+            ),
             "{text}"
         );
         assert!(!text.contains("planted-secret-value"), "{text}");
