@@ -1,9 +1,9 @@
 ---
 feature: mds-compiler
-name: MDS Compiler Core (mds-core)
-description: "Use when changing the MDS compile pipeline: directives, scope, frontmatter, reserved keys, imports, @extends, local data sources, path security, output caps. Keywords: resolver, read_data, MAX_DATA_FILES."
+name: MDS Compiler Core (mds-core), with URL Data Entries
+description: "Use when changing the MDS compile pipeline: directives, scope, frontmatter, imports, @extends, data and URL entries, step compiles, network policy, mds-fetch, path security. Keywords: resolver, read_data, StepCtx."
 category: domain-knowledge
-directories: ["crates/mds-core/"]
+directories: ["crates/mds-core/", "crates/mds-fetch/", "crates/mds-cli/src/build/"]
 referencedFiles:
   - crates/mds-core/src/lib.rs
   - crates/mds-core/src/evaluator.rs
@@ -42,8 +42,18 @@ referencedFiles:
   - crates/mds-core/tests/data_paths.rs
   - crates/mds-core/tests/fixtures/data-path-vectors.json
   - crates/mds-core/tests/yaml_funnel.rs
+  - crates/mds-core/src/data/step.rs
+  - crates/mds-core/src/data/policy.rs
+  - crates/mds-core/src/data/request.rs
+  - crates/mds-core/src/data/envelope.rs
+  - crates/mds-core/tests/supply_chain.rs
+  - crates/mds-core/tests/net_sinks.rs
+  - crates/mds-fetch/src/lib.rs
+  - crates/mds-cli/src/build/net.rs
+  - crates/mds-cli/tests/panic_hook.rs
+  - crates/mds-cli/tests/cli_net.rs
 created: 2026-06-26
-updated: 2026-11-24
+updated: 2026-11-25
 ---
 
 # MDS Compiler Core (mds-core)
@@ -64,8 +74,12 @@ updated: 2026-11-24
 - **KB-AP-9** Check a data path only as written, or add a path rule as a unit test only: the segment and containment rules run again on the exact resolved key, and a new rule is a row in the shared vector table `tests/fixtures/data-path-vectors.json`. Details: Local Data Sources.
 - **KB-AP-10** Parse data JSON or YAML outside `resolver/frontmatter.rs`: `tests/yaml_funnel.rs` permits the parse entry points only there (and `serde_json` also in `vars_json.rs`), so the node and memory caps apply to every data parse. Details: Local Data Sources.
 - **KB-INV-4** Only `ModuleCache::compiling` (the compile entry points) reads data files. `ModuleCache::tooling` (check, lint, fmt) reads none and marks unreplayed entries pending; a plain `ModuleCache` reports one as `mds::undefined_var`. Details: Local Data Sources.
-- **KB-INV-5** No data file is read before the whole-graph preflight passes over every module. An unreplayed URL entry gives `mds::network_denied` before any local read; a kept graph refusal blocks every read, but the first fault that the compile meets itself wins. Details: Local Data Sources.
+- **KB-INV-5** No data file is read before the whole-graph preflight passes over every module. In a compile with no step context, an unreplayed URL entry gives `mds::network_denied` before any local read; a kept graph refusal blocks every read, but the first fault that the compile meets itself wins. Details: Local Data Sources.
 - **KB-INV-6** A `@message` role never depends on data: `expr_reads_data` must see each expression form that can carry a data value. Details: Local Data Sources.
+- **KB-AP-11** Call a step engine function (anything that `bind_with_engine` reaches) directly from resolver code: resolver code reaches the engine only through `step::bind_url_entry` and the `StepCtx.bind` pointer, so the WASM build, which starts no step compile, keeps no engine code. A direct call links the engine into WASM and can break the CI WASM size limit. Details: URL Data Entries.
+- **KB-INV-7** The core makes every network decision: the allow list, the import opt-in, the method, the strict URL parse, each redirect hop, the secret binding and the response secret scan. A sender follows no redirect and only checks addresses with `NetworkPolicy::check_address`. A policy can only narrow (`NetworkPolicy::narrow`), and the secret header rule (entry module only) runs on every URL entry, replayed too. Details: URL Data Entries.
+- **KB-AP-12** Format a value that can hold a planted secret (the secret, stderr, stdout, an error message) into a test assertion message: the code scan of the repository flags it. Use a fixed message, and check that the value is absent before a later assertion prints the stream (`assert_no_secret` in `crates/mds-cli/tests/cli_net.rs`). Details: Anti-Patterns.
+- **KB-AP-13** Write expected CLI path text with `/` in a CLI test: the CLI prints `.\mds.json` on Windows, and the test fails only in the Windows CI job. Build the text with `MAIN_SEPARATOR_STR` and keep the full sentence (`cli_net.rs`). Details: Anti-Patterns.
 
 ## Overview
 
@@ -316,7 +330,7 @@ Normative text: `spec.md` §4.12 "Data sources", the "Local data limits" of §4.
 - Reach: a data path can name any `.json`, `.yaml` or `.yml` file that these rules permit below the project root (the nearest directory with `.git` or `.mdsroot`), not only files near the template, and a template can put that content in its output. `SECURITY.md` states this reach; change the two together.
 
 ### Entry-point roles
-- The compile entry points (`compile*`, `compile_native_fs`, `compile_virtual_fs` and their wrappers) use `ModuleCache::compiling` (`data.compile` and `analyze_data` on). They read and bind local files. An unreplayed URL entry fails the compile with `mds::network_denied`: this release sends no network request.
+- The compile entry points (`compile*`, `compile_native_fs`, `compile_virtual_fs` and their wrappers) use `ModuleCache::compiling` (`data.compile` and `analyze_data` on). They read and bind local files. An unreplayed URL entry fails the compile with `mds::network_denied`: a plain compile has no step context and sends no request. Only the step entry points (`ModuleCache::stepping`) bind URL entries; see URL Data Entries.
 - `check*`, `lint*`, `fmt` and the lint fix verify use `ModuleCache::tooling` (`analyze_data` only). They read no data file (WASM `check_and_lint_read_no_data_file`, napi `D-6`, `tooling_checks_pending_variables_without_opening_data` in `tests/data_tooling.rs`). Unreplayed entries become pending names, the warning `data pending; output was not evaluated: <entries>` is added, and module evaluation is skipped while `data.pending` is set. `tooling_output_in_dir` returns `None` then, so `fmt` and the fix verify do not compare output.
 - A plain `ModuleCache` (`new`, `native`, `virtual_fs`, `with_fs`) has neither flag: an unreplayed entry is `mds::undefined_var`, and `dependencies()` lists modules only.
 - A runtime variable with the entry's name replays it in every role: the graph marks it replayed, and no file or URL is used.
@@ -324,7 +338,7 @@ Normative text: `spec.md` §4.12 "Data sources", the "Local data limits" of §4.
 ### Preflight, graph and first-fault order
 - `prepare_data` runs once, at the root, when `analyze_data` is on. `collect_data_preflight` reads every module source into a snapshot before any module evaluates, and `check_scope` builds the graph of each scope (`FrontmatterNames::Preflight`).
 - `graph::analyze`: the root of each `Source::Url` reference must name a winning entry, a frontmatter key or a runtime variable (`unknown data reference name`). `check_levels` removes one level for each pass; a pass with nothing ready is a cycle (`blocked by a data dependency cycle`); more than `MAX_DATA_LEVELS` levels is `mds::resource_limit`. A file entry has no dependencies.
-- In the compile role, the frontier (unreplayed URL entries, in module first-resolution order, then declaration order) gives `MdsError::network_denied` before any local read (`url_frontier_precedes_local_reads_and_follows_module_then_declaration_order`).
+- In the compile role with no step context (`data.net` is `None`), the frontier (unreplayed URL entries, in module first-resolution order, then declaration order) gives `MdsError::network_denied` before any local read (`url_frontier_precedes_local_reads_and_follows_module_then_declaration_order`).
 - A preflight refusal does not return at once. `graph_refusal` keeps it; the compile continues from the snapshot and reports its own first fault, `bind_data` returns the refusal and reads nothing, and `pop_resolving` returns it at root close when no other fault came first (`a_later_missing_import_does_not_replace_the_first_fault_of_the_compile`, `a_refused_graph_check_still_blocks_every_data_read` in `tests/data_graph.rs`).
 - `bind_data` reads each distinct canonical key once for each compile (the `data.files` memo; `one_canonical_file_is_read_once_across_three_modules`).
 
@@ -351,6 +365,70 @@ The compile memory budget also counts data: `read_file` reserves one `MAX_DATA_F
 - `MdsError::Data` (`mds::data`), `NetworkDenied` (`mds::network_denied`) and `DataFileNotFound` are `#[non_exhaustive]`, and each has a public named constructor: `MdsError::data(module, entry, field, reason, help)`, `MdsError::network_denied(&[(module, entry)])`, `MdsError::data_file_not_found(key)` (a custom backend uses it for a miss). `data_error_variants_have_named_constructors` in `tests/api_surface.rs` pins them. Give a project-relative module label and prose; `data_location` escapes the module and sanitizes the entry and field.
 - A bad data file is `mds::yaml`, `data file "<root-relative>", entry "<name>": invalid <format> data`. JSON and YAML data parse through `parse_data_json_with` and `parse_data_yaml_with` in `resolver/frontmatter.rs`; `yaml_parse_sites_are_funnelled` and `json_parse_sites_are_funnelled` (`tests/yaml_funnel.rs`) refuse a parse entry point in another file (`vars_json.rs` is the one other JSON owner).
 - Lint (`lint/facts.rs`): each entry is a `FmVarKind::DataEntry` fact that `unused-variable` reports with "data entry" text; each URL reference root counts as a use; `shadow-variable` reports a `@for` variable or `@define` parameter over an entry (`ShadowKind::DataEntry`).
+
+## URL Data Entries (step compiles, `mds-fetch`, `mds build --allow-net`, #405)
+
+Normative text: `spec.md` §4.12 ("Replay and network access", "Network access") and the `SECURITY.md` bullet "URL data entries"; change the two with the code. Core code: `src/data/step.rs` (the step engine), `policy.rs`, `request.rs`, `url.rs` (the one strict URL parser), `encode.rs` (reference expansion into a URL or a header), `envelope.rs`, `digest.rs` (SHA-256 and HMAC). The resolver calls the engine from `bind_data` (`resolver/module_scope.rs`); `prepare_data` (`resolver/process.rs`) refuses the frontier only when there is no step context.
+
+### Roles and the host loop
+- `ModuleCache::stepping(fs, StepCtx)` is `compiling` plus `data.net = Some(ctx)`. It is the only role with a step context; the tooling roles and a plain compile have none.
+- Public step entry points: `compile_step_native_fs`, `compile_step_str` and `compile_step_virtual_fs`. Each takes the normal compile arguments plus `&FetchContext` and `&FetchState`, and gives `Step::Done(Box<CompileResult>)` or `Step::Need(Vec<Request>)`. Each round is a fresh compile with a fresh budget: it derives every request again and runs every check again, so the core keeps no state between rounds (`every_resume_runs_every_check_again` in `tests/data_step.rs`).
+- `FetchState` holds responses only, keyed by `RequestId`. `with_response` refuses a second response for one ID (`mds::invalid_options`) and a response past `MAX_REQUESTS_PER_COMPILE` (`mds::resource_limit`). `StepCtx::finish` refuses a response that the compile did not consume (`mds::invalid_options`), so a host cannot give a value for a request that the core did not derive. Pending data with no request, or a request with no pending entry, is `mds::internal`.
+- `bind_data` walks the graph in level order. For a URL entry, `bind_url_entry` gives `Bound::Value` (bound like a file value) or `Bound::Pending` (the name goes into `pending` and `data.pending` is set). An entry whose reference root is pending is pending too, with no request of its own.
+- `CompileResult::remote_inputs` lists each bound entry as `RemoteInput { module, entry, template, origin }`, in template form. `dependencies` holds files only, never a URL.
+
+### The `StepCtx.bind` pointer keeps the engine out of the WASM build
+`StepCtx` has a field `bind: BindFn`. Only `StepCtx::new` sets it (to `bind_with_engine`), and only `FetchContext::start` calls `StepCtx::new`, from the step entry points. `bind_url_entry` calls the engine through this pointer. `mds-wasm` calls no step entry point, so the linker drops every function that only `bind_with_engine` reaches. `check_secret_module` is the one engine function that `bind_data` calls directly: it is small, and it must also run in a plain compile. The measure of this rule is the WASM size limit of `.github/workflows/ci.yml` (`WASM_SIZE_LIMIT`); use the CI-measured size, because a local build with another `wasm-opt` or compiler gives another number. No test pins the pointer (KB-AP-11).
+
+### Engine order for one entry (`derive`, then `follow`)
+1. `check_secret_module`: a secret header outside the entry module is `mds::data` ("a secret header is allowed in the entry module only").
+2. A header in `SENDER_HEADERS` (`host`, `content-length`, `transfer-encoding`, `connection` and the other framing names, any ASCII case) is `mds::data` ("a request cannot set this header"): a `host` header would name a host that the allow list never checked.
+3. The literal origin of the URL as declared; `check_method` (GET and HEAD only; another method is refused at `Layer::Method`).
+4. A reference to a pending root gives `Bound::Pending`.
+5. The URL is expanded (`encode::expand`, `Target::Url`; the budget charges twice `MAX_URL_BYTES` before), parsed by `url::parse_absolute`, and its origin must equal the literal origin: a reference cannot change the host. Then `check_origin`: the allow list first, then the import opt-in for an entry of an imported module.
+6. `request_headers`: a text header is expanded through `Target::Header`; a secret header is bound with `policy.bind_secret(name, declared origin)`, its prefix plus value must fit `MAX_HEADER_VALUE_BYTES`, and the request keeps only the descriptor `HeaderValue::Secret { name, prefix }`, never the value.
+7. `Request::new` builds the identity; then `follow` reads the response chain:
+   - each hop is a new request with its own ID, at most `MAX_REDIRECTS` hops; the memo is keyed by `(RequestId, envelope flag)`;
+   - `TransportFailure::AddressRefused` is a refusal at `transport-address` (`mds::network_denied`); another failure is `mds::network` with the fixed text of its kind; the response header bytes are checked again;
+   - a 301, 302, 303, 307 or 308 answer goes to `redirect`: exactly one `location`, UTF-8, no host secret value in it, `url::parse_location`, then `check_hop` (the hop count first, as `mds::resource_limit`; then https to http is refused; then the allow list). `Hop::keeps_header` drops each secret header and each `CREDENTIAL_HEADERS` header on a hop to another origin;
+   - a 2xx answer binds; 300 to 599 binds only with the envelope; another status is `mds::network`. The body cap is checked again. A HEAD answer binds `Value::Null` as its body. A body goes through `convert`, the parse funnel of data files, and `admit_bytes` counts it against the data byte total;
+   - `scan_secrets` refuses a value that holds the exact bytes of a host secret value in a string or an object key (`response-check`). A changed form (base64, percent encoding) is not found.
+
+### Policy (`policy.rs`)
+- The network is off until a host builds `NetworkPolicy::new(items)` (one to `MAX_ALLOW_ITEMS` items). `AllowItem::parse` accepts `host`, `host:port`, `https://host[:port]` and `http://host:port`: an exact origin, with no path, wildcard, upper-case letter or trailing dot. It reads the host through `url::parse_absolute`, so one parser reads every host.
+- `narrow(items, imports)` is the one narrowing rule of every host surface. Each item must be `within` an item of the wider policy (the same origin; an IP item with a written port only when the wider item also has a written port, because such a port can open a refused address). `imports` can be true only when the wider policy allows imports. The secrets stay the same.
+- `check_address` refuses each address in `REFUSED_V4` and `REFUSED_V6` (loopback, private, link-local, shared, multicast, the IPv4-mapped, 6to4 and NAT64 ranges, and others). Such an address passes only when an allow item is that exact IP address with that exact written port; an IPv4-mapped IPv6 address never equals an IPv4 item. A `const` block asserts that each range is a valid prefix. The core does no name lookup: the sender calls this check.
+- `Secret::new(name, SecretValue, origin)`: an identifier name, an `https` origin only; at most `MAX_SECRETS`, each name once. `SecretValue` has no `Display` and no `Serialize`, its `Debug` shows no value, and `expose_for_send` is its one accessor. The core calls `bind_secret` for each secret header, and the sender calls it again before it writes the header.
+- `Refusal` is a `Layer` plus a fixed `&'static str`; code outside the core cannot build one. A message shows the layer name (`Layer::name`, for example `response-check: ...`) and never input text.
+
+### Header declarations and the secret form (`decl.rs`)
+- A request map has the keys `url`, `method`, `accept`, `headers`, `body`, `cache` and `envelope` (a bool).
+- A `CREDENTIAL_HEADERS` name (`authorization`, `proxy-authorization`, `cookie`, `x-api-key`, any case) with a string value is refused: "use the secret form for this header".
+- The secret form is the exact map `{secret, prefix}`: two keys, an identifier secret name and a literal prefix with no `{{` that passes the header byte check. A secret header is allowed in the entry module only. `bind_data` runs `check_secret_module` on every URL entry, replayed or not, in a plain compile and in a step compile, so a runtime value cannot lift the rule in an imported module or an `@extends` base (`a_replayed_secret_header_is_allowed_in_the_entry_module_only` in `tests/data_resolve.rs`).
+
+### Request identity (`request.rs`)
+- `RequestId` is the SHA-256 of a canonical text of length-prefixed fields: the version tag `IDENTITY_VERSION`, the method, the URL, the format, the header count, the header keys in lower-case name order, and the body (empty in this release). Change the tag with any change of the text.
+- A secret header enters the text as its name, the secret name, the prefix and the hex HMAC-SHA-256 of the value under the per-run `RunKey`. So two requests that differ in one header value have two IDs, and an ID permits no offline guess of a short secret. The template is not part of the identity.
+- `RunKey::from_bytes` takes 32 random bytes once per run (`mds_fetch::run_key`). `RequestId::as_hex` and `parse_hex` (exactly 64 lower-case hex digits, else `RequestIdError`). `identity_bytes` is the budget charge before `Request::new`.
+
+### The status envelope (`envelope.rs`)
+With `envelope: true`, the entry binds `{status, headers, body}` for each status from 200 to 599. A header name becomes lower case with `-` changed to `_`; a name that is then not an identifier is dropped, and `set-cookie` and `set-cookie2` are dropped. Two names that give the same key fail; a repeated header joins its values with `, `. A message names the entry and the field `headers` only, never a header name or value.
+
+### Sinks of request text
+The module doc of `step.rs` lists each sink. `request_label` builds every message about a request from the module, the entry, the URL as declared and the origin, never the expanded URL, a header value or response text. `Debug` of `Request`, `Response` and `FetchState` shows the template, the origin and sizes only. `tests/net_sinks.rs` pins this.
+
+### Public API
+`lib.rs` re-exports `policy` (`AllowItem`, `Layer`, `NarrowError`, `NetworkPolicy`, `PolicyError`, `Refusal`, `Secret`, `SecretValue`), `request` (`HeaderValue`, `Method`, `Request`, `RequestHeader`, `RequestId`, `RequestIdError`, `RunKey`), `step` (`FetchContext`, `FetchState`, `RemoteInput`, `Response`, `Step`, `TransportFailure`) and `url` (`CheckedUrl`, `Host`, `Origin`, `Scheme`), plus `COMPILE_DEADLINE`, `MAX_PARALLEL_SENDS`, `MAX_REQUESTS_PER_COMPILE` and `MAX_REQUESTS_PER_RUN` for a driver. Each type that can grow is `#[non_exhaustive]` and has a named constructor in the same change (`Response::http`, `Response::failed`, `FetchContext::new`, `FetchState::new`, `with_response`). `network_policy_api_exists`, `request_identity_api_exists`, `step_api_exists` and `secret_binding_api_exists` in `tests/api_surface.rs` pin them from outside the crate.
+
+### `mds-fetch`, the one network crate
+- `crates/mds-fetch` is the only crate with the HTTP, TLS and root list crates (`ureq`, `rustls`, `webpki-root-certs`). `Fetcher::new(Arc<NetworkPolicy>, &roots)` and `Fetcher::send(&Request, deadline) -> Response`. The sender follows no redirect (`max_redirects(0)`), uses no proxy, looks up a name once, checks every address with `check_address` and connects only to a checked address, uses TLS 1.2 or 1.3 with ring and the Mozilla roots plus the host roots, reads at most the body cap plus one byte, and keeps no connection. `clippy.toml` refuses `disable_verification`. It installs no logger: `ureq` logs request text at the debug and trace levels.
+- `tests/supply_chain.rs` (in mds-core) is the gate: no `NETWORK_CRATES` name in the normal-dependency tree of `mds-core` or `mds-wasm` for any target (it reads `cargo metadata --offline --locked` and `Cargo.lock`), and no `LOGGER_CRATES` name in any workspace crate, tests included. `the_gate_finds_planted_crates` and `the_gate_fails_closed_on_an_unknown_edge` are its controls. `deny.toml` holds the license and duplicate-version exceptions of the TLS tree.
+
+### The CLI driver (`crates/mds-cli/src/build/net.rs`)
+- Only `mds build` has network flags: `--allow-net` (a comma list), and `--allow-net-imports`, `--secret NAME=env:VAR@ORIGIN` and `--tls-root`, which need `--allow-net`. With no `--allow-net` the network stays off, whatever `mds.json` holds. The `mds.json` `network` section (`allow`, `allow_imports`) only narrows the flags through `NetworkPolicy::narrow`. `mds watch`, `check`, `lint` and `fmt` never send.
+- `NetRun::from_flags` builds the policy, the `Fetcher` and the run key. `drive` runs at most `MAX_REQUESTS_PER_COMPILE` plus one rounds; one `COMPILE_DEADLINE` starts at the first send; `reserve` counts each round against `MAX_REQUESTS_PER_RUN` for the whole run; `send_round` sends `MAX_PARALLEL_SENDS` at a time on scoped threads, with no retry, and a failed join is `MdsError::Internal`. `compile_native` and `compile_source_text` select the plain or the step compile; a directory build compiles each file through `compile_pinned_to_content` in `build.rs`.
+- The driver prints nothing: the core builds each message about a request, and a `--secret` message names the index, the name and the variable, never the value or the flag text.
+- The panic gate (`tests/panic_hook.rs`): `each_catch_wraps_one_compile_call_and_nothing_else` and `compile_reach_findings` start from `COMPILE_CALLS` and follow each call BY NAME into every mds-cli function with that name; a reached call that ends with a `WRITES` name fails. A call whose path starts with an `OTHER_CRATES` prefix is not followed. So a driver helper with the same name as a mds-cli function that writes (`start`, `compile_source`, the `failed` methods of the lint sinks) makes the gate fail: rename it, or write a core call with its `mds::` path (`mds::Response::failed`). A new compile call inside a catch must be added to `COMPILE_CALLS`.
 
 ## Severity has one parser, shared by every surface (#175, #418)
 
@@ -452,6 +530,9 @@ Mixed-content errors surface as `mds::mixed_content` from both `compile*` and `c
 - **Treating `VirtualFs::with_aliases` as applying to entry resolution** — it only affects `normalize_in_dir` (imports); an entry key is always taken as given, unaliased
 - **KB-AP-2 — Reserving a frontmatter key at fewer than all the reserved-key sites**: the sites are listed in Fence Opt-In and Indented Directives. A missing site leaks the key into scope (`build_scope_from_frontmatter`), the merge (`RESERVED_MERGE_KEYS`), standalone output (the `RESERVED_OUTPUT_KEYS` entry, which also feeds the proof and the form messages) or `unused-variable` (`RESERVED`); a missing data site lets a data entry take the key as its name (`RESERVED_NAMES`) or treats the key as a scope name (`is_scope_key`). Add the key to the output table with its form message, then audit the other lists at their SYNC POINT comments.
 - **KB-AP-3 — A lexer step that does not move `pos`**: `Lexer::run` stops with `mds::internal` instead of looping. Every new `step` branch must consume at least one character or return an error.
+- **KB-AP-11 — A direct call into the step engine from resolver code**: the WASM build compiles the resolver but starts no step compile, so the linker can drop the engine only while the sole path into it is the `StepCtx.bind` pointer that `StepCtx::new` sets. A new direct call (for example to `derive`, `follow` or a policy check that only the engine needs) from `bind_data`, `prepare_data` or other resolver code keeps the engine in `mds-wasm`. No unit test fails; only the CI WASM size check shows it. Add a new engine behavior inside `bind_with_engine`'s reach. A check that must also run in a plain compile (as `check_secret_module`) stays small and is called directly.
+- **KB-AP-12 — A planted secret in an assertion message**: `assert!(!stderr.contains(SECRET), "{}", stderr)` prints the stream when the check fails, and the stream can hold the planted value. Use a fixed message (`"stderr must not show the secret value"`), and run the absence check (`assert_no_secret`) before an assertion that prints stderr. This applies to each test that plants a secret value, in the core and in the CLI.
+- **KB-AP-13 — `/` in expected CLI path text**: the CLI joins its own paths with the platform separator, so the `mds.json` prefix of a `network.allow[i]` refusal is `.\mds.json` on Windows. Build the expected text as `format!(".{MAIN_SEPARATOR_STR}mds.json network.allow[2]: ...")`, keep the full sentence, and never normalize the output side, so a real change of the text still fails.
 
 ## Gotchas
 
@@ -468,6 +549,9 @@ Mixed-content errors surface as `mds::mixed_content` from both `compile*` and `c
 - **KB-AP-5 — Merged `@extends` frontmatter is not stripped**: `frontmatter_prefix` takes `MarkdownFrontmatter::Standalone` raw text through the stripper, but `MarkdownFrontmatter::Merged` text (from `serialize_merged_frontmatter`) is emitted as is. The merge already drops reserved keys at depth 0, so a reserved key in the merged mapping is a compiler bug and gives a real `mds::internal` check, not a silent strip. Each base is proved at its own parse, so a bad spelling in a base fails before the merge. `fmt` returns the form error itself: `formatter.rs` lets `is_frontmatter_form_message` errors pass before the structural fallback, so a refused form is never "verified" by token comparison.
 - **KB-AP-6 — Two scanners read `type: mds`**: `is_type_mds_line` (`resolver/module.rs`, decides whether a `.md` file is MDS) trims the value and accepts only `mds`, `"mds"` or `'mds'`. `ReservedOutputKey::matches_line` (the stripper) also accepts a trailing ` #` comment. Both match only unindented lines and neither parses YAML, so a spelling change in one leaves the two disagreeing. The parse proof catches only the stripper side.
 - The `+mds` marker is the last blank-separated word of the info string. A longer word that holds it (`x+mds`) is not the marker and is refused as a reserved word.
+- **KB-INV-7 — Where each network check runs**: a sender gives a redirect answer back as it is, so the core checks each hop with `check_hop` and drops the secret and credential headers on a hop to another origin. A check that only the sender runs is a check that another host surface can skip. The address check is the one exception: only the sender sees the lookup answer, so it calls `NetworkPolicy::check_address` and reports `TransportFailure::AddressRefused`, which the core turns into a `transport-address` refusal. Before the replay fix, only the request step checked the secret header rule, so a replayed entry with a secret header passed in an imported module; the check now lives in `bind_data` too, for every URL entry.
+- The panic gate of `mds-cli` follows calls by name, not by type. A new helper in `build/net.rs` with a common name (`start`, `failed`, `compile_source`) can lead the walk to an unrelated mds-cli function that writes, and the gate fails with "`<compile call>` reaches `<name>`, which calls `<write>`". Rename the helper or write the core call with its `mds::` path. The walk does not follow a function pointer, a trait object or another crate.
+- A step compile reads its local data files again in each round (`a_data_file_changed_between_two_steps_is_read_again` in `tests/data_step.rs`): the rounds share no file memo.
 
 ## Key Files
 
@@ -504,12 +588,24 @@ Mixed-content errors surface as `mds::mixed_content` from both `compile*` and `c
 - `crates/mds-core/tests/data_*.rs` — data behavior by stage: `data_paths.rs` (both `read_data` backends), `data_limits.rs` (each cap and its order), `data_graph.rs` (first-fault order), `data_role.rs` (role gate and lint facts), `data_tooling.rs` (roles and frontier order), `data_extends.rs`, `data_output.rs`, `data_convert.rs`, `data_resolve.rs`
 - `crates/mds-core/tests/fixtures/data-path-vectors.json` — the shared data path vector table (`portable`, `windows`)
 - `crates/mds-core/tests/yaml_funnel.rs` — source-scan gate: YAML parse entry points only in `resolver/frontmatter.rs`, JSON ones only there and in `vars_json.rs`
+- `crates/mds-core/src/data/step.rs` — the step engine: `StepCtx` and its `bind` pointer, `bind_url_entry`, `check_secret_module`, `derive`, `follow`, `redirect`, `scan_secrets`, `request_label`; `FetchContext`, `FetchState`, `Step`, `Response`, `TransportFailure`, `RemoteInput`
+- `crates/mds-core/src/data/policy.rs` — `NetworkPolicy` (`new`, `narrow`, `check_address`, `check_origin`, `check_hop`, `bind_secret`, `check_method`), `AllowItem`, `Secret`, `SecretValue`, `Refusal`, `Layer`, the refused address tables
+- `crates/mds-core/src/data/request.rs` — `Request`, `RequestId`, `RunKey`, `HeaderValue`, the canonical identity text and `identity_bytes`
+- `crates/mds-core/src/data/decl.rs` — also `CREDENTIAL_HEADERS`, `SENDER_HEADERS` and the `{secret, prefix}` form (`secret_parts`)
+- `crates/mds-core/src/data/url.rs`, `envelope.rs`, `encode.rs` — the strict URL parser, the status envelope, reference expansion into a URL or a header
+- `crates/mds-core/tests/data_step.rs`, `tests/net_sinks.rs`, `tests/supply_chain.rs` — the host loop, the sinks of request text, the network crate and logger gate
+- `crates/mds-fetch/src/` — `Fetcher` (`send.rs`), the checked name lookup (`resolve.rs`), the roots (`tls.rs`), `run_key` (`lib.rs`)
+- `crates/mds-cli/src/build/net.rs` — `NetFlags`, `NetRun` (`from_flags`, `drive`, `reserve`, `send_round`), `compile_native`, `compile_source_text`, `effective_policy`, `parse_secret`
+- `crates/mds-cli/tests/cli_net.rs` — end-to-end `mds build --allow-net` tests with local listeners (`assert_no_secret`, the proxy variables, the narrowing messages)
+- `crates/mds-cli/tests/panic_hook.rs` — the panic gate: `COMPILE_CALLS`, `WRITES`, `OTHER_CRATES`, `compile_reach_findings`
 
 ## Related
 
 - Feature: mds-cli — consumes `CompileResult` and `CompiledOutput`; derives output extension from `OutputKind::from(&compiled.output)`; its own directory-argument and output-path refusals now call `NativeFs::check_directory`/`reject_forbidden_path` (#413) and its `lint.rules` reader calls `parse_rule_severities` (#175/#418); `mds build` and `mds watch` never write an output over a data file that the run reads (`build_never_writes_over_a_data_file_it_reads` in `crates/mds-cli/tests/cli_data.rs`)
-- Feature: mds-napi — builds the canonical discriminated-union wire object from `CompileResult` via `build_canonical_result`; its `rules` option now reads through `parse_rule_severities`; `lintVirtual` counts data keys apart from modules- Feature: mds-js — TypeScript `CompileResult = MarkdownResult | MessagesResult` union mirrors this Rust type; its WASM-backend file pre-scanner mirrors `check_module_bytes`/`check_module_type`/`scan_import_records`/`VirtualFs::with_aliases` via `preflightModule`/`scanImportRecords`/`moduleAliases` (#414)
-- Feature: mds-lint — the `literal-directive` rule reports the conditional lines that these opt-ins leave literal; `unused-variable` and `shadow-variable` read the data entry facts; `Severity`, `parse_rule_severities` and `apply_fixes_incremental` live here; consult it for the fix-tier and reverify-gate model
+- Feature: mds-napi — builds the canonical discriminated-union wire object from `CompileResult` via `build_canonical_result`; its `rules` option now reads through `parse_rule_severities`; `lintVirtual` counts data keys apart from modules
+- Feature: mds-cli — also owns `mds build --allow-net` (`crates/mds-cli/src/build/net.rs`), the only host surface in this release that runs step compiles; its `mds.json` `network` section narrows the flags through `NetworkPolicy::narrow`
+- Feature: mds-js — TypeScript `CompileResult = MarkdownResult | MessagesResult` union mirrors this Rust type; its WASM-backend file pre-scanner mirrors `check_module_bytes`/`check_module_type`/`scan_import_records`/`VirtualFs::with_aliases` via `preflightModule`/`scanImportRecords`/`moduleAliases` (#414)
+- Feature: mds-lint — the `literal-directive` rule reports the conditional lines that these opt-ins leave literal; `unused-variable` and `shadow-variable` read the data entry facts; `insecure-data-origin` and `literal-credential-header` (`lint/rules/`) read the URL entry declarations, never a response; `Severity`, `parse_rule_severities` and `apply_fixes_incremental` live here; consult it for the fix-tier and reverify-gate model
 - Feature: source-map-security — `relativize_source`/`source_root` path-relativization choke point; this KB's `SourceTable`/`MapBuilder`/`FragmentMap` section (#416) covers the source-SHARING model that choke point's callers rely on
 - Lesson: an alternate code path silently bypassing a resource/security check — cited above for the pre-#155 `let _ =` anchor-failure swallow and for why `EvalBudget` is one-per-chain, not one-per-region
 - Lesson: a host-path leak fixed on one surface stays live on its siblings — cited above for `NotMdsFile`'s pre-#417 shape and the design-time census that found #413/#414/#417's remaining sinks before they shipped
