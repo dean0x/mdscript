@@ -119,6 +119,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   policy. It sends only when an `http://host:port` allow item names its origin (#405).
 - A `GET` or `HEAD` request map with a `body` fails with `mds::data`. A `HEAD` request needs
   `envelope: true` (#405).
+- A request map cannot set the headers `Host`, `Content-Length`, `Transfer-Encoding`,
+  `Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer` or `Upgrade`. A step compile
+  fails with `mds::data` before it sends (#405).
 
 ### Fixed
 

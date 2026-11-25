@@ -89,7 +89,8 @@ input. The compiler enforces several defense-in-depth controls:
   the network (`crates/mds-cli/tests/cli_net.rs`).
   - Each allow item names one exact origin: scheme, host and port, with no wildcard. An `http`
     origin needs an `http://host:port` item. A URL entry of an imported module or an
-    `@extends` base needs `--allow-net-imports`.
+    `@extends` base needs `--allow-net-imports`. A request cannot set the `Host` header or a
+    header that frames the message, so it reaches only the origin of its URL.
   - The sender looks up a name once per request and checks every address before it connects.
     It refuses the special ranges that spec §4.12 lists, such as loopback, private,
     link-local and multicast addresses, unless an allow item is that exact IP address with

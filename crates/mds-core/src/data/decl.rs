@@ -125,6 +125,27 @@ pub(crate) fn is_credential_header(name: &str) -> bool {
         .any(|known| same_name(name, known))
 }
 
+/// The header names that the sender writes from the URL or that frame the message, in
+/// lower case. A request can not set them: a `host` header would name a host that the
+/// allow list and the secret origins never checked. The step engine refuses them before
+/// a request exists.
+const SENDER_HEADERS: [&str; 9] = [
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "upgrade",
+];
+
+/// `name` is one of [`SENDER_HEADERS`] in any ASCII letter case.
+pub(crate) fn is_sender_header(name: &str) -> bool {
+    SENDER_HEADERS.iter().any(|known| same_name(name, known))
+}
+
 /// `a` and `b` are equal in any ASCII letter case. It is not inlined, so the WASM build
 /// carries one copy of the compare loop for all the names of the list.
 #[inline(never)]

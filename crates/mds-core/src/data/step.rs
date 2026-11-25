@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 
-use super::decl::{HeaderSource, RequestTemplate};
+use super::decl::{is_sender_header, HeaderSource, RequestTemplate};
 use super::encode::{self, FieldLabel, Target};
 use super::graph::Node;
 use super::policy::{HopError, Layer, NetworkPolicy, Refusal, ADDRESS_REFUSED};
@@ -507,6 +507,19 @@ fn derive(
             None,
         ));
     }
+    if let Some(header) = template
+        .headers
+        .iter()
+        .find(|header| is_sender_header(&header.name))
+    {
+        return Err(MdsError::data(
+            module,
+            Some(entry),
+            Some(&header.name),
+            "a request cannot set this header",
+            None,
+        ));
+    }
     let literal = literal_origin(&template.url, mem)?;
     mem.charge(Part::Temp, Some(origin_text_bytes(&literal)))?;
     let label = request_label(node, template, &literal);
@@ -544,7 +557,25 @@ fn derive(
     ctx.policy
         .check_origin(&literal, scope.entry_module)
         .map_err(|refusal| label.refused(refusal, None))?;
+    let headers = request_headers(template, scope, &label, &ctx.policy, mem)?;
+    let first = new_request(method, url, template.accept, headers, ctx, mem, &label)?;
+    let shape = Shape {
+        accept: template.accept,
+        envelope: template.envelope,
+    };
+    follow(first, shape, node, label, ctx, mem, admit_bytes)
+}
 
+/// The headers of the first request of a URL entry, in declaration order: each text
+/// header expanded through the header encoder, and each secret header bound to the
+/// declared origin and bounded by `MAX_HEADER_VALUE_BYTES`, as a descriptor only.
+fn request_headers(
+    template: &RequestTemplate,
+    scope: &EntryScope<'_>,
+    label: &RequestLabel<'_>,
+    policy: &NetworkPolicy,
+    mem: &mut MemBudget,
+) -> Result<Vec<RequestHeader>, MdsError> {
     mem.charge(
         Part::Temp,
         template
@@ -554,28 +585,24 @@ fn derive(
     )?;
     let mut headers = Vec::with_capacity(template.headers.len());
     for header in &template.headers {
-        let header_field = FieldLabel {
-            module,
-            entry,
+        let field = FieldLabel {
+            module: label.module,
+            entry: label.entry,
             field: &header.name,
         };
         let value = match &header.value {
             HeaderSource::Text(text) => {
                 mem.charge(Part::Temp, Some(2 * MAX_HEADER_VALUE_BYTES))?;
-                HeaderValue::Text(encode::expand(
-                    text,
-                    Target::Header,
-                    header_field,
-                    |path| reference(scope, header_field, path),
-                )?)
+                HeaderValue::Text(encode::expand(text, Target::Header, field, |path| {
+                    reference(scope, field, path)
+                })?)
             }
             HeaderSource::Secret { name, prefix } => {
-                let secret = ctx
-                    .policy
-                    .bind_secret(name, &literal)
+                let secret = policy
+                    .bind_secret(name, label.declared)
                     .map_err(|refusal| label.refused(refusal, Some(name)))?;
                 if prefix.len() + secret.expose_for_send().len() > MAX_HEADER_VALUE_BYTES {
-                    return Err(header_field.limit("header value", MAX_HEADER_VALUE_BYTES));
+                    return Err(field.limit("header value", MAX_HEADER_VALUE_BYTES));
                 }
                 mem.charge(Part::Temp, name.len().checked_add(prefix.len()))?;
                 HeaderValue::Secret {
@@ -587,12 +614,7 @@ fn derive(
         mem.charge(Part::Temp, Some(header.name.len()))?;
         headers.push(RequestHeader::new(header.name.clone(), value));
     }
-    let first = new_request(method, url, template.accept, headers, ctx, mem, &label)?;
-    let shape = Shape {
-        accept: template.accept,
-        envelope: template.envelope,
-    };
-    follow(first, shape, node, label, ctx, mem, admit_bytes)
+    Ok(headers)
 }
 
 /// The value form of a URL entry: the body format and the envelope flag.

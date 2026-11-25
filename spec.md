@@ -1296,7 +1296,8 @@ IPv4 ranges are `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.
 `240.0.0.0/4` and `255.255.255.255/32`. The refused IPv6 ranges are `::/128`, `::1/128`,
 `::ffff:0:0/96`, `2002::/16`, `64:ff9b::/96`, `fc00::/7`, `fe80::/10` and `ff00::/8`. An
 address in a refused range passes only when an allow item is that exact IP address with that
-exact port. Thus a name can never open such an address (`address_table_refuses_both_edges_of_each_range`,
+exact port. Thus a name can never open such an address that no allow item names
+(`address_table_refuses_both_edges_of_each_range`,
 `only_an_exact_ip_item_with_its_port_opens_a_refused_address`).
 
 #### Requests
@@ -1330,6 +1331,13 @@ The strict URL parser then reads the expanded URL. A request carries the method,
 `accept` format and the headers in declaration order. The native sender adds
 `User-Agent: mds-fetch/<version>`, `Accept: application/json, application/yaml, text/plain` and
 `Accept-Encoding: identity`.
+
+A request cannot set the headers `Host`, `Content-Length`, `Transfer-Encoding`, `Connection`,
+`Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer` and `Upgrade`, in any letter case and in any
+value form. The sender writes the host from the URL, so a request reaches only the origin that
+the allow list and the secret origins check. A step compile fails with `mds::data`
+(`a request cannot set this header`) before any request exists
+(`a_request_cannot_set_a_sender_header` in `step_tests.rs`).
 
 **Request identity.** Each request has a `RequestId`: the SHA-256 digest of a canonical text,
 written as 64 lower-case hex digits. The text is a sequence of fields, each its byte length as

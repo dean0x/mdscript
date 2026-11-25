@@ -785,6 +785,68 @@ fn a_secret_header_is_allowed_in_the_entry_module_only() {
     assert_eq!(urls(&requests), ["https://a.example/x"]);
 }
 
+/// A request cannot set a header that the sender writes from the URL or that frames the
+/// message, in any letter case and in any value form, so a `Host` header can not name a
+/// host that the allow list did not check. The compile fails before any request exists.
+/// Controls: a name that only holds one of these names, and the plain request.
+#[test]
+fn a_request_cannot_set_a_sender_header() {
+    let net = with_secret(policy(&["a.example"]), "TOKEN", PLANTED, "a.example");
+    let main = |header: &str| {
+        format!("---\ndata:\n  a:\n    url: https://a.example/x\n    headers:\n      {header}\n---\n{{{{a.n}}}}\n")
+    };
+    let runtime = Runtime::from([("v".to_owned(), Value::String("other.example".into()))]);
+    for name in [
+        "Host",
+        "HOST",
+        "host",
+        "Content-Length",
+        "transfer-encoding",
+        "Connection",
+        "Keep-Alive",
+        "Proxy-Connection",
+        "TE",
+        "Trailer",
+        "Upgrade",
+    ] {
+        for value in ["other.example", "'{{v}}'", "{secret: TOKEN, prefix: ''}"] {
+            let text = main(&format!("{name}: {value}"));
+            let (result, needed) = run_round(
+                &[("main.mds", text.as_str())],
+                &runtime,
+                &net,
+                &Responses::new(),
+            );
+            let err = result.unwrap_err();
+            assert_eq!(code(&err), "mds::data", "{name}: {value}");
+            let message = err.to_string();
+            assert!(
+                message.ends_with(&format!(
+                    "field \"{name}\": a request cannot set this header"
+                )),
+                "{message}"
+            );
+            assert!(!message.contains("other.example"), "{message}");
+            assert!(needed.is_empty(), "{name}: {value}");
+        }
+    }
+    for control in [
+        "X-Host: other.example",
+        "Hosts: other.example",
+        "X-Plain: kept",
+    ] {
+        let text = main(control);
+        let requests = need(run_step(
+            &[("main.mds", text.as_str())],
+            &runtime,
+            &net,
+            &Responses::new(),
+        ));
+        assert_eq!(urls(&requests), ["https://a.example/x"], "{control}");
+        assert_eq!(requests[0].headers().len(), 1, "{control}");
+    }
+}
+
 /// An `@extends` base is a module other than the entry module, so its URL entry cannot
 /// use a secret header, also with the import opt-in. Control: the same base text as the
 /// entry module derives its request.
