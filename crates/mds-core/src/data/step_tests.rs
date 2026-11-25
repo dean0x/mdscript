@@ -9,10 +9,13 @@ use super::encode::{check_header_value, encode_path_segment, encode_query, Encod
 use super::encode_tests::{vectors, Vector};
 use super::policy::{AllowItem, NetworkPolicy, Secret, SecretValue};
 use super::request::{HeaderValue, Request, RequestId, RunKey};
-use super::step::{Outcome, RemoteInput, Response, StepCtx, TransportFailure};
+use super::step::{FetchState, Outcome, RemoteInput, Response, StepCtx, TransportFailure};
 use super::{convert, Accept, DataInput, DataLabel};
 use crate::evaluator::budget::MemBudget;
-use crate::limits::{MAX_HEADER_VALUE_BYTES, MAX_REDIRECTS, MAX_REQUESTS_PER_COMPILE};
+use crate::limits::{
+    MAX_DATA_BYTES_PER_COMPILE, MAX_HEADER_VALUE_BYTES, MAX_REDIRECTS, MAX_REQUESTS_PER_COMPILE,
+    MAX_RESPONSE_BODY_BYTES_PER_COMPILE, MAX_RESPONSE_BYTES,
+};
 use crate::resolver::ModuleCache;
 use crate::{CompiledOutput, MdsError, Value, VirtualFs};
 
@@ -1191,4 +1194,127 @@ fn a_secret_value_in_an_envelope_header_fails_the_response_check() {
     );
     let text = run_answered(main, &net, answered(200, &[("X-Echo", "plain")], "1")).unwrap();
     assert!(text.ends_with("200\n"), "{text:?}");
+}
+
+/// The raw bodies of one fetch state count against one total, the compile memory budget,
+/// whatever the status: a redirect body and an error body count too. Exactly the total
+/// passes, an answer with no body and a failed send still pass at the total, and one
+/// more byte fails with `mds::resource_limit`.
+#[test]
+fn the_fetch_state_counts_every_body_against_one_total() {
+    let cap = usize::try_from(MAX_RESPONSE_BYTES).unwrap();
+    let total = MAX_RESPONSE_BODY_BYTES_PER_COMPILE;
+    assert_eq!(total % cap, 0, "the total is a whole number of full bodies");
+    let id = |n: usize| RequestId::parse_hex(&format!("{n:064x}")).unwrap();
+    let mut state = FetchState::new();
+    assert_eq!(state.body_bytes_left(), total);
+    // The bodies come zeroed from the allocator, so the test writes no 200 MiB.
+    let statuses = [200, 301, 302, 404, 500].into_iter().cycle();
+    for (n, status) in statuses.take(total / cap).enumerate() {
+        let response = Response::http(status, Vec::new(), vec![0; cap]);
+        state = state.with_response(id(n), response).unwrap();
+        assert_eq!(state.body_bytes_left(), total - (n + 1) * cap);
+    }
+    state = state
+        .with_response(id(100), Response::http(302, Vec::new(), Vec::new()))
+        .unwrap();
+    state = state
+        .with_response(id(101), Response::failed(TransportFailure::Timeout))
+        .unwrap();
+    let err = state
+        .with_response(id(102), Response::http(302, Vec::new(), vec![0; 1]))
+        .unwrap_err();
+    assert_eq!(code(&err), "mds::resource_limit");
+    assert_eq!(
+        err.to_string(),
+        "resource limit exceeded: response bodies exceed 209715200 bytes per compile"
+    );
+    assert_eq!(
+        err.to_string(),
+        MdsError::response_bodies_exceeded().to_string()
+    );
+}
+
+/// The core checks the body of an answer that the host gives again: a body of exactly
+/// 10 MiB binds, and one byte more fails with `mds::network`. A redirect answer is
+/// checked too: at the cap its hop goes on, and one byte more fails.
+#[test]
+fn the_core_body_cap_binds_at_the_cap_and_fails_one_byte_over() {
+    let cap = usize::try_from(MAX_RESPONSE_BYTES).unwrap();
+    let net = policy(&["a.example"]);
+    let text =
+        "---\ndata:\n  a: {url: 'https://a.example/x', accept: text}\n---\n@if a:\nbound\n@end\n";
+    let main = "---\ndata:\n  a: https://a.example/x\n---\n{{a.n}}\n";
+    let body = |len| Response::http(200, Vec::new(), vec![b'a'; len]);
+    let hop = |len| {
+        Response::http(
+            302,
+            vec![("Location".into(), b"/next".to_vec())],
+            vec![b'a'; len],
+        )
+    };
+    let bound = run_answered(text, &net, body(cap)).unwrap();
+    assert!(bound.ends_with("bound\n"), "control: a full body binds");
+    let files = [("main.mds", main)];
+    let first = need(run_step(&files, &Runtime::new(), &net, &Responses::new()));
+    let mut responses = Responses::new();
+    answer(&first, &mut responses, &[("https://a.example/x", hop(cap))]);
+    let next = need(run_step(&files, &Runtime::new(), &net, &responses));
+    assert_eq!(
+        urls(&next),
+        ["https://a.example/next"],
+        "control: a full hop"
+    );
+    for (source, response) in [(text, body(cap + 1)), (main, hop(cap + 1))] {
+        let err = run_answered(source, &net, response).unwrap_err();
+        assert_eq!(code(&err), "mds::network", "{err}");
+        assert!(
+            err.to_string()
+                .ends_with("the response body exceeds 10485760 bytes"),
+            "{err}"
+        );
+    }
+}
+
+/// A response body counts against the data byte total of a compile, as a data file
+/// does: four bodies of 8 MiB give exactly 32 MiB and bind, and one byte more fails with
+/// `mds::resource_limit`.
+#[test]
+fn response_bodies_count_against_the_data_total_of_a_compile() {
+    let mut main = String::from("---\ndata:\n");
+    for name in ["a", "b", "c", "d"] {
+        main.push_str(&format!(
+            "  {name}: {{url: 'https://a.example/{name}', accept: text}}\n"
+        ));
+    }
+    main.push_str("---\nbound\n");
+    let files = [("main.mds", main.as_str())];
+    let net = policy(&["a.example"]);
+    let requests = need(run_step(&files, &Runtime::new(), &net, &Responses::new()));
+    assert_eq!(requests.len(), 4);
+    let quarter = MAX_DATA_BYTES_PER_COMPILE / 4;
+    for (extra, fits) in [(0, true), (1, false)] {
+        let mut responses = Responses::new();
+        for (index, request) in requests.iter().enumerate() {
+            let len = quarter + if index == 3 { extra } else { 0 };
+            responses.insert(
+                request.id(),
+                Response::http(200, Vec::new(), vec![b'a'; len]),
+            );
+        }
+        let result = run_step(&files, &Runtime::new(), &net, &responses);
+        if fits {
+            assert!(
+                done(result).ends_with("bound\n"),
+                "control: the total binds"
+            );
+        } else {
+            let err = result.unwrap_err();
+            assert_eq!(code(&err), "mds::resource_limit", "{err}");
+            assert_eq!(
+                err.to_string(),
+                "resource limit exceeded: data files exceed 33554432 bytes per compile"
+            );
+        }
+    }
 }

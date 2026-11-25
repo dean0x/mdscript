@@ -49,8 +49,9 @@ use super::{convert, envelope, Accept, DataInput, DataLabel};
 use crate::error::request_location;
 use crate::evaluator::budget::{MemBudget, Part};
 use crate::limits::{
-    MAX_HEADER_VALUE_BYTES, MAX_REDIRECTS, MAX_REQUESTS_PER_COMPILE, MAX_RESPONSE_BYTES,
-    MAX_RESPONSE_HEADER_BYTES, MAX_URL_BYTES,
+    MAX_HEADER_VALUE_BYTES, MAX_REDIRECTS, MAX_REQUESTS_PER_COMPILE,
+    MAX_RESPONSE_BODY_BYTES_PER_COMPILE, MAX_RESPONSE_BYTES, MAX_RESPONSE_HEADER_BYTES,
+    MAX_URL_BYTES,
 };
 use crate::scope::VarLayer;
 use crate::value::{Value, MAX_VALUE_DEPTH};
@@ -205,13 +206,17 @@ impl FetchContext {
 
 /// The responses that a host has for the requests of a step compile, keyed by request
 /// ID. It holds responses only: each step compile derives every request again and runs
-/// every check again. Its `Debug` shows the response count only.
+/// every check again. The raw bodies of its responses, of every status, are at most
+/// 200 MiB in total. Its `Debug` shows the response count and the body bytes only.
 ///
 /// This type is `#[non_exhaustive]`: obtain values from [`FetchState::new`].
 #[non_exhaustive]
 #[derive(Clone, Default)]
 pub struct FetchState {
     responses: Arc<IndexMap<RequestId, Response>>,
+    /// The raw body bytes of the responses, every status counted. At most
+    /// `MAX_RESPONSE_BODY_BYTES_PER_COMPILE`.
+    body_bytes: usize,
 }
 
 impl FetchState {
@@ -222,8 +227,10 @@ impl FetchState {
     }
 
     /// The state with the response to the request `id` added. A second response for one
-    /// ID fails with `mds::invalid_options`, and a response past the request cap of a
-    /// compile (64) fails with `mds::resource_limit`.
+    /// ID fails with `mds::invalid_options`. A response past the request cap of a compile
+    /// (64) fails with `mds::resource_limit`, and so does a body that takes the raw body
+    /// bytes of the state past 200 MiB ([`MdsError::response_bodies_exceeded`]). Every
+    /// body counts, of every status: a redirect body and an error body too.
     #[must_use = "a response can be refused"]
     pub fn with_response(mut self, id: RequestId, response: Response) -> Result<Self, MdsError> {
         if self.responses.contains_key(&id) {
@@ -236,8 +243,26 @@ impl FetchState {
                 "too many responses in the fetch state (max {MAX_REQUESTS_PER_COMPILE})"
             )));
         }
+        let body = match &response {
+            Response::Http { body, .. } => body.len(),
+            Response::Failed(_) => 0,
+        };
+        let Some(total @ ..=MAX_RESPONSE_BODY_BYTES_PER_COMPILE) =
+            self.body_bytes.checked_add(body)
+        else {
+            return Err(MdsError::response_bodies_exceeded());
+        };
         Arc::make_mut(&mut self.responses).insert(id, response);
+        self.body_bytes = total;
         Ok(self)
+    }
+
+    /// The raw body bytes that the state can still take, of the 200 MiB total. A host
+    /// caps its body reads with it: a host that sends in parallel gives each send a share,
+    /// so the bodies in flight can not pass the total.
+    #[must_use]
+    pub fn body_bytes_left(&self) -> usize {
+        MAX_RESPONSE_BODY_BYTES_PER_COMPILE.saturating_sub(self.body_bytes)
     }
 
     /// The number of responses.
@@ -256,6 +281,7 @@ impl fmt::Debug for FetchState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FetchState")
             .field("responses", &self.responses.len())
+            .field("body_bytes", &self.body_bytes)
             .finish()
     }
 }
@@ -710,6 +736,10 @@ fn follow(
         if header_bytes.is_none_or(|bytes| bytes > MAX_RESPONSE_HEADER_BYTES) {
             return Err(label.network(&TransportFailure::HeadersTooLarge.kind()));
         }
+        // The body cap applies to every status, a redirect answer too.
+        if u64::try_from(body.len()).map_or(true, |len| len > MAX_RESPONSE_BYTES) {
+            return Err(label.network(&TransportFailure::BodyTooLarge.kind()));
+        }
         let bound = match status {
             301 | 302 | 303 | 307 | 308 => {
                 let next = redirect(&request, shape.accept, headers, hop, &label, ctx, mem)?;
@@ -725,9 +755,6 @@ fn follow(
         };
         if !bound {
             return Err(label.network(&format!("the server answered with HTTP status {status}")));
-        }
-        if u64::try_from(body.len()).map_or(true, |len| len > MAX_RESPONSE_BYTES) {
-            return Err(label.network(&TransportFailure::BodyTooLarge.kind()));
         }
         let data = DataLabel {
             module: node.module,

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use miette::{Diagnostic, SourceSpan};
 use thiserror::Error;
 
-use crate::limits::{MAX_COMPILE_MEMORY, MAX_OUTPUT_SIZE};
+use crate::limits::{MAX_COMPILE_MEMORY, MAX_OUTPUT_SIZE, MAX_RESPONSE_BODY_BYTES_PER_COMPILE};
 use crate::lint::{
     escape_path_for_message, named_source_for_render, sanitize_control_chars,
     sanitize_control_chars_wire,
@@ -1191,6 +1191,18 @@ impl MdsError {
     pub(crate) fn compile_memory_exceeded() -> Self {
         Self::resource_limit(format!(
             "compile memory exceeds maximum of {MAX_COMPILE_MEMORY} bytes"
+        ))
+    }
+
+    /// The error of the response body total of one compile, 200 MiB of raw body bytes of
+    /// every status. [`crate::FetchState::with_response`] returns it for a body that takes
+    /// the state past the total. A host sender returns it for a body past the share of
+    /// [`crate::FetchState::body_bytes_left`] that the sender read it with.
+    #[cold]
+    #[inline(never)]
+    pub fn response_bodies_exceeded() -> Self {
+        Self::resource_limit(format!(
+            "response bodies exceed {MAX_RESPONSE_BODY_BYTES_PER_COMPILE} bytes per compile"
         ))
     }
 

@@ -330,9 +330,21 @@ pub(crate) const MAX_REQUESTS_PER_RUN: usize = 512;
 
 /// Maximum body bytes of one response: the data file cap, 10 MiB.
 /// The unit is one body byte as received. The fetcher stops its read at one byte past
-/// the cap, and the core checks the length again before conversion. A dense body can
+/// the cap, and the core checks the length again for every status, before it follows a
+/// redirect or converts a body. A dense body can
 /// reach the node cap or the compile memory budget first, as a data file can.
 pub(crate) const MAX_RESPONSE_BYTES: u64 = MAX_DATA_FILE_BYTES;
+
+/// Maximum raw body bytes of all the responses of one compile: the compile memory budget,
+/// 200 MiB.
+/// The unit is one body byte as the host gives it, for every status: the body of a
+/// redirect answer and of an error answer count too, though no entry converts them.
+/// `FetchState::with_response` counts each body as the response enters the state, before
+/// any step compile reads it. For the bodies that entries convert,
+/// `MAX_DATA_BYTES_PER_COMPILE` binds first, in the next step compile. A host that sends
+/// in parallel caps each read at its share of the bytes left (`FetchState::body_bytes_left`),
+/// so a group of sends in flight can not pass this bound.
+pub(crate) const MAX_RESPONSE_BODY_BYTES_PER_COMPILE: usize = MAX_COMPILE_MEMORY;
 
 /// Maximum bytes of the status line and the headers of one response: 16 KiB.
 /// The fetcher counts them as it reads them, before the body. It binds before the body

@@ -187,7 +187,8 @@ Each fails with `mds::resource_limit`:
 | `MAX_REDIRECTS` | 5 redirects per entry, counted on each derive, before the next hop request |
 | `MAX_URL_BYTES` | 8 KiB (8192 bytes) per expanded URL and per redirect `location` |
 | `MAX_RESPONSE_HEADER_BYTES` | 16 KiB of status line and headers per response, counted as they arrive |
-| `MAX_RESPONSE_BYTES` | 10 MiB of body per response, as received. The sender reads at most one byte more |
+| `MAX_RESPONSE_BYTES` | 10 MiB of body per response of every status, as received. The sender reads at most one byte more, and the core checks the length again before it follows a redirect or converts a body |
+| `MAX_RESPONSE_BODY_BYTES_PER_COMPILE` | 200 MiB (209,715,200 bytes, the compile memory budget) of raw response bodies per compile, of every status, counted as each response enters the fetch state. In `mds build`, each send of a group reads at most its share of the bytes left |
 | `REQUEST_TIMEOUT` | 10 s per request, from the name lookup to the end of the body |
 | `COMPILE_DEADLINE` | 30 s of network work per compile, from its first send |
 | `MAX_PARALLEL_SENDS` | 8 requests in flight at one time in one compile |
@@ -206,17 +207,28 @@ These bounds bind in this order:
   compile memory budget before the body cap, as a data file can.
 - When less than 10 s of the compile deadline is left, the deadline binds before the request
   timeout. With no time left, the request is not sent and fails as a timeout.
+- The body total counts every body that the host gives, before a step compile reads it. The
+  body of a redirect answer and of an error answer count too. For the bodies that entries
+  convert, the 32 MiB data total (`MAX_DATA_BYTES_PER_COMPILE`) binds first, in the next step
+  compile.
+- `mds build` sends a group of at most 8 requests at one time, and each send of the group gets
+  an equal share of the body bytes left. A body past a share that is less than 10 MiB fails
+  with the body total error, also when the other bodies of the group are smaller.
 
-The request caps and the redirect cap fail with `mds::resource_limit` (exit 3):
-`too many requests (max 64 per compile)`, `<request>: too many redirects (max 5 per entry)` and
-`one run sends at most 512 requests`. `<request>` is the request location of §4.12 "Errors of a
-request". A response past a byte cap, a timeout and a lookup past the address cap fail the
-request with `mds::network` (exit 2): `the response body exceeds 10485760 bytes`,
-`the response headers exceed 16384 bytes`, `the request timed out` and `the connection failed`.
-An allow list or a secret list past its cap is a host input error: `mds build` reports it as
-`mds::invalid_options` (exit 2). Tests: `the_request_cap_binds_before_a_new_request_is_added` and
-`redirect_chains_take_the_hop_cap` in `crates/mds-core/src/data/`,
-`the_run_cap_refuses_request_513` in `crates/mds-cli/src/build/net.rs`, and
+The request caps, the redirect cap and the body total fail with `mds::resource_limit` (exit 3):
+`too many requests (max 64 per compile)`, `<request>: too many redirects (max 5 per entry)`,
+`one run sends at most 512 requests` and `response bodies exceed 209715200 bytes per compile`.
+`<request>` is the request location of §4.12 "Errors of a request". A response past a byte
+cap, a timeout and a lookup past the address cap fail the request with `mds::network` (exit 2):
+`the response body exceeds 10485760 bytes`, `the response headers exceed 16384 bytes`,
+`the request timed out` and `the connection failed`. The body cap applies to a redirect answer
+too. An allow list or a secret list past its cap is a host input error: `mds build` reports it as
+`mds::invalid_options` (exit 2). Tests: `the_request_cap_binds_before_a_new_request_is_added`,
+`redirect_chains_take_the_hop_cap`, `the_fetch_state_counts_every_body_against_one_total`,
+`the_core_body_cap_binds_at_the_cap_and_fails_one_byte_over` and
+`response_bodies_count_against_the_data_total_of_a_compile` in `crates/mds-core/src/data/`,
+`the_run_cap_refuses_request_513`, `each_send_reads_at_most_its_share_of_the_bytes_left` and
+`a_body_past_its_share_fails_with_the_body_total_error` in `crates/mds-cli/src/build/net.rs`, and
 `the_body_cap_passes_at_the_cap_and_fails_one_byte_over`,
 `response_headers_past_the_cap_fail`, `a_lookup_answer_past_the_cap_fails` and
 `a_silent_server_times_out_at_the_narrowed_deadline` in `crates/mds-fetch/tests/plain.rs`.
@@ -1409,8 +1421,11 @@ and `compile_step_str`. Each takes the arguments of its compile function plus a 
 - The state holds responses only, keyed by `RequestId` (64 lower-case hex digits). A second
   response for one ID fails with `mds::invalid_options`
   (`the fetch state already holds a response for this request`). More than 64 responses fail
-  with `mds::resource_limit`. A response that the compile did not request fails with
-  `mds::invalid_options` (§5).
+  with `mds::resource_limit`, and so does a body that takes the raw bodies of the state past
+  200 MiB (§4.1 "Network limits"). `FetchState::body_bytes_left` gives the body bytes that the
+  state can still take, so that a host can cap its reads. A host read past its share gives
+  `MdsError::response_bodies_exceeded`, the error of the total. A response that the compile
+  did not request fails with `mds::invalid_options` (§5).
 - A host gives a failure as a fixed `TransportFailure` kind. `AddressRefused` fails with
   `mds::network_denied` (`transport-address`), each other kind with `mds::network`.
 - `CompileResult.remote_inputs` lists each bound URL entry as its module, entry, URL as declared

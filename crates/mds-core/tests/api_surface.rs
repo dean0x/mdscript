@@ -3090,6 +3090,17 @@ fn step_api_exists() {
     let state = state.with_response(id, answer).unwrap();
     assert_eq!(state.len(), 1);
     assert!(!format!("{state:?}").contains("marker"));
+    // The raw bodies of one compile share one 200 MiB total; a host caps its reads with
+    // the bytes left, and a read past its share gives the error of the total.
+    let left: fn(&mds::FetchState) -> usize = mds::FetchState::body_bytes_left;
+    assert_eq!(left(&state), 200 * 1024 * 1024 - "marker".len());
+    let over: fn() -> MdsError = MdsError::response_bodies_exceeded;
+    let err = over();
+    assert!(matches!(err, MdsError::ResourceLimit { .. }), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "resource limit exceeded: response bodies exceed 209715200 bytes per compile"
+    );
     assert_eq!(
         format!(
             "{:?}",

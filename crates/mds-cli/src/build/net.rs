@@ -20,6 +20,7 @@ use mds::{
     AllowItem, CompileOptions, CompileResult, FetchContext, FetchState, MdsError, NarrowError,
     NativeFs, NetworkPolicy, Request, Response, Secret, SecretValue, Step, TransportFailure, Value,
     COMPILE_DEADLINE, MAX_PARALLEL_SENDS, MAX_REQUESTS_PER_COMPILE, MAX_REQUESTS_PER_RUN,
+    MAX_RESPONSE_BYTES,
 };
 use mds_fetch::{CertificateDer, Fetcher, SetupError};
 
@@ -83,7 +84,9 @@ impl NetRun {
     /// Run step compiles to the end: each round sends the requests that the compile
     /// needs and runs the compile again with every response. At most one round per
     /// request of a compile and one more. One deadline binds the network work of the
-    /// compile from its first send; each request is sent once, with no retry.
+    /// compile from its first send; each request is sent once, with no retry. The state
+    /// counts the raw bodies of the compile against one total, and each send reads at
+    /// most its share of the bytes left.
     fn drive(
         &self,
         mut step: impl FnMut(&FetchContext, &FetchState) -> Result<Step, MdsError>,
@@ -106,10 +109,7 @@ impl NetRun {
                 ),
             };
             self.reserve(requests.len())?;
-            let responses = self.send_round(&requests, deadline)?;
-            for (request, response) in requests.iter().zip(responses) {
-                state = state.with_response(request.id(), response)?;
-            }
+            state = self.send_round(&requests, deadline, state)?;
         }
         // The core needs at most one round per request of a compile and one more.
         Err(MdsError::Internal)
@@ -127,11 +127,15 @@ impl NetRun {
         Ok(())
     }
 
-    /// Send the requests of one round, at most [`MAX_PARALLEL_SENDS`] at a time, and give
-    /// their responses in request order.
+    /// Send the requests of one round, at most [`MAX_PARALLEL_SENDS`] at a time, and add
+    /// their responses to `state` in request order. Each group enters the state before
+    /// the next group starts, and each send of a group reads at most its share of the
+    /// body bytes that the state can still take, so a group in flight can not take the
+    /// compile past its body total.
     ///
     /// # Errors
     ///
+    /// The refusals of [`FetchState::with_response`] and of [`add_group`], and
     /// `MdsError::Internal` when a send thread panics. In `mds` the panic hook ends the
     /// process with the internal code first, as on any thread that catches nothing, so
     /// the error is the way out only where no hook is set.
@@ -139,40 +143,81 @@ impl NetRun {
         &self,
         requests: &[Request],
         deadline: Instant,
-    ) -> Result<Vec<Response>, MdsError> {
-        let mut responses = Vec::with_capacity(requests.len());
+        mut state: FetchState,
+    ) -> Result<FetchState, MdsError> {
         for group in requests.chunks(MAX_PARALLEL_SENDS) {
+            let share = body_share(state.body_bytes_left(), group.len());
+            let fetcher = self.fetcher.clone().with_body_cap(share);
+            let fetcher = &fetcher;
+            let mut responses = Vec::with_capacity(group.len());
             thread::scope(|scope| {
                 let sends: Vec<_> = group
                     .iter()
                     .map(|request| {
                         thread::Builder::new()
-                            .spawn_scoped(scope, move || self.send(request, deadline))
+                            .spawn_scoped(scope, move || send(fetcher, request, deadline))
                             .map_err(|_| request)
                     })
                     .collect();
-                for send in sends {
-                    responses.push(match send {
+                for send_thread in sends {
+                    responses.push(match send_thread {
                         // Each thread is joined, so the scope itself never panics.
                         Ok(handle) => handle.join().map_err(|_| MdsError::Internal),
                         // With no thread for it, the request is sent on this thread.
-                        Err(request) => Ok(self.send(request, deadline)),
+                        Err(request) => Ok(send(fetcher, request, deadline)),
                     });
                 }
             });
+            state = add_group(state, group, responses, share)?;
         }
-        responses.into_iter().collect()
+        Ok(state)
     }
+}
 
-    /// Send one request before `deadline`. With no time left, it is not sent.
-    fn send(&self, request: &Request, deadline: Instant) -> Response {
-        if Instant::now() >= deadline {
-            // The `mds::` path keeps this call apart from the `failed` methods of
-            // mds-cli's lint sinks, which tests/panic_hook.rs follows by name.
-            return mds::Response::failed(TransportFailure::Timeout);
-        }
-        self.fetcher.send(request, deadline)
+/// Send one request before `deadline`. With no time left, it is not sent.
+fn send(fetcher: &Fetcher, request: &Request, deadline: Instant) -> Response {
+    if Instant::now() >= deadline {
+        // The `mds::` path keeps this call apart from the `failed` methods of
+        // mds-cli's lint sinks, which tests/panic_hook.rs follows by name.
+        return mds::Response::failed(TransportFailure::Timeout);
     }
+    fetcher.send(request, deadline)
+}
+
+/// The body cap of each of `sends` sends of one group: an equal share of the `left` body
+/// bytes of the compile, at most the cap of one response. The shares of a group add up
+/// to at most `left`.
+fn body_share(left: usize, sends: usize) -> u64 {
+    let share = left.checked_div(sends).unwrap_or(0);
+    u64::try_from(share).map_or(MAX_RESPONSE_BYTES, |share| share.min(MAX_RESPONSE_BYTES))
+}
+
+/// Add the responses of one group, sent with a body cap of `share`, to `state` in
+/// request order. A body past a share below the cap of one response would take the
+/// compile past its body total, so it fails with the error of that total.
+fn add_group(
+    mut state: FetchState,
+    group: &[Request],
+    responses: Vec<Result<Response, MdsError>>,
+    share: u64,
+) -> Result<FetchState, MdsError> {
+    for (request, response) in group.iter().zip(responses) {
+        let response = response?;
+        // A `#[non_exhaustive]` tuple variant of another crate matches in brace form.
+        if share < MAX_RESPONSE_BYTES
+            && matches!(
+                response,
+                Response::Failed {
+                    0: TransportFailure::BodyTooLarge,
+                    ..
+                }
+            )
+        {
+            return Err(MdsError::response_bodies_exceeded());
+        }
+        state = state.with_response(request.id(), response)?;
+    }
+    Ok(state)
 }
 
 /// Compile the native entry `input` with the filesystem that `fs` gives each compile.
@@ -469,6 +514,81 @@ mod tests {
         assert!(
             error.to_string().contains("at most 512 requests"),
             "{error}"
+        );
+    }
+
+    /// Each send of a group reads at most its share of the body bytes that the compile
+    /// can still take, so the shares of a group add up to at most the bytes left.
+    /// Control: with room, each send keeps the cap of one response.
+    #[test]
+    fn each_send_reads_at_most_its_share_of_the_bytes_left() {
+        let total = FetchState::new().body_bytes_left();
+        assert_eq!(
+            body_share(total, MAX_PARALLEL_SENDS),
+            MAX_RESPONSE_BYTES,
+            "control: with room, a send keeps the cap of one response"
+        );
+        assert_eq!(
+            body_share(40 * 1024 * 1024, MAX_PARALLEL_SENDS),
+            5 * 1024 * 1024
+        );
+        for left in [0, 7, 8 * 1024, 79 * 1024 * 1024, total] {
+            for sends in 1..=MAX_PARALLEL_SENDS {
+                let share = body_share(left, sends);
+                assert!(share <= MAX_RESPONSE_BYTES, "{left} bytes, {sends} sends");
+                let shares = share * u64::try_from(sends).unwrap();
+                assert!(
+                    shares <= u64::try_from(left).unwrap(),
+                    "{left} bytes, {sends} sends"
+                );
+            }
+        }
+    }
+
+    /// A body past a share below the cap of one response fails with the body total error
+    /// of the core, not the 10 MiB network text. Control: at the full cap the failure
+    /// enters the state, and the core reports it for its entry.
+    #[test]
+    fn a_body_past_its_share_fails_with_the_body_total_error() {
+        let policy = NetworkPolicy::new(vec![AllowItem::parse("api.example").unwrap()]).unwrap();
+        let ctx = FetchContext::new(policy, mds::RunKey::from_bytes([7; 32]));
+        let source = "---\ndata:\n  a: https://api.example/x\n---\n{{a}}\n";
+        let step = mds::compile_step_str(
+            source,
+            None,
+            None,
+            CompileOptions::default(),
+            &ctx,
+            &FetchState::new(),
+        )
+        .unwrap();
+        let Step::Need(requests) = step else {
+            panic!("expected the request of the entry");
+        };
+        assert_eq!(requests.len(), 1);
+        let too_large = || vec![Ok(mds::Response::failed(TransportFailure::BodyTooLarge))];
+        let error = add_group(
+            FetchState::new(),
+            &requests,
+            too_large(),
+            MAX_RESPONSE_BYTES - 1,
+        )
+        .unwrap_err();
+        assert_eq!(code(&error), "mds::resource_limit");
+        assert_eq!(
+            error.to_string(),
+            "resource limit exceeded: response bodies exceed 209715200 bytes per compile"
+        );
+        let state = add_group(
+            FetchState::new(),
+            &requests,
+            too_large(),
+            MAX_RESPONSE_BYTES,
+        );
+        assert_eq!(
+            state.unwrap().len(),
+            1,
+            "control: at the full cap the failure enters the state"
         );
     }
 

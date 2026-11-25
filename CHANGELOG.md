@@ -98,8 +98,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused request fails with `mds::network_denied` (exit 2) and names the check. A data value in
   a request URL or header that is not a string, a boolean or an exact integer fails with
   `mds::type_error`. Messages show the URL as declared and the origin only.
-- New network limits: 64 requests per compile and 512 per `mds build` run (`mds::resource_limit`,
-  exit 3); 16 KiB of response headers, 10 MiB of response body, 10 s per request and 30 s of
+- New network limits: 64 requests per compile, 512 per `mds build` run and 200 MiB of response
+  bodies per compile, of every status (`mds::resource_limit`, exit 3); 16 KiB of response
+  headers, 10 MiB of response body, also for a redirect answer, 10 s per request and 30 s of
   network work per compile (`mds::network`, exit 2). See spec §4.1 "Network limits".
 - Lint: `insecure-data-origin` reports a request map with an `http://` URL.
   `literal-credential-header` reports a header with literal text when its name contains
@@ -107,8 +108,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rust API: the step compiles `compile_step_native_fs`, `compile_step_virtual_fs` and
   `compile_step_str`, with `FetchContext`, `FetchState`, `Step`, `Request`, `RequestId`,
   `Response`, `TransportFailure`, `NetworkPolicy`, `AllowItem`, `Secret`, `SecretValue` and the
-  network limit constants. `CompileResult.remote_inputs` lists the bound URL entries in template
-  form. The canonical JSON writes `remoteInputs` only when the list is not empty.
+  network limit constants. `FetchState::body_bytes_left` gives the body bytes that a compile can
+  still take, and `MdsError::response_bodies_exceeded` gives the error of that total.
+  `CompileResult.remote_inputs` lists the bound URL entries in template form. The canonical
+  JSON writes `remoteInputs` only when the list is not empty.
 - The new crate `mds-fetch` holds the native sender of URL entries. `mds-cli` depends on it,
   and `mds-core` and the WASM build depend on no network crate.
 
