@@ -8,7 +8,8 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use common::{
-    answer, entry, failure, header, http, policy, request, soon, step, Reply, Scripted, Server,
+    answer, entry, failure, header, http, policy, read_head, reply_on, request, soon, step, Reply,
+    Scripted, Server,
 };
 use mds::{FetchState, Step, TransportFailure, MAX_RESPONSE_BYTES};
 use mds_fetch::Fetcher;
@@ -181,6 +182,36 @@ fn a_silent_server_times_out_at_the_narrowed_deadline() {
     assert!(took < Duration::from_secs(5), "{took:?}");
     let past = fetcher.send(&request, Instant::now());
     assert_eq!(failure(&past), Some(TransportFailure::Timeout));
+    assert_eq!(server.stop().connections, 1);
+}
+
+/// TP-95: a listener that waits inside the narrowed deadline and then answers gives its
+/// 200 and body. The wait is 100 ms of a 1 s deadline, so a loaded runner keeps a wide
+/// margin. The silent listener above is the case past the deadline.
+#[test]
+fn a_late_answer_inside_the_narrowed_deadline_passes() {
+    const WAIT: Duration = Duration::from_millis(100);
+    let reply = Reply::bytes(answer("200 OK", "", OK));
+    let server = Server::start_with(move |mut stream, stop| {
+        let head = read_head(&mut stream).ok()?;
+        std::thread::sleep(WAIT);
+        reply_on(&mut stream, &reply, stop);
+        Some(head)
+    });
+    let port = server.port();
+    let policy = policy(&[&format!("http://127.0.0.1:{port}")]);
+    let request = request(
+        &entry(&format!("url: 'http://127.0.0.1:{port}/x'")),
+        &policy,
+    );
+    let fetcher = Fetcher::new(policy, &[])
+        .unwrap()
+        .with_deadline(Duration::from_secs(1));
+    let start = Instant::now();
+    let response = fetcher.send(&request, soon());
+    let took = start.elapsed();
+    assert_eq!(http(&response), Some((200, OK)));
+    assert!(took >= WAIT, "{took:?}");
     assert_eq!(server.stop().connections, 1);
 }
 
