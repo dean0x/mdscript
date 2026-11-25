@@ -2,6 +2,11 @@
 
 mod convert;
 pub(crate) mod decl;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the request identity is the first caller")
+)]
+pub(crate) mod digest;
 pub(crate) mod graph;
 pub(crate) mod path;
 mod refs;
@@ -18,5 +23,7 @@ pub(crate) use convert::{convert, Accept, DataLabel};
 mod convert_tests;
 #[cfg(test)]
 mod corpus_tests;
+#[cfg(test)]
+mod digest_tests;
 #[cfg(test)]
 mod url_tests;
