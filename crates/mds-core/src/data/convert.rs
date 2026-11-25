@@ -4,11 +4,10 @@ use crate::limits::MAX_DATA_FILE_BYTES;
 use crate::resolver::{parse_data_json_with, parse_data_yaml_with, Allowance, NODE_YAML};
 use crate::value::Value;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Accept {
     Json,
     Yaml,
-    #[cfg_attr(not(test), expect(dead_code, reason = "text is a response format"))]
     Text,
 }
 

@@ -1090,19 +1090,34 @@ The value of `data` is a mapping. Each key is an entry name. Each value has one 
 - A string with a URI scheme is a URL entry. The scheme must be the literal `https`
   (`expected the literal https scheme`). The authority is literal and has no trailing host dot.
   The URL has no backslash and no fragment. A query needs a path.
-- A request map has the fields `url` (required), `method`, `headers`, `body`, `cache` and `accept`.
-  `method` is `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` or `OPTIONS`. `accept` is `json`,
-  `yaml` or `text`. `cache` is a count with the unit `s`, `m`, `h` or `d`, or `forever`, or `off`.
+- The strict URL parser reads the literal URL of each URL entry and request map. Each reference
+  counts as the shortest text that it can give: one byte in a path segment, none in the query.
+  A host that is not a canonical name or address (for example `127.1`, `2130706433` or an
+  upper-case letter), a bad port, or a URL longer than 8192 bytes (`mds::resource_limit`) fails
+  at declaration. These rules also apply to an entry that replay satisfies.
+- A request map has the fields `url` (required), `method`, `headers`, `body`, `cache`, `accept`
+  and `envelope`. The `url` of a request map can also have the literal `http` scheme. `method` is
+  `GET` (the default), `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` or `OPTIONS`. `accept` is `json`
+  (the default), `yaml` or `text`. `cache` is a count with the unit `s`, `m`, `h` or `d`, or
+  `forever`, or `off`. `envelope` is `true` or `false` (the default).
   A header name is a literal token. A header value is a string, or a map of `secret` (an
-  identifier) and `prefix` (a literal string). A `body` is a mapping or a literal string, with no
-  YAML tags. Another field fails (`unknown request field`).
+  identifier) and `prefix` (literal header text: visible ASCII characters and spaces). A `body`
+  is a mapping or a literal string, with no YAML tags. Another field fails (`unknown request field`).
+- A `GET` or `HEAD` request cannot have a body. A `HEAD` request requires `envelope: true`.
+- The headers `Authorization`, `Proxy-Authorization`, `Cookie` and `X-Api-Key`, in any letter
+  case, take the secret form only (`use the secret form for this header`).
 - Any other value fails with `mds::data`: `expected a dot-relative path, an HTTPS URL or a request map`.
   The help is `` `data` is reserved for data sources; rename the variable ``. A `data` value that
   is not a mapping fails with the same help (`expected a mapping of data entries`).
 
 Tests: `unknown_forms_have_rename_help`, `both_url_forms_require_a_literal_https_origin`,
-`exact_method_accept_and_cache_grammars` and `header_grammar_keeps_names_and_secret_parts_literal`
-in `crates/mds-core/src/data/decl_tests.rs`.
+`exact_method_accept_and_cache_grammars`, `header_grammar_keeps_names_and_secret_parts_literal`,
+`http_is_accepted_in_the_request_map_form_only`, `get_and_head_requests_cannot_have_a_body`,
+`head_requires_the_envelope`, `credential_headers_take_the_secret_form_only`,
+`literal_url_goes_through_the_strict_parser` and
+`literal_url_at_the_length_cap_passes_and_one_byte_over_fails` in
+`crates/mds-core/src/data/decl_tests.rs`, and `request_map_rules_run_before_replay` in
+`crates/mds-core/tests/data_resolve.rs`.
 
 #### Entry names
 

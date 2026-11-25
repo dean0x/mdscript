@@ -81,8 +81,8 @@ pub(crate) fn analyze<'a>(
             // Replay satisfies the node without use of its outgoing references.
             // The declaration parser already checked the source form.
             replayed.insert(index);
-        } else if let Source::Url(refs) = &node.entry.source {
-            for path in refs {
+        } else if let Source::Url(template) = &node.entry.source {
+            for path in &template.refs {
                 let root = path.split_once('.').map_or(path.as_str(), |(root, _)| root);
                 if let Ok(slot) = indices.binary_search_by_key(&root, |&i| name_at(i)) {
                     deps.insert(indices[slot]);

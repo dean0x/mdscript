@@ -564,7 +564,7 @@ describe('WASM backend data pre-scanner (#405)', () => {
       await put(sub, 'big.json', `"${'a'.repeat(MAX_DATA_FILE_BYTES - 2)}"`);
       // An entry with 254 references in its body, one in its URL and one in a header.
       const refs = (extra) =>
-        `---\nk: v\ndata:\n  a: ./a.json\n  b:\n    url: 'https://example.com/{{k}}'\n    headers:\n      X-Key: '{{k}}'\n` +
+        `---\nk: v\ndata:\n  a: ./a.json\n  b:\n    url: 'https://example.com/{{k}}'\n    method: POST\n    headers:\n      X-Key: '{{k}}'\n` +
         `    body:\n      text: '${'{{k}}'.repeat(254)}${extra}'\n---\n{{a}}\n`;
       const rules = [
         ['root', dataModule({ d: '../outside.json' }, '{{d}}\n'), dataModule({ d: '../outside.json' }, '{{d}}\n')],

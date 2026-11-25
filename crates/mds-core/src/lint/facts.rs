@@ -359,8 +359,8 @@ fn collect_data_entries(
         return;
     };
     for entry in entries {
-        if let crate::data::decl::Source::Url(paths) = &entry.source {
-            ctx.used_vars.extend(paths.iter().map(|path| {
+        if let crate::data::decl::Source::Url(template) = &entry.source {
+            ctx.used_vars.extend(template.refs.iter().map(|path| {
                 path.split_once('.')
                     .map_or(path.as_str(), |(root, _)| root)
                     .to_owned()

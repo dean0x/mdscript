@@ -10,6 +10,19 @@ fn parse(raw: &str, module: &str) -> Result<Vec<Entry>, MdsError> {
     parse_declarations(&tree["data"], module, &mut MemBudget::default())
 }
 
+/// A GET entry whose declaration references `refs`.
+fn url_source(refs: Vec<String>) -> Source {
+    Source::Url(Box::new(crate::data::decl::RequestTemplate {
+        url: "https://example.test/".into(),
+        method: crate::data::decl::DeclaredMethod::Get,
+        accept: crate::data::Accept::Json,
+        envelope: false,
+        headers: Vec::new(),
+        has_body: false,
+        refs,
+    }))
+}
+
 fn nodes<'a>(entries: &'a [Entry], module: &'a str) -> Vec<Node<'a>> {
     entries
         .iter()
@@ -209,7 +222,7 @@ fn merged_graph_accepts_the_compile_entry_cap_but_not_more() {
             source: Source::File("./leaf.json".into()),
         })
         .collect::<Vec<_>>();
-    entries[0].source = Source::Url(vec![format!("{last}.id"), format!("{last}.name")]);
+    entries[0].source = url_source(vec![format!("{last}.id"), format!("{last}.name")]);
     let at_cap = nodes(&entries, MODULE);
     let graph = check(&at_cap[..cap], &[], &[]).unwrap();
     assert_eq!(graph.unreplayed().count(), cap);
@@ -218,7 +231,7 @@ fn merged_graph_accepts_the_compile_entry_cap_but_not_more() {
         "mds::resource_limit"
     );
 
-    entries[cap - 1].source = Source::Url(vec!["entry0.id".into()]);
+    entries[cap - 1].source = url_source(vec!["entry0.id".into()]);
     let cycle = nodes(&entries[..cap], MODULE);
     let error = check(&cycle, &[], &[]).unwrap_err().serialize();
     assert_eq!(error.code, "mds::data");
