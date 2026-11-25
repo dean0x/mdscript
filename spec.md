@@ -1202,6 +1202,28 @@ entries in declaration order. The denial comes before any local data read
 `frontier_keeps_module_and_declaration_order` in `graph_tests.rs`,
 `build_denies_network_entries_without_replay_and_opens_no_connection` in `cli_data.rs`).
 
+#### Status envelope
+
+The value of a URL entry is the converted response body. A status that is not 2xx fails with
+`mds::network` (`the server answered with HTTP status <n>`). A request map with `envelope: true`
+binds `{status, headers, body}` for any final status from 200 to 599:
+
+- `status` is the number. `body` is the converted body, and `null` for a `HEAD` request.
+- A header name becomes lower case, and each `-` becomes `_`, so `{{a.headers.x_rate_limit}}`
+  reads `X-Rate-Limit`. A name that is then not an identifier is dropped. `set-cookie` and
+  `set-cookie2` are dropped.
+- A repeated header joins its values with `, `, in received order. Two different names that give
+  the same key fail with `mds::data` (`two response header names give the same envelope key`).
+- A header value follows the character rule of data strings below. A value that breaks it fails
+  with `mds::data`. The message names the field `headers`, never a header name or value.
+- A redirect is followed as without the envelope. The envelope holds the final answer.
+- One response can bind a body entry and an envelope entry of the same request.
+
+Tests: `envelope_tests.rs` in `crates/mds-core/src/data/`, and
+`a_status_that_is_not_2xx_binds_only_with_the_envelope`,
+`the_envelope_binds_a_status_from_200_to_599_only`, `a_head_envelope_has_a_null_body` and
+`one_response_binds_a_body_entry_and_an_envelope_entry` in `crates/mds-core/src/data/step_tests.rs`.
+
 #### Conversion
 
 The extension of the resolved file selects the parser.

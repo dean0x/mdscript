@@ -945,17 +945,117 @@ fn a_failed_answer_fails_the_entry() {
     }
 }
 
-/// The envelope form binds the status and the headers too, which this engine does not
-/// do, so it fails closed and derives no request.
+fn answered(status: u16, headers: &[(&str, &str)], body: &str) -> Response {
+    Response::Http {
+        status,
+        headers: headers
+            .iter()
+            .map(|&(name, value)| (name.to_owned(), value.as_bytes().to_vec()))
+            .collect(),
+        body: body.as_bytes().to_vec(),
+    }
+}
+
+/// Run one entry `a` of `main` to its end, with `response` as the answer to its request.
+fn run_answered(main: &str, net: &NetworkPolicy, response: Response) -> Result<String, MdsError> {
+    let files = [("main.mds", main)];
+    let requests = need(run_step(&files, &Runtime::new(), net, &Responses::new()));
+    let mut responses = Responses::new();
+    for request in &requests {
+        responses.insert(request.id(), response.clone());
+    }
+    run_step(&files, &Runtime::new(), net, &responses).map(|(text, outcome)| {
+        assert!(matches!(outcome, Outcome::Done(_)), "{outcome:?}");
+        text
+    })
+}
+
+/// TP-95 and TP-100: with the envelope, a status that is not 2xx binds as
+/// `{status, headers, body}`, and a reference reads a header with dot access. Control:
+/// the same answer without the envelope fails with the status number.
 #[test]
-fn an_envelope_entry_fails_closed() {
-    let main = "---\ndata:\n  a: {url: 'https://a.example/x', envelope: true}\n---\n{{a}}\n";
-    let (result, needed) = run_round(
+fn a_status_that_is_not_2xx_binds_only_with_the_envelope() {
+    let net = policy(&["a.example"]);
+    let response = answered(404, &[("X-Rate-Limit", "7")], r#"{"n": 1}"#);
+    let main = "---\ndata:\n  a: {url: 'https://a.example/x', envelope: true}\n---\n{{a.status}} {{a.headers.x_rate_limit}} {{a.body.n}}\n";
+    let text = run_answered(main, &net, response.clone()).unwrap();
+    assert!(text.ends_with("404 7 1\n"), "{text:?}");
+    let plain = "---\ndata:\n  a: https://a.example/x\n---\n{{a.n}}\n";
+    let err = run_answered(plain, &net, response).unwrap_err();
+    assert_eq!(code(&err), "mds::network");
+    assert!(
+        err.to_string()
+            .ends_with("the server answered with HTTP status 404"),
+        "{err}"
+    );
+}
+
+/// The envelope binds a status from 200 to 599 only. Control: 599 binds.
+#[test]
+fn the_envelope_binds_a_status_from_200_to_599_only() {
+    let net = policy(&["a.example"]);
+    let main = "---\ndata:\n  a: {url: 'https://a.example/x', envelope: true}\n---\n{{a.status}}\n";
+    for status in [100, 199, 600] {
+        let err = run_answered(main, &net, answered(status, &[], "1")).unwrap_err();
+        assert_eq!(code(&err), "mds::network", "{err}");
+        assert!(
+            err.to_string()
+                .ends_with(&format!("the server answered with HTTP status {status}")),
+            "{err}"
+        );
+    }
+    let text = run_answered(main, &net, answered(599, &[], "1")).unwrap();
+    assert!(text.ends_with("599\n"), "{text:?}");
+}
+
+/// A HEAD envelope has `body: null`: the core never converts the body of a HEAD answer,
+/// so a body that is not JSON does not fail. Control: the same body for GET fails.
+#[test]
+fn a_head_envelope_has_a_null_body() {
+    let net = policy(&["a.example"]);
+    let response = answered(200, &[("Content-Length", "12")], "not json [");
+    let entry = |method: &str| {
+        format!("---\ndata:\n  a: {{url: 'https://a.example/x', method: {method}, envelope: true}}\n---\n{{{{a.headers.content_length}}}}\n@if a.body:\nbody\n@else:\nno body\n@end\n")
+    };
+    let text = run_answered(&entry("HEAD"), &net, response.clone()).unwrap();
+    assert!(text.ends_with("12\nno body\n"), "{text:?}");
+    let err = run_answered(&entry("GET"), &net, response).unwrap_err();
+    assert_eq!(code(&err), "mds::yaml", "{err}");
+}
+
+/// One response binds a body entry and an envelope entry of the same request, each in
+/// its own shape: the memo keeps the envelope flag next to the request ID.
+#[test]
+fn one_response_binds_a_body_entry_and_an_envelope_entry() {
+    let main = "---\ndata:\n  a: https://a.example/x\n  b: {url: 'https://a.example/x', envelope: true}\n---\n{{a.n}} {{b.status}} {{b.body.n}}\n";
+    let net = policy(&["a.example"]);
+    let requests = need(run_step(
         &[("main.mds", main)],
         &Runtime::new(),
-        &policy(&["a.example"]),
+        &net,
         &Responses::new(),
+    ));
+    assert_eq!(urls(&requests), ["https://a.example/x"]);
+    let text = run_answered(main, &net, answered(200, &[], r#"{"n": 3}"#)).unwrap();
+    assert!(text.ends_with("3 200 3\n"), "{text:?}");
+}
+
+/// A host secret value in a header of the envelope fails the response check, and the
+/// message names the secret, never its value. Control: another header value binds.
+#[test]
+fn a_secret_value_in_an_envelope_header_fails_the_response_check() {
+    let net = with_secret(policy(&["a.example"]), "TOKEN", PLANTED, "a.example");
+    let main = "---\ndata:\n  a: {url: 'https://a.example/x', envelope: true}\n---\n{{a.status}}\n";
+    let err = run_answered(main, &net, answered(200, &[("X-Echo", PLANTED)], "1")).unwrap_err();
+    assert_eq!(code(&err), "mds::network_denied");
+    let message = err.to_string();
+    assert!(
+        message.ends_with(
+            r#"response-check: the response holds the value of a host secret (secret "TOKEN")"#
+        ),
+        "{message}"
     );
-    assert_eq!(code(&result.unwrap_err()), "mds::internal");
-    assert!(needed.is_empty());
+    assert!(!message.contains(PLANTED), "{message}");
+    let text = run_answered(main, &net, answered(200, &[("X-Echo", "plain")], "1")).unwrap();
+    assert!(text.ends_with("200\n"), "{text:?}");
 }

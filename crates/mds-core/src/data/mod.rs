@@ -4,6 +4,7 @@ mod convert;
 pub(crate) mod decl;
 pub(crate) mod digest;
 pub(crate) mod encode;
+pub(crate) mod envelope;
 pub(crate) mod graph;
 pub(crate) mod path;
 pub(crate) mod policy;
@@ -23,6 +24,8 @@ mod corpus_tests;
 mod digest_tests;
 #[cfg(test)]
 mod encode_tests;
+#[cfg(test)]
+mod envelope_tests;
 #[cfg(test)]
 mod policy_tests;
 #[cfg(test)]

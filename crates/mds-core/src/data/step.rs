@@ -12,6 +12,7 @@
 //! and the needed [`Request`] list. A message names the URL as declared and the origin,
 //! never the expanded URL, and each one is built through [`request_label`].
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -24,7 +25,7 @@ use super::policy::{HopError, Layer, NetworkPolicy, Refusal};
 use super::request::RunKey;
 use super::request::{identity_bytes, HeaderValue, Method, Request, RequestHeader, RequestId};
 use super::url::{self, CheckedUrl, Host, Origin};
-use super::{convert, Accept, DataInput, DataLabel};
+use super::{convert, envelope, Accept, DataInput, DataLabel};
 use crate::error::request_location;
 use crate::evaluator::budget::{MemBudget, Part};
 use crate::limits::{
@@ -110,8 +111,10 @@ pub(crate) struct StepCtx {
     needed: IndexMap<RequestId, Request>,
     /// The IDs of the responses that this compile used.
     consumed: HashSet<RequestId>,
-    /// The value of each request of a bound chain, for the other entries of the compile.
-    memo: HashMap<RequestId, Arc<Value>>,
+    /// The value of each request of a bound chain, for the other entries of the compile,
+    /// with the envelope flag of the entry: the request ID does not hold the flag, and
+    /// one response gives a body value and an envelope value of two shapes.
+    memo: HashMap<(RequestId, bool), Arc<Value>>,
     remote: Vec<RemoteInput>,
 }
 
@@ -320,11 +323,6 @@ fn derive(
         .policy
         .check_method(template.method)
         .map_err(|refusal| label.refused(refusal, None))?;
-    if template.envelope {
-        // The envelope form binds the status and the headers too. This engine binds a
-        // body only, so it refuses the form and never binds the body in its place.
-        return Err(MdsError::internal());
-    }
     let blocked = template.refs.iter().any(|path| {
         let root = path.split_once('.').map_or(path.as_str(), |(root, _)| root);
         scope.pending.contains(root)
@@ -399,7 +397,18 @@ fn derive(
         headers.push(RequestHeader::new(header.name.clone(), value));
     }
     let first = new_request(method, url, template.accept, headers, ctx, mem, &label)?;
-    follow(first, template.accept, node, label, ctx, mem, admit_bytes)
+    let shape = Shape {
+        accept: template.accept,
+        envelope: template.envelope,
+    };
+    follow(first, shape, node, label, ctx, mem, admit_bytes)
+}
+
+/// The value form of a URL entry: the body format and the envelope flag.
+#[derive(Clone, Copy)]
+struct Shape {
+    accept: Accept,
+    envelope: bool,
 }
 
 /// The value of the reference `path` of a template field. A path that names no value
@@ -424,10 +433,12 @@ fn reference<'s>(
 }
 
 /// Follow the redirect chain of `request` through the responses of `ctx`, at most
-/// `MAX_REDIRECTS` hops. Each hop is a new request with its own ID and checks.
+/// `MAX_REDIRECTS` hops. Each hop is a new request with its own ID and checks. With the
+/// envelope, the final answer binds as `{status, headers, body}` for any status from
+/// 200 to 599; without it, a status that is not 2xx fails.
 fn follow(
     mut request: Request,
-    accept: Accept,
+    shape: Shape,
     node: Node<'_>,
     mut label: RequestLabel<'_>,
     ctx: &mut StepCtx,
@@ -439,9 +450,9 @@ fn follow(
     for hop in 0..=MAX_REDIRECTS {
         let id = request.id();
         chain[hop] = Some(id);
-        if let Some(value) = ctx.memo.get(&id) {
+        if let Some(value) = ctx.memo.get(&(id, shape.envelope)) {
             let value = Arc::clone(value);
-            return bind_value(value, &chain[..=hop], node, &label, ctx, mem);
+            return bind_value(value, &chain[..=hop], shape, node, &label, ctx, mem);
         }
         if ctx.needed.contains_key(&id) {
             return Ok(Bound::Pending);
@@ -474,38 +485,58 @@ fn follow(
         if header_bytes.is_none_or(|bytes| bytes > MAX_RESPONSE_HEADER_BYTES) {
             return Err(label.network(&Transport::HeadersTooLarge.kind()));
         }
-        match status {
+        let bound = match status {
             301 | 302 | 303 | 307 | 308 => {
-                let next = redirect(&request, accept, headers, hop, &label, ctx, mem)?;
+                let next = redirect(&request, shape.accept, headers, hop, &label, ctx, mem)?;
                 let origin = next.url().origin();
                 mem.charge(Part::Temp, Some(origin_text_bytes(&origin)))?;
                 label.origin = origin.to_string();
                 request = next;
+                continue;
             }
-            200..=299 => {
-                if u64::try_from(body.len()).map_or(true, |len| len > MAX_RESPONSE_BYTES) {
-                    return Err(label.network(&Transport::BodyTooLarge.kind()));
-                }
-                admit_bytes(body.len())?;
-                let data = DataLabel {
-                    module: node.module,
-                    entry: &node.entry.name,
-                    input: DataInput::Response,
-                };
-                let value = convert(body, accept, data, mem)?;
-                if let Some(secret) = scan_secrets(&value, &ctx.policy)? {
-                    return Err(label.refused(response_check(), Some(secret)));
-                }
-                mem.charge(
-                    Part::Buffers,
-                    Some(size_of::<Value>() + 2 * size_of::<usize>()),
-                )?;
-                return bind_value(Arc::new(value), &chain[..=hop], node, &label, ctx, mem);
-            }
-            _ => {
-                return Err(label.network(&format!("the server answered with HTTP status {status}")))
-            }
+            200..=299 => true,
+            300..=599 => shape.envelope,
+            _ => false,
+        };
+        if !bound {
+            return Err(label.network(&format!("the server answered with HTTP status {status}")));
         }
+        if u64::try_from(body.len()).map_or(true, |len| len > MAX_RESPONSE_BYTES) {
+            return Err(label.network(&Transport::BodyTooLarge.kind()));
+        }
+        let data = DataLabel {
+            module: node.module,
+            entry: &node.entry.name,
+            input: DataInput::Response,
+        };
+        // A HEAD answer has no body, so its envelope holds `body: null`.
+        let value = if request.method() == Method::Head {
+            Value::Null
+        } else {
+            admit_bytes(body.len())?;
+            convert(body, shape.accept, data, mem)?
+        };
+        let value = if shape.envelope {
+            envelope::envelope(status, headers, value, data, mem)?
+        } else {
+            value
+        };
+        if let Some(secret) = scan_secrets(&value, &ctx.policy)? {
+            return Err(label.refused(response_check(), Some(secret)));
+        }
+        mem.charge(
+            Part::Buffers,
+            Some(size_of::<Value>() + 2 * size_of::<usize>()),
+        )?;
+        return bind_value(
+            Arc::new(value),
+            &chain[..=hop],
+            shape,
+            node,
+            &label,
+            ctx,
+            mem,
+        );
     }
     // The hop check refuses the hop past `MAX_REDIRECTS`, so the loop always returns.
     Err(MdsError::internal())
@@ -595,18 +626,19 @@ fn new_request(
 fn bind_value(
     value: Arc<Value>,
     chain: &[Option<RequestId>],
+    shape: Shape,
     node: Node<'_>,
     label: &RequestLabel<'_>,
     ctx: &mut StepCtx,
     mem: &mut MemBudget,
 ) -> Result<Bound, MdsError> {
     for id in chain.iter().flatten() {
-        if !ctx.memo.contains_key(id) {
+        if let Entry::Vacant(slot) = ctx.memo.entry((*id, shape.envelope)) {
             mem.charge(
                 Part::Buffers,
-                Some(2 * size_of::<(RequestId, Arc<Value>, usize)>()),
+                Some(2 * size_of::<((RequestId, bool), Arc<Value>, usize)>()),
             )?;
-            ctx.memo.insert(*id, Arc::clone(&value));
+            slot.insert(Arc::clone(&value));
         }
     }
     let template = label.template;
