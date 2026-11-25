@@ -185,8 +185,12 @@ fn debug_output_does_not_show_a_secret_value() {
         .unwrap();
     assert_eq!(bound.expose_for_send(), "planted-secret-value");
     let debug = format!("{policy:?} {bound:?}");
-    assert!(!debug.contains("planted-secret-value"), "{debug}");
-    assert!(debug.contains("token"), "{debug}");
+    // Fixed messages: a failure must not show the text that holds the value.
+    assert!(
+        !debug.contains("planted-secret-value"),
+        "Debug must not show the secret value"
+    );
+    assert!(debug.contains("token"), "Debug must show the secret name");
 }
 
 /// A secret binds only to its declared name and its exact origin.

@@ -719,8 +719,13 @@ fn a_host_secret_is_only_a_header_value() {
             let err = result.unwrap_err();
             assert_eq!(code(&err), "mds::network_denied");
             let message = err.to_string();
+            // The value check comes first with a fixed message, so `{message}` below
+            // cannot show the value.
+            assert!(
+                !message.contains(PLANTED),
+                "the message must not show the secret value"
+            );
             assert!(message.ends_with("response-check: the response holds the value of a host secret (secret \"GITHUB\")"), "{message}");
-            assert!(!message.contains(PLANTED), "{message}");
         } else {
             assert!(done(result).ends_with("4\n"));
         }
@@ -1172,13 +1177,18 @@ fn a_secret_value_in_an_envelope_header_fails_the_response_check() {
     let err = run_answered(main, &net, answered(200, &[("X-Echo", PLANTED)], "1")).unwrap_err();
     assert_eq!(code(&err), "mds::network_denied");
     let message = err.to_string();
+    // The value check comes first with a fixed message, so `{message}` below cannot
+    // show the value.
+    assert!(
+        !message.contains(PLANTED),
+        "the message must not show the secret value"
+    );
     assert!(
         message.ends_with(
             r#"response-check: the response holds the value of a host secret (secret "TOKEN")"#
         ),
         "{message}"
     );
-    assert!(!message.contains(PLANTED), "{message}");
     let text = run_answered(main, &net, answered(200, &[("X-Echo", "plain")], "1")).unwrap();
     assert!(text.ends_with("200\n"), "{text:?}");
 }

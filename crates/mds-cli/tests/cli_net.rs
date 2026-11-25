@@ -297,6 +297,19 @@ fn assert_fails(out: &Output, code: &str, text: &str) {
     );
 }
 
+/// Assert that neither stream of `out` holds the planted secret value. The messages
+/// are fixed text, so a failure does not show the value.
+fn assert_no_secret(out: &Output) {
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains(SECRET),
+        "stdout must not show the secret value"
+    );
+    assert!(
+        !stderr_of(out).contains(SECRET),
+        "stderr must not show the secret value"
+    );
+}
+
 /// The proxy variables of common HTTP clients, in both letter cases.
 const PROXY_VARS: [&str; 8] = [
     "HTTP_PROXY",
@@ -519,17 +532,19 @@ fn an_echoed_secret_stops_the_chain_and_tls_needs_the_host_root() {
         "control: the chain reaches the second listener"
     );
 
+    // Check for the value first, with a fixed message, so that no failure message
+    // below can show it.
     let out = send("echo.mds", true);
+    assert_no_secret(&out);
     assert_fails(
         &out,
         "mds::network_denied",
         "response-check: the response holds the value of a host secret",
     );
-    assert!(!stderr_of(&out).contains(SECRET), "{}", stderr_of(&out));
 
     let out = send("fixed.mds", false);
+    assert_no_secret(&out);
     assert_fails(&out, "mds::network", "the TLS handshake failed");
-    assert!(!stderr_of(&out).contains(SECRET), "{}", stderr_of(&out));
 
     assert_eq!(
         next.stop().connections,

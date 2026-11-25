@@ -165,12 +165,19 @@ fn secret_headers_bind_to_the_secret_origin() {
 fn debug_output_of_a_secret_request_has_no_secret_value() {
     let bound = request(URL, vec![secret("Authorization", "token")], &key(1));
     let debug = format!("{bound:?} {:?}", key(7));
-    assert!(!debug.contains(PLANTED), "{debug}");
+    // Fixed messages: a failure must not show the text that holds the value.
+    assert!(
+        !debug.contains(PLANTED),
+        "Debug must not show the secret value"
+    );
     assert!(
         debug.contains("token") && debug.contains("Bearer "),
-        "{debug}"
+        "Debug must show the secret name and prefix"
     );
-    assert!(!debug.contains("[7, 7"), "{debug}");
+    assert!(
+        !debug.contains("[7, 7"),
+        "Debug must not show the key bytes"
+    );
 }
 
 /// `Debug` of a request and of its URL shows the URL as declared, the origin and the
