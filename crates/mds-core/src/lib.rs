@@ -65,6 +65,14 @@ pub(crate) mod vars_json;
 #[cfg(any(windows, test))]
 pub(crate) mod verbatim;
 
+pub use data::policy::{
+    AllowItem, Layer, NarrowError, NetworkPolicy, PolicyError, Refusal, Secret, SecretValue,
+};
+pub use data::request::{
+    HeaderValue, Method, Request, RequestHeader, RequestId, RequestIdError, RunKey,
+};
+pub use data::step::{FetchContext, FetchState, RemoteInput, Response, Step, TransportFailure};
+pub use data::url::{CheckedUrl, Host, Origin, Scheme};
 pub use formatter::{format_str, format_str_named, format_str_with};
 pub use fs::{
     check_module_bytes, effective_parent, read_at_most, reject_forbidden_path, EntryPin,
@@ -181,6 +189,12 @@ pub struct CompileResult {
     /// `CompileOptions::source_map` is `true` (AC-API-02: absent, not null, when off).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_map: Option<SourceMap>,
+    /// The URL entries that a step compile bound, in bind order, in template form: the
+    /// module, the entry, the URL as declared and its origin, never an expanded URL. An
+    /// entry of two modules occurs once per module. Empty for a compile that is not a
+    /// step compile and for an entry that a runtime variable replays.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub remote_inputs: Vec<RemoteInput>,
 }
 
 impl CompileResult {
@@ -225,17 +239,20 @@ impl CompileResult {
     /// carve-out — emitted verbatim, so their paths reach the consumer with whatever
     /// bytes the filesystem allowed. See [`CompileResult::dependencies`] and
     /// [`crate::SourceMap`]; consumers that display those paths must escape them.
+    /// `remoteInputs` (present only when not empty) is display text: each field of each
+    /// `{module, entry, template, origin}` item is WIRE-escaped.
     pub fn to_canonical_json(self) -> serde_json::Value {
         // Sanitize warnings at the serialization boundary (issue #176 / CWE-150):
         // warning strings may embed a hostile filename.  WIRE mode — this value is
         // consumed as JSON by the bindings, so an embedded newline could forge an
         // extra warning line downstream.
+        let wire = |text: &str| {
+            serde_json::Value::String(crate::lint::sanitize_control_chars_wire(text).into_owned())
+        };
         let warnings: serde_json::Value = self
             .warnings
-            .into_iter()
-            .map(|w| {
-                serde_json::Value::String(crate::lint::sanitize_control_chars_wire(&w).into_owned())
-            })
+            .iter()
+            .map(|w| wire(w))
             .collect::<Vec<_>>()
             .into();
         let dependencies: serde_json::Value = self
@@ -248,20 +265,31 @@ impl CompileResult {
         let source_map_val: Option<serde_json::Value> = self
             .source_map
             .map(|sm| serde_json::to_value(sm).unwrap_or(serde_json::Value::Null));
+        // Remote inputs: absent when empty, so a compile that is not a step compile keeps
+        // its exact shape.
+        let remote_inputs: Option<serde_json::Value> =
+            (!self.remote_inputs.is_empty()).then(|| {
+                self.remote_inputs
+                    .iter()
+                    .map(|input| {
+                        serde_json::json!({
+                            "module": wire(&input.module),
+                            "entry": wire(&input.entry),
+                            "template": wire(&input.template),
+                            "origin": wire(&input.origin),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into()
+            });
 
-        match self.output {
-            CompiledOutput::Markdown(text) => {
-                let mut obj = serde_json::json!({
-                    "kind": "markdown",
-                    "output": text,
-                    "warnings": warnings,
-                    "dependencies": dependencies,
-                });
-                if let Some(sm) = source_map_val {
-                    obj["sourceMap"] = sm;
-                }
-                obj
-            }
+        let mut obj = match self.output {
+            CompiledOutput::Markdown(text) => serde_json::json!({
+                "kind": "markdown",
+                "output": text,
+                "warnings": warnings,
+                "dependencies": dependencies,
+            }),
             CompiledOutput::Messages(msgs) => {
                 let messages: serde_json::Value = msgs
                     .into_iter()
@@ -273,18 +301,21 @@ impl CompileResult {
                     })
                     .collect::<Vec<_>>()
                     .into();
-                let mut obj = serde_json::json!({
+                serde_json::json!({
                     "kind": "messages",
                     "messages": messages,
                     "warnings": warnings,
                     "dependencies": dependencies,
-                });
-                if let Some(sm) = source_map_val {
-                    obj["sourceMap"] = sm;
-                }
-                obj
+                })
             }
+        };
+        if let Some(sm) = source_map_val {
+            obj["sourceMap"] = sm;
         }
+        if let Some(inputs) = remote_inputs {
+            obj["remoteInputs"] = inputs;
+        }
+        obj
     }
 }
 
@@ -419,6 +450,33 @@ pub const MAX_DATA_BYTES: usize = limits::MAX_DATA_BYTES_PER_COMPILE;
 /// One more fails with `mds::resource_limit` during declaration analysis, before the
 /// data graph check.
 pub const MAX_DATA_REFS_PER_ENTRY: usize = limits::MAX_DATA_REFS_PER_ENTRY;
+
+/// Maximum distinct requests of one compile, redirect hops included: 64.
+///
+/// The core counts them on each derive, so a host driver loop that sends what the core
+/// asks for ends after at most this many rounds plus one.
+pub const MAX_REQUESTS_PER_COMPILE: usize = limits::MAX_REQUESTS_PER_COMPILE;
+
+/// Maximum requests that one CLI run sends, over all of its compiles: 512.
+pub const MAX_REQUESTS_PER_RUN: usize = limits::MAX_REQUESTS_PER_RUN;
+
+/// Maximum body bytes of one response that a fetcher reads: 10 MiB.
+pub const MAX_RESPONSE_BYTES: u64 = limits::MAX_RESPONSE_BYTES;
+
+/// Maximum bytes of the status line and the headers of one response: 16 KiB.
+pub const MAX_RESPONSE_HEADER_BYTES: usize = limits::MAX_RESPONSE_HEADER_BYTES;
+
+/// Maximum time of one request, from the name lookup to the end of the response read: 10 s.
+pub const REQUEST_TIMEOUT: std::time::Duration = limits::REQUEST_TIMEOUT;
+
+/// Maximum time of the network work of one compile, over all of its rounds: 30 s.
+pub const COMPILE_DEADLINE: std::time::Duration = limits::COMPILE_DEADLINE;
+
+/// Maximum requests in flight at one time in one compile: 8.
+pub const MAX_PARALLEL_SENDS: usize = limits::MAX_PARALLEL_SENDS;
+
+/// Maximum addresses that a fetcher takes from one name lookup: 64.
+pub const MAX_RESOLVED_ADDRS: usize = limits::MAX_RESOLVED_ADDRS;
 
 /// Whether `path` names a local data file: it ends with `.json`, `.yaml` or `.yml`,
 /// compared byte for byte, so `a.JSON` is not a data path.
@@ -808,6 +866,7 @@ pub fn compile_collecting_warnings(
         warnings,
         dependencies,
         source_map: None,
+        remote_inputs: Vec::new(),
     })
 }
 
@@ -843,6 +902,7 @@ fn compile_source_in_dir(
         warnings,
         dependencies,
         source_map: None,
+        remote_inputs: Vec::new(),
     })
 }
 
@@ -1465,6 +1525,7 @@ pub fn compile_virtual_collecting_warnings(
         warnings,
         dependencies,
         source_map: None,
+        remote_inputs: Vec::new(),
     })
 }
 
@@ -1594,10 +1655,54 @@ pub fn compile_native_fs(
     runtime_vars: Option<HashMap<String, Value>>,
     opts: CompileOptions,
 ) -> Result<CompileResult, MdsError> {
-    let path = entry.as_ref();
+    let mut cache = ModuleCache::compiling(Box::new(fs));
+    compile_native_in(&mut cache, entry.as_ref(), runtime_vars, opts)
+}
+
+/// One step compile of a native entry: a fresh compile with a fresh budget that derives
+/// every request of its URL entries again, runs every check again and binds the
+/// responses of `state`. See [`compile_step_virtual_fs`] for the host loop.
+///
+/// # Errors
+/// Returns the errors of [`compile_native_fs`], a refused request
+/// (`mds::network_denied`), a failed or refused response (`mds::network`,
+/// `mds::network_denied`, `mds::data`), and a state that holds a response that this
+/// compile did not request (`mds::invalid_options`).
+#[must_use = "a step either completes the compile or needs requests"]
+pub fn compile_step_native_fs(
+    fs: NativeFs,
+    entry: impl AsRef<Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+    opts: CompileOptions,
+    ctx: &FetchContext,
+    state: &FetchState,
+) -> Result<Step, MdsError> {
+    let mut cache = ModuleCache::stepping(Box::new(fs), ctx.start(state));
+    let result = compile_native_in(&mut cache, entry.as_ref(), runtime_vars, opts)?;
+    finish_step(&mut cache, result)
+}
+
+/// The step result of a compile in `cache` that gave `result`.
+fn finish_step(cache: &mut ModuleCache, result: CompileResult) -> Result<Step, MdsError> {
+    let pending = cache.has_pending_data();
+    let step = cache.take_step().ok_or_else(MdsError::internal)?;
+    Ok(match step.finish(pending)? {
+        data::step::Outcome::Need(requests) => Step::Need(requests),
+        data::step::Outcome::Done(remote_inputs) => Step::Done(Box::new(CompileResult {
+            remote_inputs,
+            ..result
+        })),
+    })
+}
+
+fn compile_native_in(
+    cache: &mut ModuleCache,
+    path: &Path,
+    runtime_vars: Option<HashMap<String, Value>>,
+    opts: CompileOptions,
+) -> Result<CompileResult, MdsError> {
     let path_str = path_to_str(path)?;
     let vars = runtime_vars.unwrap_or_default();
-    let mut cache = ModuleCache::compiling(Box::new(fs));
     let mut warnings = vec![];
     let (output, source_map) =
         cache.resolve_path_intrinsic_opts(path_str, &vars, &opts, &mut warnings)?;
@@ -1615,6 +1720,7 @@ pub fn compile_native_fs(
         warnings,
         dependencies,
         source_map,
+        remote_inputs: Vec::new(),
     })
 }
 
@@ -1641,18 +1747,50 @@ pub fn compile_str_with_deps_opts(
     runtime_vars: Option<HashMap<String, Value>>,
     opts: CompileOptions,
 ) -> Result<CompileResult, MdsError> {
-    let vars = runtime_vars.unwrap_or_default();
     let dir = resolve_base_dir(base_dir)?;
     let mut cache = ModuleCache::compiling(Box::new(NativeFs::new()));
+    compile_str_in(&mut cache, source, &dir, runtime_vars, opts)
+}
+
+/// One step compile of MDS source from a string, as [`compile_step_native_fs`] for a
+/// file. `base_dir` is as for [`compile_str_with_deps_opts`].
+///
+/// # Errors
+/// Returns the errors of [`compile_str_with_deps_opts`] and the step errors of
+/// [`compile_step_native_fs`].
+#[must_use = "a step either completes the compile or needs requests"]
+pub fn compile_step_str(
+    source: &str,
+    base_dir: Option<&Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+    opts: CompileOptions,
+    ctx: &FetchContext,
+    state: &FetchState,
+) -> Result<Step, MdsError> {
+    let dir = resolve_base_dir(base_dir)?;
+    let mut cache = ModuleCache::stepping(Box::new(NativeFs::new()), ctx.start(state));
+    let result = compile_str_in(&mut cache, source, &dir, runtime_vars, opts)?;
+    finish_step(&mut cache, result)
+}
+
+fn compile_str_in(
+    cache: &mut ModuleCache,
+    source: &str,
+    dir: &str,
+    runtime_vars: Option<HashMap<String, Value>>,
+    opts: CompileOptions,
+) -> Result<CompileResult, MdsError> {
+    let vars = runtime_vars.unwrap_or_default();
     let mut warnings = vec![];
     let (output, source_map) =
-        cache.resolve_source_intrinsic_opts(source, &dir, &vars, &opts, &mut warnings)?;
+        cache.resolve_source_intrinsic_opts(source, dir, &vars, &opts, &mut warnings)?;
     let dependencies = native_dependencies(cache.dependencies());
     Ok(CompileResult {
         output,
         warnings,
         dependencies,
         source_map,
+        remote_inputs: Vec::new(),
     })
 }
 
@@ -1711,8 +1849,73 @@ pub fn compile_virtual_fs(
     runtime_vars: Option<HashMap<String, Value>>,
     opts: CompileOptions,
 ) -> Result<CompileResult, MdsError> {
-    let vars = runtime_vars.unwrap_or_default();
     let mut cache = ModuleCache::compiling(Box::new(fs));
+    compile_virtual_in(&mut cache, entry, runtime_vars, opts)
+}
+
+/// One step compile of a module from a [`VirtualFs`], as [`compile_step_native_fs`] for
+/// a native entry.
+///
+/// Each call is a fresh compile. It derives every request of the URL entries again,
+/// runs every check again, and binds the responses of `state`. A host loop sends each
+/// request of [`Step::Need`], adds each response under its [`Request::id`], and calls
+/// again until [`Step::Done`]. The loop needs at most one call per request and one more.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::collections::HashMap;
+/// let modules = HashMap::from([(
+///     "main.mds".to_string(),
+///     "---\ndata:\n  user: https://api.example/user\n---\nHi {{user.name}}!\n".to_string(),
+/// )]);
+/// let policy = mds::NetworkPolicy::new(vec![mds::AllowItem::parse("api.example")?])?;
+/// let ctx = mds::FetchContext::new(policy, mds::RunKey::from_bytes([7; 32]));
+/// let mut state = mds::FetchState::new();
+/// for _ in 0..=64 {
+///     let fs = mds::VirtualFs::new(modules.clone());
+///     match mds::compile_step_virtual_fs(fs, "main.mds", None, Default::default(), &ctx, &state)? {
+///         mds::Step::Need(requests) => {
+///             for request in requests {
+///                 // A real host sends the request here.
+///                 let answer = mds::Response::http(200, Vec::new(), br#"{"name": "Ada"}"#.to_vec());
+///                 state = state.with_response(request.id(), answer)?;
+///             }
+///         }
+///         mds::Step::Done(result) => {
+///             assert_eq!(result.into_markdown()?, "Hi Ada!\n");
+///             break;
+///         }
+///         _ => return Err("an unknown step".into()),
+///     }
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// # Errors
+/// Returns the errors of [`compile_virtual_fs`] and the step errors of
+/// [`compile_step_native_fs`].
+#[must_use = "a step either completes the compile or needs requests"]
+pub fn compile_step_virtual_fs(
+    fs: VirtualFs,
+    entry: &str,
+    runtime_vars: Option<HashMap<String, Value>>,
+    opts: CompileOptions,
+    ctx: &FetchContext,
+    state: &FetchState,
+) -> Result<Step, MdsError> {
+    let mut cache = ModuleCache::stepping(Box::new(fs), ctx.start(state));
+    let result = compile_virtual_in(&mut cache, entry, runtime_vars, opts)?;
+    finish_step(&mut cache, result)
+}
+
+fn compile_virtual_in(
+    cache: &mut ModuleCache,
+    entry: &str,
+    runtime_vars: Option<HashMap<String, Value>>,
+    opts: CompileOptions,
+) -> Result<CompileResult, MdsError> {
+    let vars = runtime_vars.unwrap_or_default();
     let mut warnings = vec![];
     let (output, source_map) =
         cache.resolve_virtual_intrinsic_opts(entry, &vars, &opts, &mut warnings)?;
@@ -1726,6 +1929,7 @@ pub fn compile_virtual_fs(
         warnings,
         dependencies,
         source_map,
+        remote_inputs: Vec::new(),
     })
 }
 

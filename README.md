@@ -81,9 +81,10 @@ data:
 
 Each path starts with `./` or `../` and stays inside the [project root](#project-root). A runtime
 variable with the same name (`--set team=...`, `--vars`) replaces the entry, and then MDS reads
-no file. `mds check`, `mds lint` and `mds fmt` read no data file. In this release, MDS does not
-fetch a URL entry: give it a runtime value. See [spec §4.12](spec.md#412-data-sources-data) for the forms, the
-conversion rules and the limits.
+no file. `mds check`, `mds lint` and `mds fmt` read no data file. A URL entry sends a `GET` or
+`HEAD` request only with `mds build --allow-net <origins>`, to the listed origins only. Elsewhere,
+give it a runtime value. See [spec §4.12](spec.md#412-data-sources-data) for the forms, the
+conversion rules, the network rules and the limits.
 
 ## Features
 
@@ -399,6 +400,8 @@ Rules (configure via `mds.json` `lint.rules`; severities differ per rule):
 | `empty-block` | warn | `@if`/`@elseif`/`@else`/`@for`/`@define`/`@message` body is empty or whitespace-only (auto-fixable) |
 | `legacy-interpolation` | warn | Single-brace `{x}` syntax from MDS v0.x; migrates to `{{x}}` automatically (auto-fixable) |
 | `literal-directive` | warn | Conditional lines that stay literal: indented lines without the file opt-in, or lines in an unmarked fence with `@if …:` before `@end` (report-only). The `mds` label suppresses the fence warning. |
+| `insecure-data-origin` | warn | A request map of a URL data entry names an `http://` URL (report-only) |
+| `literal-credential-header` | warn | A URL data entry sets a credential header such as `X-Auth-Token` to literal text; use the secret form (report-only) |
 | `redundant-else` | warn | `@else` body is structurally identical to the `@if`/`@elseif` then-body |
 | `unreachable-branch` | **error** | Branch condition is always-true or always-false (auto-fixable) |
 | `duplicate-import` | **error** | Same file imported more than once (auto-fixable) |

@@ -249,6 +249,11 @@ impl VarLayer {
         self.0.get(name)
     }
 
+    /// The value of the variable `name`, if the layer holds one.
+    pub(crate) fn value(&self, name: &str) -> Option<&Value> {
+        self.get(name).and_then(Slot::get)
+    }
+
     fn len(&self) -> usize {
         self.0.len()
     }

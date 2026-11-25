@@ -8,7 +8,8 @@
 //! |      | empty-block, legacy-interpolation                          |           |
 //! | B    | unused-import, unused-function                             | Fixable only when structural-standalone (no imports/extends/partial; reverify applies) |
 //! | C    | literal-directive, unused-variable, redundant-else,         | Report-only; never fixed |
-//! |      | shadow-variable                                            |           |
+//! |      | shadow-variable, insecure-data-origin,                     |           |
+//! |      | literal-credential-header                                  |           |
 //!
 //! **Tier B nuance:**
 //! - `unused-function` sets `fix_removals` to a whole-block [`FixLineSpan`] and is

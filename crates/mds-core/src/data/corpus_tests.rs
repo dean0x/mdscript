@@ -12,7 +12,7 @@ use crate::value::MAX_VALUE_DEPTH;
 const LABEL: DataLabel<'static> = DataLabel {
     module: "entry.mds",
     entry: "sample",
-    file: None,
+    input: crate::data::DataInput::Declaration,
 };
 
 fn parsed_json(raw: &str) -> Result<Value, MdsError> {

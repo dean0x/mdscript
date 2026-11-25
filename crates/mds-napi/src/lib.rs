@@ -20,9 +20,10 @@
 //! Errors thrown at the napi boundary carry a `code` property (set via
 //! N-API `napi_create_error` with an explicit code string). Codes that
 //! originate inside `mds-core` (e.g. `"mds::syntax"`) are defined by
-//! [`mds::MdsError`]. The following codes are synthesised here. Only
-//! `mds::invalid_options` is **binding-only**: the core crate also returns
-//! `mds::internal` and `mds::resource_limit`.
+//! [`mds::MdsError`]. The following codes are synthesised here. None of them is
+//! binding-only: the core crate also returns `mds::internal` and
+//! `mds::resource_limit`, and `mds::invalid_options` for the fetch state of a step
+//! compile.
 //!
 //! | Code                   | Meaning                                                                        |
 //! |------------------------|--------------------------------------------------------------------------------|

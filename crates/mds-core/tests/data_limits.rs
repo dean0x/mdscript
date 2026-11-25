@@ -197,7 +197,7 @@ fn reference_cap_counts_the_fields_of_one_entry_and_binds_before_the_graph_check
     let entry = |name: &str, extra: &str| {
         let body = "{{k}}".repeat(REFS_PER_ENTRY - 2) + extra;
         format!(
-            "  {name}:\n    url: 'https://example.com/{{{{k}}}}'\n    headers:\n      X-Key: '{{{{k}}}}'\n    body:\n      text: '{body}'\n"
+            "  {name}:\n    url: 'https://example.com/{{{{k}}}}'\n    method: POST\n    headers:\n      X-Key: '{{{{k}}}}'\n    body:\n      text: '{body}'\n"
         )
     };
     let files = |extra: &str| {

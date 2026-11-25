@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Set a new version in the workspace Cargo.toml and its path+version
-// dependencies on mds-core. Update publishable npm versions and internal
+// dependencies on mds-core and mds-fetch. Update publishable npm versions and internal
 // dependency ranges. Update only the workspace entries in both lockfiles.
 // Stamp CHANGELOG.md. Run locally before you tag a release.
 //
@@ -11,9 +11,9 @@
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { CRATE_CARGO_PATHS, DEP_SETS, LOCK_MEMBERS, PKG_DIRS, PKG_PATHS } from './release-manifest.mjs';
+import { DEP_SETS, LOCK_MEMBERS, PKG_DIRS, PKG_PATHS } from './release-manifest.mjs';
 import {
-  CARGO_LOCK_VERSION, CORE_DEP_VERSION, WORKSPACE_VERSION, checkVersions, isInternal,
+  CARGO_LOCK_VERSION, VERSIONED_DEPS, WORKSPACE_VERSION, checkVersions, isInternal,
   isMainModule, isRecord, parsePackageLock, parseRecord, readVersionFiles, reportVersionProblems, scanCargoLock,
 } from './verify-versions.mjs';
 
@@ -85,8 +85,8 @@ function prepareBump(files, version, date) {
   const updated = new Map(files);
   const replacement = setVersion(version);
   updated.set('Cargo.toml', files.get('Cargo.toml').replace(WORKSPACE_VERSION, replacement));
-  for (const path of CRATE_CARGO_PATHS) {
-    updated.set(path, files.get(path).replace(CORE_DEP_VERSION, replacement));
+  for (const { paths, pattern } of VERSIONED_DEPS) {
+    for (const path of paths) updated.set(path, updated.get(path).replace(pattern, replacement));
   }
 
   const problems = [];

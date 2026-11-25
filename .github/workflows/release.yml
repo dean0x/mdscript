@@ -1446,28 +1446,75 @@ jobs:
             echo "$OUTPUT"
             exit 1
           fi
-      - name: Wait for crates.io index to update
+      - name: Wait for crates.io index to update (mds-core)
+        env:
+          CRATE: mds-core
         run: |
           # Bounded poll — max 20 attempts × 15 s = 300 s (5 min), then fail with
           # a clear message. Avoids the former unbounded sleep 30 that silently
-          # masked races on slow registry propagation.
+          # masked races on slow registry propagation. Both poll steps run this
+          # block, each with its own CRATE.
           VERSION=$(cargo metadata --no-deps --format-version 1 \
-            | grep -o '"name":"mds-core","version":"[^"]*"' \
+            | grep -o "\"name\":\"$CRATE\",\"version\":\"[^\"]*\"" \
             | grep -o '[0-9][^"]*' | head -1)
-          echo "Polling crates.io for mds-core@${VERSION} (max 20 × 15 s)"
+          test -n "$VERSION" || { echo "::error::no workspace version for $CRATE"; exit 1; }
+          echo "Polling crates.io for ${CRATE}@${VERSION} (max 20 × 15 s)"
           MAX=20
           for i in $(seq 1 "$MAX"); do
             if curl -sf --max-time 20 --connect-timeout 10 \
-                 "https://crates.io/api/v1/crates/mds-core/${VERSION}" \
+                 "https://crates.io/api/v1/crates/${CRATE}/${VERSION}" \
                  -H "User-Agent: mds-release-ci/1.0" \
                  | grep -qF "\"num\":\"${VERSION}\""; then
-              echo "mds-core@${VERSION} is visible in crates.io (attempt $i/$MAX)"
+              echo "${CRATE}@${VERSION} is visible in crates.io (attempt $i/$MAX)"
               exit 0
             fi
             echo "  Attempt $i/$MAX: not yet visible — sleeping 15 s..."
             sleep 15
           done
-          echo "::error::mds-core@${VERSION} not visible in crates.io after $((MAX * 15)) s"
+          echo "::error::${CRATE}@${VERSION} not visible in crates.io after $((MAX * 15)) s"
+          exit 1
+      - name: Publish mds-fetch
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # Same idempotency guard as mds-core above. mds-fetch needs mds-core in
+          # the index, and mds-cli needs mds-fetch.
+          if OUTPUT=$(cargo publish -p mds-fetch 2>&1); then
+            echo "$OUTPUT"
+          elif echo "$OUTPUT" | grep -qE "already (uploaded|exists|published)"; then
+            echo "::notice::mds-fetch already published — idempotent re-run, skipping"
+            echo "$OUTPUT"
+          else
+            echo "::error::mds-fetch publish failed"
+            echo "$OUTPUT"
+            exit 1
+          fi
+      - name: Wait for crates.io index to update (mds-fetch)
+        env:
+          CRATE: mds-fetch
+        run: |
+          # Bounded poll — max 20 attempts × 15 s = 300 s (5 min), then fail with
+          # a clear message. Avoids the former unbounded sleep 30 that silently
+          # masked races on slow registry propagation. Both poll steps run this
+          # block, each with its own CRATE.
+          VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | grep -o "\"name\":\"$CRATE\",\"version\":\"[^\"]*\"" \
+            | grep -o '[0-9][^"]*' | head -1)
+          test -n "$VERSION" || { echo "::error::no workspace version for $CRATE"; exit 1; }
+          echo "Polling crates.io for ${CRATE}@${VERSION} (max 20 × 15 s)"
+          MAX=20
+          for i in $(seq 1 "$MAX"); do
+            if curl -sf --max-time 20 --connect-timeout 10 \
+                 "https://crates.io/api/v1/crates/${CRATE}/${VERSION}" \
+                 -H "User-Agent: mds-release-ci/1.0" \
+                 | grep -qF "\"num\":\"${VERSION}\""; then
+              echo "${CRATE}@${VERSION} is visible in crates.io (attempt $i/$MAX)"
+              exit 0
+            fi
+            echo "  Attempt $i/$MAX: not yet visible — sleeping 15 s..."
+            sleep 15
+          done
+          echo "::error::${CRATE}@${VERSION} not visible in crates.io after $((MAX * 15)) s"
           exit 1
       - name: Publish mds-cli
         env:

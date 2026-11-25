@@ -1,0 +1,5 @@
+# TLS certificate checks stay on in every build of the sender. A call to one of these
+# methods fails `cargo clippy -- -D warnings`.
+disallowed-methods = [
+    { path = "ureq::tls::TlsConfigBuilder::disable_verification", reason = "the sender always checks the certificate of the server" },
+]

@@ -18,7 +18,11 @@ export const CRATE_CARGO_PATHS = Object.freeze([
   'crates/mds-napi/Cargo.toml',
   'crates/mds-wasm/Cargo.toml',
   'crates/mds-python/Cargo.toml',
+  'crates/mds-fetch/Cargo.toml',
 ]);
+
+// Workspace crates with a path and version dependency on mds-fetch.
+export const FETCH_DEP_PATHS = Object.freeze(['crates/mds-cli/Cargo.toml']);
 
 export const DEP_SETS = Object.freeze(['dependencies', 'optionalDependencies', 'peerDependencies']);
 export const PKG_DIRS = Object.freeze(PKG_PATHS.map(dirname));

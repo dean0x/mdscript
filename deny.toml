@@ -41,6 +41,10 @@ exceptions = [
     { crate = "foldhash", allow = ["Zlib"] },
     # Accept the LLVM exception for the target triple crate.
     { crate = "target-lexicon", allow = ["Apache-2.0 WITH LLVM-exception"] },
+    # Accept the permissive data license for the Mozilla root list of the sender.
+    { crate = "webpki-root-certs", allow = ["CDLA-Permissive-2.0"] },
+    # Accept BSD-3-Clause terms for the constant-time crate of the TLS library.
+    { crate = "subtle", allow = ["BSD-3-Clause"] },
 ]
 
 [licenses.private]
@@ -66,8 +70,14 @@ skip = [
     { crate = "unicode-width@0.1.14", reason = "miette uses 0.1 and textwrap uses 0.2" },
     { crate = "windows-sys@0.60.2", reason = "notify uses 0.60 and ctrlc uses 0.61" },
     { crate = "wit-bindgen@0.51.0", reason = "wasip3 uses 0.51 and wasip2 uses 0.57" },
+    { crate = "getrandom@0.2.17", reason = "ring uses 0.2 and the workspace uses 0.4" },
+    { crate = "windows-sys@0.52.0", reason = "ring uses 0.52, notify uses 0.60 and ctrlc uses 0.61" },
 ]
-skip-tree = []
+# The windows-targets 0.52 tree holds only windows-targets and its eight windows_* target
+# crates, all at 0.52.6 and with no other dependency.
+skip-tree = [
+    { crate = "windows-targets@0.52.6", reason = "ring uses 0.52 through windows-sys and notify uses 0.53" },
+]
 
 [bans.workspace-dependencies]
 duplicates = "deny"

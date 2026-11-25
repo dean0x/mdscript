@@ -789,8 +789,10 @@ describe('unknown lint rule names (AC-224-1 / D8)', () => {
   // field can appear. Without this, an implementation that always populated
   // lint_warnings would pass every assertion above.
   test('U-L-WARN-4: every recognised rule name is accepted with no lint_warnings', () => {
-    assert.equal(LINT_RULE_NAMES.length, 11, 'LINT_RULE_NAMES must have exactly 11 entries');
+    assert.equal(LINT_RULE_NAMES.length, 13, 'LINT_RULE_NAMES must have exactly 13 entries');
     assert.ok(LINT_RULE_NAMES.includes('literal-directive'));
+    assert.ok(LINT_RULE_NAMES.includes('insecure-data-origin'));
+    assert.ok(LINT_RULE_NAMES.includes('literal-credential-header'));
     for (const name of LINT_RULE_NAMES) {
       const result = lint(CLEAN_SOURCE, { rules: { [name]: 'off' } });
       assert.equal(

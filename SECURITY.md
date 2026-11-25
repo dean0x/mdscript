@@ -78,9 +78,39 @@ input. The compiler enforces several defense-in-depth controls:
   `mds check`, `mds lint`, `mds fmt` and the check and lint calls of the Rust API, the Python
   binding, the napi binding and the WASM binding read no data file (tests: `D-6` in
   `crates/mds-napi/__test__/index.spec.mjs`, `check_and_lint_read_no_data_file` in
-  `crates/mds-wasm/tests/web.rs`). This release sends no network request: a URL entry fails
-  with `mds::network_denied` unless a runtime value replaces it. `mds build` and `mds watch`
+  `crates/mds-wasm/tests/web.rs`). `mds build` and `mds watch`
   never write an output over a data file that the run reads (`mds::io`, exit 2).
+- **URL data entries** (spec §4.12 "Network access", `crates/mds-core/src/data/policy.rs`,
+  `crates/mds-fetch`): the network is off by default. Only `mds build --allow-net <origins>`
+  and the Rust step API send requests, and only `GET` and `HEAD`. Without a grant, a URL entry
+  with no runtime value fails with `mds::network_denied`. The napi, WASM and Python bindings,
+  `@mdscript/mds`, `mds watch`, `mds check`, `mds lint` and `mds fmt` send no request in this
+  release. The `network` section of `mds.json` can only narrow the flags, and it can never open
+  the network (`crates/mds-cli/tests/cli_net.rs`).
+  - Each allow item names one exact origin: scheme, host and port, with no wildcard. An `http`
+    origin needs an `http://host:port` item. A URL entry of an imported module or an
+    `@extends` base needs `--allow-net-imports`. A request cannot set the `Host` header or a
+    header that frames the message, so it reaches only the origin of its URL.
+  - The sender looks up a name once per request and checks every address before it connects.
+    It refuses the special ranges that spec §4.12 lists, such as loopback, private,
+    link-local and multicast addresses, unless an allow item is that exact IP address with
+    its port.
+  - The sender follows no redirect. The core checks each hop against the allow list, refuses
+    a hop from `https` to `http`, stops after 5 hops, and drops secret and credential headers
+    on a hop to another origin.
+  - The sender ignores the proxy environment variables. It uses TLS 1.2 or 1.3 with the
+    certificate check always on. The trust roots are the Mozilla list and the `--tls-root`
+    files, never the system or environment roots.
+  - A host secret (`--secret NAME=env:VAR@ORIGIN`) binds to one `https` origin and fills a
+    header value only. In a directory build, each `.mds` file of the tree that is not a
+    partial is its own entry module with the same network flags, so each such file can use
+    the host secret. A message, a request ID and a `Debug` view never show its value. A
+    response that holds the exact value fails the request. **Residual:** this check finds
+    exact bytes only, so a server that returns the value in a changed form (for example
+    base64 or percent encoding) is not detected.
+  - Messages show the URL as declared and the origin, never the expanded URL, a header
+    value or response text. The request, redirect, size and time limits are in spec §4.1
+    "Network limits".
 - **Directory and watch entries**: a directory build, check, lint or fmt compares each
   entry with its walked canonical path, plus the walk's device and inode on Unix.
   `mds watch` compares the directory argument with its watched canonical directory before each rebuild.
@@ -305,13 +335,17 @@ place each check runs, and the tests that pin them — in `spec.md` §4.6
 | Max data references | 256 per data entry, in its URL, headers and body together, before the data graph check | `limits.rs` (`MAX_DATA_REFS_PER_ENTRY`) |
 | Max data graph depth | 16 levels of references between data entries | `limits.rs` (`MAX_DATA_LEVELS`) |
 | Max data text | 32 MiB (33,554,432 bytes) of data file text per compile, and of data text in a binding's virtual module map | `limits.rs` (`MAX_DATA_BYTES_PER_COMPILE`) |
+| Max requests | 64 per compile, 512 per `mds build` run, 5 redirects per entry, 8 in flight at one time | `limits.rs` (`MAX_REQUESTS_PER_COMPILE`, `MAX_REQUESTS_PER_RUN`, `MAX_REDIRECTS`, `MAX_PARALLEL_SENDS`) |
+| Max response size | 16 KiB of status line and headers, 10 MiB of body | `limits.rs` (`MAX_RESPONSE_HEADER_BYTES`, `MAX_RESPONSE_BYTES`) |
+| Network time | 10 s per request, 30 s of network work per compile | `limits.rs` (`REQUEST_TIMEOUT`, `COMPILE_DEADLINE`) |
 
 The data limits and their messages are in [spec §4.1](spec.md#41-variables-yaml-frontmatter)
-"Local data limits". A data file also counts toward the compile memory budget: the budget
-keeps the converted value of each distinct data file once per compile.
+"Local data limits", and the network limits in "Network limits". A data file also counts
+toward the compile memory budget: the budget keeps the converted value of each distinct data
+file once per compile. A response body counts as a data file does.
 
-These limits apply to the quantities and scopes in the table. They do not bound
-elapsed time.
+These limits apply to the quantities and scopes in the table. Apart from the two network
+times, they do not bound elapsed time.
 
 In a compile or a check, the compile memory budget counts an estimate of the syntax tree
 of each module: a cached import, an `@extends` base, the file entry and the string

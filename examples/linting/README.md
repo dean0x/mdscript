@@ -1,6 +1,6 @@
 # Linting demo
 
-`mds lint` checks a template against eleven static-analysis rules. This directory
+`mds lint` checks a template against thirteen static-analysis rules. This directory
 shows lint reports, automatic fixes and rule severity overrides in `mds.json`.
 
 `demo.mds` compiles cleanly (`mds build examples/linting/demo.mds`) but deliberately
@@ -25,7 +25,7 @@ The file key does not suppress warnings in unmarked fences.
 
 Run the commands below from the repository root.
 
-## The eleven rules
+## The thirteen rules
 
 | Rule | Default severity | Tier | `--fix` behavior |
 |------|------------------|------|------------------|
@@ -39,6 +39,8 @@ Run the commands below from the repository root.
 | `unused-variable`       | warn  | C | Never auto-fixed (report-only). |
 | `redundant-else`        | warn  | C | Never auto-fixed (report-only). |
 | `literal-directive`     | warn  | C | Never auto-fixed (report-only). |
+| `insecure-data-origin`  | warn  | C | Never auto-fixed (report-only). |
+| `literal-credential-header` | warn | C | Never auto-fixed (report-only). |
 | `shadow-variable`       | off   | C | Never auto-fixed; off by default (see config demo). |
 
 **Tiers.** Tier **A** fixes apply always (gated by a re-verify recompile); Tier **B**

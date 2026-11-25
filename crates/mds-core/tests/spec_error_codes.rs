@@ -70,12 +70,72 @@ fn network_denied_names_each_frontier_entry_without_a_source_span() {
     assert_eq!(err.source_name(), None);
 }
 
+#[test]
+fn data_type_error_names_its_location_without_a_source_span() {
+    let err = MdsError::data_type_error(
+        "sub/mo\tdule.mds",
+        "en\x1btry",
+        "fi\neld",
+        "a header value takes a string, a boolean or an exact integer up to 2^53, not null",
+    );
+    let serialized = err.serialize();
+    let message = concat!(
+        r#"type error in "sub/mo\u"#,
+        r#"0009dule.mds", entry "en\u"#,
+        r#"001Btry", field "fi\u"#,
+        r#"000Aeld": a header value takes a string, a boolean or an exact integer up to 2^53, not null"#,
+    );
+    assert_eq!(serialized.code, "mds::type_error");
+    assert_eq!(err.to_string(), message);
+    assert_eq!(serialized.message, message);
+    assert_eq!(serialized.span, None);
+    assert_eq!(err.source_name(), None);
+}
+
+/// A transport failure names the entry, the URL as declared and the origin. Each name is
+/// escaped as a path is, so a control character in it can not start a new line.
+#[test]
+fn network_error_names_the_entry_template_and_origin_without_a_source_span() {
+    let err = MdsError::network(
+        "sub/mod\nule.mds",
+        "us\x1bers",
+        "https://api.example/users/{{id}}\t",
+        "https://api.example\n",
+        "request timed out",
+    );
+    let serialized = err.serialize();
+    let message = concat!(
+        r#"network error in "sub/mod\u"#,
+        r#"000Aule.mds", entry "us\u"#,
+        r#"001Bers", URL "https://api.example/users/{{id}}\u"#,
+        r#"0009", origin "https://api.example\u"#,
+        r#"000A": request timed out"#,
+    );
+    assert_eq!(serialized.code, "mds::network");
+    assert_eq!(err.to_string(), message);
+    assert_eq!(serialized.message, message);
+    assert_eq!(serialized.help, None);
+    assert_eq!(serialized.span, None);
+    assert_eq!(err.source_name(), None);
+}
+
+/// A step compile refuses host input with `mds::invalid_options`: fixed text, no span and
+/// no help. The bindings use the same code for their option checks.
+#[test]
+fn invalid_options_is_fixed_text_without_a_source_span() {
+    let reason = "the fetch state holds a response that this compile did not request";
+    let err = MdsError::invalid_options(reason);
+    let serialized = err.serialize();
+    assert_eq!(serialized.code, "mds::invalid_options");
+    assert_eq!(err.to_string(), format!("invalid options: {reason}"));
+    assert_eq!(serialized.message, err.to_string());
+    assert_eq!(serialized.help, None);
+    assert_eq!(serialized.span, None);
+    assert_eq!(err.source_name(), None);
+}
+
 /// Codes the napi, WASM, or Python bindings return but `mds-core` does not declare.
-const BINDING_ONLY_CODES: &[&str] = &[
-    "mds::invalid_options",
-    "mds::filename_collision",
-    "mds::invalid_backend_result",
-];
+const BINDING_ONLY_CODES: &[&str] = &["mds::filename_collision", "mds::invalid_backend_result"];
 
 fn read_error_rs() -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/error.rs");
@@ -211,7 +271,12 @@ fn core_codes_are_documented_in_spec() {
 fn data_codes_have_core_declarations_and_spec_exit_classes() {
     let codes = extract_codes(&read_error_rs());
     let section = error_codes_section(&read_spec_md()).expect("spec error registry");
-    for (code, exits) in [("mds::data", "1 / 2"), ("mds::network_denied", "2 / 2")] {
+    for (code, exits) in [
+        ("mds::data", "1 / 2"),
+        ("mds::network_denied", "2 / 2"),
+        ("mds::network", "2 / 2"),
+        ("mds::invalid_options", "2 / n/a"),
+    ] {
         assert!(codes.iter().any(|declared| declared == code), "{code}");
         let row = section
             .lines()

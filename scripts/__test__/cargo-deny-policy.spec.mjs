@@ -22,8 +22,15 @@ const EXCEPTIONS = {
   'unicode-ident': 'Unicode-3.0',
   foldhash: 'Zlib',
   'target-lexicon': 'Apache-2.0 WITH LLVM-exception',
+  'webpki-root-certs': 'CDLA-Permissive-2.0',
+  subtle: 'BSD-3-Clause',
 };
-const SKIPS = ['syn@2.0.117', 'unicode-width@0.1.14', 'windows-sys@0.60.2', 'wit-bindgen@0.51.0'];
+const SKIPS = [
+  'syn@2.0.117', 'unicode-width@0.1.14', 'windows-sys@0.60.2', 'wit-bindgen@0.51.0',
+  'getrandom@0.2.17', 'windows-sys@0.52.0',
+];
+// A skipped tree must hold only one crate family at one version.
+const SKIP_TREES = ['windows-targets@0.52.6'];
 const SHAPE = Symbol('shape');
 const POLICY = {
   graph: { 'all-features': true, 'no-default-features': false, features: [], 'exclude-dev': false },
@@ -43,7 +50,7 @@ const POLICY = {
     'multiple-versions': 'warn', 'multiple-versions-include-dev': true, wildcards: 'deny',
     'allow-wildcard-paths': false, highlight: 'all', 'workspace-default-features': 'allow',
     'external-default-features': 'allow', allow: [], 'allow-workspace': false, deny: [], features: [],
-    skip: SHAPE, 'skip-tree': [],
+    skip: SHAPE, 'skip-tree': SHAPE,
   },
   'bans.workspace-dependencies': { duplicates: 'deny', 'include-path-dependencies': false, unused: 'deny' },
   sources: {
@@ -74,7 +81,11 @@ const ABOUT = {
     license: 'MIT',
     files: [{ path: 'LICENSE-MIT.md', checksum: '799e9ca9d179295ef372f25d3769cdda7d25bb2668add6a6a1e22d1e4c678b8d' }],
   },
+  'webpki-root-certs': { accepted: SHAPE },
+  subtle: { accepted: SHAPE },
 };
+// The notice config accepts the exception license of these crates in a crate table only.
+const ABOUT_SCOPED = ['webpki-root-certs', 'subtle'];
 
 const BARE = /^[A-Za-z0-9_-]+$/;
 const BASIC = /^"[^"\\\x00-\x1f]*"$/;
@@ -199,13 +210,14 @@ function checkShape(table, key, rows, today) {
       assert.deepEqual(value.allow, [EXCEPTIONS[value.crate]], 'crate license exception');
       assert.ok(comment, 'license exception needs a reason comment on the previous line');
     }
-    if (key === 'skip') {
+    if (key === 'skip' || key === 'skip-tree') {
       exactSet(Object.keys(value), ['crate', 'reason'], 'duplicate skip fields');
       assert.match(value.reason, /\S/, 'duplicate skip needs a reason');
     }
   }
   if (key === 'exceptions') exactSet(rows.map(row => row.value.crate), Object.keys(EXCEPTIONS), 'exception crates');
   if (key === 'skip') exactSet(rows.map(row => row.value.crate), SKIPS, 'versioned duplicate skips');
+  if (key === 'skip-tree') exactSet(rows.map(row => row.value.crate), SKIP_TREES, 'versioned duplicate tree skips');
 }
 
 function checkPolicy(text, today) {
@@ -227,9 +239,10 @@ function checkAbout(text, denyText) {
   const tables = readPolicy(text, ABOUT);
   exactSet(tables.keys(), Object.keys(ABOUT), 'about.toml tables');
   const licenses = readPolicy(denyText).get('licenses');
-  const accepted = new Set([
+  const exceptions = licenses.get('exceptions').map(({ value }) => value);
+  const global = new Set([
     ...licenses.get('allow').map(({ value }) => value),
-    ...licenses.get('exceptions').flatMap(({ value }) => value.allow),
+    ...exceptions.filter(({ crate }) => !ABOUT_SCOPED.includes(crate)).flatMap(({ allow }) => allow),
   ]);
   for (const [name, table] of tables) {
     exactSet(table.keys(), Object.keys(ABOUT[name]), `about.toml ${name || 'root'} keys`);
@@ -237,7 +250,13 @@ function checkAbout(text, denyText) {
       const actual = Array.isArray(value) ? value.map(row => row.value) : value;
       if (key === 'accepted') {
         assert.ok(Array.isArray(actual), 'about.toml accepted must be an array');
-        exactSet(actual, accepted, 'about.toml accepted licenses');
+        if (name === '') {
+          exactSet(actual, global, 'about.toml accepted licenses');
+        } else {
+          const scoped = exceptions.find(({ crate }) => crate === name);
+          assert.ok(scoped, `about.toml ${name} needs a deny.toml exception`);
+          exactSet(actual, scoped.allow, `about.toml ${name} accepted licenses`);
+        }
       } else {
         assert.deepEqual(actual, ABOUT[name][key], `about.toml ${key}`);
       }
@@ -497,6 +516,21 @@ test('the license policy requires a reason immediately above an exception', () =
   assert.throws(() => checkShape('licenses', 'exceptions', [{ value: { crate: 'notify', allow: ['CC0-1.0'] } }]), /reason comment/);
 });
 
+test('the duplicate policy skips only the approved tree, with no depth field', () => {
+  const baseline = read('deny.toml');
+  checkPolicy(baseline, TODAY);
+  const entry = '{ crate = "windows-targets@0.52.6", reason';
+  const empty = baseline.replace(/^skip-tree = \[\n[^\]]*\]$/m, 'skip-tree = []');
+  for (const [modified, diagnostic] of [
+    [baseline.replace(entry, '{ crate = "windows-sys@0.52.0", reason'), /versioned duplicate tree skips/],
+    [baseline.replace(entry, '{ crate = "windows-targets@0.52.6", depth = 1, reason'), /duplicate skip fields/],
+    [empty, /versioned duplicate tree skips/],
+  ]) {
+    assert.notEqual(modified, baseline, 'the control must change the policy');
+    assert.throws(() => checkPolicy(modified, TODAY), diagnostic);
+  }
+});
+
 test('the global license list excludes extra licenses', () => {
   const allow = [...LICENSES, 'Zlib'].map(value => ({ value }));
   assert.throws(() => checkShape('licenses', 'allow', allow), /global license list/);
@@ -508,8 +542,11 @@ test('the notice config matches the dependency license policy (#136)', () => {
 });
 
 for (const [name, from, to, message] of [
-  ['an extra accepted license', 'accepted = [', 'accepted = ["BSD-3-Clause", ', /^about\.toml accepted licenses/],
+  ['an extra accepted license', 'accepted = [', 'accepted = ["MPL-2.0", ', /^about\.toml accepted licenses/],
   ['a missing accepted license', '"CC0-1.0", ', '', /^about\.toml accepted licenses/],
+  ['a crate license in the global list', 'accepted = ["MIT", ', 'accepted = ["MIT", "BSD-3-Clause", ', /^about\.toml accepted licenses/],
+  ['a crate license for another crate', 'accepted = ["BSD-3-Clause"]', 'accepted = ["CDLA-Permissive-2.0"]', /^about\.toml subtle accepted licenses/],
+  ['a missing crate table', '[subtle]\naccepted = ["BSD-3-Clause"]\n', '', /^about\.toml tables/],
   ['a quoted key', 'accepted =', '"accepted" =', /^expected a bare key$/],
   ['a missing target', '    "wasm32-unknown-unknown",\n', '', /^about\.toml targets/],
   ['the alternate miniz license file', 'path = "LICENSE-MIT.md"', 'path = "LICENSE"', /^about\.toml files/],

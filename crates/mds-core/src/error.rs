@@ -3,7 +3,7 @@ use std::sync::Arc;
 use miette::{Diagnostic, SourceSpan};
 use thiserror::Error;
 
-use crate::limits::{MAX_COMPILE_MEMORY, MAX_OUTPUT_SIZE};
+use crate::limits::{MAX_COMPILE_MEMORY, MAX_OUTPUT_SIZE, MAX_RESPONSE_BODY_BYTES_PER_COMPILE};
 use crate::lint::{
     escape_path_for_message, named_source_for_render, sanitize_control_chars,
     sanitize_control_chars_wire,
@@ -22,6 +22,40 @@ pub(crate) fn data_location(module: &str, entry: Option<&str>, field: Option<&st
         location.push('"');
     }
     location
+}
+
+/// The location of one request of a URL entry: the module, the entry, the URL as
+/// declared and the origin, each escaped. Never pass the expanded URL.
+pub(crate) fn request_location(module: &str, entry: &str, template: &str, origin: &str) -> String {
+    format!(
+        "{}, URL \"{}\", origin \"{}\"",
+        data_location(module, Some(entry), None),
+        escape_path_for_message(template),
+        escape_path_for_message(origin),
+    )
+}
+
+/// The fixed help of each check that can refuse a request. It never holds input text.
+fn refusal_help(layer: crate::Layer) -> &'static str {
+    use crate::Layer;
+    match layer {
+        Layer::AllowList => "add the origin to the network allow list of the host",
+        Layer::ImportOptIn => {
+            "allow the network entries of imported modules with the import opt-in of the host"
+        }
+        Layer::UrlParser => "check the URL template and the values that its references give",
+        Layer::RedirectCheck => {
+            "the redirect breaks a redirect rule; request the final URL directly"
+        }
+        Layer::SecretBinding => {
+            "give the host a secret of this name for the origin of the request"
+        }
+        Layer::TransportAddress => {
+            "to reach an address in a refused range, add its exact IP address and port to the allow list"
+        }
+        Layer::ResponseCheck => "the server sent back the value of a host secret; the response is not used",
+        Layer::Method => "use a GET or HEAD request",
+    }
 }
 
 // ── Serializable error types ──────────────────────────────────────────────────
@@ -470,14 +504,38 @@ pub enum MdsError {
         help: Option<String>,
     },
 
-    /// Data entries need network access but have no replay value.
+    /// Data entries need network access but have no replay value, or a step compile
+    /// refused a request of a URL entry.
     #[error("network access denied for data entries: {entries}")]
-    #[diagnostic(
-        code(mds::network_denied),
-        help("provide a runtime value for each entry to replay it without network access")
-    )]
+    #[diagnostic(code(mds::network_denied))]
     #[non_exhaustive]
-    NetworkDenied { entries: String },
+    NetworkDenied {
+        entries: String,
+        /// The replay help for entries with no replay value, else the fixed help of the
+        /// check that refused the request.
+        #[help]
+        detail: String,
+    },
+
+    /// A request of a network data entry failed in transport. The message names the
+    /// entry, the URL as declared and the origin, never the expanded URL.
+    #[error("network error in {message}")]
+    #[diagnostic(code(mds::network))]
+    #[non_exhaustive]
+    Network { message: String },
+
+    /// A step compile refused the input of its host: a fetch state that holds a response
+    /// that the compile did not request. The message is fixed text.
+    #[error("invalid options: {message}")]
+    #[diagnostic(code(mds::invalid_options))]
+    #[non_exhaustive]
+    InvalidOptions { message: String },
+
+    /// A data value has a type that its place in a request does not take.
+    #[error("type error in {message}")]
+    #[diagnostic(code(mds::type_error))]
+    #[non_exhaustive]
+    DataTypeError { message: String },
 
     #[error("YAML parse error: {message}")]
     #[diagnostic(code(mds::yaml))]
@@ -1038,6 +1096,83 @@ impl MdsError {
                 .map(|&(module, entry)| data_location(module, Some(entry), None))
                 .collect::<Vec<_>>()
                 .join("; "),
+            detail: "provide a runtime value for each entry to replay it without network access"
+                .to_owned(),
+        }
+    }
+
+    /// Construct a spanless transport failure of one URL entry.
+    /// Pass the project-relative module label, the entry name, the URL as declared (with
+    /// its `{{…}}` text) and the origin of the request. Never pass the expanded URL, a
+    /// header value or a body. Pass fixed prose as `kind`, for example
+    /// `request timed out`, never text that a host error or a server supplies.
+    pub fn network(module: &str, entry: &str, template: &str, origin: &str, kind: &str) -> Self {
+        Self::Network {
+            message: format!(
+                "{}: {kind}",
+                request_location(module, entry, template, origin)
+            ),
+        }
+    }
+
+    /// Construct a spanless policy refusal of one URL entry: the location of the
+    /// request, the name of the check and its fixed reason, with the fixed help of the
+    /// check. Pass the other arguments as for [`MdsError::network`]. A sender that
+    /// refuses an address passes the refusal of [`crate::NetworkPolicy::check_address`].
+    pub fn network_refused(
+        module: &str,
+        entry: &str,
+        template: &str,
+        origin: &str,
+        refusal: crate::Refusal,
+    ) -> Self {
+        Self::refused_request(module, entry, template, origin, refusal, None)
+    }
+
+    /// [`MdsError::network_refused`] about the host secret `secret`: the message names
+    /// the secret, never its value.
+    pub(crate) fn refused_request(
+        module: &str,
+        entry: &str,
+        template: &str,
+        origin: &str,
+        refusal: crate::Refusal,
+        secret: Option<&str>,
+    ) -> Self {
+        let mut entries = format!(
+            "{}: {}: {}",
+            request_location(module, entry, template, origin),
+            refusal.layer().name(),
+            refusal.reason()
+        );
+        if let Some(secret) = secret {
+            entries.push_str(" (secret \"");
+            entries.push_str(&sanitize_control_chars_wire(secret));
+            entries.push_str("\")");
+        }
+        Self::NetworkDenied {
+            entries,
+            detail: refusal_help(refusal.layer()).to_owned(),
+        }
+    }
+
+    /// Construct a spanless refusal of the host input to a step compile. Pass fixed prose
+    /// as `reason`, never text that a host or a server supplies.
+    pub fn invalid_options(reason: &str) -> Self {
+        Self::InvalidOptions {
+            message: reason.to_owned(),
+        }
+    }
+
+    /// Construct a spanless type error of a data value in a request field.
+    /// Pass the project-relative module label, the entry and the field. Pass diagnostic
+    /// prose as `reason`, never the value.
+    pub fn data_type_error(module: &str, entry: &str, field: &str, reason: &str) -> Self {
+        Self::DataTypeError {
+            message: format!(
+                "{}: {reason}",
+                data_location(module, Some(entry), Some(field))
+            ),
         }
     }
 
@@ -1056,6 +1191,18 @@ impl MdsError {
     pub(crate) fn compile_memory_exceeded() -> Self {
         Self::resource_limit(format!(
             "compile memory exceeds maximum of {MAX_COMPILE_MEMORY} bytes"
+        ))
+    }
+
+    /// The error of the response body total of one compile, 200 MiB of raw body bytes of
+    /// every status. [`crate::FetchState::with_response`] returns it for a body that takes
+    /// the state past the total. A host sender returns it for a body past the share of
+    /// [`crate::FetchState::body_bytes_left`] that the sender read it with.
+    #[cold]
+    #[inline(never)]
+    pub fn response_bodies_exceeded() -> Self {
+        Self::resource_limit(format!(
+            "response bodies exceed {MAX_RESPONSE_BODY_BYTES_PER_COMPILE} bytes per compile"
         ))
     }
 
@@ -1246,6 +1393,9 @@ impl MdsError {
             | MdsError::ResourceLimit { .. }
             | MdsError::Data { .. }
             | MdsError::NetworkDenied { .. }
+            | MdsError::Network { .. }
+            | MdsError::InvalidOptions { .. }
+            | MdsError::DataTypeError { .. }
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }
             | MdsError::InvalidVars { .. }
@@ -1343,6 +1493,9 @@ impl MdsError {
             | MdsError::ResourceLimit { .. }
             | MdsError::Data { .. }
             | MdsError::NetworkDenied { .. }
+            | MdsError::Network { .. }
+            | MdsError::InvalidOptions { .. }
+            | MdsError::DataTypeError { .. }
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }
             | MdsError::InvalidVars { .. }

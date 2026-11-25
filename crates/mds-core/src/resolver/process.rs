@@ -450,8 +450,10 @@ impl ModuleCache {
             }
         };
         if self.data.compile {
+            // A step compile binds its URL entries from the step context, so only a
+            // compile without one refuses a frontier.
             let frontier: Vec<_> = preflight.frontier().collect();
-            if !frontier.is_empty() {
+            if !frontier.is_empty() && self.data.net.is_none() {
                 self.budget.mem.release_buffers(preflight.snapshot.charge);
                 return Err(MdsError::network_denied(&frontier));
             }

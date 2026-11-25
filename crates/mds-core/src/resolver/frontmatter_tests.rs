@@ -12,7 +12,7 @@
 const DATA_LABEL: crate::data::DataLabel<'static> = crate::data::DataLabel {
     module: "test.mds",
     entry: "item",
-    file: Some("item.yml"),
+    input: crate::data::DataInput::File("item.yml"),
 };
 
 use super::{

@@ -7,7 +7,7 @@ use super::{
     MemBudget, Module, ModuleCache, ModuleCtx, Node, Part, Scope, Value, VarLayer,
     INDENTED_DIRECTIVES, MAX_BLOCKS_PER_MODULE, MAX_DEFINES_PER_MODULE,
 };
-use crate::data::{decl::Source, resolve, DataLabel};
+use crate::data::{decl::Source, resolve, step, DataLabel};
 
 /// Return `true` when the AST body contains at least one `@message` block
 /// (possibly nested inside `@if` or `@for` — a shallow scan is enough for the
@@ -311,6 +311,8 @@ impl ModuleCache {
         let fs = &*self.fs;
         let data = &mut self.data;
         let analyze_data = self.analyze_data;
+        // The module that the compile starts from: only its entries can send a secret.
+        let entry_key = self.resolving.first().map(String::as_str);
         let result = resolve::Declarations::with_graph(
             chain,
             resolve::FrontmatterNames::Parsed { mapping, is_md },
@@ -319,8 +321,16 @@ impl ModuleCache {
             |count, graph, mem| {
                 count_data_entries(&mut data.entries, count)?;
                 // The role check reads these names, so a replayed entry keeps its source.
+                // Replay does not lift the secret header rule, so check every URL entry.
                 let mut names = HashSet::new();
                 for node in graph.nodes() {
+                    if let Source::Url(template) = &node.entry.source {
+                        step::check_secret_module(
+                            node,
+                            template,
+                            Some(node.position.0) == entry_key,
+                        )?;
+                    }
                     let name = &node.entry.name;
                     mem.charge(
                         Part::Buffers,
@@ -346,17 +356,46 @@ impl ModuleCache {
                     }
                     return Ok((names, pending));
                 }
-                if graph.frontier().next().is_some() {
+                // Only a step compile has a context for its URL entries.
+                if graph.frontier().next().is_some() && data.net.is_none() {
                     return Err(MdsError::internal());
                 }
-                for node in graph.unreplayed() {
-                    let Source::File(written) = &node.entry.source else {
-                        return Err(MdsError::internal());
+                for node in graph.in_level_order() {
+                    let written = match &node.entry.source {
+                        Source::File(written) => written,
+                        Source::Url(template) => {
+                            let ctx = data.net.as_mut().ok_or_else(MdsError::internal)?;
+                            let scope = step::EntryScope {
+                                runtime,
+                                vars,
+                                pending: &pending,
+                                entry_module: Some(node.position.0) == entry_key,
+                            };
+                            let bound =
+                                step::bind_url_entry(node, template, &scope, ctx, mem, |len| {
+                                    count_data_bytes(&mut data.bytes, len)
+                                })?;
+                            let name = &node.entry.name;
+                            match bound {
+                                step::Bound::Value(value) => {
+                                    bind_entry(name, value, vars, mem)?;
+                                }
+                                step::Bound::Pending => {
+                                    mem.charge(
+                                        Part::Buffers,
+                                        name.len().checked_add(2 * size_of::<String>()),
+                                    )?;
+                                    pending.insert(name.clone());
+                                    data.pending = true;
+                                }
+                            }
+                            continue;
+                        }
                     };
                     let label = DataLabel {
                         module: node.module,
                         entry: &node.entry.name,
-                        file: None,
+                        input: crate::data::DataInput::Declaration,
                     };
                     let (key, accept) = resolve::canonical_file(fs, node.dir, written, label)?;
                     let value = if let Some(value) = data.files.get(&key) {
@@ -372,13 +411,7 @@ impl ModuleCache {
                         data.files.insert(key, Arc::clone(&value));
                         value
                     };
-                    let binding_bytes = node
-                        .entry
-                        .name
-                        .len()
-                        .checked_add(2 * size_of::<(String, crate::scope::Slot)>());
-                    mem.charge(Part::Buffers, binding_bytes)?;
-                    vars.insert(node.entry.name.clone(), value);
+                    bind_entry(&node.entry.name, value, vars, mem)?;
                 }
                 Ok((names, pending))
             },
@@ -386,6 +419,21 @@ impl ModuleCache {
         self.commit_retained(self.budget.mem.buffers - before);
         result.map(Option::unwrap_or_default)
     }
+}
+
+/// Bind the value of the entry `name` into the module variables.
+fn bind_entry(
+    name: &str,
+    value: Arc<Value>,
+    vars: &mut VarLayer,
+    mem: &mut MemBudget,
+) -> Result<(), MdsError> {
+    let binding_bytes = name
+        .len()
+        .checked_add(2 * size_of::<(String, crate::scope::Slot)>());
+    mem.charge(Part::Buffers, binding_bytes)?;
+    vars.insert(name.to_owned(), value);
+    Ok(())
 }
 
 fn data_memo_bytes(key: usize) -> Option<usize> {

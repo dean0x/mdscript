@@ -20,7 +20,7 @@ impl Node<'_> {
         DataLabel {
             module: self.module,
             entry: &self.entry.name,
-            file: None,
+            input: crate::data::DataInput::Declaration,
         }
     }
 }
@@ -29,6 +29,11 @@ impl Node<'_> {
 pub(crate) struct Graph<'a> {
     nodes: &'a [Node<'a>],
     replayed: NodeSet,
+    /// The level of each node: 1 for a node with no dependency, else one more than
+    /// the highest level of its dependencies.
+    levels: [u8; MAX_DATA_ENTRIES_PER_COMPILE],
+    /// The highest level, at most `MAX_DATA_LEVELS`.
+    depth: usize,
 }
 
 impl<'a> Graph<'a> {
@@ -44,6 +49,22 @@ impl<'a> Graph<'a> {
             .copied()
             .enumerate()
             .filter_map(|(index, node)| (!self.replayed.contains(index)).then_some(node))
+    }
+
+    /// The entries that a bind must satisfy, level by level and in declaration order
+    /// inside a level, so each entry comes after every entry it references. Replayed
+    /// entries are left out.
+    pub(crate) fn in_level_order(&self) -> impl Iterator<Item = Node<'a>> + '_ {
+        (1..=self.depth).flat_map(move |level| {
+            self.nodes
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(move |&(index, _)| {
+                    usize::from(self.levels[index]) == level && !self.replayed.contains(index)
+                })
+                .map(|(_, node)| node)
+        })
     }
 
     /// Append these pairs in module first-resolution order in the collect pass.
@@ -81,8 +102,8 @@ pub(crate) fn analyze<'a>(
             // Replay satisfies the node without use of its outgoing references.
             // The declaration parser already checked the source form.
             replayed.insert(index);
-        } else if let Source::Url(refs) = &node.entry.source {
-            for path in refs {
+        } else if let Source::Url(template) = &node.entry.source {
+            for path in &template.refs {
                 let root = path.split_once('.').map_or(path.as_str(), |(root, _)| root);
                 if let Ok(slot) = indices.binary_search_by_key(&root, |&i| name_at(i)) {
                     deps.insert(indices[slot]);
@@ -99,8 +120,14 @@ pub(crate) fn analyze<'a>(
         }
         waiting[index] = Some(deps);
     }
-    check_levels(nodes, waiting)?;
-    Ok(Graph { nodes, replayed })
+    let mut levels = [0; MAX_DATA_ENTRIES_PER_COMPILE];
+    let depth = check_levels(nodes, waiting, &mut levels[..nodes.len()])?;
+    Ok(Graph {
+        nodes,
+        replayed,
+        levels,
+        depth,
+    })
 }
 
 pub(crate) fn entry_limit() -> MdsError {
@@ -133,7 +160,12 @@ pub(crate) fn sort_entries_by_key<T, K: Ord>(
     Ok(())
 }
 
-fn check_levels(nodes: &[Node<'_>], waiting: &mut [Option<NodeSet>]) -> Result<(), MdsError> {
+/// Give each node its level and return the highest level. An empty graph has none.
+fn check_levels(
+    nodes: &[Node<'_>],
+    waiting: &mut [Option<NodeSet>],
+    levels: &mut [u8],
+) -> Result<usize, MdsError> {
     // Each pass removes one whole level. At most one pass per node is necessary.
     for level in 1..=nodes.len() {
         let mut ready = NodeSet::default();
@@ -141,6 +173,8 @@ fn check_levels(nodes: &[Node<'_>], waiting: &mut [Option<NodeSet>]) -> Result<(
             if deps.as_ref().is_some_and(NodeSet::is_empty) {
                 ready.insert(index);
                 *deps = None;
+                // A level past the cap fails below, before any caller reads it.
+                levels[index] = u8::try_from(level).unwrap_or(u8::MAX);
             }
         }
         let Some(blocked) = waiting.iter().position(Option::is_some) else {
@@ -149,7 +183,7 @@ fn check_levels(nodes: &[Node<'_>], waiting: &mut [Option<NodeSet>]) -> Result<(
                     "data dependency graph exceeds {MAX_DATA_LEVELS} levels"
                 )));
             }
-            break;
+            return Ok(level);
         };
         if ready.is_empty() {
             return Err(nodes[blocked]
@@ -160,7 +194,12 @@ fn check_levels(nodes: &[Node<'_>], waiting: &mut [Option<NodeSet>]) -> Result<(
             deps.remove_all(&ready);
         }
     }
-    Ok(())
+    // Only an empty graph gets here: each pass returns or removes at least one node.
+    if nodes.is_empty() {
+        Ok(0)
+    } else {
+        Err(MdsError::internal())
+    }
 }
 
 // The graph uses fixed-size sets. Repeated references cost only one edge each.

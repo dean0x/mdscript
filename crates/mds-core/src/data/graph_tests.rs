@@ -10,6 +10,19 @@ fn parse(raw: &str, module: &str) -> Result<Vec<Entry>, MdsError> {
     parse_declarations(&tree["data"], module, &mut MemBudget::default())
 }
 
+/// A GET entry whose declaration references `refs`.
+fn url_source(refs: Vec<String>) -> Source {
+    Source::Url(Box::new(crate::data::decl::RequestTemplate {
+        url: "https://example.test/".into(),
+        method: crate::data::decl::DeclaredMethod::Get,
+        accept: crate::data::Accept::Json,
+        envelope: false,
+        headers: Vec::new(),
+        has_body: false,
+        refs,
+    }))
+}
+
 fn nodes<'a>(entries: &'a [Entry], module: &'a str) -> Vec<Node<'a>> {
     entries
         .iter()
@@ -209,7 +222,7 @@ fn merged_graph_accepts_the_compile_entry_cap_but_not_more() {
             source: Source::File("./leaf.json".into()),
         })
         .collect::<Vec<_>>();
-    entries[0].source = Source::Url(vec![format!("{last}.id"), format!("{last}.name")]);
+    entries[0].source = url_source(vec![format!("{last}.id"), format!("{last}.name")]);
     let at_cap = nodes(&entries, MODULE);
     let graph = check(&at_cap[..cap], &[], &[]).unwrap();
     assert_eq!(graph.unreplayed().count(), cap);
@@ -218,9 +231,34 @@ fn merged_graph_accepts_the_compile_entry_cap_but_not_more() {
         "mds::resource_limit"
     );
 
-    entries[cap - 1].source = Source::Url(vec!["entry0.id".into()]);
+    entries[cap - 1].source = url_source(vec!["entry0.id".into()]);
     let cycle = nodes(&entries[..cap], MODULE);
     let error = check(&cycle, &[], &[]).unwrap_err().serialize();
     assert_eq!(error.code, "mds::data");
     assert!(error.message.contains("data dependency cycle"));
+}
+
+/// The bind order is level by level, declaration order inside a level, and it skips a
+/// replayed entry: a dependent entry always comes after each entry it references.
+#[test]
+fn level_order_puts_each_entry_after_its_dependencies() {
+    let entries = parse(
+        "{c: 'https://example.test/{{b.x}}', b: 'https://example.test/{{a.x}}', \
+         d: ./d.json, a: 'https://example.test/a', e: 'https://example.test/{{a.x}}', \
+         r: 'https://example.test/{{c.x}}'}",
+        MODULE,
+    )
+    .unwrap();
+    let nodes = nodes(&entries, MODULE);
+    let order = |runtime: &[&str]| {
+        check(&nodes, &[], runtime)
+            .unwrap()
+            .in_level_order()
+            .map(|node| node.entry.name.as_str())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(order(&[]), ["d", "a", "b", "e", "c", "r"]);
+    assert_eq!(order(&["r"]), ["d", "a", "b", "e", "c"]);
+    // A replayed entry is skipped, and its dependents keep their level.
+    assert_eq!(order(&["b"]), ["d", "a", "c", "e", "r"]);
 }

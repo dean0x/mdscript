@@ -30,6 +30,8 @@ debug-panics = []
 
 [dependencies]
 mds = { package = "mds-core", path = "../mds-core", version = "0.7.0" }
+# The sender of URL data entries for `mds build --allow-net`.
+mds-fetch = { path = "../mds-fetch", version = "0.7.0" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -49,6 +51,10 @@ tempfile = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 thiserror = { workspace = true }
+# The TLS tests of `tests/cli_net.rs` make their CA, certificate and key at test time
+# and serve them with rustls, so the repository holds no key.
+rcgen = { workspace = true }
+rustls = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

@@ -4,11 +4,10 @@ use crate::limits::MAX_DATA_FILE_BYTES;
 use crate::resolver::{parse_data_json_with, parse_data_yaml_with, Allowance, NODE_YAML};
 use crate::value::Value;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Accept {
     Json,
     Yaml,
-    #[cfg_attr(not(test), expect(dead_code, reason = "text is a response format"))]
     Text,
 }
 
@@ -17,19 +16,46 @@ pub(crate) struct DataLabel<'a> {
     /// Project-relative label of the declaring module.
     pub(crate) module: &'a str,
     pub(crate) entry: &'a str,
-    pub(crate) file: Option<&'a str>,
+    pub(crate) input: DataInput<'a>,
+}
+
+/// The input that a data value comes from, for messages.
+#[derive(Clone, Copy)]
+pub(crate) enum DataInput<'a> {
+    /// The declaration itself.
+    Declaration,
+    /// A data file, by its project-relative label.
+    File(&'a str),
+    /// The response of a network request. A message names the entry, never the URL.
+    Response,
 }
 
 impl DataLabel<'_> {
     pub(crate) fn syntax(self, format: &str) -> MdsError {
-        MdsError::yaml_error(format!(
-            "data file \"{}\", entry \"{}\": invalid {format} data",
-            crate::escape_path_for_message(self.file.unwrap_or(self.module)),
-            crate::sanitize_control_chars_wire(self.entry),
-        ))
+        let entry = crate::sanitize_control_chars_wire(self.entry);
+        let module = crate::escape_path_for_message(self.module);
+        MdsError::yaml_error(match self.input {
+            DataInput::Response => {
+                format!("\"{module}\", response for entry \"{entry}\": invalid {format} data")
+            }
+            DataInput::File(file) => format!(
+                "data file \"{}\", entry \"{entry}\": invalid {format} data",
+                crate::escape_path_for_message(file),
+            ),
+            DataInput::Declaration => {
+                format!("data file \"{module}\", entry \"{entry}\": invalid {format} data")
+            }
+        })
     }
 
+    /// A data error of this input. For a file or a declaration, `field` is the key path
+    /// of the value. A key path of a response is body text, so a response error names
+    /// the entry only.
     pub(crate) fn error(self, field: Option<&str>, reason: &str) -> MdsError {
+        let field = match self.input {
+            DataInput::Response => None,
+            DataInput::Declaration | DataInput::File(_) => field,
+        };
         MdsError::data(self.module, Some(self.entry), field, reason, None)
     }
 }

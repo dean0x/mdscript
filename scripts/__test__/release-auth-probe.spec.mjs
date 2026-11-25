@@ -1996,7 +1996,7 @@ function assertPublishEnv(section, names, binding) {
 }
 
 function assertCargoPublishEnv(section) {
-  assertPublishEnv(section, ['Publish mds-core', 'Publish mds-cli'],
+  assertPublishEnv(section, ['Publish mds-core', 'Publish mds-fetch', 'Publish mds-cli'],
     'CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}');
   assert.doesNotMatch(stripCommentLines(section), /\bcargo publish[^\n]*\s--token\b/,
     'cargo publish must not use a token flag');
@@ -2030,7 +2030,78 @@ function assertNpmRegistryOrder(section) {
   assert.equal(platform.index + 1, npm.index, 'no step may separate the two npm publishes');
 }
 
-test('S24: only the two Cargo publish steps bind registry values', () => {
+// The crates publish in dependency order. Each crate publishes directly after a bounded
+// index poll shows the crate before it, and each publish passes on a re-run where its
+// version is already on crates.io (PF-023).
+const CRATE_PUBLISH_STEPS = [
+  ['Publish mds-core', 'mds-core'],
+  ['Wait for crates.io index to update (mds-core)', 'mds-core'],
+  ['Publish mds-fetch', 'mds-fetch'],
+  ['Wait for crates.io index to update (mds-fetch)', 'mds-fetch'],
+  ['Publish mds-cli', 'mds-cli'],
+];
+
+function assertCratePublishOrder(section) {
+  const steps = jobSteps(section);
+  const found = CRATE_PUBLISH_STEPS.map(([name]) => namedStep(steps, name));
+  for (const [n, [name]] of CRATE_PUBLISH_STEPS.entries()) {
+    assert.ok(found[n], `${name} must exist`);
+  }
+  assert.deepEqual(found.map(step => step.index), found.map((_, n) => found[0].index + n),
+    'the crate publish and index poll steps must run in dependency order, with no step between');
+  const polls = [];
+  for (const [n, [name, crate]] of CRATE_PUBLISH_STEPS.entries()) {
+    const run = stepRun(found[n].body);
+    if (name.startsWith('Publish ')) {
+      assert.ok(run.includes(`if OUTPUT=$(cargo publish -p ${crate} 2>&1); then\n`),
+        `${name} must publish ${crate}`);
+      assert.ok(run.includes('grep -qE "already (uploaded|exists|published)"'),
+        `${name} must pass on a re-run`);
+    } else {
+      assert.ok(stepEnv(found[n].body).split('\n').includes(`          CRATE: ${crate}`),
+        `${name} must poll ${crate}`);
+      polls.push(run);
+    }
+  }
+  assert.ok(/^ {10}MAX=20$/m.test(polls[0]) && /for i in \$\(seq 1 "\$MAX"\); do/.test(polls[0]),
+    'the index poll must be bounded');
+  assert.equal(polls[1], polls[0], 'both index polls must run the same block');
+}
+
+test('S34: the crates publish in dependency order after each index poll', () => {
+  const section = extractJobSection(yml, 'publish-crates');
+  assertCratePublishOrder(section);
+  const name = step => `      - name: ${step}\n`;
+  const fetchPublish = name('Publish mds-fetch');
+  const fetchPoll = name('Wait for crates.io index to update (mds-fetch)');
+  const cliPublish = name('Publish mds-cli');
+  const start = section.indexOf(fetchPublish);
+  const end = section.indexOf(cliPublish);
+  assert.ok(start > 0 && end > start, 'non-vacuity: the mds-fetch steps precede Publish mds-cli');
+  const coreStart = section.indexOf(name('Publish mds-core'));
+  assert.ok(coreStart > 0 && coreStart < start, 'non-vacuity: Publish mds-core comes first');
+  const moved = section.slice(0, coreStart) + section.slice(start, end) +
+    section.slice(coreStart, start) + section.slice(end);
+  assert.throws(() => assertCratePublishOrder(moved), /dependency order/);
+  const noPoll = section.replace(fetchPoll, name('Wait for the mds-fetch index'));
+  assert.throws(() => assertCratePublishOrder(noPoll), /\(mds-fetch\) must exist/);
+  const wrongCrate = section.replace('cargo publish -p mds-fetch 2>&1', 'cargo publish -p mds-cli 2>&1');
+  assert.throws(() => assertCratePublishOrder(wrongCrate), /Publish mds-fetch must publish mds-fetch/);
+  const notIdempotent = section.replace(
+    /(Publish mds-fetch\n(?:.*\n)*?.*)grep -qE "already \(uploaded\|exists\|published\)"/,
+    '$1grep -qE "already uploaded"');
+  assert.notEqual(notIdempotent, section, 'non-vacuity: the re-run guard plant changes the section');
+  assert.throws(() => assertCratePublishOrder(notIdempotent), /Publish mds-fetch must pass on a re-run/);
+  const otherCrate = section.replace('          CRATE: mds-fetch\n', '          CRATE: mds-core\n');
+  assert.throws(() => assertCratePublishOrder(otherCrate), /must poll mds-fetch/);
+  const unbounded = section.replaceAll('          MAX=20\n', '          MAX=\n');
+  assert.throws(() => assertCratePublishOrder(unbounded), /must be bounded/);
+  const drifted = section.replace(/(CRATE: mds-fetch\n(?:.*\n)*?.*)--max-time 20/, '$1--max-time 99');
+  assert.notEqual(drifted, section, 'non-vacuity: the drift plant changes the section');
+  assert.throws(() => assertCratePublishOrder(drifted), /same block/);
+});
+
+test('S24: only the three Cargo publish steps bind registry values', () => {
   const section = extractJobSection(yml, 'publish-crates');
   assertCargoPublishEnv(section);
   const withFlag = section.replace('cargo publish -p mds-core ',

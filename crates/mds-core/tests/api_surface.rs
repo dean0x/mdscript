@@ -455,6 +455,9 @@ fn mds_error_variants_exist() {
         | MdsError::ResourceLimit { .. }
         | MdsError::Data { .. }
         | MdsError::NetworkDenied { .. }
+        | MdsError::Network { .. }
+        | MdsError::InvalidOptions { .. }
+        | MdsError::DataTypeError { .. }
         | MdsError::DataFileNotFound { .. }
         | MdsError::YamlError { .. }
         | MdsError::JsonError { .. }
@@ -489,6 +492,21 @@ fn data_error_variants_have_named_constructors() {
     type DataFn = fn(&str, Option<&str>, Option<&str>, &str, Option<String>) -> MdsError;
     let _: DataFn = MdsError::data;
     let _: fn(&[(&str, &str)]) -> MdsError = MdsError::network_denied;
+    let _: fn(&str, &str, &str, &str, mds::Refusal) -> MdsError = MdsError::network_refused;
+    let network: fn(&str, &str, &str, &str, &str) -> MdsError = MdsError::network;
+    let err = network(
+        "main.mds",
+        "users",
+        "https://a.example/",
+        "https://a.example",
+        "x",
+    );
+    assert!(matches!(err, MdsError::Network { .. }), "{err:?}");
+    let invalid: fn(&str) -> MdsError = MdsError::invalid_options;
+    assert!(matches!(invalid("x"), MdsError::InvalidOptions { .. }));
+    let type_error: fn(&str, &str, &str, &str) -> MdsError = MdsError::data_type_error;
+    let err = type_error("main.mds", "users", "url", "x");
+    assert!(matches!(err, MdsError::DataTypeError { .. }), "{err:?}");
 }
 
 #[test]
@@ -641,6 +659,14 @@ fn constants_have_expected_values() {
     assert_eq!(mds::MAX_DATA_FILES, 256);
     assert_eq!(mds::MAX_DATA_BYTES, 32 * 1024 * 1024);
     assert_eq!(mds::MAX_DATA_REFS_PER_ENTRY, 256);
+    assert_eq!(mds::MAX_REQUESTS_PER_COMPILE, 64);
+    assert_eq!(mds::MAX_REQUESTS_PER_RUN, 512);
+    assert_eq!(mds::MAX_RESPONSE_BYTES, MAX_FILE_SIZE);
+    assert_eq!(mds::MAX_RESPONSE_HEADER_BYTES, 16 * 1024);
+    assert_eq!(mds::REQUEST_TIMEOUT, std::time::Duration::from_secs(10));
+    assert_eq!(mds::COMPILE_DEADLINE, std::time::Duration::from_secs(30));
+    assert_eq!(mds::MAX_PARALLEL_SENDS, 8);
+    assert_eq!(mds::MAX_RESOLVED_ADDRS, 64);
     const _: () = assert!(MAX_TRAVERSAL_DEPTH > 0);
     const _: () = assert!(MAX_TRAVERSAL_DEPTH <= 1000);
 }
@@ -2314,7 +2340,7 @@ fn lint_types_exist() {
 /// AC-224-7 / AC-224-8: KNOWN_LINT_RULES and UnknownRuleNames honour ADR-010.
 ///
 /// - `KNOWN_LINT_RULES` is publicly reachable from an external crate.
-/// - It contains exactly the eleven registered rule names.
+/// - It contains exactly the thirteen registered rule names.
 /// - Every entry in the registry is accepted by `LintConfig::from_rules_checked` without
 ///   unknowns.
 /// - `find_unknown_rule_names` returns `None` for all-known maps and `Some` for
@@ -2325,11 +2351,11 @@ fn lint_types_exist() {
 fn known_lint_rules_and_unknown_detection() {
     use mds::{find_unknown_rule_names, KNOWN_LINT_RULES};
 
-    // AC-224-7: exactly 11 rules.
+    // AC-224-7: exactly 13 rules.
     assert_eq!(
         KNOWN_LINT_RULES.len(),
-        11,
-        "KNOWN_LINT_RULES must have exactly 11 entries"
+        13,
+        "KNOWN_LINT_RULES must have exactly 13 entries"
     );
 
     // AC-224-7: exact sorted contents.
@@ -2337,7 +2363,9 @@ fn known_lint_rules_and_unknown_detection() {
         "duplicate-export",
         "duplicate-import",
         "empty-block",
+        "insecure-data-origin",
         "legacy-interpolation",
+        "literal-credential-header",
         "literal-directive",
         "redundant-else",
         "shadow-variable",
@@ -2944,4 +2972,188 @@ fn text_edit_and_fix_edits_public_api() {
     assert_eq!(arr[0]["start"], 6);
     assert_eq!(arr[0]["end"], 12);
     assert_eq!(arr[0]["new_text"], "{{name}}");
+}
+
+/// #405: the network policy is reachable from the crate root and built through its
+/// named constructors. A secret value is absent from `Debug`, the refusals are fixed
+/// text, and a match on `Layer` or `Scheme` needs a wildcard arm, as a new kind may be
+/// added.
+#[test]
+fn network_policy_api_exists() {
+    let local = mds::AllowItem::parse("http://127.0.0.1:8080").unwrap();
+    let origin: mds::Origin = mds::AllowItem::parse("api.example").unwrap().origin();
+    assert_eq!(
+        (origin.scheme().as_str(), origin.port(), origin.to_string()),
+        ("https", 443, "https://api.example".to_owned())
+    );
+    assert!(matches!(origin.host(), mds::Host::Name(name) if name == "api.example"));
+    let value = mds::SecretValue::new("planted-value".into()).unwrap();
+    assert_eq!(value.expose_for_send(), "planted-value");
+    let secret = mds::Secret::new("token", value, origin).unwrap();
+    let policy = mds::NetworkPolicy::new(vec![local.clone()])
+        .unwrap()
+        .with_imports(true)
+        .with_secret(secret)
+        .unwrap();
+    assert!(!format!("{policy:?}").contains("planted-value"));
+
+    let narrowed = policy.narrow(vec![local.clone()], false).unwrap();
+    assert!(narrowed
+        .check_address("127.0.0.1:8080".parse().unwrap())
+        .is_ok());
+    let refusal: mds::Refusal = narrowed
+        .check_address("10.0.0.1:443".parse().unwrap())
+        .unwrap_err();
+    assert_eq!(refusal.reason(), "the address is in a refused range");
+    match refusal.layer() {
+        mds::Layer::TransportAddress => {}
+        other => panic!("unexpected layer {}", other.name()),
+    }
+    let error: mds::NarrowError = narrowed.narrow(vec![local], true).unwrap_err();
+    assert_eq!(error, mds::NarrowError::ImportsNotAllowed);
+    let error: mds::PolicyError = mds::NetworkPolicy::new(Vec::new()).unwrap_err();
+    let error: &dyn std::error::Error = &error;
+    assert_eq!(error.to_string(), "an allow list needs at least one item");
+}
+
+/// #405: the request types are reachable from the crate root. The core builds each
+/// `Request`, so its accessors are pinned by type here; `RequestId` has a strict hex
+/// form, and `RunKey` hides its bytes from `Debug`.
+#[test]
+fn request_identity_api_exists() {
+    fn accessors(request: &mds::Request) -> (mds::RequestId, mds::Method, String) {
+        let url: &mds::CheckedUrl = request.url();
+        let _: &str = request.template();
+        let _: (mds::Origin, &str, Option<&str>) = (url.origin(), url.path(), url.query());
+        for header in request.headers() {
+            let _: &str = header.name();
+            match header.value() {
+                mds::HeaderValue::Text(_) | mds::HeaderValue::Secret { .. } => {}
+                _ => {}
+            }
+        }
+        (request.id(), request.method(), url.to_text())
+    }
+    let _ = accessors;
+
+    assert!(!format!("{:?}", mds::RunKey::from_bytes([7; 32])).contains('7'));
+    match mds::Method::Head {
+        mds::Method::Get => panic!("unexpected method"),
+        other => assert_eq!(other.as_str(), "HEAD"),
+    }
+    let text = "0123456789abcdef".repeat(4);
+    let id = mds::RequestId::parse_hex(&text).unwrap();
+    assert_eq!(id.as_hex(), text);
+    let error: mds::RequestIdError = mds::RequestId::parse_hex("remote").unwrap_err();
+    let error: &dyn std::error::Error = &error;
+    assert_eq!(
+        error.to_string(),
+        "a request ID is 64 lower-case hex digits"
+    );
+}
+
+/// #405: the step API is reachable from the crate root. Each step function takes the
+/// options of its compile function plus the context and the state; a match on `Step`,
+/// `Response` or `TransportFailure` needs a wildcard arm, as a new kind may be added.
+#[test]
+fn step_api_exists() {
+    type Vars = Option<HashMap<String, mds::Value>>;
+    type Ctx<'a> = &'a mds::FetchContext;
+    type State<'a> = &'a mds::FetchState;
+    type Stepped = Result<mds::Step, MdsError>;
+    type VirtualStep = fn(mds::VirtualFs, &str, Vars, mds::CompileOptions, Ctx, State) -> Stepped;
+    type StrStep =
+        fn(&str, Option<&std::path::Path>, Vars, mds::CompileOptions, Ctx, State) -> Stepped;
+    let native = |fs: mds::NativeFs,
+                  entry: &std::path::Path,
+                  vars: Vars,
+                  opts,
+                  ctx: Ctx,
+                  state: State|
+     -> Stepped { mds::compile_step_native_fs(fs, entry, vars, opts, ctx, state) };
+    let _ = native;
+    let _: VirtualStep = mds::compile_step_virtual_fs;
+    let _: StrStep = mds::compile_step_str;
+
+    let policy =
+        mds::NetworkPolicy::new(vec![mds::AllowItem::parse("a.example").unwrap()]).unwrap();
+    let ctx = mds::FetchContext::new(policy, mds::RunKey::from_bytes([7; 32]));
+    let _: &mds::NetworkPolicy = ctx.policy();
+    let state = mds::FetchState::new();
+    assert!(state.is_empty());
+    let id = mds::RequestId::parse_hex(&"ab".repeat(32)).unwrap();
+    let answer = mds::Response::http(
+        200,
+        vec![("x-a".into(), b"marker".to_vec())],
+        b"marker".to_vec(),
+    );
+    let state = state.with_response(id, answer).unwrap();
+    assert_eq!(state.len(), 1);
+    assert!(!format!("{state:?}").contains("marker"));
+    // The raw bodies of one compile share one 200 MiB total; a host caps its reads with
+    // the bytes left, and a read past its share gives the error of the total.
+    let left: fn(&mds::FetchState) -> usize = mds::FetchState::body_bytes_left;
+    assert_eq!(left(&state), 200 * 1024 * 1024 - "marker".len());
+    let over: fn() -> MdsError = MdsError::response_bodies_exceeded;
+    let err = over();
+    assert!(matches!(err, MdsError::ResourceLimit { .. }), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "resource limit exceeded: response bodies exceed 209715200 bytes per compile"
+    );
+    assert_eq!(
+        format!(
+            "{:?}",
+            mds::Response::failed(mds::TransportFailure::Timeout)
+        ),
+        "Failed(Timeout)"
+    );
+    assert_ne!(
+        mds::TransportFailure::AddressRefused,
+        mds::TransportFailure::Timeout
+    );
+
+    let fs = mds::VirtualFs::new(HashMap::from([(
+        "main.mds".to_string(),
+        "Hi!\n".to_string(),
+    )]));
+    let step = mds::compile_step_virtual_fs(
+        fs,
+        "main.mds",
+        None,
+        mds::CompileOptions::default(),
+        &ctx,
+        &mds::FetchState::new(),
+    )
+    .unwrap();
+    let result: mds::CompileResult = match step {
+        mds::Step::Done(result) => *result,
+        mds::Step::Need(_) => panic!("expected a finished compile"),
+        _ => panic!("unexpected step"),
+    };
+    let _: &[mds::RemoteInput] = &result.remote_inputs;
+    for input in &result.remote_inputs {
+        let _: (&str, &str, &str, &str) =
+            (&input.module, &input.entry, &input.template, &input.origin);
+    }
+}
+
+/// #405: a host sender binds a secret header through the policy again before it writes
+/// the header. A secret binds only for its own name and the one origin of the secret.
+#[test]
+fn secret_binding_api_exists() {
+    let item = mds::AllowItem::parse("api.example").unwrap();
+    let origin = item.origin();
+    let other = mds::AllowItem::parse("other.example").unwrap().origin();
+    let value = mds::SecretValue::new("planted-value".into()).unwrap();
+    let policy = mds::NetworkPolicy::new(vec![item])
+        .unwrap()
+        .with_secret(mds::Secret::new("token", value, origin.clone()).unwrap())
+        .unwrap();
+    let bound: &mds::SecretValue = policy.bind_secret("token", &origin).unwrap();
+    assert_eq!(bound.expose_for_send(), "planted-value");
+    for (name, at) in [("token", &other), ("missing", &origin)] {
+        let refusal: mds::Refusal = policy.bind_secret(name, at).unwrap_err();
+        assert_eq!(refusal.layer(), mds::Layer::SecretBinding, "{name}");
+    }
 }

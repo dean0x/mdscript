@@ -2,7 +2,7 @@
 //!
 //! The engine runs AFTER the check gate (resolve+validate) passes, confirming the
 //! template compiles correctly. It then independently tokenizes and parses the entry
-//! source for a single-pass facts walk, applies the 11 lint rules as plain
+//! source for a single-pass facts walk, applies the 13 lint rules as plain
 //! functions, and returns a `LintResult`.
 //!
 //! ## Pipeline (per file)
@@ -69,7 +69,7 @@ pub(crate) fn is_partial_by_name(path: &str) -> bool {
 ///
 /// `source` is the raw entry source string (already used for the check gate).
 /// `filename` is the display name used in diagnostics and JSON grouping.
-/// Returns `Ok(LintResult)` with diagnostics from all 11 rules.
+/// Returns `Ok(LintResult)` with diagnostics from all 13 rules.
 pub(crate) fn lint_source(
     source: &str,
     filename: &str,
@@ -104,7 +104,7 @@ pub(crate) fn lint_source(
     Ok(builder.build(is_standalone))
 }
 
-/// Apply all 11 lint rules over the module and facts context.
+/// Apply all 13 lint rules over the module and facts context.
 ///
 /// Non-generic dispatch: each rule is a plain function call with no monomorphization.
 /// Rules are listed in the same order as the implementation steps (local-AST first,
@@ -130,6 +130,8 @@ fn run_rules(
     rules::unused_import::check(module, ctx, filename, config, builder);
     rules::unused_function::check(module, ctx, filename, config, builder);
     rules::shadow_variable::check(module, ctx, filename, config, builder);
+    rules::insecure_data_origin::check(module, ctx, filename, config, builder);
+    rules::literal_credential_header::check(module, ctx, filename, config, builder);
 
     // Step 6 — token-based rules (require raw token stream)
     rules::legacy_interpolation::check(tokens, source, filename, config, builder);

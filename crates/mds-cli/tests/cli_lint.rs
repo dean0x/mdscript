@@ -4389,13 +4389,14 @@ fn unknown_rule_plural_sorted_warning() {
 #[test]
 fn unknown_rule_cli_exact_golden() {
     // We cannot import mds:: directly from an integration test; hard-code the
-    // current eleven names in alphabetical order (the same value KNOWN_LINT_RULES
+    // current thirteen names in alphabetical order (the same value KNOWN_LINT_RULES
     // holds, verified by AC-224-7).  If the registry grows this golden must be
     // updated alongside the registry — the test will fail loudly.
     #[rustfmt::skip]
     let recognised = concat!(
-        "duplicate-export, duplicate-import, empty-block, legacy-interpolation, ",
-        "literal-directive, redundant-else, shadow-variable, unreachable-branch, ",
+        "duplicate-export, duplicate-import, empty-block, insecure-data-origin, ",
+        "legacy-interpolation, literal-credential-header, literal-directive, ",
+        "redundant-else, shadow-variable, unreachable-branch, ",
         "unused-function, unused-import, unused-variable"
     );
 
@@ -4486,8 +4487,9 @@ fn unknown_rule_cli_exact_golden() {
 fn unknown_rule_cli_exact_golden_single_file() {
     #[rustfmt::skip]
     let recognised = concat!(
-        "duplicate-export, duplicate-import, empty-block, legacy-interpolation, ",
-        "literal-directive, redundant-else, shadow-variable, unreachable-branch, ",
+        "duplicate-export, duplicate-import, empty-block, insecure-data-origin, ",
+        "legacy-interpolation, literal-credential-header, literal-directive, ",
+        "redundant-else, shadow-variable, unreachable-branch, ",
         "unused-function, unused-import, unused-variable"
     );
 
@@ -9253,4 +9255,69 @@ fn stdin_where_the_working_directory_is_gone_fails_in_the_words_build_uses() {
         },
         "control: where the working directory exists"
     );
+}
+
+/// TP-100: the data rules report a literal credential header and an http request map
+/// URL through the CLI, with no header value in the JSON output. Lint sends no request.
+/// Control: the secret form and an https URL give no data rule finding.
+#[test]
+fn data_rules_report_a_literal_credential_header_and_an_http_url() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("main.mds");
+    let source = "---\ndata:\n  feed:\n    url: http://127.0.0.1:9/x\n    headers:\n      X-Auth-Token: planted-value\n---\n{{feed}}\n";
+    fs::write(&file, source).unwrap();
+    // The checks for the value come first, with fixed messages: `lint_json` and
+    // `json_diagnostics` print the output when they fail. The second check covers a value
+    // that the JSON text escapes.
+    let out = lint_path(&file, &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("planted-value"),
+        "the lint output must not show the header value"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("lint --format json must emit valid JSON");
+    assert!(
+        !json.to_string().contains("planted-value"),
+        "the decoded lint output must not show the header value"
+    );
+    assert_eq!(json["version"], 1, "the JSON version must be 1");
+    let mut found: Vec<(String, String)> = json_diagnostics(&json, "data rules")
+        .iter()
+        .map(|d| {
+            (
+                d["rule"].as_str().unwrap().to_owned(),
+                d["message"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        [
+            (
+                "insecure-data-origin".to_owned(),
+                "Data entry 'feed' requests an http URL.".to_owned()
+            ),
+            (
+                "literal-credential-header".to_owned(),
+                "Data entry 'feed' sets the credential header 'X-Auth-Token' to literal text."
+                    .to_owned()
+            ),
+        ],
+        "lint must report the two data rules"
+    );
+
+    let safe = source
+        .replace("http://127.0.0.1:9/x", "https://a.example/x")
+        .replace("planted-value", "{secret: TOKEN, prefix: ''}");
+    fs::write(&file, safe).unwrap();
+    let (json, _) = lint_json(&file, "control");
+    let files = json["files"].as_array().unwrap();
+    let rules: Vec<&str> = files
+        .iter()
+        .flat_map(|f| f["diagnostics"].as_array().into_iter().flatten())
+        .filter_map(|d| d["rule"].as_str())
+        .collect();
+    assert!(rules.is_empty(), "control: {rules:?}");
 }

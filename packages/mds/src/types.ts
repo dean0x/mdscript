@@ -271,7 +271,9 @@ export type LintRuleName =
   | 'duplicate-export'
   | 'duplicate-import'
   | 'empty-block'
+  | 'insecure-data-origin'
   | 'legacy-interpolation'
+  | 'literal-credential-header'
   | 'literal-directive'
   | 'redundant-else'
   | 'shadow-variable'
@@ -295,7 +297,9 @@ export const LINT_RULE_NAMES: readonly LintRuleName[] = [
   'duplicate-export',
   'duplicate-import',
   'empty-block',
+  'insecure-data-origin',
   'legacy-interpolation',
+  'literal-credential-header',
   'literal-directive',
   'redundant-else',
   'shadow-variable',
