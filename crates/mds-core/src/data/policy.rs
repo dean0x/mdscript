@@ -459,8 +459,11 @@ impl NetworkPolicy {
     }
 
     /// The value of the host secret `name` for a request to `origin`. The secret must
-    /// exist and name that exact origin, which is always an `https` origin.
-    pub(crate) fn bind_secret(&self, name: &str, origin: &Origin) -> Result<&SecretValue, Refusal> {
+    /// exist and name that exact origin, which is always an `https` origin. The core
+    /// binds each secret header with it, and a sender binds it again before it writes
+    /// the header.
+    #[must_use = "a secret binding can be refused"]
+    pub fn bind_secret(&self, name: &str, origin: &Origin) -> Result<&SecretValue, Refusal> {
         let Some(secret) = self.secrets.iter().find(|secret| secret.name == name) else {
             return Err(Refusal::new(
                 Layer::SecretBinding,

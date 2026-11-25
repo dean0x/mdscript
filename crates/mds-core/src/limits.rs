@@ -346,7 +346,7 @@ pub(crate) const MAX_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
 /// redirect.
 pub(crate) const MAX_REDIRECTS: usize = 5;
 
-/// Maximum time of one request, from the connect to the end of the response read: 10 s.
+/// Maximum time of one request, from the name lookup to the end of the response read: 10 s.
 /// The fetcher applies it to each request. `COMPILE_DEADLINE` binds first when less
 /// time is left in the compile.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);

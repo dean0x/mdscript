@@ -122,8 +122,8 @@ pub enum TransportFailure {
     Timeout,
     Connect,
     Tls,
-    /// Each address of the host is in a refused range: see
-    /// [`NetworkPolicy::check_address`].
+    /// An address that the name lookup gave is in a refused range: see
+    /// [`NetworkPolicy::check_address`]. One such address fails the request.
     AddressRefused,
     /// The body is longer than 10 MiB.
     BodyTooLarge,

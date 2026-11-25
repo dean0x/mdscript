@@ -3126,3 +3126,23 @@ fn step_api_exists() {
             (&input.module, &input.entry, &input.template, &input.origin);
     }
 }
+
+/// #405: a host sender binds a secret header through the policy again before it writes
+/// the header. A secret binds only for its own name and the one origin of the secret.
+#[test]
+fn secret_binding_api_exists() {
+    let item = mds::AllowItem::parse("api.example").unwrap();
+    let origin = item.origin();
+    let other = mds::AllowItem::parse("other.example").unwrap().origin();
+    let value = mds::SecretValue::new("planted-value".into()).unwrap();
+    let policy = mds::NetworkPolicy::new(vec![item])
+        .unwrap()
+        .with_secret(mds::Secret::new("token", value, origin.clone()).unwrap())
+        .unwrap();
+    let bound: &mds::SecretValue = policy.bind_secret("token", &origin).unwrap();
+    assert_eq!(bound.expose_for_send(), "planted-value");
+    for (name, at) in [("token", &other), ("missing", &origin)] {
+        let refusal: mds::Refusal = policy.bind_secret(name, at).unwrap_err();
+        assert_eq!(refusal.layer(), mds::Layer::SecretBinding, "{name}");
+    }
+}

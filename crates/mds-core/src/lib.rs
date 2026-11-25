@@ -466,7 +466,7 @@ pub const MAX_RESPONSE_BYTES: u64 = limits::MAX_RESPONSE_BYTES;
 /// Maximum bytes of the status line and the headers of one response: 16 KiB.
 pub const MAX_RESPONSE_HEADER_BYTES: usize = limits::MAX_RESPONSE_HEADER_BYTES;
 
-/// Maximum time of one request, from the connect to the end of the response read: 10 s.
+/// Maximum time of one request, from the name lookup to the end of the response read: 10 s.
 pub const REQUEST_TIMEOUT: std::time::Duration = limits::REQUEST_TIMEOUT;
 
 /// Maximum time of the network work of one compile, over all of its rounds: 30 s.
