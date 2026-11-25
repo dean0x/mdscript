@@ -291,8 +291,9 @@ function fileNotFoundError(shown: string): PathError {
  * - through a frontmatter import, `mds::file_not_found` becomes `mds::import`
  *   (`file not found: "<path>" (in frontmatter imports[<i>])`), and an `mds::import`
  *   error not already placed in a frontmatter gets ` (in frontmatter imports[<i>])`;
- * - through `@extends`, `@import` or `@export … from`, `mds::file_not_found` names
- *   the import as written and points at its directive.
+ * - through `@extends`, `@import` or `@export … from`, `mds::file_not_found` points at
+ *   the directive and keeps the path it names: the import as written when the import
+ *   itself is missing, or a missing data file that the imported module declares (#531).
  * Every other engine error passes through unchanged.
  */
 function withImportContext(err: unknown, record: ImportRecord): unknown {
@@ -315,7 +316,7 @@ function withImportContext(err: unknown, record: ImportRecord): unknown {
     return parts.detail.includes('in frontmatter') ? err : importError(`${parts.detail}${where}`);
   }
   if (record.span !== null && parts.code === 'mds::file_not_found') {
-    const located = fileNotFoundError(record.path);
+    const located = fileNotFoundError(parts.shown);
     located.span = { ...record.span };
     return located;
   }

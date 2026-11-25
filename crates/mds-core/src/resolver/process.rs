@@ -280,7 +280,7 @@ impl DataGraphWalk<'_> {
                 )
             })();
             if let Some(offset) = offset {
-                result.map_err(|err| super::attach_import_span(err, path, &display, source, offset))
+                result.map_err(|err| super::attach_import_span(err, &display, source, offset))
             } else {
                 result
             }

@@ -4390,13 +4390,7 @@ fn attach_import_span_non_boundary_offset_degrades_to_zero_len_span() {
     // promoted: promoting it would make the release branch below panic as well, which
     // is exactly the degradation this test exists to forbid.
     let caught = std::panic::catch_unwind(|| {
-        attach_import_span(
-            MdsError::file_not_found("./x.mds"),
-            "./x.mds",
-            "<child>",
-            "é\n",
-            1,
-        )
+        attach_import_span(MdsError::file_not_found("./x.mds"), "<child>", "é\n", 1)
     });
 
     if cfg!(debug_assertions) {
@@ -4438,13 +4432,7 @@ fn attach_import_span_out_of_range_offset_on_empty_source_degrades() {
     // An empty source is `MdsError::at()`'s documented exemption, so no canary fires in
     // either profile: the only thing that could panic here is the raw `source[offset..]`
     // slice this site used to perform.
-    let err = attach_import_span(
-        MdsError::file_not_found("./x.mds"),
-        "./x.mds",
-        "<child>",
-        "",
-        1,
-    );
+    let err = attach_import_span(MdsError::file_not_found("./x.mds"), "<child>", "", 1);
     match err {
         MdsError::FileNotFound { span, src, .. } => {
             let span = span.expect("the numeric offset must survive the degradation");
@@ -4461,13 +4449,7 @@ fn attach_import_span_valid_offset_spans_whole_directive_and_passes_other_errors
     // Positive control: a trustworthy offset must still underline the whole directive
     // and still carry the snippet, so the degradation above is not a blanket downgrade.
     let source = "@import \"./x.mds\"\nnext\n";
-    let err = attach_import_span(
-        MdsError::file_not_found("./x.mds"),
-        "./x.mds",
-        "child.mds",
-        source,
-        0,
-    );
+    let err = attach_import_span(MdsError::file_not_found("./x.mds"), "child.mds", source, 0);
     match err {
         MdsError::FileNotFound { span, src, .. } => {
             let span = span.expect("a valid offset must produce a span");
@@ -4486,7 +4468,7 @@ fn attach_import_span_valid_offset_spans_whole_directive_and_passes_other_errors
     }
 
     // Control: variants outside the three span-attaching arms are returned unchanged.
-    let passthrough = attach_import_span(MdsError::syntax("x"), "./x.mds", "child.mds", source, 0);
+    let passthrough = attach_import_span(MdsError::syntax("x"), "child.mds", source, 0);
     match passthrough {
         MdsError::Syntax { message, span, src } => {
             assert_eq!(message, "x", "the message must be untouched");

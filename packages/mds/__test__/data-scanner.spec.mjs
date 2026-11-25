@@ -792,7 +792,7 @@ describe('WASM backend data pre-scanner (#405)', () => {
       await put(root, 'a.json', '"Ada"');
       // The engine splits the key `a\..\missing.json` at `\` and sees a `..` segment.
       const missing = await put(root, 'missing.mds', dataModule({ d: './a\\..\\missing.json' }, '{{d}}\n'));
-      // The same module reached through an import: native names the import.
+      // The same module reached through an import names the data file at the import (#531).
       const imported = await put(root, 'imports.mds', '@import "./missing.mds" as m\nHi\n');
       // Control: the same form names a file that is there on Windows.
       const control = await put(root, 'control.mds', dataModule({ d: './a\\..\\a.json' }, '{{d}}\n'));
@@ -804,7 +804,7 @@ describe('WASM backend data pre-scanner (#405)', () => {
         span: null,
       });
       assert.deepEqual(native[0], notFound('./a\\..\\missing.json'));
-      assert.deepEqual({ ...native[1], span: null }, notFound('./missing.mds'));
+      assert.deepEqual({ ...native[1], span: null }, notFound('./a\\..\\missing.json'));
       assert.notEqual(native[1].span, null, 'native gives the import its span');
       assert.deepEqual(native[2], onWindows ? { output: 'Ada\n' } : notFound('./a\\..\\a.json'));
     });

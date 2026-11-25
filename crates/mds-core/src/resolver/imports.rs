@@ -111,9 +111,7 @@ impl ModuleCache {
                 // so path validation errors surface with correct messages automatically.
                 let source_module = self
                     .resolve_import_from(ctx, import_path, Some(ctx.import_site(*offset)), warnings)
-                    .map_err(|e| {
-                        attach_import_span(e, import_path, ctx.file_str, ctx.source, *offset)
-                    })?;
+                    .map_err(|e| attach_import_span(e, ctx.file_str, ctx.source, *offset))?;
                 let func = source_module.get_export(name).ok_or_else(|| {
                     MdsError::export_error(format!(
                         "cannot re-export '{name}': not exported from \"{import_path}\""
@@ -132,9 +130,7 @@ impl ModuleCache {
                 // so path validation errors surface with correct messages automatically.
                 let source_module = self
                     .resolve_import_from(ctx, import_path, Some(ctx.import_site(*offset)), warnings)
-                    .map_err(|e| {
-                        attach_import_span(e, import_path, ctx.file_str, ctx.source, *offset)
-                    })?;
+                    .map_err(|e| attach_import_span(e, ctx.file_str, ctx.source, *offset))?;
                 let line_len = line_len_at(ctx.source, *offset);
                 for (name, func) in source_module.get_all_exports() {
                     if defs.functions.contains_key(&name) {
@@ -174,7 +170,7 @@ impl ModuleCache {
         }
         let resolved = self
             .resolve_import_from(ctx, path, Some(ctx.import_site(offset)), warnings)
-            .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
+            .map_err(|e| attach_import_span(e, ctx.file_str, ctx.source, offset))?;
         scope.set_namespace(alias, resolved.shared_namespace());
         Ok(())
     }
@@ -250,7 +246,7 @@ impl ModuleCache {
     ) -> Result<(), MdsError> {
         let resolved = self
             .resolve_import_from(ctx, path, Some(ctx.import_site(offset)), warnings)
-            .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
+            .map_err(|e| attach_import_span(e, ctx.file_str, ctx.source, offset))?;
         // Per spec: only functions and the prompt body are imported via merge.
         // Frontmatter variables from the imported module are NOT brought into scope.
         let line_len = line_len_at(ctx.source, offset);
@@ -281,7 +277,7 @@ impl ModuleCache {
     ) -> Result<(), MdsError> {
         let resolved = self
             .resolve_import_from(ctx, path, Some(ctx.import_site(offset)), warnings)
-            .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
+            .map_err(|e| attach_import_span(e, ctx.file_str, ctx.source, offset))?;
         let line_len = line_len_at(ctx.source, offset);
         let not_exported = |name: &str| {
             MdsError::import_error_at(
