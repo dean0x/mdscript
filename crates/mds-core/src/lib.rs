@@ -2172,7 +2172,8 @@ pub struct ImportRecord {
     pub frontmatter_index: Option<usize>,
     /// For `@extends`, `@import` and `@export … from`, the span a
     /// `mds::file_not_found` or `mds::not_mds` error for the path points at:
-    /// the whole directive line. `None` for a frontmatter import.
+    /// the whole directive line. A missing data file of the imported module gets
+    /// this span too. `None` for a frontmatter import.
     pub span: Option<SerializedSpan>,
 }
 
@@ -2206,7 +2207,8 @@ pub enum ResolveAs {
 /// in the resolver's own terms:
 ///
 /// - `@extends`, `@import` and `@export … from`: a `mds::file_not_found` or
-///   `mds::not_mds` error for the path gets [`ImportRecord::span`], the directive's line;
+///   `mds::not_mds` error for the path gets [`ImportRecord::span`], the directive's line,
+///   and so does a missing data file of the imported module, named as that module writes it;
 /// - a frontmatter import: a file, module, cycle or import error with no span becomes
 ///   `mds::import`, with `(in frontmatter imports[<i>])` appended
 ///   ([`ImportRecord::frontmatter_index`]); a `mds::not_mds` error stays spanless.

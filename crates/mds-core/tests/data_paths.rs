@@ -174,6 +174,38 @@ fn native_and_virtual_data_misses_name_the_file() {
     }
 }
 
+/// A compile names a missing data file as the declaring module writes it, also when an
+/// import reached that module: the import adds its span and keeps the data file's name.
+/// Controls: the entry's own miss has no span, and a missing module still names the
+/// import as written.
+#[test]
+fn a_data_miss_in_an_imported_module_names_the_data_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let declares = b"---\ndata:\n  item: ./absent.json\n---\n{{item}}\n";
+    put(root, ".mdsroot", b"");
+    put(root, "entry.mds", declares);
+    put(root, "sub/m.mds", declares);
+    let import = "@import \"./sub/m.mds\" as m";
+    put(root, "main.mds", format!("{import}\nHi\n").as_bytes());
+    put(root, "gone.mds", b"@import \"./sub/gone.mds\" as g\nHi\n");
+    for (entry, message, spanned) in [
+        ("entry.mds", "file not found: ./absent.json", false),
+        ("main.mds", "file not found: ./absent.json", true),
+        ("gone.mds", "file not found: ./sub/gone.mds", true),
+    ] {
+        let error = mds::compile_with_deps(root.join(entry), None).unwrap_err();
+        let serialized = error.serialize();
+        assert_eq!(serialized.code, "mds::file_not_found", "{entry}: {error}");
+        assert_eq!(serialized.message, message, "{entry}");
+        let span = serialized.span.map(|span| (span.offset, span.line));
+        assert_eq!(span.is_some(), spanned, "{entry}: {span:?}");
+        if spanned {
+            assert_eq!(span, Some((0, Some(1))), "{entry}");
+        }
+    }
+}
+
 #[test]
 fn virtual_aliases_must_not_hide_a_blocked_key() {
     let fs = VirtualFs::new(HashMap::from([

@@ -27,7 +27,10 @@ export interface ImportRecord {
   readonly kind: 'extends' | 'frontmatter' | 'import' | 'export-from' | 'data';
   /** A frontmatter import's position in the `imports:` list: `(in frontmatter imports[<i>])`. */
   readonly frontmatterIndex: number | null;
-  /** For `@extends` and `@import`, the span a `mds::file_not_found` error for the path carries. */
+  /**
+   * For `@extends` and `@import`, the span a `mds::file_not_found` error for the path carries.
+   * A missing data file of the imported module carries this span too.
+   */
   readonly span: MdsErrorSpan | null;
 }
 

@@ -327,11 +327,11 @@ impl ModuleCache {
     ) -> Result<ExtendsComponents, MdsError> {
         // ── Step 3a: validate and resolve the base in skeleton mode ──────────
         validate_import_path(&ext.path)
-            .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
+            .map_err(|e| attach_import_span(e, ctx.file_str, ctx.source, ext.offset))?;
 
         let base_key = self
             .normalize_module_edge(ctx, &ext.path)
-            .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
+            .map_err(|e| attach_import_span(e, ctx.file_str, ctx.source, ext.offset))?;
 
         // PF-004 (avoids PF-004): resolve through resolve_by_key_skeleton so cycle
         // detection, MAX_IMPORT_DEPTH, dependency tracking, and MAX_FILE_SIZE all apply.
@@ -347,7 +347,7 @@ impl ModuleCache {
                 ctx.import_site(ext.offset),
                 warnings,
             )
-            .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
+            .map_err(|e| attach_import_span(e, ctx.file_str, ctx.source, ext.offset))?;
 
         // ── Step 3b: child-only-blocks check ─────────────────────────────────
         // Every top-level node in module.body must be Node::Block or whitespace-only Text.
@@ -655,10 +655,10 @@ impl ModuleCache {
     > {
         let (own_fm, own_fm_bytes) = own_frontmatter;
         validate_import_path(&ext.path)
-            .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
+            .map_err(|e| attach_import_span(e, ctx.file_str, ctx.source, ext.offset))?;
         let grandparent_key = self
             .normalize_module_edge(ctx, &ext.path)
-            .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
+            .map_err(|e| attach_import_span(e, ctx.file_str, ctx.source, ext.offset))?;
         let grandparent_ref = ModuleRef {
             key: &grandparent_key,
             typed: &ext.path,
@@ -670,7 +670,7 @@ impl ModuleCache {
                 ctx.import_site(ext.offset),
                 warnings,
             )
-            .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
+            .map_err(|e| attach_import_span(e, ctx.file_str, ctx.source, ext.offset))?;
 
         // Child-only-blocks check for this intermediate base (3b).
         check_child_only_blocks(module_body, ctx)?;

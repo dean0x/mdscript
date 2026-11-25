@@ -69,6 +69,9 @@ const MAX_PATH_SEGMENTS: usize = 256;
 /// - **Segment cap**: `resolve_entry` and `normalize_in_dir` must refuse a path
 ///   of more than 256 segments with [`MdsError::ResourceLimit`]. Both built-in
 ///   backends enforce it on entry paths and on imports.
+/// - **Missing-file paths**: an [`MdsError::FileNotFound`] that the backend returns
+///   names its `path` in the error text as given (#531). Use the path as the caller
+///   wrote it, never a host path.
 /// - **File size limits**: `read` must refuse content larger than
 ///   [`crate::MAX_FILE_SIZE`] bytes (10 MB) to prevent resource exhaustion.
 /// - **Base directories**: a backend whose keys are host paths must override

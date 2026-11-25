@@ -27,7 +27,7 @@ pub struct ExtendsDirective {
     ///
     /// The resolver uses this to attach precise error spans when the base file is not
     /// found or when a stray `@extends` occurs mid-file, via
-    /// `attach_import_span(e, path, file, source, ext.offset)`.
+    /// `attach_import_span(e, file, source, ext.offset)`.
     pub offset: usize,
 }
 

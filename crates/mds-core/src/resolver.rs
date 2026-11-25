@@ -907,13 +907,9 @@ impl Default for ModuleCache {
 
 /// Attach the importing directive's span to a spanless file, module, or cycle error.
 /// Keep an existing span so errors inside another module retain their own source.
-fn attach_import_span(
-    err: MdsError,
-    path: &str,
-    file_str: &str,
-    source: &str,
-    offset: usize,
-) -> MdsError {
+/// Keep the path a spanless file error names: the import as written when the import
+/// itself is missing, or a missing data file that the imported module declares.
+fn attach_import_span(err: MdsError, file_str: &str, source: &str, offset: usize) -> MdsError {
     // Compute the span length as the number of bytes from `offset` to the
     // end of the `@import` line (not including the newline character itself),
     // so the whole directive is underlined. A non-boundary or out-of-range
@@ -923,9 +919,9 @@ fn attach_import_span(
     // the snippet rather than mis-attributing.
     let line_len = line_len_at(source, offset);
     match err {
-        MdsError::FileNotFound { span: None, .. } => {
-            MdsError::file_not_found_at(path, file_str, source, offset, line_len)
-        }
+        MdsError::FileNotFound {
+            path, span: None, ..
+        } => MdsError::file_not_found_at(path, file_str, source, offset, line_len),
         MdsError::ModuleNotFound {
             key, span: None, ..
         } => MdsError::module_not_found_at(key, file_str, source, offset, line_len),
