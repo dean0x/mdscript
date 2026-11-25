@@ -1383,8 +1383,11 @@ async function readFile(
  *   UTF-8, checked by the engine's own `preflightData`;
  * - at most 256 distinct data files and 32 MiB of data text in one compile, counted
  *   apart from the modules (`mds::resource_limit`, `too many data files (max 256 per
- *   compile)`, `data files exceed 33554432 bytes per compile`). Once a bound is reached,
- *   no further data file is read.
+ *   compile)`, `data files exceed 33554432 bytes per compile`). Once the walk reaches a
+ *   bound, it reads no further data file, and no read ahead of the walk starts one. A
+ *   read ahead that started before then can still read a data file that comes after the
+ *   bound in walk order, within the read-ahead window and byte budget described below.
+ *   The walk uses none of these files.
  * A data file is keyed by its canonical path below the project root, and a path the
  * engine resolves to another key is listed in `aliases`, as for a module. A module whose
  * `data:` declarations the engine refuses — more than 64 entries, an entry with more
@@ -1536,7 +1539,10 @@ export async function buildModulesMap(
   /** The data refusals that `walkData` throws with their whole context: no walk adds more. */
   const dataRefusalsInContext = new WeakSet<object>();
   let dataBytes = 0;
-  /** The refusal of the first data bound the scan reached: no data file is read after it. */
+  /**
+   * The refusal of the first data bound the walk reached: after it, the walk reads no data
+   * file and no read ahead starts one.
+   */
   let dataBound: (() => PathError) | undefined;
   const limit = concurrencyLimit(MAX_CONCURRENT_OPENS);
   /** Every read-ahead started and not yet settled. */
