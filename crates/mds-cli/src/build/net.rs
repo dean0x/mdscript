@@ -609,7 +609,7 @@ mod tests {
     }
 
     /// The wait of [`SlowServer`] before each answer.
-    const ANSWER_WAIT: Duration = Duration::from_millis(150);
+    const ANSWER_WAIT: Duration = Duration::from_millis(600);
     /// The poll interval of [`SlowServer`] and of the wait for its end.
     const POLL: Duration = Duration::from_millis(5);
 
@@ -697,8 +697,9 @@ mod tests {
 
     /// One deadline binds the network work of a compile from its first send, so round 2
     /// gets only the time that is left. `b` reads `a`, so it is sent in round 2, and the
-    /// listener answers each request 150 ms after it. With a 250 ms deadline, `a` passes
-    /// and `b` fails with the timeout. Control: with a 2 s deadline the chain renders.
+    /// listener answers each request 600 ms after it. With a 900 ms deadline, `a` passes
+    /// (300 ms of slack for a slow runner) and `b` fails with the timeout, because at most
+    /// 300 ms are left for it. Control: with a 5 s deadline the chain renders.
     #[test]
     fn round_two_gets_only_the_time_left_of_the_compile_deadline() {
         let chain = |deadline: Duration| {
@@ -715,7 +716,7 @@ mod tests {
             (item, result, server.stop())
         };
 
-        let (_, result, lines) = chain(Duration::from_secs(2));
+        let (_, result, lines) = chain(Duration::from_secs(5));
         assert_eq!(
             result.unwrap().output,
             mds::CompiledOutput::Markdown("1\n".into()),
@@ -723,7 +724,7 @@ mod tests {
         );
         assert_eq!(lines.len(), 2, "control: the listener gets a and b");
 
-        let (item, result, lines) = chain(Duration::from_millis(250));
+        let (item, result, lines) = chain(Duration::from_millis(900));
         let error = result.unwrap_err();
         assert_eq!(code(&error), "mds::network");
         let text = error.to_string();
