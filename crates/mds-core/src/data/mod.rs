@@ -2,10 +2,6 @@
 
 mod convert;
 pub(crate) mod decl;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the request identity is the first caller")
-)]
 pub(crate) mod digest;
 #[cfg_attr(
     not(test),
@@ -16,6 +12,7 @@ pub(crate) mod graph;
 pub(crate) mod path;
 pub(crate) mod policy;
 mod refs;
+pub(crate) mod request;
 pub(crate) mod resolve;
 pub(crate) mod url;
 
@@ -31,5 +28,7 @@ mod digest_tests;
 mod encode_tests;
 #[cfg(test)]
 mod policy_tests;
+#[cfg(test)]
+mod request_tests;
 #[cfg(test)]
 mod url_tests;

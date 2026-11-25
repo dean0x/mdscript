@@ -3009,3 +3009,38 @@ fn network_policy_api_exists() {
     let error: &dyn std::error::Error = &error;
     assert_eq!(error.to_string(), "an allow list needs at least one item");
 }
+
+/// #405: the request types are reachable from the crate root. The core builds each
+/// `Request`, so its accessors are pinned by type here; `RequestId` has a strict hex
+/// form, and `RunKey` hides its bytes from `Debug`.
+#[test]
+fn request_identity_api_exists() {
+    fn accessors(request: &mds::Request) -> (mds::RequestId, mds::Method, String) {
+        let url: &mds::CheckedUrl = request.url();
+        let _: (mds::Origin, &str, Option<&str>) = (url.origin(), url.path(), url.query());
+        for header in request.headers() {
+            let _: &str = header.name();
+            match header.value() {
+                mds::HeaderValue::Text(_) | mds::HeaderValue::Secret { .. } => {}
+                _ => {}
+            }
+        }
+        (request.id(), request.method(), url.to_text())
+    }
+    let _ = accessors;
+
+    assert!(!format!("{:?}", mds::RunKey::from_bytes([7; 32])).contains('7'));
+    match mds::Method::Head {
+        mds::Method::Get => panic!("unexpected method"),
+        other => assert_eq!(other.as_str(), "HEAD"),
+    }
+    let text = "0123456789abcdef".repeat(4);
+    let id = mds::RequestId::parse_hex(&text).unwrap();
+    assert_eq!(id.as_hex(), text);
+    let error: mds::RequestIdError = mds::RequestId::parse_hex("remote").unwrap_err();
+    let error: &dyn std::error::Error = &error;
+    assert_eq!(
+        error.to_string(),
+        "a request ID is 64 lower-case hex digits"
+    );
+}

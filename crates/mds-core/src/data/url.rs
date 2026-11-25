@@ -71,8 +71,12 @@ impl fmt::Display for Host {
 
 /// A URL that passed the strict parser. It has no `Display`, so a message can not show
 /// its path or query by accident: a message shows the [`Origin`] only.
+///
+/// Obtain a URL from [`Request::url`](crate::Request::url). This type is
+/// `#[non_exhaustive]` and cannot be built with a struct literal.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CheckedUrl {
+pub struct CheckedUrl {
     pub(crate) scheme: Scheme,
     pub(crate) host: Host,
     /// The port as written. `None` means the default port of the scheme.
@@ -84,12 +88,38 @@ pub(crate) struct CheckedUrl {
 }
 
 impl CheckedUrl {
-    pub(crate) fn origin(&self) -> Origin {
+    /// The scheme, host and port. A URL with no port has the default port.
+    #[must_use]
+    pub fn origin(&self) -> Origin {
         Origin {
             scheme: self.scheme,
             host: self.host.clone(),
             port: self.port.unwrap_or(self.scheme.default_port()),
         }
+    }
+
+    /// The path. It starts with `/`.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// The text after the first `?`, if the URL has one.
+    #[must_use]
+    pub fn query(&self) -> Option<&str> {
+        self.query.as_deref()
+    }
+
+    /// The URL text that a request sends: the origin (with no default port), the path
+    /// and the query. Never put it in a message: a message shows the origin only.
+    #[must_use]
+    pub fn to_text(&self) -> String {
+        let mut text = format!("{}{}", self.origin(), self.path);
+        if let Some(query) = &self.query {
+            text.push('?');
+            text.push_str(query);
+        }
+        text
     }
 }
 

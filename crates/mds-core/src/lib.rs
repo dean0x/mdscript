@@ -68,7 +68,10 @@ pub(crate) mod verbatim;
 pub use data::policy::{
     AllowItem, Layer, NarrowError, NetworkPolicy, PolicyError, Refusal, Secret, SecretValue,
 };
-pub use data::url::{Host, Origin, Scheme};
+pub use data::request::{
+    HeaderValue, Method, Request, RequestHeader, RequestId, RequestIdError, RunKey,
+};
+pub use data::url::{CheckedUrl, Host, Origin, Scheme};
 pub use formatter::{format_str, format_str_named, format_str_with};
 pub use fs::{
     check_module_bytes, effective_parent, read_at_most, reject_forbidden_path, EntryPin,
