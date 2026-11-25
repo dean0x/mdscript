@@ -1452,7 +1452,7 @@ fn engine_reach_findings(path: &str, text: &str) -> Vec<String> {
         for (index, line) in code.lines().enumerate() {
             let names = ENGINE_NAMES
                 .iter()
-                .chain(Some(&"ctx.start(").filter(|_| path != "lib.rs"));
+                .chain((path != "lib.rs").then_some(&"ctx.start("));
             for name in names {
                 if has_name(line, name) {
                     findings.push(format!("{path}:{}: {name}", index + 1));
