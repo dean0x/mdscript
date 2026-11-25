@@ -664,8 +664,10 @@ The local pre-flight command runs all four checks.
   and on pushes to `main`. The verifier requires the GitHub Actions check run with this exact name.
   The license check accepts only the allowed licenses and crate exceptions.
   The bans check rejects wildcard requirements and duplicate or unused workspace dependency declarations.
-  Duplicate crate versions give a warning only. The checked graph has four duplicate
-  pairs with skips: `syn`, `unicode-width`, `windows-sys`, and `wit-bindgen`.
+  Duplicate crate versions give a warning only. The checked graph has six skips for
+  older versions: `syn`, `unicode-width`, `windows-sys` 0.52 and 0.60, `wit-bindgen`,
+  and `getrandom`. One tree skip covers `windows-targets` 0.52 and its eight
+  `windows_*` target crates.
   The sources check rejects dependencies from Git or registries other than crates.io.
 - `Rust — cargo-deny advisories` runs in `.github/workflows/deny-advisories.yml`.
   It runs daily at 04:23 UTC, on manual dispatch, and on pull requests that change
