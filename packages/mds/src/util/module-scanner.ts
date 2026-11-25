@@ -626,12 +626,24 @@ function dataPathError(shown: string, reason: string): PathError {
 }
 
 /**
+ * Whether native `check_segments` drops a trailing dot or space from a segment before its
+ * `node_modules` test: on Windows, which drops them from a name. The wasm32 engine never
+ * does.
+ */
+const TRIMS_SEGMENTS = sep === '\\';
+
+/**
  * The segment refusal of a data path, if any — Rust `check_segments`. It splits at `/`
  * and `\` on every OS. A segment that starts with `.` is refused, except `.` and `..`
- * when `allowRelative`. A `node_modules` segment is refused in any ASCII case; on Windows
- * a trailing dot or space does not hide one, as Windows drops them from a name.
+ * when `allowRelative`. A `node_modules` segment is refused in any ASCII case; with
+ * `trimsSegments` a trailing dot or space does not hide one.
  */
-function dataSegmentRefusal(path: string, shown: string, allowRelative: boolean): PathError | undefined {
+function dataSegmentRefusal(
+  path: string,
+  shown: string,
+  allowRelative: boolean,
+  trimsSegments: boolean,
+): PathError | undefined {
   for (const written of path.split(/[/\\]/)) {
     if (allowRelative && (written === '.' || written === '..')) {
       continue;
@@ -640,7 +652,7 @@ function dataSegmentRefusal(path: string, shown: string, allowRelative: boolean)
       return dataPathError(shown, 'dot-prefixed segments are not allowed');
     }
     let end = written.length;
-    while (sep === '\\' && end > 0 && (written[end - 1] === '.' || written[end - 1] === ' ')) {
+    while (trimsSegments && end > 0 && (written[end - 1] === '.' || written[end - 1] === ' ')) {
       end -= 1;
     }
     if (eqIgnoreAsciiCase(written.slice(0, end), 'node_modules')) {
@@ -650,17 +662,8 @@ function dataSegmentRefusal(path: string, shown: string, allowRelative: boolean)
   return undefined;
 }
 
-/**
- * The refusal of a data path as written, if any — Rust `data::path::normalize` before it
- * resolves the path, with its checks in its order: `validate_relative_import`
- * (`relativeImportError`), the `./` or `../` prefix, no `{{`, the exact `.json`, `.yaml`
- * or `.yml` extension, then the segment rule. `crates/mds-core/tests/fixtures/data-path-vectors.json`
- * is the table both sides share. The engine runs this same rule when the compile binds
- * the entry, so the scanner reads no file it refuses and leaves the error to the engine.
- *
- * @internal
- */
-export function dataPathRefusal(path: string): PathError | undefined {
+/** The rule of `dataPathRefusal`, with the segment trim of `trimsSegments`. */
+function dataStringRefusal(path: string, trimsSegments: boolean): PathError | undefined {
   const relativeErr = relativeImportError(path);
   if (relativeErr !== undefined) {
     return relativeErr;
@@ -674,7 +677,39 @@ export function dataPathRefusal(path: string): PathError | undefined {
   if (!isDataPath(path)) {
     return dataPathError(path, 'expected the .json, .yaml or .yml extension');
   }
-  return dataSegmentRefusal(path, path, true);
+  return dataSegmentRefusal(path, path, true, trimsSegments);
+}
+
+/**
+ * The refusal of a data path as written, if any — Rust `data::path::normalize` on this OS
+ * before it resolves the path, with its checks in its order: `validate_relative_import`
+ * (`relativeImportError`), the `./` or `../` prefix, no `{{`, the exact `.json`, `.yaml`
+ * or `.yml` extension, then the segment rule. `crates/mds-core/tests/fixtures/data-path-vectors.json`
+ * is the table both sides share. The scanner reads no file that this rule refuses. The
+ * wasm32 engine runs the same rule with no Windows trim when the compile binds the entry
+ * (`dataAliasKey`).
+ *
+ * @internal
+ */
+export function dataPathRefusal(path: string): PathError | undefined {
+  return dataStringRefusal(path, TRIMS_SEGMENTS);
+}
+
+/**
+ * The refusal that the WASM engine gives the lexical data key `key` of the path `shown`
+ * before it looks for the key, if any: Rust `check_key` with no project root, as
+ * `data::path::normalize` runs it on VirtualFs, which has no root. It refuses a key that
+ * starts with `/` or `\`, or whose second byte is `:`, and it splits the key at `\` too,
+ * with no Windows trim. Native runs `check_key` on the canonical key below its root, where
+ * these rules do not apply. `reject_forbidden_in_path` runs first there, and a key passes
+ * it: a key holds only characters of its path, which passed the same check.
+ */
+function rootlessDataKeyRefusal(key: string, shown: string): PathError | undefined {
+  // The second byte is `:` only when the first character is one byte, ASCII.
+  if (key.startsWith('/') || key.startsWith('\\') || (key.charCodeAt(0) < 0x80 && key.charCodeAt(1) === 0x3a)) {
+    return dataPathError(shown, 'escapes project directory');
+  }
+  return dataSegmentRefusal(key, shown, false, false);
 }
 
 /** NativeFs's refusal of the 257th distinct data file of a compile (`check_data_file_count`). */
@@ -701,11 +736,16 @@ function dataFileNotFoundMessage(key: string): string {
  * entry replaces, and it reports a refused file when it binds it, in its own error order.
  * So a refused file stays out of the module map, and the engine reports its absence
  * (`mds::module_not_found`, `data file '<key>' is not in the virtual module map`, with no
- * span) at the point where native reads the file. This function gives back the refusal
- * that native makes there.
+ * span) at the point where native reads the file. A key that the engine checks with no
+ * project root and refuses before it looks for it (`rootlessDataKeyRefusal`) gets
+ * `mds::import` with no span, and the scan keeps the refusal under that exact message
+ * too. This function gives back the refusal that native makes there.
  */
 export function restoreDataRefusal(err: unknown, refusals: ReadonlyMap<string, unknown>): unknown {
-  if (!isMdsError(err) || err.code !== 'mds::module_not_found' || err.span !== undefined) {
+  if (!isMdsError(err) || err.span !== undefined) {
+    return err;
+  }
+  if (err.code !== 'mds::module_not_found' && err.code !== 'mds::import') {
     return err;
   }
   return refusals.get(err.message) ?? err;
@@ -759,8 +799,10 @@ export interface BuildModulesMapResult {
   aliases: Record<string, string>;
   /**
    * The refusal of each data file that the scan refused, keyed by the message of the
-   * engine's error for its absence from `modules`. `restoreDataRefusal` gives back the
-   * refusal when the compile reads the file. Empty when the scan reads no data.
+   * engine's error for its absence from `modules`, and also by the message of the engine's
+   * refusal of its key, where the engine refuses that key before it looks for it.
+   * `restoreDataRefusal` gives back the refusal when the compile reads the file. Empty
+   * when the scan reads no data.
    */
   dataRefusals: ReadonlyMap<string, unknown>;
 }
@@ -1096,7 +1138,7 @@ async function locateData(projectRoot: string, importer: Located, path: string):
     throw stringErr;
   }
   const located = await locateImport(projectRoot, importer, path);
-  const keyErr = dataSegmentRefusal(located.key, path, false);
+  const keyErr = dataSegmentRefusal(located.key, path, false, TRIMS_SEGMENTS);
   if (keyErr !== undefined) {
     throw keyErr;
   }
@@ -1106,12 +1148,14 @@ async function locateData(projectRoot: string, importer: Located, path: string):
 /**
  * The key by which a compile reads the data file `path` of the module keyed
  * `importerKey`: the lexical key, before the engine applies an alias. `undefined` when
- * the engine refuses the path before it reads a key — the string rule
- * (`dataPathRefusal`), or a path that climbs above the key root or passes the segment
- * cap (`normalizeVirtualKey`) — with the same refusal as native, when it binds the entry.
+ * the engine refuses the path before it computes a key — the string rule as the wasm32
+ * engine runs it, with no Windows trim, or a path that climbs above the key root or
+ * passes the segment cap (`normalizeVirtualKey`) — with the same refusal as native, when
+ * it binds the entry. A path that only the Windows trim refuses has a key: the engine
+ * looks for it, so the scan keeps native's refusal under it.
  */
 function dataAliasKey(importerKey: string, path: string): string | undefined {
-  if (dataPathRefusal(path) !== undefined) {
+  if (dataStringRefusal(path, false) !== undefined) {
     return undefined;
   }
   try {
@@ -1316,10 +1360,15 @@ async function readFile(
  * native's error when the compile binds the entry. Every other refusal is kept in
  * `dataRefusals` with the context the resolver adds to it, and the file stays out of
  * `modules`. So a compile fails for a data file only where native fails for it, and with
- * native's error, except as difference 10 lists. One more exception: a path whose key is
- * already in the map must name the file of that key. Else the scan throws the alias
- * refusal of a module import, or the path's own refusal, because the engine reads the
- * file of that key for both paths.
+ * native's error, except as differences 10 and 11 list. Native binds the data of an
+ * `@extends` base in the scope of its child, so a refusal there has the context of the
+ * child, not of the `@extends` directive. A refused key stays out of `modules` also when
+ * a later path resolves to it, for example `./missing/../a.json` and then `./lnk/a.json`
+ * through a link `lnk` to `.`: the engine gives back the first refusal, and the scan
+ * keeps the alias refusal of a module import for the later path. One more exception: a
+ * path whose key is already in the map must name the file of that key. Else the scan
+ * throws the alias refusal of a module import, or the path's own refusal, because the
+ * engine reads the file of that key for both paths.
  *
  * The scanner uses `scanImportRecords` for import context (#414, #423).
  * A missing target of `@import`, `@extends` or `@export … from` gets the directive's
@@ -1391,8 +1440,15 @@ async function readFile(
  *    engine's bound of 257 module keys besides the entry, so a project whose modules
  *    besides the entry and such keys are more than 257 together is refused there (the
  *    scan admits at most 256 modules besides the entry). Deliberate: the scan
- *    knows no runtime variable and no entry name. Differences 1, 3, 6 and 9 apply to data
+ *    knows no runtime variable and no entry name. For the same reason, a later path whose
+ *    canonical key is the key of a refused path is refused with `mds::import` where the
+ *    compile binds it and not the refused path. Differences 1, 3, 6 and 9 apply to data
  *    files too.
+ * 11. On POSIX, the WASM backend refuses a local data file whose name starts with `\` or
+ *    has `:` as its second byte, such as `\x.json` or `a:b.json` in the project root,
+ *    which native reads (`mds::import`, `data path "<path>": escapes project directory`).
+ *    The engine checks a data key with no project root (`rootlessDataKeyRefusal`), and an
+ *    alias cannot help where the key is the file's own canonical key.
  */
 export async function buildModulesMap(
   entryPath: string,
@@ -1435,6 +1491,8 @@ export async function buildModulesMap(
   const dataKeys = new Set<string>();
   /** The refusal of each data file the scan refused (`BuildModulesMapResult.dataRefusals`). */
   const dataRefusals = new Map<string, unknown>();
+  /** The data refusals that `walkData` throws with their whole context: no walk adds more. */
+  const dataRefusalsInContext = new WeakSet<object>();
   let dataBytes = 0;
   /** The refusal of the first data bound the scan reached: no data file is read after it. */
   let dataBound: (() => PathError) | undefined;
@@ -1600,7 +1658,11 @@ export async function buildModulesMap(
    * reached as the `@extends` base of another (`asBase`) or for itself. An error
    * resolving an import is reported with the context the resolver adds to it
    * (`withImportContext`); `context` adds the context of the imports that reached this
-   * module. With `readData`, the module's data files follow its imports (`walkData`).
+   * module. With `readData`, the module's data files follow its imports (`walkData`),
+   * and `dataContext` adds the context of their refusals. Native binds the data of an
+   * `@extends` base in the scope of the child that extends it, outside the span of the
+   * `@extends` directive, so a base has the data context of its child; every other
+   * module has its own `context`.
    */
   async function walk(
     located: Located,
@@ -1609,6 +1671,7 @@ export async function buildModulesMap(
     readAheadOutcome: Settled<FileRead> | undefined,
     asBase: boolean,
     context: ImportContext,
+    dataContext: ImportContext,
   ): Promise<void> {
     const { key } = located;
     if (completed.has(key) || walking.has(key)) {
@@ -1642,15 +1705,25 @@ export async function buildModulesMap(
     const imports = slidingWindow(records, MAX_IMPORTS_READ_AHEAD, (record) => startReadAhead(located, record));
     for (const [record, ahead] of imports) {
       if (record.kind === 'data') {
-        await walkData(located, record, await ahead, context);
+        await walkData(located, record, await ahead, dataContext);
         continue;
       }
       const { located: child, read: childRead } = await ahead;
+      const asChildBase = record.kind === 'extends';
       const childContext: ImportContext = (err) => context(withImportContext(err, record));
       try {
-        await walk(unwrap(child), record.path, depth + 1, childRead, record.kind === 'extends', childContext);
+        await walk(
+          unwrap(child),
+          record.path,
+          depth + 1,
+          childRead,
+          asChildBase,
+          childContext,
+          asChildBase ? dataContext : childContext,
+        );
       } catch (err) {
-        throw withImportContext(err, record);
+        // A data refusal thrown below has its whole context already (`walkData`).
+        throw isMdsError(err) && dataRefusalsInContext.has(err) ? err : withImportContext(err, record);
       }
     }
     walking.delete(key);
@@ -1661,9 +1734,9 @@ export async function buildModulesMap(
    * Put the data file of the `data` record `record` of `importer` in `modules`, as a
    * leaf: in walk order, once per canonical key, within the data bounds, with an alias
    * for another spelling of its key. A refusal of a new key is not thrown: it is kept in
-   * `dataRefusals`, with the context the resolver adds to it, and the file stays out of
-   * `modules` (`restoreDataRefusal`). A refusal of a path whose key is already in the map
-   * is thrown, as for a module import.
+   * `dataRefusals`, with the context the resolver adds to it (`context`), and the file
+   * stays out of `modules` (`restoreDataRefusal`). A refusal of a path whose key is
+   * already in the map is thrown with that context, as for a module import.
    */
   async function walkData(
     importer: Located,
@@ -1682,8 +1755,19 @@ export async function buildModulesMap(
       // On POSIX, `./sub/../a.json` and `./a.json` have one key but can name two files,
       // as for a module import. So the path must name that same file (`aliasRefusal`).
       // The key is in the map, so the engine cannot report a refusal of this path:
-      // the refusal is thrown.
-      checkAndRecordAlias(unwrap(ahead.located), record.path);
+      // the refusal is thrown, with the context of its data, and no walk above adds more.
+      try {
+        checkAndRecordAlias(unwrap(ahead.located), record.path);
+      } catch (err) {
+        if (!isMdsError(err)) {
+          throw err;
+        }
+        const placed = context(err);
+        if (isMdsError(placed)) {
+          dataRefusalsInContext.add(placed);
+        }
+        throw placed;
+      }
       return;
     }
     try {
@@ -1701,6 +1785,14 @@ export async function buildModulesMap(
         return;
       }
       if (!dataKeys.has(key)) {
+        // An earlier path that the scan refused has this key as its lexical key. If the
+        // file got into `modules` under it, the engine would bind this file to that path,
+        // and the kept refusal would be lost. So the key stays out: the engine gives back
+        // the first refusal where native gives it, when the compile binds the first path.
+        // This path has no file in the map, so the scan keeps a refusal for it too.
+        if (dataRefusals.has(dataFileNotFoundMessage(key))) {
+          throw aliasConflictError(record.path);
+        }
         if (dataKeys.size >= MAX_DATA_FILES) {
           dataBound ??= dataFileCountError;
         }
@@ -1728,13 +1820,25 @@ export async function buildModulesMap(
       }
       // A data record has no span and no frontmatter index, so only the imports that
       // reached the module add context, as they do to native's data error.
-      dataRefusals.set(dataFileNotFoundMessage(aliasKey), context(err));
+      const refusal = context(err);
+      dataRefusals.set(dataFileNotFoundMessage(aliasKey), refusal);
+      // The engine refuses some keys before it looks for them (`rootlessDataKeyRefusal`).
+      // Keep the refusal under the message of that engine refusal too, so native's
+      // refusal comes back. The first refusal kept under a message stays.
+      const engineRefusal = rootlessDataKeyRefusal(aliasKey, record.path);
+      if (engineRefusal !== undefined) {
+        const placed = context(engineRefusal);
+        if (isMdsError(placed) && !dataRefusals.has(placed.message)) {
+          dataRefusals.set(placed.message, refusal);
+        }
+      }
     }
   }
 
   try {
     const entryLocated = { key: entryFilename, aliasKey: entryFilename, ...entry };
-    await walk(entryLocated, entryPath, 0, undefined, false, (err) => err);
+    const noContext: ImportContext = (err) => err;
+    await walk(entryLocated, entryPath, 0, undefined, false, noContext, noContext);
   } finally {
     // A walk that throws leaves read-aheads under way, holding open files and about to
     // call into the engine. Each stops at its next step and is waited for, so none

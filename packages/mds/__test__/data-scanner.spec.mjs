@@ -1,7 +1,9 @@
 /**
  * Data-file pre-scanner tests for @mdscript/mds (#405).
- * Tests: TP-20, TP-21, TP-23, TP-26, TP-27, TP-56, TP-112, the data key conflict, the data
- * file count and byte bounds, and the case-variant data key.
+ * Tests: TP-20 (with its Windows rows), TP-21, TP-23, TP-26, TP-27, TP-56, TP-112, the data
+ * key conflict, a refused data key that a later path resolves to, the data file count and
+ * byte bounds, the case-variant data key, and the data keys that the engine checks with no
+ * project root.
  *
  * The WASM backend's file pre-scanner reads the local data files of a compile with the
  * data path rules of the native backend. Each rule test compares the WASM backend with
@@ -13,7 +15,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import fs, { closeSync, constants as fsConstants, lstatSync, openSync, readFileSync, rmSync } from 'node:fs';
+import fs, { closeSync, constants as fsConstants, existsSync, lstatSync, openSync, readFileSync, rmSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -42,7 +44,8 @@ const MAX_CONCURRENT_OPENS = 16;
 const MAX_IMPORTS_READ_AHEAD = 2 * MAX_CONCURRENT_OPENS;
 /** The per-file cap of a data file (`mds::MAX_DATA_FILE_BYTES`). */
 const MAX_DATA_FILE_BYTES = 10 * 1024 * 1024;
-const noFifo = process.platform === 'win32' && 'Windows has no named pipe in the file system';
+const onWindows = process.platform === 'win32';
+const noFifo = onWindows && 'Windows has no named pipe in the file system';
 
 /** Run `fn` with a new temporary directory, given by its canonical path, then remove it. */
 async function withTemp(prefix, fn) {
@@ -574,24 +577,215 @@ describe('WASM backend data pre-scanner (#405)', () => {
         await put(root, 'link-last.mds', dataModule({ a: './z.json', b: './sub/../z.json' }, '{{a}} {{b}}\n')),
         // Control: the second path names the file of the first path by its own key.
         await put(root, 'control.mds', dataModule({ a: './sub/../z.json', b: './deep/z.json' }, '{{a}} {{b}}\n')),
+        // Control: one key, two spellings, one file. Both paths name deep/z.json by the key
+        // `z.json`, so the scan refuses neither.
+        await put(root, 'one-file.mds', dataModule({ a: './sub/../z.json', b: './sub/./../z.json' }, '{{a}} {{b}}\n')),
       ];
       const native = await compileFileOutcomes('native', files);
       const wasm = await compileFileOutcomes('wasm', files);
       if (process.platform === 'win32') {
         assert.deepEqual(native.slice(0, 2), [{ output: 'ROOT ROOT\n' }, { output: 'ROOT ROOT\n' }]);
+        assert.deepEqual(native[3], { output: 'ROOT ROOT\n' });
         assert.deepEqual(wasm, native);
         return;
       }
       // Native reads two files. The WASM engine has one file for the key, so the scan
       // refuses the second path and never gives the first file for it.
-      assert.deepEqual(native, [{ output: 'DEEP ROOT\n' }, { output: 'ROOT DEEP\n' }, { output: 'DEEP DEEP\n' }]);
+      assert.deepEqual(native, [
+        { output: 'DEEP ROOT\n' },
+        { output: 'ROOT DEEP\n' },
+        { output: 'DEEP DEEP\n' },
+        { output: 'DEEP DEEP\n' },
+      ]);
       const conflict = (shown) => ({
         code: 'mds::import',
         message: `import error: two imports name different files by one module key, which the WASM backend cannot resolve: "${shown}"`,
         help: null,
         span: null,
       });
-      assert.deepEqual(wasm, [conflict('./z.json'), conflict('./sub/../z.json'), { output: 'DEEP DEEP\n' }]);
+      assert.deepEqual(wasm, [
+        conflict('./z.json'),
+        conflict('./sub/../z.json'),
+        { output: 'DEEP DEEP\n' },
+        { output: 'DEEP DEEP\n' },
+      ]);
+    });
+  });
+
+  test('a refused data path is never bound to the file of a later path whose canonical key is its key', async (t) => {
+    if (!requireEngines(t, engines, 'refused data key')) return;
+    await withTemp('mds-dref-', async (tmp) => {
+      // `./out/../a.json` names this file outside the root.
+      await put(tmp, 'a.json', '"OUTSIDE"');
+      await mkdir(path.join(tmp, 'outside'));
+      const root = await project(tmp, 'p');
+      await put(root, 'a.json', '"Ada"');
+      await put(root, 'node_modules/a.json', '"NM"');
+      await mkdir(path.join(root, 'node_modules', 'pkg'));
+      // `./lnk/a.json` names a.json by the key `lnk/a.json`. Its canonical key is `a.json`.
+      if (!(await symlinkOrSkip(t, '.', path.join(root, 'lnk'), 'dir'))) return;
+      if (!(await symlinkOrSkip(t, path.join('..', 'outside'), path.join(root, 'out'), 'dir'))) return;
+      if (!(await symlinkOrSkip(t, path.join('node_modules', 'pkg'), path.join(root, 'nm'), 'dir'))) return;
+      // Each first path has the key `a.json`. On POSIX it is refused: its directory is
+      // missing, or a link takes it out of the root, or into node_modules.
+      const firsts = ['./missing/../a.json', './out/../a.json', './nm/../a.json'];
+      const files = [];
+      for (const [i, first] of firsts.entries()) {
+        files.push(await put(root, `first${i}.mds`, dataModule({ a: first, b: './lnk/a.json' }, '{{a}} {{b}}\n')));
+        // Control: the same two entries in the opposite order.
+        files.push(await put(root, `last${i}.mds`, dataModule({ b: './lnk/a.json', a: first }, '{{a}} {{b}}\n')));
+      }
+      const native = await nativeEqualsWasm(files);
+      if (process.platform === 'win32') {
+        // Windows applies `..` before it follows a link, so each first path names a.json.
+        assert.deepEqual(native, files.map(() => ({ output: 'Ada Ada\n' })));
+        return;
+      }
+      const error = (code, message, help = null) => ({ code, message, help, span: null });
+      const refusals = [
+        error('mds::file_not_found', 'file not found: ./missing/../a.json', 'check the file path and ensure the file exists'),
+        error('mds::import', 'import error: import path escapes project directory: "./out/../a.json"'),
+        error('mds::import', 'import error: data path "./nm/../a.json": node_modules segments are not allowed'),
+      ];
+      assert.deepEqual(native, refusals.flatMap((refusal) => [refusal, refusal]));
+      // A runtime variable replaces the first entry, so native reads only the second path.
+      // The WASM engine cannot have the key `a.json` both refused and bound: the scan keeps
+      // a refusal for the second path, and never binds a.json to the first.
+      const replaced = files.filter((_, i) => i % 2 === 0);
+      const vars = { a: 'X' };
+      assert.deepEqual(await compileFileOutcomes('native', replaced, { vars }), replaced.map(() => ({ output: 'X Ada\n' })));
+      const conflict = error(
+        'mds::import',
+        'import error: two imports name different files by one module key, which the WASM backend cannot resolve: "./lnk/a.json"',
+      );
+      assert.deepEqual(await compileFileOutcomes('wasm', replaced, { vars }), replaced.map(() => conflict));
+      // A child entry replaces the first entry of its base: the same outcomes.
+      await put(root, 'c.json', '"Kid"');
+      await put(root, 'base.mds', dataModule({ a: './missing/../a.json', b: './lnk/a.json' }, '{{a}} {{b}}\n@block body:\n@end\n'));
+      const child = await put(root, 'child.mds', dataModule({ a: './c.json' }, '@extends "./base.mds"\n@block body:\nchild\n@end\n'));
+      assert.deepEqual(await compileFileOutcomes('native', [child]), [{ output: 'Kid Ada\nchild\n' }]);
+      assert.deepEqual(await compileFileOutcomes('wasm', [child]), [conflict]);
+      // The file is not in the map under the refused key.
+      for (const file of [...replaced, child]) {
+        assert.equal(Object.hasOwn((await scanData(file)).modules, 'a.json'), false, file);
+      }
+    });
+  });
+
+  test('on a case-insensitive volume, a refused data path is never bound to the file of a later case variant of its key', async (t) => {
+    if (!requireEngines(t, engines, 'refused data key, case variant')) return;
+    await withTemp('mds-drefcase-', async (tmp) => {
+      if (!(await caseInsensitive(tmp))) {
+        t.skip('needs a case-insensitive volume, where ./A.json can name a.json (the macOS and Windows default)');
+        return;
+      }
+      const root = await project(tmp, 'p');
+      await put(root, 'a.json', '"Ada"');
+      // `./A.json` has the key `A.json`. Its canonical key is the on-disk spelling `a.json`.
+      const files = [
+        await put(root, 'first.mds', dataModule({ a: './missing/../a.json', b: './A.json' }, '{{a}} {{b}}\n')),
+        // Control: the same two entries in the opposite order.
+        await put(root, 'last.mds', dataModule({ b: './A.json', a: './missing/../a.json' }, '{{a}} {{b}}\n')),
+      ];
+      const native = await nativeEqualsWasm(files);
+      if (process.platform === 'win32') {
+        // Windows applies `..` first, so `./missing/../a.json` names a.json.
+        assert.deepEqual(native, [{ output: 'Ada Ada\n' }, { output: 'Ada Ada\n' }]);
+        return;
+      }
+      const missing = {
+        code: 'mds::file_not_found',
+        message: 'file not found: ./missing/../a.json',
+        help: 'check the file path and ensure the file exists',
+        span: null,
+      };
+      assert.deepEqual(native, [missing, missing]);
+    });
+  });
+
+  test('TP-20 TP-26: each Windows row of the shared data path table gives the native outcome on the WASM backend', { skip: !onWindows && 'the Windows rows name forms that only Windows resolves' }, async (t) => {
+    if (!requireEngines(t, engines, 'TP-20 Windows')) return;
+    await withTemp('mds-tp20w-', async (tmp) => {
+      const root = await project(tmp, 'project');
+      await put(root, 'modules/a.json', 'true');
+      await put(root, 'node_modules/a.json', 'true');
+      // If this volume has no 8.3 name, give the short spelling a directory junction, as the
+      // Rust test does. Either form resolves to node_modules before the segment check.
+      const short = path.join(root, 'NODE_M~1');
+      if (!existsSync(short) && !(await symlinkOrSkip(t, path.join(root, 'node_modules'), short, 'junction'))) return;
+      const rows = [
+        ...VECTORS.windows,
+        // A trailing space hides a node_modules segment as a trailing dot does.
+        { path: './node_modules /a.json', code: 'mds::import', reason: 'node_modules' },
+        // A `\` separator: with a trailing dot, and as a control that reads the file.
+        { path: './node_modules.\\a.json', code: 'mds::import', reason: 'node_modules' },
+        { path: './modules\\a.json', code: null },
+      ];
+      const files = [];
+      for (const [i, row] of rows.entries()) {
+        files.push(await put(root, `row${i}.mds`, dataModule({ d: row.path }, '{{d}}\n')));
+      }
+      const native = await nativeEqualsWasm(files);
+      const mismatches = [];
+      for (const [i, row] of rows.entries()) {
+        const outcome = native[i];
+        const fits = row.code === null
+          ? outcome.output === 'true\n'
+          : outcome.code === row.code && outcome.message.includes(row.reason);
+        if (!fits) mismatches.push({ path: row.path, outcome });
+      }
+      assert.deepEqual(mismatches, []);
+      // No byte of a refused file reaches the engine. Control: the file of the last row does.
+      const preflighted = [];
+      for (const file of files) preflighted.push((await scanData(file)).preflighted);
+      assert.deepEqual(preflighted, [...rows.slice(0, -1).map(() => []), ['modules/a.json']]);
+    });
+  });
+
+  test('a data key that the WASM engine checks with no project root: a missing file gets the native refusal', async (t) => {
+    if (!requireEngines(t, engines, 'root-less data key')) return;
+    await withTemp('mds-drootless-', async (tmp) => {
+      const root = await project(tmp, 'p');
+      await put(root, 'a.json', '"Ada"');
+      // The engine splits the key `a\..\missing.json` at `\` and sees a `..` segment.
+      const missing = await put(root, 'missing.mds', dataModule({ d: './a\\..\\missing.json' }, '{{d}}\n'));
+      // The same module reached through an import: native names the import.
+      const imported = await put(root, 'imports.mds', '@import "./missing.mds" as m\nHi\n');
+      // Control: the same form names a file that is there on Windows.
+      const control = await put(root, 'control.mds', dataModule({ d: './a\\..\\a.json' }, '{{d}}\n'));
+      const native = await nativeEqualsWasm([missing, imported, control]);
+      const notFound = (shown) => ({
+        code: 'mds::file_not_found',
+        message: `file not found: ${shown}`,
+        help: 'check the file path and ensure the file exists',
+        span: null,
+      });
+      assert.deepEqual(native[0], notFound('./a\\..\\missing.json'));
+      assert.deepEqual({ ...native[1], span: null }, notFound('./missing.mds'));
+      assert.notEqual(native[1].span, null, 'native gives the import its span');
+      assert.deepEqual(native[2], onWindows ? { output: 'Ada\n' } : notFound('./a\\..\\a.json'));
+    });
+  });
+
+  test('known limit: the WASM backend refuses the POSIX data files named \\x.json and a:b.json, which native reads', { skip: onWindows && 'Windows does not allow these file names' }, async (t) => {
+    if (!requireEngines(t, engines, 'root-less data key names')) return;
+    await withTemp('mds-drootname-', async (tmp) => {
+      const root = await project(tmp, 'p');
+      await put(root, '\\x.json', '"BACK"');
+      await put(root, 'a:b.json', '"COLON"');
+      const shown = ['./\\x.json', './a:b.json'];
+      const files = [];
+      for (const [i, file] of shown.entries()) files.push(await put(root, `name${i}.mds`, dataModule({ d: file }, '{{d}}\n')));
+      assert.deepEqual(await compileFileOutcomes('native', files), [{ output: 'BACK\n' }, { output: 'COLON\n' }]);
+      // The key of each is its name, with no alias. The engine checks it with no project
+      // root and refuses a key that starts with `\` or has `:` as its second byte.
+      const escapes = (path) => ({
+        code: 'mds::import',
+        message: `import error: data path "${path}": escapes project directory`,
+        help: null,
+        span: null,
+      });
+      assert.deepEqual(await compileFileOutcomes('wasm', files), shown.map(escapes));
     });
   });
 
