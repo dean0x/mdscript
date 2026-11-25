@@ -19,6 +19,7 @@ import {
   compileFileOutcomes,
   loadEngines,
   requireEngines,
+  symlinkOrSkip,
 } from './helpers.mjs';
 import path from 'node:path';
 import os from 'node:os';
@@ -432,28 +433,85 @@ describe('WASM backend — compileFile/checkFile', () => {
     }
   });
 
-  test('U-WCF15: a data entry fails closed on the WASM backend, naming the data file (#405)', async (t) => {
+  test('U-WCF15: the WASM backend reads data files as the native backend does (#405)', async (t) => {
     const engines = await loadEngines();
     if (!requireEngines(t, engines, 'U-WCF15')) return;
     const dir = await mkdtemp(path.join(os.tmpdir(), 'mds-wcf15-'));
     try {
-      await writeFile(path.join(dir, '.mdsroot'), '');
-      await writeFile(path.join(dir, 'main.mds'), '---\ndata:\n  cfg: ./cfg.json\n---\nHi {{cfg.name}}\n');
-      await writeFile(path.join(dir, 'cfg.json'), '{"name": "Ada"}\n');
-      const files = [path.join(dir, 'main.mds')];
-      // Control: the native backend reads the data file.
-      assert.deepEqual(await compileFileOutcomes('native', files), [{ output: 'Hi Ada\n' }]);
-      // The WASM backend does not read data files yet: its compile refuses the entry,
-      // naming the data file, and never reads that file as a module.
-      assert.deepEqual(await compileFileOutcomes('wasm', files), [{
-        code: 'mds::module_not_found',
-        message: "data file 'cfg.json' is not in the virtual module map",
-        help: 'add the data file to `options.modules` or use the native backend',
+      const root = await realpath(dir);
+      const write = (name, text) => writeFile(path.join(root, name), text);
+      await write('.mdsroot', '');
+      await write('cfg.json', '{"name": "Ada"}\n');
+      await write('main.mds', '---\ndata:\n  cfg: ./cfg.json\n---\nHi {{cfg.name}}\n');
+      await write('missing.mds', '---\ndata:\n  cfg: ./missing.json\n---\nHi {{cfg.name}}\n');
+      // A missing data file of an imported module: native names the import, with its span.
+      await write('m.mds', '---\ndata:\n  d: ./missing.json\n---\nM {{d}}\n');
+      await write('imports.mds', '@import "./m.mds" as m\nHi\n');
+      // A child entry replaces the base entry, so the base file is never needed.
+      await write('base.mds', '---\ndata:\n  d: ./missing.json\n---\nbase {{d.name}}\n@block body:\n@end\n');
+      await write('child.mds', '---\ndata:\n  d: ./cfg.json\n---\n@extends "./base.mds"\n@block body:\nchild\n@end\n');
+      await mkdir(path.join(root, 'node_modules', 'x'), { recursive: true });
+      await write(path.join('node_modules', 'x', 'a.json'), '{"a": 1}\n');
+      const linked = await symlinkOrSkip(t, path.join('node_modules', 'x'), path.join(root, 'nmlink'), 'dir');
+      if (!linked) return;
+      await write('nm.mds', '---\ndata:\n  d: ./nmlink/a.json\n---\n{{d.a}}\n');
+      // No child entry replaces the base entry. Native binds the base data in the scope of
+      // the child, so its error has no `@extends` context: through one base, a chain of two
+      // and an import of the child. `child.mds` above is the control.
+      await write('lone-base.mds', '---\ndata:\n  d: ./missing.json\n---\nbase {{d}}\n@block body:\n@end\n');
+      await write('lone-child.mds', '@extends "./lone-base.mds"\n@block body:\nchild\n@end\n');
+      await write('middle.mds', '@extends "./lone-base.mds"\n@block body:\nmiddle\n@end\n');
+      await write('chain.mds', '@extends "./middle.mds"\n@block body:\nchain\n@end\n');
+      await write('import-child.mds', '@import "./lone-child.mds" as c\nHi\n');
+      // A base path whose key a base entry before it read: the scan refuses it at once.
+      await write(
+        'known-base.mds',
+        '---\ndata:\n  a: ./cfg.json\n  b: ./gone/../cfg.json\n---\nbase {{a.name}} {{b.name}}\n@block body:\n@end\n',
+      );
+      await write('known-child.mds', '@extends "./known-base.mds"\n@block body:\nchild\n@end\n');
+      const names = [
+        'main.mds', 'missing.mds', 'imports.mds', 'child.mds', 'nm.mds',
+        'lone-child.mds', 'chain.mds', 'import-child.mds', 'known-child.mds',
+      ];
+      const files = names.map((name) => path.join(root, name));
+      // Native names a dependency by its absolute path, the WASM backend by its key.
+      const belowRoot = (outcome) =>
+        outcome.dependencies === undefined
+          ? outcome
+          : {
+            ...outcome,
+            dependencies: outcome.dependencies.map((d) =>
+              path.isAbsolute(d) ? path.relative(root, d).split(path.sep).join('/') : d,
+            ),
+          };
+      const native = (await compileFileOutcomes('native', files, { sourceMap: true })).map(belowRoot);
+      // Control: the native outcomes are the ones each fixture is for, so the equality
+      // below compares reads and refusals, not two identical failures.
+      assert.deepEqual(native[0], { output: 'Hi Ada\n', dependencies: ['cfg.json'], sources: ['main.mds'] });
+      assert.deepEqual(native[1], {
+        code: 'mds::file_not_found',
+        message: 'file not found: ./missing.json',
+        help: 'check the file path and ensure the file exists',
         span: null,
-      }]);
+      });
+      assert.equal(native[2].code, 'mds::file_not_found', JSON.stringify(native[2]));
+      assert.equal(native[2].message, 'file not found: ./m.mds');
+      assert.equal(native[3].output, 'base Ada\nchild\n', JSON.stringify(native[3]));
+      assert.equal(native[4].code, 'mds::import', JSON.stringify(native[4]));
+      assert.equal(native[4].message, 'import error: data path "./nmlink/a.json": node_modules segments are not allowed');
+      assert.deepEqual(native.slice(5, 7), [native[1], native[1]]);
+      assert.equal(native[7].code, 'mds::file_not_found', JSON.stringify(native[7]));
+      assert.equal(native[7].message, 'file not found: ./lone-child.mds');
+      if (process.platform === 'win32') {
+        // Windows applies `..` first, so `./gone/../cfg.json` names cfg.json.
+        assert.equal(native[8].output, 'base Ada Ada\nchild\n', JSON.stringify(native[8]));
+      } else {
+        assert.deepEqual(native[8], { ...native[1], message: 'file not found: ./gone/../cfg.json' });
+      }
+      assert.deepEqual((await compileFileOutcomes('wasm', files, { sourceMap: true })).map(belowRoot), native);
       // A check reads no data file, so both backends pass the same entry.
-      const checks = await compileFileOutcomes('native', files, { method: 'checkFile' });
-      assert.deepEqual(await compileFileOutcomes('wasm', files, { method: 'checkFile' }), checks);
+      const checks = await compileFileOutcomes('native', files.slice(0, 1), { method: 'checkFile' });
+      assert.deepEqual(await compileFileOutcomes('wasm', files.slice(0, 1), { method: 'checkFile' }), checks);
       assert.ok(!('code' in checks[0]), JSON.stringify(checks));
     } finally {
       await rm(dir, { recursive: true, force: true });

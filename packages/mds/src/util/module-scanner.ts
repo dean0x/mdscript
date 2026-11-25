@@ -3,7 +3,7 @@
 // its on-disk spelling.
 import { isUtf8 } from 'node:buffer';
 import { lstat, open, realpath } from 'node:fs/promises';
-import { constants, existsSync } from 'node:fs';
+import { constants, existsSync, type BigIntStats } from 'node:fs';
 import { resolve, dirname, basename, join, relative, isAbsolute, parse, sep } from 'node:path';
 import { isMdsError, type MdsError } from '../types.js';
 import type { ImportRecord, WasmModule } from '../backend/wasm.js';
@@ -21,6 +21,10 @@ import { slidingWindow } from './sliding-window.js';
 // On Windows, O_NOFOLLOW is not defined; fall back to 0 (no-op flag) and
 // rely on a post-open lstat check instead.
 const O_NOFOLLOW: number = (constants as Record<string, number>)['O_NOFOLLOW'] ?? 0;
+// A data file is opened without a wait on a named pipe, as NativeFs opens it
+// (`ReadRule::Data`): the handle type check then refuses the pipe before a byte is read.
+// Windows has no such flag and no FIFO race; there the open is a plain open.
+const O_NONBLOCK: number = (constants as Record<string, number>)['O_NONBLOCK'] ?? 0;
 
 const MAX_PATH_SEGMENTS = 256;
 const MAX_IMPORT_DEPTH = 64;
@@ -30,12 +34,16 @@ const MAX_FILE_SIZE = 10 * 1024 * 1024;
 const MAX_MODULE_ALIASES = 65_536;
 const MAX_MODULE_ALIASES_SIZE = 10 * 1024 * 1024;
 const MAX_TRAVERSAL_DEPTH = 256;
+/** The engine's bound on distinct data files in one compile (`mds::MAX_DATA_FILES`). */
+const MAX_DATA_FILES = 256;
+/** The engine's bound on the text of all data files in one compile (`mds::MAX_DATA_BYTES`). */
+const MAX_DATA_BYTES = 32 * 1024 * 1024;
 // Maximum concurrent file opens while reading ahead of the walk. Keeps file
 // descriptor usage predictable even when a module imports many siblings at once.
 const MAX_CONCURRENT_OPENS = 16;
-// How many of a module's imports are located and read ahead of the walk at once. Each
-// import walked makes room for the next, so a module listing many imports holds a
-// bounded number of pending reads rather than one per import.
+// How many of a module's imports and data files are located and read ahead of the walk
+// at once. Each one walked makes room for the next, so a module listing many holds a
+// bounded number of pending reads rather than one per record.
 const MAX_IMPORTS_READ_AHEAD = 2 * MAX_CONCURRENT_OPENS;
 const PROJECT_ROOT_MARKERS = ['.git', '.mdsroot'] as const;
 /** The path separators Rust's `std::path::is_separator` accepts on this platform. */
@@ -127,7 +135,8 @@ function isWithinRoot(root: string, candidate: string): boolean {
 }
 
 /**
- * Open a file descriptor with O_NOFOLLOW | O_RDONLY. Map ELOOP to `symlinkError(shown)`.
+ * Open a file descriptor with O_NOFOLLOW | O_RDONLY and the extra `flags`. Map ELOOP to
+ * `symlinkError(shown)`.
  * For other open errors, use `lstat` to distinguish the two NativeFs error codes.
  * If `lstat` fails, report `mds::file_not_found` with `shown` as written.
  * If `lstat` succeeds, report `mds::io` with the root-relative `display` and an errno name.
@@ -139,9 +148,10 @@ async function openNoFollow(
   absolutePath: string,
   shown: string,
   display: string,
+  flags: number,
 ): Promise<Awaited<ReturnType<typeof open>>> {
   try {
-    return await open(absolutePath, constants.O_RDONLY | O_NOFOLLOW);
+    return await open(absolutePath, constants.O_RDONLY | O_NOFOLLOW | flags);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ELOOP') {
       throw symlinkError(shown);
@@ -332,6 +342,14 @@ function notRegularFileError(display: string): PathError {
   return cannotReadError(display, 'not a regular file');
 }
 
+/**
+ * `cannotReadError` for a file whose opened handle is not the file located — NativeFs's
+ * `file_changed`: another file took the place of the located one before the open.
+ */
+function fileChangedError(display: string): PathError {
+  return cannotReadError(display, 'the file changed while it was opened');
+}
+
 /** `cannotReadError` for a failed Node call, with its errno name as the reason. */
 function readError(display: string, err: unknown): PathError {
   const errno = (err as NodeJS.ErrnoException | undefined)?.code;
@@ -371,7 +389,7 @@ function moduleCountError(): PathError {
 }
 
 /** NativeFs's refusal of a module over `MAX_FILE_SIZE`, naming its root-relative path. */
-function fileTooLargeError(size: number, display: string): PathError {
+function fileTooLargeError(size: number | bigint, display: string): PathError {
   return resourceLimitError(
     `file too large (${size} bytes, max ${MAX_FILE_SIZE} bytes): ${escapePathForMessage(display)}`,
   );
@@ -591,14 +609,165 @@ function resolvedPathError(resolved: string, shown: string): PathError | undefin
   return cp === undefined ? undefined : pathError('mds::io', forbiddenCharMessage('resolved path', cp, shown));
 }
 
+/** `mds::is_data_path`: the path ends in exactly `.json`, `.yaml` or `.yml`. */
+function isDataPath(path: string): boolean {
+  return path.endsWith('.json') || path.endsWith('.yaml') || path.endsWith('.yml');
+}
+
+/** Rust `str::eq_ignore_ascii_case`: only `A`–`Z` fold, so no other character matches. */
+function eqIgnoreAsciiCase(a: string, b: string): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  const fold = (unit: number): number => (unit >= 0x41 && unit <= 0x5a ? unit + 0x20 : unit);
+  for (let i = 0; i < a.length; i += 1) {
+    if (fold(a.charCodeAt(i)) !== fold(b.charCodeAt(i))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** `mds::import`, `data path "<shown>": <reason>` — the Rust data path refusal (`data::path`). */
+function dataPathError(shown: string, reason: string): PathError {
+  return importError(`data path "${escapePathForMessage(shown)}": ${reason}`);
+}
+
 /**
- * The two WASM engine calls the scanner makes, the WASM module's own exports (#414):
- * listing a module's imports, and checking a file's bytes and type. What those two check
- * is the Rust engine's own code. The scanner's other checks — of paths, symlinks, the
- * project root and the limits, and the context an import's error gains — are TypeScript
- * mirrors of the native backend's, held to it by the native-vs-WASM differentials.
+ * Whether native `check_segments` drops a trailing dot or space from a segment before its
+ * `node_modules` test: on Windows, which drops them from a name. The wasm32 engine never
+ * does.
  */
-export type ScannerEngine = Pick<WasmModule, 'scanImportRecords' | 'preflightModule'>;
+const TRIMS_SEGMENTS = sep === '\\';
+
+/**
+ * The segment refusal of a data path, if any — Rust `check_segments`. It splits at `/`
+ * and `\` on every OS. A segment that starts with `.` is refused, except `.` and `..`
+ * when `allowRelative`. A `node_modules` segment is refused in any ASCII case; with
+ * `trimsSegments` a trailing dot or space does not hide one.
+ */
+function dataSegmentRefusal(
+  path: string,
+  shown: string,
+  allowRelative: boolean,
+  trimsSegments: boolean,
+): PathError | undefined {
+  for (const written of path.split(/[/\\]/)) {
+    if (allowRelative && (written === '.' || written === '..')) {
+      continue;
+    }
+    if (written.startsWith('.')) {
+      return dataPathError(shown, 'dot-prefixed segments are not allowed');
+    }
+    let end = written.length;
+    while (trimsSegments && end > 0 && (written[end - 1] === '.' || written[end - 1] === ' ')) {
+      end -= 1;
+    }
+    if (eqIgnoreAsciiCase(written.slice(0, end), 'node_modules')) {
+      return dataPathError(shown, 'node_modules segments are not allowed');
+    }
+  }
+  return undefined;
+}
+
+/** The rule of `dataPathRefusal`, with the segment trim of `trimsSegments`. */
+function dataStringRefusal(path: string, trimsSegments: boolean): PathError | undefined {
+  const relativeErr = relativeImportError(path);
+  if (relativeErr !== undefined) {
+    return relativeErr;
+  }
+  if (!path.startsWith('./') && !path.startsWith('../')) {
+    return dataPathError(path, "must start with './' or '../'");
+  }
+  if (path.includes('{{')) {
+    return dataPathError(path, 'references are not allowed');
+  }
+  if (!isDataPath(path)) {
+    return dataPathError(path, 'expected the .json, .yaml or .yml extension');
+  }
+  return dataSegmentRefusal(path, path, true, trimsSegments);
+}
+
+/**
+ * The refusal of a data path as written, if any — Rust `data::path::normalize` on this OS
+ * before it resolves the path, with its checks in its order: `validate_relative_import`
+ * (`relativeImportError`), the `./` or `../` prefix, no `{{`, the exact `.json`, `.yaml`
+ * or `.yml` extension, then the segment rule. `crates/mds-core/tests/fixtures/data-path-vectors.json`
+ * is the table both sides share. The scanner reads no file that this rule refuses. The
+ * wasm32 engine runs the same rule with no Windows trim when the compile binds the entry
+ * (`dataAliasKey`).
+ *
+ * @internal
+ */
+export function dataPathRefusal(path: string): PathError | undefined {
+  return dataStringRefusal(path, TRIMS_SEGMENTS);
+}
+
+/**
+ * The refusal that the WASM engine gives the lexical data key `key` of the path `shown`
+ * before it looks for the key, if any: Rust `check_key` with no project root, as
+ * `data::path::normalize` runs it on VirtualFs, which has no root. It refuses a key that
+ * starts with `/` or `\`, or whose second byte is `:`, and it splits the key at `\` too,
+ * with no Windows trim. Native runs `check_key` on the canonical key below its root, where
+ * these rules do not apply. `reject_forbidden_in_path` runs first there, and a key passes
+ * it: a key holds only characters of its path, which passed the same check.
+ */
+function rootlessDataKeyRefusal(key: string, shown: string): PathError | undefined {
+  // The second byte is `:` only when the first character is one byte, ASCII.
+  if (key.startsWith('/') || key.startsWith('\\') || (key.charCodeAt(0) < 0x80 && key.charCodeAt(1) === 0x3a)) {
+    return dataPathError(shown, 'escapes project directory');
+  }
+  return dataSegmentRefusal(key, shown, false, false);
+}
+
+/** NativeFs's refusal of the 257th distinct data file of a compile (`check_data_file_count`). */
+function dataFileCountError(): PathError {
+  return resourceLimitError(`too many data files (max ${MAX_DATA_FILES} per compile)`);
+}
+
+/** NativeFs's refusal of data text past `MAX_DATA_BYTES` in one compile (`count_data_bytes`). */
+function dataBytesError(): PathError {
+  return resourceLimitError(`data files exceed ${MAX_DATA_BYTES} bytes per compile`);
+}
+
+/** The message of the engine's error for a data file key absent from the module map. */
+function dataFileNotFoundMessage(key: string): string {
+  return `data file '${escapePathForMessage(key)}' is not in the virtual module map`;
+}
+
+/**
+ * The refusal the scan kept for the data file that the engine's error `err` names, or
+ * `err` itself.
+ *
+ * The scan throws no refusal of a data file. Native reads only the files that a compile
+ * binds: it reads no file of an entry that a runtime variable replays or that a child
+ * entry replaces, and it reports a refused file when it binds it, in its own error order.
+ * So a refused file stays out of the module map, and the engine reports its absence
+ * (`mds::module_not_found`, `data file '<key>' is not in the virtual module map`, with no
+ * span) at the point where native reads the file. A key that the engine checks with no
+ * project root and refuses before it looks for it (`rootlessDataKeyRefusal`) gets
+ * `mds::import` with no span, and the scan keeps the refusal under that exact message
+ * too. This function gives back the refusal that native makes there.
+ */
+export function restoreDataRefusal(err: unknown, refusals: ReadonlyMap<string, unknown>): unknown {
+  if (!isMdsError(err) || err.span !== undefined) {
+    return err;
+  }
+  if (err.code !== 'mds::module_not_found' && err.code !== 'mds::import') {
+    return err;
+  }
+  return refusals.get(err.message) ?? err;
+}
+
+/**
+ * The three WASM engine calls the scanner makes, the WASM module's own exports (#414,
+ * #405): listing a module's imports and data files, checking a module file's bytes and
+ * type, and checking a data file's bytes. What those check is the Rust engine's own code.
+ * The scanner's other checks — of paths, symlinks, the project root and the limits, and
+ * the context an import's error gains — are TypeScript mirrors of the native backend's,
+ * held to it by the native-vs-WASM differentials.
+ */
+export type ScannerEngine = Pick<WasmModule, 'scanImportRecords' | 'preflightModule' | 'preflightData'>;
 
 export interface ModuleScannerOptions {
   /**
@@ -618,8 +787,11 @@ export interface BuildModulesMapResult {
   entryFilename: string;
   /**
    * Flat map of virtual filename → source for the entry file and all its
-   * transitive imports. The entry file itself is included, keyed by
-   * `entryFilename`. Callers that pass `modules` as extra dependencies to the
+   * transitive imports, and the text of each local data file that a `data:` entry of
+   * one of them names, when the scan reads data (an empty text for a data file whose
+   * canonical key has no data extension, which the engine refuses unread). The entry
+   * file itself is included,
+   * keyed by `entryFilename`. Callers that pass `modules` as extra dependencies to the
    * WASM `build_modules()` function MUST extract and remove the entry source
    * before the call — leaving the entry key present causes
    * `mds::filename_collision` because `build_modules()` also inserts the entry
@@ -633,6 +805,14 @@ export interface BuildModulesMapResult {
    * A new import form must update `scan_import_records` and the walk together.
    */
   aliases: Record<string, string>;
+  /**
+   * The refusal of each data file that the scan refused, keyed by the message of the
+   * engine's error for its absence from `modules`, and also by the message of the engine's
+   * refusal of its key, where the engine refuses that key before it looks for it.
+   * `restoreDataRefusal` gives back the refusal when the compile reads the file. Empty
+   * when the scan reads no data.
+   */
+  dataRefusals: ReadonlyMap<string, unknown>;
 }
 
 /**
@@ -703,20 +883,31 @@ function keyOf(root: string, path: string): string {
 }
 
 /**
+ * The identity of a file as the OS reports it: its device and inode — on Windows, its
+ * volume serial number and file index. Exact, as `bigint`.
+ */
+interface FileIdentity {
+  readonly dev: bigint;
+  readonly ino: bigint;
+}
+
+/**
  * NativeFs's `symlink_metadata` step: a final component that does not resolve is
  * not found; one whose own file type is a symlink — a junction too, on Windows —
- * is refused. Nothing is opened.
+ * is refused. Nothing is opened. The identity of the file found is returned from the
+ * same lookup, as NativeFs keeps it for the read to compare with the opened file.
  */
-async function assertFileNotSymlink(path: string, shown: string): Promise<void> {
-  let isSymlink: boolean;
+async function lookupFile(path: string, shown: string): Promise<FileIdentity> {
+  let stats: BigIntStats;
   try {
-    isSymlink = (await lstat(path)).isSymbolicLink();
+    stats = await lstat(path, { bigint: true });
   } catch {
     throw fileNotFoundError(shown);
   }
-  if (isSymlink) {
+  if (stats.isSymbolicLink()) {
     throw symlinkError(shown);
   }
+  return { dev: stats.dev, ino: stats.ino };
 }
 
 /**
@@ -755,10 +946,12 @@ interface Located {
   readonly dir: string;
   /** Its canonical path. */
   readonly resolved: string;
+  /** The identity of the file found when it was located: a read refuses another file. */
+  readonly id: FileIdentity;
 }
 
-/** A module file opened, checked and read. */
-interface ReadModule {
+/** A module file or data file opened, checked and read. */
+interface FileRead {
   /** Its canonical path. */
   readonly resolved: string;
   /** Its size in bytes. */
@@ -768,21 +961,38 @@ interface ReadModule {
 }
 
 /**
+ * How a file is opened and checked: as a module or as a data file, each as NativeFs's
+ * read rule for it (`ReadRule::Module`, `ReadRule::Data`).
+ */
+interface ReadRule {
+  /** The flags the open adds to `O_RDONLY | O_NOFOLLOW`. */
+  readonly openFlags: number;
+  /** The engine's own checks of the bytes, in the native order, which decode them. */
+  check(bytes: Uint8Array, display: string, shown: string): string;
+}
+
+/**
  * The byte budget reads ahead of the walk draw on, counted in the bytes read: a file may
  * change size between its fstat and its read.
  */
 interface ReadBudget {
-  /** Whether a module whose fstat reports `size` bytes is read; if so, `size` is charged. */
+  /** Whether a file whose fstat reports `size` bytes is read; if so, `size` is charged. */
   admit(size: number): boolean;
   /** Charge what a read took beyond the size admitted: negative when the file shrank. */
   charge(bytes: number): void;
 }
 
-/** An import of a walked module: located, and read too when read ahead of the walk. */
+/** An import or data file of a walked module: located, and read too when read ahead of the walk. */
 interface ReadAhead {
   readonly located: Settled<Located>;
-  readonly read: Settled<ReadModule> | undefined;
+  readonly read: Settled<FileRead> | undefined;
 }
+
+/**
+ * The context the resolver adds to an error of a module, for the chain of imports that
+ * reached the module (`withImportContext` for each, innermost first).
+ */
+type ImportContext = (err: unknown) => unknown;
 
 /**
  * The outcome of a read-ahead that starts after the walk has already finished, which
@@ -816,7 +1026,7 @@ export function _unwrapWalkFinishedForTesting(): never {
  * then canonicalized, and refused when its canonical path carries a forbidden path
  * character.
  */
-async function locateEntry(entryPath: string): Promise<{ path: string; dir: string; resolved: string }> {
+async function locateEntry(entryPath: string): Promise<Omit<Located, 'key' | 'aliasKey'>> {
   const entryErr = entryPathError(entryPath) ?? segmentCountError(entryPath);
   if (entryErr !== undefined) {
     throw entryErr;
@@ -827,13 +1037,13 @@ async function locateEntry(entryPath: string): Promise<{ path: string; dir: stri
   }
   const dir = await canonicalPath(parent, entryPath);
   const path = join(dir, name);
-  await assertFileNotSymlink(path, entryPath);
+  const id = await lookupFile(path, entryPath);
   const resolved = await canonicalFile(path, dir, entryPath);
   const hostileErr = resolvedPathError(resolved, entryPath);
   if (hostileErr !== undefined) {
     throw hostileErr;
   }
-  return { path, dir, resolved };
+  return { path, dir, resolved, id };
 }
 
 function hasDotDotAfterName(shown: string): boolean {
@@ -922,7 +1132,7 @@ async function locateImport(projectRoot: string, importer: Located, importPath: 
   if (!isWithinRoot(projectRoot, path)) {
     throw escapesProjectError(importPath);
   }
-  await assertFileNotSymlink(path, importPath);
+  const id = await lookupFile(path, importPath);
   const resolved = await canonicalFile(path, dir, importPath);
   // Security (#265): a directory the import never named, reached through a
   // symlink, can carry a forbidden path character — and so can the on-disk name of
@@ -932,15 +1142,60 @@ async function locateImport(projectRoot: string, importer: Located, importPath: 
     throw hostileErr;
   }
   const key = name === undefined ? '' : keyOf(projectRoot, resolved);
-  return { key, aliasKey, path, dir, resolved };
+  return { key, aliasKey, path, dir, resolved, id };
 }
 
 /**
- * Open a located module of the project rooted at `projectRoot` with O_NOFOLLOW and
- * read it, as NativeFs's `read` does — `mds::io` when it cannot be read, `file too
- * large` over the per-file cap — and check it with the `engine`. Given a `budget`, it is
- * read only when the budget admits its size, and `undefined` otherwise; the budget is
- * then charged what the read took beyond that size.
+ * Locate the data file `path` of `importer` as NativeFs locates a data file for a compile
+ * (`data::path::normalize`): the string rule (`dataPathRefusal`), then the path rules of
+ * a module import (`locateImport`: containment in the project root, the final component's
+ * own file type, forbidden characters and UTF-8 of the canonical path), then the segment
+ * rule again on the canonical key below the project root, the key the read uses (Rust
+ * `check_key`). Each refusal is native's, code and message.
+ */
+async function locateData(projectRoot: string, importer: Located, path: string): Promise<Located> {
+  const stringErr = dataPathRefusal(path);
+  if (stringErr !== undefined) {
+    throw stringErr;
+  }
+  const located = await locateImport(projectRoot, importer, path);
+  const keyErr = dataSegmentRefusal(located.key, path, false, TRIMS_SEGMENTS);
+  if (keyErr !== undefined) {
+    throw keyErr;
+  }
+  return located;
+}
+
+/**
+ * The key by which a compile reads the data file `path` of the module keyed
+ * `importerKey`: the lexical key, before the engine applies an alias. `undefined` when
+ * the engine refuses the path before it computes a key — the string rule as the wasm32
+ * engine runs it, with no Windows trim, or a path that climbs above the key root or
+ * passes the segment cap (`normalizeVirtualKey`) — with the same refusal as native, when
+ * it binds the entry. A path that only the Windows trim refuses has a key: the engine
+ * looks for it, so the scan keeps native's refusal under it.
+ */
+function dataAliasKey(importerKey: string, path: string): string | undefined {
+  if (dataStringRefusal(path, false) !== undefined) {
+    return undefined;
+  }
+  try {
+    return normalizeVirtualKey(importerKey, path);
+  } catch (err) {
+    // Only a refusal means that the engine has no key. Any other error is a defect.
+    if (!isMdsError(err)) {
+      throw err;
+    }
+    return undefined;
+  }
+}
+
+/**
+ * Open a located file of the project rooted at `projectRoot` with O_NOFOLLOW and read it
+ * by `rule`, as NativeFs's `read` and `read_data` do — `mds::io` when it cannot be read,
+ * `file too large` over the per-file cap — and check it with the engine (`rule.check`).
+ * Given a `budget`, it is read only when the budget admits its size, and `undefined`
+ * otherwise; the budget is then charged what the read took beyond that size.
  *
  * O_NOFOLLOW makes open() fail with ELOOP when the final component was swapped for
  * a symlink after it was located, so no link is followed between the check and the
@@ -953,29 +1208,36 @@ async function locateImport(projectRoot: string, importer: Located, importPath: 
  * path with the path as written: on a case-insensitive volume realpath returns the
  * on-disk spelling, so `Entry.mds` for `entry.mds` differs from its canonical form
  * without being a symlink (#408).
+ *
+ * The path checks above name the file at the path, not the file the handle holds: a
+ * directory of the path can change and change back between the open and the checks. So
+ * the opened file's device and inode are compared with those found when it was located
+ * (`Located.id`), before a byte or its size is checked, as NativeFs compares the opened
+ * file with its resolve record; another file is refused with NativeFs's text (`mds::io`,
+ * `cannot read <root-relative path>: the file changed while it was opened`).
  */
-async function readModule(
+async function readFile(
   projectRoot: string,
-  engine: ScannerEngine,
   located: Located,
   shown: string,
-): Promise<ReadModule>;
-async function readModule(
+  rule: ReadRule,
+): Promise<FileRead>;
+async function readFile(
   projectRoot: string,
-  engine: ScannerEngine,
   located: Located,
   shown: string,
+  rule: ReadRule,
   budget: ReadBudget,
-): Promise<ReadModule | undefined>;
-async function readModule(
+): Promise<FileRead | undefined>;
+async function readFile(
   projectRoot: string,
-  engine: ScannerEngine,
   located: Located,
   shown: string,
+  rule: ReadRule,
   budget?: ReadBudget,
-): Promise<ReadModule | undefined> {
+): Promise<FileRead | undefined> {
   const display = keyOf(projectRoot, located.resolved) || '.';
-  // A module that is not a regular file is refused before it is opened, as NativeFs
+  // A file that is not a regular file is refused before it is opened, as NativeFs
   // refuses it: opening a FIFO nobody writes to blocks (#428). A symlink is left to
   // the open below, which refuses it without following it.
   const before = await lstat(located.path).catch(() => {
@@ -984,7 +1246,7 @@ async function readModule(
   if (!before.isFile() && !before.isSymbolicLink()) {
     throw notRegularFileError(display);
   }
-  const handle = await openNoFollow(located.path, shown, display);
+  const handle = await openNoFollow(located.path, shown, display, rule.openFlags);
   try {
     // `openNoFollow` above already succeeded, so the file existed a moment ago; a
     // failure here can only come from a concurrent change (TOCTOU). It is still
@@ -992,7 +1254,7 @@ async function readModule(
     // stat and canonicalize steps (file-not-found), the fd-based `stat` is part of
     // reading the file.
     const [stats, linkStats, resolution] = await Promise.all([
-      handle.stat().catch((err: unknown) => {
+      handle.stat({ bigint: true }).catch((err: unknown) => {
         throw readError(display, err);
       }),
       lstat(located.path).catch(() => {
@@ -1008,29 +1270,31 @@ async function readModule(
       throw symlinkError(shown);
     }
     // Checked again on the opened fd, as NativeFs checks its opened file: another
-    // file may have taken the module's place since it was checked above.
+    // file may have taken the file's place since it was checked above.
     if (!stats.isFile()) {
       throw notRegularFileError(display);
+    }
+    if (stats.dev !== located.id.dev || stats.ino !== located.id.ino) {
+      throw fileChangedError(display);
     }
     // Checked on the fstat size too, before a byte is read, so a file over the cap
     // when it is opened is never read into memory; one that grows past it while it
     // is read is read to one byte past the cap and no further (#428), and refused by
-    // the engine's own check below.
-    if (stats.size > MAX_FILE_SIZE) {
+    // the engine's own check below. A data file has the same cap
+    // (`MAX_DATA_FILE_BYTES` is `MAX_FILE_SIZE`).
+    if (stats.size > BigInt(MAX_FILE_SIZE)) {
       throw fileTooLargeError(stats.size, display);
     }
-    if (budget !== undefined && !budget.admit(stats.size)) {
+    // At most the cap, so the number is exact.
+    const size = Number(stats.size);
+    if (budget !== undefined && !budget.admit(size)) {
       return undefined;
     }
-    const bytes = await readAtMost(handle, MAX_FILE_SIZE + 1, stats.size).catch((err: unknown) => {
+    const bytes = await readAtMost(handle, MAX_FILE_SIZE + 1, size).catch((err: unknown) => {
       throw readError(display, err);
     });
-    budget?.charge(bytes.length - stats.size);
-    // The engine's own checks, in the native order — the per-file cap and UTF-8
-    // (#414), then the file type (#417) — decode it: it refuses exactly the files the
-    // native backend refuses, and a file that is not an MDS file is refused before
-    // any import-like line in it is followed.
-    return { resolved: located.resolved, size: bytes.length, content: engine.preflightModule(bytes, display, shown) };
+    budget?.charge(bytes.length - size);
+    return { resolved: located.resolved, size: bytes.length, content: rule.check(bytes, display, shown) };
   } finally {
     await closeModule(handle, display);
   }
@@ -1084,6 +1348,10 @@ async function readModule(
  *   before the open (`mds::io`, `cannot read <root-relative path>: not a regular
  *   file`, #428), and one that cannot be read (`mds::io`,
  *   `cannot read <root-relative path>: <errno name>`);
+ * - a module whose opened file is not the file located — its device and inode differ,
+ *   because another file took its place before the open — checked before its size and
+ *   its bytes (`mds::io`, `cannot read <root-relative path>: the file changed while it
+ *   was opened`);
  * - a file over the engine's 10 MiB per-file cap (`mds::resource_limit`) or whose
  *   bytes are not valid UTF-8 (`mds::io`), then a file that is neither a `.mds` file
  *   nor a `.md` file declaring `type: mds` (`mds::not_mds`, `not an MDS file: <path as
@@ -1091,6 +1359,56 @@ async function readModule(
  *   native backend makes on every file it reads, which also decodes the file (a
  *   leading byte-order mark kept). A file that is not an MDS file is refused before
  *   any import-like line in it is followed.
+ *
+ * `readData` is `true` for a compile, which reads the local data files that the `data:`
+ * entries of each module name (#405), and `false` for a check or a lint, which read no
+ * data file; there is no default, and only `true` reads one. The data files are the
+ * `data` records of `scanImportRecords`, which come after a module's imports. Each is
+ * a leaf: never read as a module, never scanned for imports. Data files go through the
+ * same read-ahead window and budget as modules, and each read follows NativeFs's data
+ * read rule (`data::path`, `ReadRule::Data`):
+ * - the string rule as written (`dataPathRefusal`): the import path rules, the `./` or
+ *   `../` prefix, no `{{`, the exact `.json`, `.yaml` or `.yml` extension, no segment
+ *   that starts with `.` other than `.` and `..`, and no `node_modules` segment in any
+ *   ASCII case;
+ * - the path rules of a module import listed above, then the segment rule again on the
+ *   canonical key below the project root, the key that the read uses. A canonical key
+ *   with no data extension (a case-insensitive volume can spell `./cfg.json` as
+ *   `CFG.JSON`) is not read: an alias gives the engine that key, with an empty text in
+ *   `modules`, and the engine refuses it as native does when the compile binds the entry
+ *   (`mds::data`, `resolved data file must have a .json, .yaml or .yml extension`), before
+ *   it reads the text;
+ * - an O_NONBLOCK open, so a named pipe put in the file's place is refused by the check
+ *   of the opened handle, never waited on, and a regular file of at most 10 MiB of
+ *   UTF-8, checked by the engine's own `preflightData`;
+ * - at most 256 distinct data files and 32 MiB of data text in one compile, counted
+ *   apart from the modules (`mds::resource_limit`, `too many data files (max 256 per
+ *   compile)`, `data files exceed 33554432 bytes per compile`). Once the walk reaches a
+ *   bound, it reads no further data file, and no read ahead of the walk starts one. A
+ *   read ahead that started before then can still read a data file that comes after the
+ *   bound in walk order, within the read-ahead window and byte budget described below.
+ *   The walk uses none of these files.
+ * A data file is keyed by its canonical path below the project root, and a path the
+ * engine resolves to another key is listed in `aliases`, as for a module. A module whose
+ * `data:` declarations the engine refuses — more than 64 entries, an entry with more
+ * than 256 references (`mds::MAX_DATA_REFS_PER_ENTRY`), a form it does not know — has
+ * no data record, so none of its files is read, and the compile refuses the module
+ * before any read, as native does.
+ *
+ * A data refusal is not thrown (`restoreDataRefusal`). A path that the string rule
+ * refuses, or that the engine cannot key, is not read: the engine refuses it with
+ * native's error when the compile binds the entry. Every other refusal is kept in
+ * `dataRefusals` with the context the resolver adds to it, and the file stays out of
+ * `modules`. So a compile fails for a data file only where native fails for it, and with
+ * native's error, except as differences 10, 11 and 12 list. Native binds the data of an
+ * `@extends` base in the scope of its child, so a refusal there has the context of the
+ * child, not of the `@extends` directive. A refused key stays out of `modules` also when
+ * a later path resolves to it, for example `./missing/../a.json` and then `./lnk/a.json`
+ * through a link `lnk` to `.`: the engine gives back the first refusal, and the scan
+ * keeps the alias refusal of a module import for the later path. One more exception: a
+ * path whose key is already in the map must name the file of that key. Else the scan
+ * throws the alias refusal of a module import, or the path's own refusal, because the
+ * engine reads the file of that key for both paths.
  *
  * The scanner uses `scanImportRecords` for import context (#414, #423).
  * A missing target of `@import`, `@extends` or `@export … from` gets the directive's
@@ -1154,12 +1472,37 @@ async function readModule(
  *    cannot name that directory exactly. To match native order, each path check
  *    would need a string and a byte form. A check on one form does not prove the
  *    other (U-SM48, Linux CI).
+ * 10. The scan reads every local data file that a module lists, also the file of an
+ *    entry that a runtime variable replays or that a child entry replaces, which native
+ *    does not read. Such a file counts toward the 256-file and 32 MiB data bounds, so a
+ *    project that lists more than those bounds can be refused where native passes. The
+ *    empty text of a canonical key with no data extension counts as a module in the
+ *    engine's bound of 257 module keys besides the entry, so a project whose modules
+ *    besides the entry and such keys are more than 257 together is refused there (the
+ *    scan admits at most 256 modules besides the entry). Deliberate: the scan
+ *    knows no runtime variable and no entry name. For the same reason, a later path whose
+ *    canonical key is the key of a refused path is refused with `mds::import` where the
+ *    compile binds it and not the refused path. Differences 1, 3, 6 and 9 apply to data
+ *    files too.
+ * 11. On POSIX, the WASM backend refuses a local data file whose name starts with `\` or
+ *    has `:` as its second byte, such as `\x.json` or `a:b.json` in the project root,
+ *    which native reads (`mds::import`, `data path "<path>": escapes project directory`).
+ *    The engine checks a data key with no project root (`rootlessDataKeyRefusal`), and an
+ *    alias cannot help where the key is the file's own canonical key.
+ * 12. On Windows, the scanner compares the volume serial number and file index of the
+ *    opened file with those of the located file, where native compares the final path of
+ *    the opened handle. So a regular file put at the same path between the lookup and the
+ *    open is refused as changed on the WASM backend, and native reads it. Deliberate: Node
+ *    gives no final path of a handle, and the stricter check never reads another file.
  */
 export async function buildModulesMap(
   entryPath: string,
   engine: ScannerEngine,
+  readData: boolean,
   options?: ModuleScannerOptions,
 ): Promise<BuildModulesMapResult> {
+  // A plain JavaScript caller that leaves `readData` out reads no data file.
+  const readsData = readData === true;
   const maxModules = options?.maxModules ?? DEFAULT_MAX_MODULES;
   const maxAggregateSize = options?.maxAggregateSize ?? DEFAULT_MAX_AGGREGATE_SIZE;
 
@@ -1183,7 +1526,24 @@ export async function buildModulesMap(
    * Each key a read-ahead has read, or is reading, and that read's outcome: at most one
    * read-ahead per module, whichever walked module's imports reach it first.
    */
-  const readAheadReads = new Map<string, Promise<Settled<ReadModule | undefined>>>();
+  const readAheadReads = new Map<string, Promise<Settled<FileRead | undefined>>>();
+  /**
+   * The same for data files, kept apart so that no file read by one rule is ever used as
+   * a file of the other: a data read has passed no module type check.
+   */
+  const dataReadAheads = new Map<string, Promise<Settled<FileRead | undefined>>>();
+  /** Keys of the data files in `modules`. */
+  const dataKeys = new Set<string>();
+  /** The refusal of each data file the scan refused (`BuildModulesMapResult.dataRefusals`). */
+  const dataRefusals = new Map<string, unknown>();
+  /** The data refusals that `walkData` throws with their whole context: no walk adds more. */
+  const dataRefusalsInContext = new WeakSet<object>();
+  let dataBytes = 0;
+  /**
+   * The refusal of the first data bound the walk reached: after it, the walk reads no data
+   * file and no read ahead starts one.
+   */
+  let dataBound: (() => PathError) | undefined;
   const limit = concurrencyLimit(MAX_CONCURRENT_OPENS);
   /** Every read-ahead started and not yet settled. */
   const pending = new Set<Promise<ReadAhead>>();
@@ -1192,8 +1552,22 @@ export async function buildModulesMap(
   let readAheadSize = 0;
   let walkFinished = false;
 
+  const moduleRule: ReadRule = {
+    openFlags: 0,
+    // The engine's own checks, in the native order — the per-file cap and UTF-8 (#414),
+    // then the file type (#417) — decode it: it refuses exactly the files the native
+    // backend refuses, and a file that is not an MDS file is refused before any
+    // import-like line in it is followed.
+    check: (bytes, display, shown) => engine.preflightModule(bytes, display, shown),
+  };
+  const dataRule: ReadRule = {
+    openFlags: O_NONBLOCK,
+    // The per-file cap and UTF-8, as for a module; a data file is not an MDS file.
+    check: (bytes, display) => engine.preflightData(bytes, display),
+  };
+
   /**
-   * The read-ahead budget: `maxAggregateSize` bytes, each module admitted by its fstat
+   * The read-ahead budget: `maxAggregateSize` bytes, each file admitted by its fstat
    * size and charged by the bytes read. Between the two, a read may take more than it
    * was admitted for — up to the per-file cap plus one byte — so at most
    * MAX_CONCURRENT_OPENS reads of MAX_FILE_SIZE + 1 bytes each are held beyond the
@@ -1213,38 +1587,48 @@ export async function buildModulesMap(
   };
 
   /**
-   * Locate an import and, when its module is new and the read-ahead budget allows,
-   * read it — ahead of the walk, which checks the outcome in the native order. Never
-   * rejects: every failure is settled for the walk to report when it gets there.
+   * Locate an import or a data file and, when its file is new and the read-ahead budget
+   * allows, read it — ahead of the walk, which checks the outcome in the native order.
+   * Never rejects: every failure is settled for the walk to report when it gets there.
    */
-  async function readAhead(importer: Located, importPath: string): Promise<ReadAhead> {
+  async function readAhead(importer: Located, record: ImportRecord): Promise<ReadAhead> {
     if (walkFinished) {
       return { located: WALK_FINISHED, read: undefined };
     }
-    const located = await settle(locateImport(projectRoot, importer, importPath));
+    const data = record.kind === 'data';
+    const located = await settle(
+      data ? locateData(projectRoot, importer, record.path) : locateImport(projectRoot, importer, record.path),
+    );
     if (!located.ok || walkFinished) {
       return { located, read: undefined };
     }
     const { key } = located.value;
-    if (completed.has(key) || walking.has(key) || readAheadReads.has(key)) {
+    const reads = data ? dataReadAheads : readAheadReads;
+    // `walkData` reads no data key without a data extension, and no new data file once
+    // a data bound is reached.
+    const known = data
+      ? !isDataPath(key) || dataKeys.has(key) || dataKeys.size >= MAX_DATA_FILES || dataBound !== undefined
+      : completed.has(key) || walking.has(key);
+    if (known || reads.has(key)) {
       return { located, read: undefined };
     }
-    const reading = settle(readModule(projectRoot, engine, located.value, importPath, readAheadBudget));
-    readAheadReads.set(key, reading);
+    const rule = data ? dataRule : moduleRule;
+    const reading = settle(readFile(projectRoot, located.value, record.path, rule, readAheadBudget));
+    reads.set(key, reading);
     const read = await reading;
     if (!read.ok) {
       return { located, read };
     }
-    // A module the read-ahead budget left unread is read by the walk itself.
+    // A file the read-ahead budget left unread is read by the walk itself.
     return { located, read: read.value === undefined ? undefined : { ok: true, value: read.value } };
   }
 
   /**
-   * Start the read-ahead of the import `importPath` of `importer`, kept in `pending`
-   * until it settles.
+   * Start the read-ahead of the import or data file `record` of `importer`, kept in
+   * `pending` until it settles.
    */
-  function startReadAhead(importer: Located, importPath: string): Promise<ReadAhead> {
-    const ahead = limit(() => readAhead(importer, importPath));
+  function startReadAhead(importer: Located, record: ImportRecord): Promise<ReadAhead> {
+    const ahead = limit(() => readAhead(importer, record));
     pending.add(ahead);
     const forget = (): void => {
       pending.delete(ahead);
@@ -1254,12 +1638,16 @@ export async function buildModulesMap(
   }
 
   /**
-   * The module `key` as a read ahead of the walk read it, when one did — reached through
-   * another module's imports. A read that failed, or that the budget declined, is left
-   * for the walk to make itself, so its error names the import the walk reached it by.
+   * The file `key` as a read ahead of the walk read it, when one did — reached through
+   * another module's imports or data files (`reads`). A read that failed, or that the
+   * budget declined, is left for the walk to make itself, so its error names the path the
+   * walk reached it by.
    */
-  async function readAheadRead(key: string): Promise<ReadModule | undefined> {
-    const read = await readAheadReads.get(key);
+  async function readAheadRead(
+    key: string,
+    reads: ReadonlyMap<string, Promise<Settled<FileRead | undefined>>>,
+  ): Promise<FileRead | undefined> {
+    const read = await reads.get(key);
     return read?.ok === true ? read.value : undefined;
   }
 
@@ -1317,14 +1705,21 @@ export async function buildModulesMap(
    * engine lists its imports in the order the resolver resolves them for a module
    * reached as the `@extends` base of another (`asBase`) or for itself. An error
    * resolving an import is reported with the context the resolver adds to it
-   * (`withImportContext`).
+   * (`withImportContext`); `context` adds the context of the imports that reached this
+   * module. With `readData`, the module's data files follow its imports (`walkData`),
+   * and `dataContext` adds the context of their refusals. Native binds the data of an
+   * `@extends` base in the scope of the child that extends it, outside the span of the
+   * `@extends` directive, so a base has the data context of its child; every other
+   * module has its own `context`.
    */
   async function walk(
     located: Located,
     shown: string,
     depth: number,
-    readAheadOutcome: Settled<ReadModule> | undefined,
+    readAheadOutcome: Settled<FileRead> | undefined,
     asBase: boolean,
+    context: ImportContext,
+    dataContext: ImportContext,
   ): Promise<void> {
     const { key } = located;
     if (completed.has(key) || walking.has(key)) {
@@ -1336,7 +1731,7 @@ export async function buildModulesMap(
     // A module its own import's read-ahead did not read is taken from the read-ahead of
     // another import of it, or read here, whatever its size: the per-file cap bounds it.
     const read = readAheadOutcome === undefined
-      ? (await readAheadRead(key)) ?? (await readModule(projectRoot, engine, located, shown))
+      ? (await readAheadRead(key, readAheadReads)) ?? (await readFile(projectRoot, located, shown, moduleRule))
       : unwrap(readAheadOutcome);
     // The WASM backend's own guard, checked in walk order once the module has passed
     // every check native makes on it — the per-file cap, UTF-8 and the file type — so
@@ -1349,28 +1744,149 @@ export async function buildModulesMap(
     checkAndRecordAlias(located, shown);
     modules[key] = read.content;
 
-    const records = engine.scanImportRecords(read.content, asBase);
+    const scanned = engine.scanImportRecords(read.content, asBase);
+    // A check or a lint reads no data file: its data records are not even located.
+    const records = readsData ? scanned : scanned.filter((record) => record.kind !== 'data');
     walking.add(key);
-    // The next MAX_IMPORTS_READ_AHEAD imports are read ahead of the walk; each one
-    // walked starts the next.
-    const imports = slidingWindow(records, MAX_IMPORTS_READ_AHEAD, (record) =>
-      startReadAhead(located, record.path),
-    );
+    // The next MAX_IMPORTS_READ_AHEAD imports and data files are read ahead of the walk;
+    // each one walked starts the next.
+    const imports = slidingWindow(records, MAX_IMPORTS_READ_AHEAD, (record) => startReadAhead(located, record));
     for (const [record, ahead] of imports) {
+      if (record.kind === 'data') {
+        await walkData(located, record, await ahead, dataContext);
+        continue;
+      }
       const { located: child, read: childRead } = await ahead;
+      const asChildBase = record.kind === 'extends';
+      const childContext: ImportContext = (err) => context(withImportContext(err, record));
       try {
-        await walk(unwrap(child), record.path, depth + 1, childRead, record.kind === 'extends');
+        await walk(
+          unwrap(child),
+          record.path,
+          depth + 1,
+          childRead,
+          asChildBase,
+          childContext,
+          asChildBase ? dataContext : childContext,
+        );
       } catch (err) {
-        throw withImportContext(err, record);
+        // A data refusal thrown below has its whole context already (`walkData`).
+        throw isMdsError(err) && dataRefusalsInContext.has(err) ? err : withImportContext(err, record);
       }
     }
     walking.delete(key);
     completed.add(key);
   }
 
+  /**
+   * Put the data file of the `data` record `record` of `importer` in `modules`, as a
+   * leaf: in walk order, once per canonical key, within the data bounds, with an alias
+   * for another spelling of its key. A refusal of a new key is not thrown: it is kept in
+   * `dataRefusals`, with the context the resolver adds to it (`context`), and the file
+   * stays out of `modules` (`restoreDataRefusal`). A refusal of a path whose key is
+   * already in the map is thrown with that context, as for a module import.
+   */
+  async function walkData(
+    importer: Located,
+    record: ImportRecord,
+    ahead: ReadAhead,
+    context: ImportContext,
+  ): Promise<void> {
+    const aliasKey = dataAliasKey(importer.key, record.path);
+    // The engine refuses a path it cannot key itself, with native's error. A key refused
+    // before stays out of `modules`, so the engine gives back that first refusal.
+    if (aliasKey === undefined || dataRefusals.has(dataFileNotFoundMessage(aliasKey))) {
+      return;
+    }
+    if (dataKeys.has(aliasKey) || aliases.has(aliasKey)) {
+      // A key met before: the engine reads the file that the first path of the key named.
+      // On POSIX, `./sub/../a.json` and `./a.json` have one key but can name two files,
+      // as for a module import. So the path must name that same file (`aliasRefusal`).
+      // The key is in the map, so the engine cannot report a refusal of this path:
+      // the refusal is thrown, with the context of its data, and no walk above adds more.
+      try {
+        checkAndRecordAlias(unwrap(ahead.located), record.path);
+      } catch (err) {
+        if (!isMdsError(err)) {
+          throw err;
+        }
+        const placed = context(err);
+        if (isMdsError(placed)) {
+          dataRefusalsInContext.add(placed);
+        }
+        throw placed;
+      }
+      return;
+    }
+    try {
+      const located = unwrap(ahead.located);
+      const { key } = located;
+      if (!isDataPath(key)) {
+        // A canonical key with no data extension (a case-insensitive volume can spell
+        // `./cfg.json` as `CFG.JSON`). Native refuses it when the compile binds the entry,
+        // before any read: `mds::data`, naming the module and the entry. The file is not
+        // read. The alias gives the engine this key, and an empty text stands for the
+        // file, so the engine makes the same refusal at the same point and never reads
+        // that text.
+        checkAndRecordAlias(located, record.path);
+        modules[key] ??= '';
+        return;
+      }
+      if (!dataKeys.has(key)) {
+        // An earlier path that the scan refused has this key as its lexical key. If the
+        // file got into `modules` under it, the engine would bind this file to that path,
+        // and the kept refusal would be lost. So the key stays out: the engine gives back
+        // the first refusal where native gives it, when the compile binds the first path.
+        // This path has no file in the map, so the scan keeps a refusal for it too.
+        if (dataRefusals.has(dataFileNotFoundMessage(key))) {
+          throw aliasConflictError(record.path);
+        }
+        if (dataKeys.size >= MAX_DATA_FILES) {
+          dataBound ??= dataFileCountError;
+        }
+        if (dataBound !== undefined) {
+          throw dataBound();
+        }
+        const read = ahead.read === undefined
+          ? (await readAheadRead(key, dataReadAheads)) ?? (await readFile(projectRoot, located, record.path, dataRule))
+          : unwrap(ahead.read);
+        if (dataBytes + read.size > MAX_DATA_BYTES) {
+          dataBound = dataBytesError;
+          throw dataBound();
+        }
+        checkAndRecordAlias(located, record.path);
+        dataBytes += read.size;
+        dataKeys.add(key);
+        modules[key] = read.content;
+        return;
+      }
+      checkAndRecordAlias(located, record.path);
+    } catch (err) {
+      // Only a refusal is kept. Any other error is a defect, and is thrown.
+      if (!isMdsError(err)) {
+        throw err;
+      }
+      // A data record has no span and no frontmatter index, so only the imports that
+      // reached the module add context, as they do to native's data error.
+      const refusal = context(err);
+      dataRefusals.set(dataFileNotFoundMessage(aliasKey), refusal);
+      // The engine refuses some keys before it looks for them (`rootlessDataKeyRefusal`).
+      // Keep the refusal under the message of that engine refusal too, so native's
+      // refusal comes back. The first refusal kept under a message stays.
+      const engineRefusal = rootlessDataKeyRefusal(aliasKey, record.path);
+      if (engineRefusal !== undefined) {
+        const placed = context(engineRefusal);
+        if (isMdsError(placed) && !dataRefusals.has(placed.message)) {
+          dataRefusals.set(placed.message, refusal);
+        }
+      }
+    }
+  }
+
   try {
     const entryLocated = { key: entryFilename, aliasKey: entryFilename, ...entry };
-    await walk(entryLocated, entryPath, 0, undefined, false);
+    const noContext: ImportContext = (err) => err;
+    await walk(entryLocated, entryPath, 0, undefined, false, noContext, noContext);
   } finally {
     // A walk that throws leaves read-aheads under way, holding open files and about to
     // call into the engine. Each stops at its next step and is waited for, so none
@@ -1379,5 +1895,5 @@ export async function buildModulesMap(
     await Promise.allSettled(pending);
   }
 
-  return { entryFilename, modules, aliases: Object.fromEntries(aliases) };
+  return { entryFilename, modules, aliases: Object.fromEntries(aliases), dataRefusals };
 }

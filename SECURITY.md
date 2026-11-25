@@ -70,6 +70,9 @@ input. The compiler enforces several defense-in-depth controls:
   it reads only the regular file that resolution found, at most 10 MiB of UTF-8
   (`crates/mds-core/src/data/path.rs`; tests in `crates/mds-core/src/data/path_tests.rs`
   and `crates/mds-core/tests/data_paths.rs`).
+  In `@mdscript/mds`, the WASM backend of `compileFile` applies the same rules before it reads
+  a data file, and `checkFile` and `lintFile` read no data file
+  (`packages/mds/__test__/data-scanner.spec.mjs`).
   A template can output any `.json`, `.yaml` or `.yml` file that these rules allow below the
   project root, the nearest directory with `.git` or `.mdsroot`.
   `mds check`, `mds lint`, `mds fmt` and the check and lint calls of the Rust API, the Python

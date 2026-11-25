@@ -186,7 +186,8 @@ export async function symlinkOrSkip(t, target, link, type) {
  * Run a public file method for each file with the requested backend in a fresh process.
  * Use `compileFile` by default. Return `{ output }` for compile unless `sourceMap` is true.
  * For `checkFile` and `lintFile`, return their JSON result. On failure, return the error fields.
- * Resolve relative files from `options.cwd` or the package root.
+ * Resolve relative files from `options.cwd` or the package root. Pass `options.vars` as
+ * the runtime variables of each call.
  */
 export async function compileFileOutcomes(backend, files, options = {}) {
   const script = `
@@ -195,12 +196,14 @@ export async function compileFileOutcomes(backend, files, options = {}) {
     const method = process.env.MDS_TEST_METHOD;
     const run = { compileFile, checkFile, lintFile }[method];
     const sourceMap = process.env.MDS_TEST_SOURCE_MAP === 'true';
+    const vars = process.env.MDS_TEST_VARS ? JSON.parse(process.env.MDS_TEST_VARS) : undefined;
+    const callOptions = sourceMap || vars ? { ...(sourceMap ? { sourceMap: true } : {}), ...(vars ? { vars } : {}) } : undefined;
     await init();
     if (process.env.MDS_TEST_CWD) process.chdir(process.env.MDS_TEST_CWD);
     const outcomes = [];
     for (const file of files) {
       try {
-        const r = await run(file, sourceMap ? { sourceMap: true } : undefined);
+        const r = await run(file, callOptions);
         if (method !== 'compileFile') outcomes.push(r);
         else if (sourceMap) outcomes.push({ output: r.output, dependencies: r.dependencies, sources: r.sourceMap?.sources });
         else outcomes.push({ output: r.output });
@@ -219,6 +222,7 @@ export async function compileFileOutcomes(backend, files, options = {}) {
       MDS_TEST_CWD: options.cwd ?? '',
       MDS_TEST_METHOD: options.method ?? 'compileFile',
       MDS_TEST_SOURCE_MAP: String(options.sourceMap === true),
+      MDS_TEST_VARS: options.vars === undefined ? '' : JSON.stringify(options.vars),
     },
     timeout: 60000,
     maxBuffer: 16 * 1024 * 1024,

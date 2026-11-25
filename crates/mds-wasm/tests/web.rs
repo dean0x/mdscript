@@ -912,49 +912,70 @@ fn scan_import_records_returns_error_for_malformed_source() {
     }
 }
 
-/// `scanImportRecords` leaves out the records of `data:` entries (#405). The
-/// `@mdscript/mds` walker reads each record as a module, so a data record would make a
-/// data file a module. Without it, the compile refuses the entry with
-/// `mds::module_not_found`, naming the data file.
+/// `scanImportRecords` lists the record of each local `data:` entry with the kind
+/// `data`, after every module record, with no frontmatter index and no span, as the
+/// engine's own scan does (#405). `scanImports` stays modules-only. Control: the compile
+/// reads the file that the data record names.
 #[wasm_bindgen_test]
-fn scan_import_records_leave_out_data_records() {
+fn scan_import_records_list_data_records() {
     let source = concat!(
-        "---\ndata:\n  cfg: ./cfg.json\nimports:\n  - path: ./fm.mds\n---\n",
-        "@import \"./a.mds\" as a\n{{cfg}}\n",
+        "---\ndata:\n  cfg: ./cfg.json\n  site: https://example.com/a.json\n",
+        "imports:\n  - path: ./fm.mds\n---\n",
+        "@import \"./a.mds\" as a\n{{cfg.name}}\n",
     );
-    // Control: the engine's own scan lists the data record of this source.
-    let engine = mds::scan_import_records(source, mds::ResolveAs::Standalone).unwrap();
-    assert!(
-        engine
-            .iter()
-            .any(|r| r.kind == mds::ImportKind::Data && r.path == "./cfg.json"),
-        "{engine:?}"
-    );
-    for as_base in [false, true] {
+    let null = || "null".to_owned();
+    for (as_base, resolve_as) in [
+        (false, mds::ResolveAs::Standalone),
+        (true, mds::ResolveAs::Base),
+    ] {
         let records = js_sys::Array::from(&mds_wasm::scan_import_records(source, as_base).unwrap());
-        let rows: Vec<(String, String)> = records
+        let rows: Vec<(String, String, String, bool)> = records
             .iter()
-            .map(|r| (get_str(&r, "path"), get_str(&r, "kind")))
+            .map(|r| {
+                let index = get_prop(&r, "frontmatterIndex");
+                let index = index.as_f64().map_or_else(null, |i| i.to_string());
+                (
+                    get_str(&r, "path"),
+                    get_str(&r, "kind"),
+                    index,
+                    get_prop(&r, "span").is_null(),
+                )
+            })
             .collect();
+        let row = |path: &str, kind: &str, index: &str, spanless: bool| {
+            (path.to_owned(), kind.to_owned(), index.to_owned(), spanless)
+        };
+        // The URL entry is not a local file, so it has no record.
         assert_eq!(
             rows,
             [
-                ("./fm.mds".to_owned(), "frontmatter".to_owned()),
-                ("./a.mds".to_owned(), "import".to_owned())
+                row("./fm.mds", "frontmatter", "0", true),
+                row("./a.mds", "import", "null", false),
+                row("./cfg.json", "data", "null", true),
             ],
             "as_base {as_base}"
         );
+        let engine: Vec<(String, String)> = mds::scan_import_records(source, resolve_as)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.path, r.kind.name().to_owned()))
+            .collect();
+        let paths: Vec<(String, String)> = rows.into_iter().map(|r| (r.0, r.1)).collect();
+        assert_eq!(paths, engine, "as_base {as_base}");
     }
-    let err = mds_wasm::compile(
-        source,
-        modules_opts(&serde_json::json!({ "fm.mds": "F\n", "a.mds": "A\n" })),
-    )
-    .unwrap_err();
-    assert_eq!(get_str(&err, "code"), "mds::module_not_found");
-    assert_eq!(
-        get_str(&err, "message"),
-        "data file 'cfg.json' is not in the virtual module map"
-    );
+    let scanned: Vec<String> = js_sys::Array::from(&mds_wasm::scan_imports(source).unwrap())
+        .iter()
+        .map(|p| p.as_string().unwrap())
+        .collect();
+    assert_eq!(scanned, ["./fm.mds", "./a.mds"]);
+    let modules =
+        serde_json::json!({ "fm.mds": "F\n", "a.mds": "A\n", "cfg.json": "{\"name\": \"Ada\"}" });
+    let replayed = to_js_object(&serde_json::json!({
+        "modules": modules,
+        "vars": { "site": "s" },
+    }));
+    let result = mds_wasm::compile(source, replayed).unwrap();
+    assert_eq!(get_str(&result, "output"), "Ada\n");
 }
 
 /// #488: an import scan counts the syntax tree against the compile memory budget

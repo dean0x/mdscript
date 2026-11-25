@@ -1374,11 +1374,22 @@ backend does, and returns its text. More than 10 MiB fails with `mds::resource_l
 `mds::io` (`invalid UTF-8 in <display>: <reason>`). It runs no file type check
 (`preflight_data_returns_the_text_or_the_native_error` in `web.rs`).
 
-Until a later release, the WASM backend of `@mdscript/mds` (`compileFile`) refuses a data entry with
-`mds::module_not_found` and names the data file. The WASM `scanImportRecords` leaves out data
-records for now (U-WCF15 in `packages/mds/__test__/wasm-compileFile.spec.mjs`,
-`scan_import_records_leave_out_data_records` in `web.rs`). The native backend of `@mdscript/mds`
-reads the data file (the control in U-WCF15). The napi `compile` and `compileFile`, and the WASM
+The WASM `scanImportRecords` lists the local data file of each `data:` entry with the kind `data`,
+after the module records, as `mds::scan_import_records` does (`scan_import_records_list_data_records`
+in `web.rs`). The WASM backend of `@mdscript/mds` reads these files for `compileFile` with the data
+path rules of the native backend. Its output and its errors are equal to those of the native
+backend for a data file that it reads, a missing data file, a missing data file of an imported
+module, a base entry that a child entry replaces, a missing data file of a base entry that no child
+entry replaces (through one `@extends` base, a chain of two and an import of the child), and a
+`node_modules` segment reached through a symbolic link (U-WCF15 in
+`packages/mds/__test__/wasm-compileFile.spec.mjs`). They are also equal for each row of the shared
+data path vector table (on Windows also its Windows rows), a symbolic link as the final component, a
+linked directory outside the project root, a named pipe, a file over 10 MiB, an entry with more
+than 256 references, more than 256 data entries in one compile, more than 32 MiB of data text in
+one compile, a refused data path whose key a later path resolves to (in both orders, also through a
+case variant on a case-insensitive volume), a missing data file whose path has a `\` separator and,
+on a case-insensitive volume, a resolved key with no data extension
+(`packages/mds/__test__/data-scanner.spec.mjs`). The napi `compile` and `compileFile`, and the WASM
 `compile` with an `options.modules` map, bind data
 ('D-1: compile and compileFile bind .json, .yaml and .yml data to the same output' in
 `index.spec.mjs`, `compile_binds_json_and_yaml_data_from_the_modules_map` in `web.rs`).
@@ -1391,6 +1402,34 @@ reads the data file (the control in U-WCF15). The napi `compile` and `compileFil
 - This release fetches no URL. A URL entry needs a replay value.
 - A data file counts toward the compile memory budget (§5). Dense data can reach that budget before
   the 32 MiB data limit (`assert_data_items_share_one_limit` in `crates/mds-core/tests/memory_bound.rs`).
+- The WASM backend of `@mdscript/mds` reads each local data file that a module lists before the
+  compile starts. This includes the file of an entry that a runtime variable or a child entry
+  replaces, which the native backend does not read. Such a file counts toward the 256-file and
+  32 MiB data limits.
+- On POSIX, two data paths with one key can name two files, for example `./a.json` and
+  `./sub/../a.json` through a linked `sub`. The WASM backend of `@mdscript/mds` refuses the second
+  path with `mds::import`, as it refuses two such module imports. The native backend reads both
+  files ('two data paths with one key that name two files are refused on the WASM backend, never
+  bound to one file' in `packages/mds/__test__/data-scanner.spec.mjs`).
+- A refused data path can have the key that a later path resolves to, for example
+  `./missing/../a.json` and `./lnk/a.json` through a link `lnk` to `.`. The WASM backend of
+  `@mdscript/mds` never binds the file of the later path to the refused path. When the compile
+  binds the refused path, the WASM backend gives the native refusal. When a runtime variable or a
+  child entry replaces the refused entry, the WASM backend refuses the later path with
+  `mds::import`. The native backend reads its file ('a refused data path is never bound to the file
+  of a later path whose canonical key is its key' in `packages/mds/__test__/data-scanner.spec.mjs`).
+- On POSIX, the WASM backend of `@mdscript/mds` refuses a data file whose name starts with `\` or
+  has `:` as its second byte, for example `./\x.json` or `./a:b.json` in the project root. It gives
+  `mds::import` (`data path "<path>": escapes project directory`), because the WASM engine checks a
+  data key with no project root. The native backend reads these files ('known limit: the WASM
+  backend refuses the POSIX data files named \x.json and a:b.json, which native reads' in
+  `packages/mds/__test__/data-scanner.spec.mjs`).
+- On Windows, the WASM backend of `@mdscript/mds` compares the volume serial number and the file
+  index of each opened module or data file with those of the located file. The native backend
+  compares the final path of the opened handle. Thus, if a regular file replaces the file at the
+  same path between the lookup and the open, the WASM backend refuses it with `mds::io` (`the file
+  changed while it was opened`), and the native backend reads it. The WASM backend never reads
+  another file.
 
 ---
 
@@ -1623,7 +1662,7 @@ and I/O failures are described below the table.
 | `mds::network_denied` | A compile needs a network data entry with no replay value. The message names the entries and their project-relative modules, escaped, with no source span. | resolver | 2 / 2 | CLI, Rust, napi, WASM, Python |
 | `mds::invalid_vars` | `--vars` file is malformed JSON or not an object (`load_vars_file`) | `mds-core` vars API | 1 / 2 | CLI, Rust |
 | `mds::var_conflict` | Same key given to both `--set` and `--set-string` | CLI | 1 / 1 | CLI |
-| `mds::module_not_found` | Virtual backend: a key absent from the module map. For a data file: `data file '<key>' is not in the virtual module map` (§4.12). Until a later release, the WASM backend of `@mdscript/mds` (`compileFile`) gives this error for a data entry and names the data file | `VirtualFs`, `@mdscript/mds` WASM backend | 1 / 2 | napi, WASM, Python, Rust, `@mdscript/mds` |
+| `mds::module_not_found` | Virtual backend: a key absent from the module map. For a data file: `data file '<key>' is not in the virtual module map` (§4.12) | `VirtualFs`, `@mdscript/mds` WASM backend | 1 / 2 | napi, WASM, Python, Rust, `@mdscript/mds` |
 | `mds::recursion` | A `@define` calls itself, directly or indirectly | evaluator | 1 / 2 | all |
 | `mds::export` | `@export` of a name that is not defined, or an invalid re-export | resolver | 1 / 2 | all |
 | `mds::extends` | Template inheritance error (E1–E10, §4.11) | resolver | 1 / 2 | all |

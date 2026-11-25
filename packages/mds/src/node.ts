@@ -16,7 +16,7 @@ import type {
 import { assertResultShape } from './backend/contract.js';
 import { initWasmNode, createWasmBackend, fileOpts } from './backend/wasm.js';
 import type { WasmModule } from './backend/wasm.js';
-import { buildModulesMap } from './util/module-scanner.js';
+import { buildModulesMap, restoreDataRefusal } from './util/module-scanner.js';
 import { assertKnownKeys, forwardOpts, getBasePathError } from './util/options.js';
 
 // Read MDS_BACKEND at module scope — sync, deterministic, no I/O.
@@ -57,8 +57,9 @@ export function _resetForTesting(): void {
 /**
  * Wrap a MdsBaseBackend with file-based compile/check operations, producing
  * a MdsNodeBackend. The wasmModule is captured so compileFile/checkFile/lintFile can
- * hand it to buildModulesMap, whose file pre-scanner calls its scanImportRecords() and
- * preflightModule() exports.
+ * hand it to buildModulesMap, whose file pre-scanner calls its scanImportRecords(),
+ * preflightModule() and preflightData() exports. Only compileFile reads data files:
+ * checkFile and lintFile read none, as on the native backend.
  *
  * buildModulesMap is imported here (Node-only), not in wasm.ts, so that
  * wasm.ts remains browser-safe.
@@ -72,12 +73,18 @@ function wrapWithFileOps(
    * removing it from the map. WASM's build_modules() treats `modules` as extra
    * dependencies and inserts the entry source separately under `filename` — if
    * the entry key is still present in `modules`, it throws mds::filename_collision.
+   * `readData` is true only for a compile.
    */
   async function prepareFileArgs(
     path: string,
     options: CompileFileOptions | undefined,
-  ): Promise<{ source: string; opts: ReturnType<typeof fileOpts> }> {
-    const { entryFilename, modules, aliases } = await buildModulesMap(path, wasmModule);
+    readData: boolean,
+  ): Promise<{
+    source: string;
+    opts: ReturnType<typeof fileOpts>;
+    dataRefusals: ReadonlyMap<string, unknown>;
+  }> {
+    const { entryFilename, modules, aliases, dataRefusals } = await buildModulesMap(path, wasmModule, readData);
     const source = modules[entryFilename];
     if (source === undefined) {
       throw new Error(
@@ -85,7 +92,7 @@ function wrapWithFileOps(
       );
     }
     delete modules[entryFilename];
-    return { source, opts: fileOpts(entryFilename, modules, aliases, options) };
+    return { source, opts: fileOpts(entryFilename, modules, aliases, options), dataRefusals };
   }
 
   return {
@@ -99,8 +106,15 @@ function wrapWithFileOps(
         const bpErr = getBasePathError(options, 'compileFile');
         if (bpErr != null) throw bpErr;
       }
-      const { source, opts } = await prepareFileArgs(path, options);
-      const result: unknown = wasmModule.compile(source, opts);
+      const { source, opts, dataRefusals } = await prepareFileArgs(path, options, true);
+      let result: unknown;
+      try {
+        result = wasmModule.compile(source, opts);
+      } catch (err) {
+        // A data file the scan refused is not in the map. The engine reports it absent
+        // where native reads it; give native's refusal back instead.
+        throw restoreDataRefusal(err, dataRefusals);
+      }
       assertResultShape(result, 'compile');
       return result as CompileResult;
     },
@@ -116,7 +130,8 @@ function wrapWithFileOps(
       // sourceMap/sourcesContent), so the cast is safe: prepareFileArgs calls
       // fileOpts which uses forwardOpts over METHOD_KEYS.compileFile; the absent
       // fields resolve as undefined and are excluded by forwardOpts's != null check.
-      const { source, opts } = await prepareFileArgs(path, options as CompileFileOptions | undefined);
+      // A check reads no data file.
+      const { source, opts } = await prepareFileArgs(path, options as CompileFileOptions | undefined, false);
       const result: unknown = wasmModule.check(source, opts);
       assertResultShape(result, 'check');
       return result as CheckResult;
@@ -137,7 +152,8 @@ function wrapWithFileOps(
       // not just the basename — this differs from the native backend's filename
       // in the canonical JSON. Use lintVirtual for byte-identical cross-surface
       // comparison.
-      const { entryFilename, modules, aliases } = await buildModulesMap(path, wasmModule);
+      // A lint reads no data file.
+      const { entryFilename, modules, aliases } = await buildModulesMap(path, wasmModule, false);
       const entrySource = modules[entryFilename];
       if (entrySource === undefined) {
         throw new Error(

@@ -68,14 +68,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hold data files. A key that ends in exactly `.json`, `.yaml` or `.yml` is a data file. Data
   files have their own bounds: 256 files and 32 MiB of text, apart from the module bounds.
 - WASM: the export `preflightData(bytes, display)` checks the bytes of a data file and returns
-  its text.
-
-### Known limits — local data in `@mdscript/mds` (#405)
-
-- Until a later release, the WASM backend of `@mdscript/mds` (`compileFile`) refuses a data entry
-  with `mds::module_not_found` and names the data file. The native backend reads data files.
-- The WASM `scanImportRecords` leaves out data records for now. The TypeScript `kind` type of an
-  import record gets the `data` kind in a later release.
+  its text. `scanImportRecords` lists the local data file of each `data:` entry with the kind
+  `data`, after the module records.
+- `@mdscript/mds`: the WASM backend of `compileFile` reads local data files with the data path
+  rules of the native backend. For the cases that spec §4.12 lists, it gives the same output and
+  the same errors as the native backend. The TypeScript
+  `kind` of an import record gets `'data'`. The WASM backend reads each data file that a module
+  lists, also the file of an entry that a runtime variable or a child entry replaces. Such a file
+  counts toward the 256-file and 32 MiB data limits. On POSIX, two data paths with one key can
+  name two files, for example `./a.json` and `./sub/../a.json` through a linked `sub`. Then the
+  WASM backend refuses the second path, as it refuses two such module imports.
 
 ### Changed
 

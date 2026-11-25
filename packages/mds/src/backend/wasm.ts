@@ -18,11 +18,13 @@ import { forwardOpts } from '../util/options.js';
 /**
  * An import path of a module as the engine's `scanImportRecords` reports it: the path
  * as written, the directive it is written in, and the context the resolver adds to an
- * error that resolving it raises (#414).
+ * error that resolving it raises (#414). A `data` record is the local file path of a
+ * frontmatter `data:` entry (#405): it comes after every module record, and has no
+ * frontmatter index and no span.
  */
 export interface ImportRecord {
   readonly path: string;
-  readonly kind: 'extends' | 'frontmatter' | 'import' | 'export-from';
+  readonly kind: 'extends' | 'frontmatter' | 'import' | 'export-from' | 'data';
   /** A frontmatter import's position in the `imports:` list: `(in frontmatter imports[<i>])`. */
   readonly frontmatterIndex: number | null;
   /** For `@extends` and `@import`, the span a `mds::file_not_found` error for the path carries. */
@@ -31,9 +33,9 @@ export interface ImportRecord {
 
 /**
  * Shape of the WASM module exports (built with wasm-pack) that @mdscript/mds calls:
- * compile, check, lint, lintVirtual, and scanImportRecords and preflightModule, the two
- * the Node file pre-scanner calls. options shapes mirror the Rust wasm-bindgen
- * signatures.
+ * compile, check, lint, lintVirtual, and scanImportRecords, preflightModule and
+ * preflightData, the three the Node file pre-scanner calls. options shapes mirror the
+ * Rust wasm-bindgen signatures.
  *
  * Exported so callers can type-annotate pre-loaded modules passed to
  * createWasmBackend().
@@ -72,7 +74,8 @@ export interface WasmModule {
    * and the context the resolver adds to an error that resolving it raises
    * (`mds::scan_import_records`), in the order the resolver resolves them — with the
    * `@extends` base after the imports for a module reached as the base of another
-   * (`asBase`), before them otherwise.
+   * (`asBase`), before them otherwise — then the local data file paths of its `data:`
+   * entries, in declaration order.
    */
   scanImportRecords(source: string, asBase: boolean): ImportRecord[];
   /**
@@ -86,6 +89,14 @@ export interface WasmModule {
    * of a file (#428).
    */
   preflightModule(bytes: Uint8Array, display: string, typed: string): string;
+  /**
+   * A local data file's text, checked as the native backend checks the data files it
+   * reads (#405): throws `mds::resource_limit` over 10 MiB and `mds::io` for invalid UTF-8,
+   * naming the file by `display`, its path below the project root (`mds::check_module_bytes`).
+   * It runs no file type check: a data file is not an MDS file. The caller bounds the
+   * bytes, as for `preflightModule`.
+   */
+  preflightData(bytes: Uint8Array, display: string): string;
   default?: (input?: unknown) => Promise<void>;
 }
 
