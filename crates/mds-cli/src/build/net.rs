@@ -83,14 +83,12 @@ impl NetRun {
     /// Run step compiles to the end: each round sends the requests that the compile
     /// needs and runs the compile again with every response. At most one round per
     /// request of a compile and one more. One deadline binds the network work of the
-    /// compile; each request is sent once, with no retry.
+    /// compile from its first send; each request is sent once, with no retry.
     fn drive(
         &self,
         mut step: impl FnMut(&FetchContext, &FetchState) -> Result<Step, MdsError>,
     ) -> Result<CompileResult, MdsError> {
-        let deadline = Instant::now()
-            .checked_add(COMPILE_DEADLINE)
-            .ok_or(MdsError::Internal)?;
+        let mut deadline = None;
         let mut state = FetchState::new();
         for _ in 0..=MAX_REQUESTS_PER_COMPILE {
             let requests = match step(&self.ctx, &state)? {
@@ -98,6 +96,14 @@ impl NetRun {
                 Step::Need(requests) if !requests.is_empty() => requests,
                 // A round that needs nothing and is not done can not end.
                 _ => return Err(MdsError::Internal),
+            };
+            let deadline = match deadline {
+                Some(deadline) => deadline,
+                None => *deadline.insert(
+                    Instant::now()
+                        .checked_add(COMPILE_DEADLINE)
+                        .ok_or(MdsError::Internal)?,
+                ),
             };
             self.reserve(requests.len())?;
             let responses = self.send_round(&requests, deadline);
