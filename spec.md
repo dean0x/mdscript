@@ -1305,8 +1305,9 @@ The sender checks each address that a name lookup gives before it connects. An a
 refused range fails the request with `mds::network_denied` (`transport-address`). The refused
 IPv4 ranges are `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`,
 `172.16.0.0/12`, `192.0.0.0/24`, `192.168.0.0/16`, `198.18.0.0/15`, `224.0.0.0/4`,
-`240.0.0.0/4` and `255.255.255.255/32`. The refused IPv6 ranges are `::/128`, `::1/128`,
-`::ffff:0:0/96`, `2002::/16`, `64:ff9b::/96`, `fc00::/7`, `fe80::/10` and `ff00::/8`. An
+`240.0.0.0/4` and `255.255.255.255/32`. The refused IPv6 ranges are `::/96` (it holds `::`
+and `::1`), `::ffff:0:0/96`, `::ffff:0:0:0/96`, `64:ff9b::/96`, `64:ff9b:1::/48`, `2001::/32`,
+`2002::/16`, `fc00::/7`, `fe80::/10`, `fec0::/10` and `ff00::/8`. An
 address in a refused range passes only when an allow item is that exact IP address with that
 exact port. Thus a name can never open such an address that no allow item names
 (`address_table_refuses_both_edges_of_each_range`,

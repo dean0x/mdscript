@@ -551,16 +551,21 @@ const REFUSED_V4: [(Ipv4Addr, u32); 12] = [
     (Ipv4Addr::new(255, 255, 255, 255), 32),
 ];
 
-/// The refused IPv6 ranges: the first address and the prefix length. The whole
-/// IPv4-mapped and 6to4 ranges are refused, so each IPv4 address that they embed is too.
-const REFUSED_V6: [(Ipv6Addr, u32); 8] = [
-    (Ipv6Addr::UNSPECIFIED, 128),
-    (Ipv6Addr::LOCALHOST, 128),
+/// The refused IPv6 ranges: the first address and the prefix length. `::/96` holds the
+/// unspecified and the loopback address. Each range that embeds an IPv4 address
+/// (IPv4-compatible, IPv4-mapped, IPv4-translated, the two NAT64 prefixes, Teredo and 6to4)
+/// is refused whole, so each IPv4 address that it embeds is too.
+const REFUSED_V6: [(Ipv6Addr, u32); 11] = [
+    (Ipv6Addr::UNSPECIFIED, 96),
     (Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0), 96),
-    (Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16),
+    (Ipv6Addr::new(0, 0, 0, 0, 0xffff, 0, 0, 0), 96),
     (Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0), 96),
+    (Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0, 0), 48),
+    (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 32),
+    (Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16),
     (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),
     (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
+    (Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0), 10),
     (Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
 ];
 
