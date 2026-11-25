@@ -3048,3 +3048,78 @@ fn request_identity_api_exists() {
         "a request ID is 64 lower-case hex digits"
     );
 }
+
+/// #405: the step API is reachable from the crate root. Each step function takes the
+/// options of its compile function plus the context and the state; a match on `Step`,
+/// `Response` or `TransportFailure` needs a wildcard arm, as a new kind may be added.
+#[test]
+fn step_api_exists() {
+    type Vars = Option<HashMap<String, mds::Value>>;
+    type Ctx<'a> = &'a mds::FetchContext;
+    type State<'a> = &'a mds::FetchState;
+    type Stepped = Result<mds::Step, MdsError>;
+    type VirtualStep = fn(mds::VirtualFs, &str, Vars, mds::CompileOptions, Ctx, State) -> Stepped;
+    type StrStep =
+        fn(&str, Option<&std::path::Path>, Vars, mds::CompileOptions, Ctx, State) -> Stepped;
+    let native = |fs: mds::NativeFs,
+                  entry: &std::path::Path,
+                  vars: Vars,
+                  opts,
+                  ctx: Ctx,
+                  state: State|
+     -> Stepped { mds::compile_step_native_fs(fs, entry, vars, opts, ctx, state) };
+    let _ = native;
+    let _: VirtualStep = mds::compile_step_virtual_fs;
+    let _: StrStep = mds::compile_step_str;
+
+    let policy =
+        mds::NetworkPolicy::new(vec![mds::AllowItem::parse("a.example").unwrap()]).unwrap();
+    let ctx = mds::FetchContext::new(policy, mds::RunKey::from_bytes([7; 32]));
+    let _: &mds::NetworkPolicy = ctx.policy();
+    let state = mds::FetchState::new();
+    assert!(state.is_empty());
+    let id = mds::RequestId::parse_hex(&"ab".repeat(32)).unwrap();
+    let answer = mds::Response::http(
+        200,
+        vec![("x-a".into(), b"marker".to_vec())],
+        b"marker".to_vec(),
+    );
+    let state = state.with_response(id, answer).unwrap();
+    assert_eq!(state.len(), 1);
+    assert!(!format!("{state:?}").contains("marker"));
+    assert_eq!(
+        format!(
+            "{:?}",
+            mds::Response::failed(mds::TransportFailure::Timeout)
+        ),
+        "Failed(Timeout)"
+    );
+    assert_ne!(
+        mds::TransportFailure::AddressRefused,
+        mds::TransportFailure::Timeout
+    );
+
+    let fs = mds::VirtualFs::new(HashMap::from([(
+        "main.mds".to_string(),
+        "Hi!\n".to_string(),
+    )]));
+    let step = mds::compile_step_virtual_fs(
+        fs,
+        "main.mds",
+        None,
+        mds::CompileOptions::default(),
+        &ctx,
+        &mds::FetchState::new(),
+    )
+    .unwrap();
+    let result: mds::CompileResult = match step {
+        mds::Step::Done(result) => *result,
+        mds::Step::Need(_) => panic!("expected a finished compile"),
+        _ => panic!("unexpected step"),
+    };
+    let _: &[mds::RemoteInput] = &result.remote_inputs;
+    for input in &result.remote_inputs {
+        let _: (&str, &str, &str, &str) =
+            (&input.module, &input.entry, &input.template, &input.origin);
+    }
+}

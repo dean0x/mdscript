@@ -14,6 +14,7 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -21,7 +22,7 @@ use indexmap::IndexMap;
 use super::decl::{HeaderSource, RequestTemplate};
 use super::encode::{self, FieldLabel, Target};
 use super::graph::Node;
-use super::policy::{HopError, Layer, NetworkPolicy, Refusal};
+use super::policy::{HopError, Layer, NetworkPolicy, Refusal, ADDRESS_REFUSED};
 use super::request::RunKey;
 use super::request::{identity_bytes, HeaderValue, Method, Request, RequestHeader, RequestId};
 use super::url::{self, CheckedUrl, Host, Origin};
@@ -34,72 +35,223 @@ use crate::limits::{
 };
 use crate::scope::VarLayer;
 use crate::value::{Value, MAX_VALUE_DEPTH};
-use crate::MdsError;
+use crate::{CompileResult, MdsError};
 
-/// The answer of the host to one request.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the public step API is the first caller")
-)]
-#[derive(Clone, Debug)]
-pub(crate) enum Response {
+/// The answer of the host to one request. The core checks every cap of the answer
+/// again when a step compile reads it. Its `Debug` shows the status and the sizes only.
+///
+/// This enum is `#[non_exhaustive]`: obtain answers from [`Response::http`] and
+/// [`Response::failed`].
+#[non_exhaustive]
+#[derive(Clone)]
+pub enum Response {
     /// An HTTP answer: the status, the headers in received order and the body.
+    #[non_exhaustive]
     Http {
         status: u16,
         headers: Vec<(String, Vec<u8>)>,
         body: Vec<u8>,
     },
     /// The request got no HTTP answer.
-    Failed(Transport),
+    #[non_exhaustive]
+    Failed(TransportFailure),
 }
 
-/// Why a request got no HTTP answer.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the public step API is the first caller")
-)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Transport {
-    Timeout,
-    Connect,
-    Tls,
-    /// The answer is not valid HTTP.
-    Protocol,
-    /// The body is longer than `MAX_RESPONSE_BYTES`.
-    BodyTooLarge,
-    /// The status line and the headers are longer than `MAX_RESPONSE_HEADER_BYTES`.
-    HeadersTooLarge,
-    /// The fetcher refused the address of the host, with this refusal.
-    Refused(Refusal),
+impl Response {
+    /// An HTTP answer: the status, the headers in received order and the body. The
+    /// sender follows no redirect: a redirect answer is given as it is.
+    #[must_use]
+    pub fn http(status: u16, headers: Vec<(String, Vec<u8>)>, body: Vec<u8>) -> Self {
+        Self::Http {
+            status,
+            headers,
+            body,
+        }
+    }
+
+    /// A request that got no HTTP answer.
+    #[must_use]
+    pub fn failed(failure: TransportFailure) -> Self {
+        Self::Failed(failure)
+    }
 }
 
-impl Transport {
-    /// The fixed text of the failure. It never holds response text.
-    fn kind(self) -> String {
+impl fmt::Debug for Response {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Transport::Timeout => "the request timed out".into(),
-            Transport::Connect => "the connection failed".into(),
-            Transport::Tls => "the TLS handshake failed".into(),
-            Transport::Protocol => "the response is not valid HTTP".into(),
-            Transport::BodyTooLarge => {
-                format!("the response body exceeds {MAX_RESPONSE_BYTES} bytes")
-            }
-            Transport::HeadersTooLarge => {
-                format!("the response headers exceed {MAX_RESPONSE_HEADER_BYTES} bytes")
-            }
-            Transport::Refused(refusal) => refusal.reason().into(),
+            Response::Http {
+                status,
+                headers,
+                body,
+            } => f
+                .debug_struct("Http")
+                .field("status", status)
+                .field("headers", &headers.len())
+                .field("body_bytes", &body.len())
+                .finish(),
+            Response::Failed(failure) => f.debug_tuple("Failed").field(failure).finish(),
         }
     }
 }
 
-/// One URL entry that a compile bound, in template form: the module, the entry, the URL
-/// as declared and its origin. It never holds the expanded URL.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RemoteInput {
-    pub(crate) module: String,
-    pub(crate) entry: String,
-    pub(crate) template: String,
-    pub(crate) origin: String,
+/// Why a request got no HTTP answer. The core gives each kind its own fixed message.
+///
+/// This enum is `#[non_exhaustive]`: new kinds may be added in minor releases.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportFailure {
+    Timeout,
+    Connect,
+    Tls,
+    /// Each address of the host is in a refused range: see
+    /// [`NetworkPolicy::check_address`].
+    AddressRefused,
+    /// The body is longer than 10 MiB.
+    BodyTooLarge,
+    /// The status line and the headers are longer than 16 KiB.
+    HeadersTooLarge,
+    /// The answer is not valid HTTP.
+    Protocol,
+}
+
+impl TransportFailure {
+    /// The fixed text of the failure. It never holds response text.
+    fn kind(self) -> String {
+        match self {
+            TransportFailure::Timeout => "the request timed out".into(),
+            TransportFailure::Connect => "the connection failed".into(),
+            TransportFailure::Tls => "the TLS handshake failed".into(),
+            TransportFailure::Protocol => "the response is not valid HTTP".into(),
+            TransportFailure::BodyTooLarge => {
+                format!("the response body exceeds {MAX_RESPONSE_BYTES} bytes")
+            }
+            TransportFailure::HeadersTooLarge => {
+                format!("the response headers exceed {MAX_RESPONSE_HEADER_BYTES} bytes")
+            }
+            TransportFailure::AddressRefused => ADDRESS_REFUSED.reason().into(),
+        }
+    }
+}
+
+/// One URL entry that a step compile bound, in template form: the module, the entry, the
+/// URL as declared and its origin. It never holds the expanded URL.
+///
+/// This type is `#[non_exhaustive]`: obtain values from [`CompileResult::remote_inputs`].
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct RemoteInput {
+    /// The project-relative label of the declaring module.
+    pub module: String,
+    pub entry: String,
+    /// The URL as declared, with its `{{…}}` text.
+    pub template: String,
+    /// The origin of the URL as declared.
+    pub origin: String,
+}
+
+/// The network grant of one run of step compiles: the policy and the per-run key.
+///
+/// This type is `#[non_exhaustive]`: obtain values from [`FetchContext::new`].
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct FetchContext {
+    policy: Arc<NetworkPolicy>,
+    key: Arc<RunKey>,
+}
+
+impl FetchContext {
+    #[must_use]
+    pub fn new(policy: NetworkPolicy, key: RunKey) -> Self {
+        Self {
+            policy: Arc::new(policy),
+            key: Arc::new(key),
+        }
+    }
+
+    /// The policy, for the address check of a sender.
+    #[must_use]
+    pub fn policy(&self) -> &NetworkPolicy {
+        &self.policy
+    }
+
+    /// The network state of one step compile with the responses of `state`.
+    pub(crate) fn start(&self, state: &FetchState) -> StepCtx {
+        StepCtx::new(
+            Arc::clone(&self.policy),
+            Arc::clone(&self.key),
+            Arc::clone(&state.responses),
+        )
+    }
+}
+
+/// The responses that a host has for the requests of a step compile, keyed by request
+/// ID. It holds responses only: each step compile derives every request again and runs
+/// every check again. Its `Debug` shows the response count only.
+///
+/// This type is `#[non_exhaustive]`: obtain values from [`FetchState::new`].
+#[non_exhaustive]
+#[derive(Clone, Default)]
+pub struct FetchState {
+    responses: Arc<IndexMap<RequestId, Response>>,
+}
+
+impl FetchState {
+    /// The start state, with no response.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The state with the response to the request `id` added. A second response for one
+    /// ID fails with `mds::invalid_options`, and a response past the request cap of a
+    /// compile (64) fails with `mds::resource_limit`.
+    #[must_use = "a response can be refused"]
+    pub fn with_response(mut self, id: RequestId, response: Response) -> Result<Self, MdsError> {
+        if self.responses.contains_key(&id) {
+            return Err(MdsError::invalid_options(
+                "the fetch state already holds a response for this request",
+            ));
+        }
+        if self.responses.len() >= MAX_REQUESTS_PER_COMPILE {
+            return Err(MdsError::resource_limit(format!(
+                "too many responses in the fetch state (max {MAX_REQUESTS_PER_COMPILE})"
+            )));
+        }
+        Arc::make_mut(&mut self.responses).insert(id, response);
+        Ok(self)
+    }
+
+    /// The number of responses.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.responses.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.responses.is_empty()
+    }
+}
+
+impl fmt::Debug for FetchState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FetchState")
+            .field("responses", &self.responses.len())
+            .finish()
+    }
+}
+
+/// The result of one step compile.
+///
+/// This enum is `#[non_exhaustive]`: new variants may be added in minor releases.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum Step {
+    /// Every URL entry is bound and the compile is complete.
+    Done(Box<CompileResult>),
+    /// The host sends these requests, adds each response to the [`FetchState`] and runs
+    /// the next step.
+    Need(Vec<Request>),
 }
 
 /// The network state of one step compile.
@@ -119,10 +271,6 @@ pub(crate) struct StepCtx {
 }
 
 /// The result of a step compile.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the public step API is the first caller")
-)]
 #[derive(Debug)]
 pub(crate) enum Outcome {
     /// Every URL entry is bound.
@@ -131,10 +279,6 @@ pub(crate) enum Outcome {
     Need(Vec<Request>),
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the public step API is the first caller")
-)]
 impl StepCtx {
     pub(crate) fn new(
         policy: Arc<NetworkPolicy>,
@@ -469,10 +613,10 @@ fn follow(
             ctx.consumed.insert(id);
         }
         let (status, headers, body) = match response {
-            Response::Failed(Transport::Refused(refusal)) => {
-                return Err(label.refused(*refusal, None));
+            Response::Failed(TransportFailure::AddressRefused) => {
+                return Err(label.refused(ADDRESS_REFUSED, None));
             }
-            Response::Failed(transport) => return Err(label.network(&transport.kind())),
+            Response::Failed(failure) => return Err(label.network(&failure.kind())),
             Response::Http {
                 status,
                 headers,
@@ -483,7 +627,7 @@ fn follow(
             sum.checked_add(name.len())?.checked_add(value.len() + 4)
         });
         if header_bytes.is_none_or(|bytes| bytes > MAX_RESPONSE_HEADER_BYTES) {
-            return Err(label.network(&Transport::HeadersTooLarge.kind()));
+            return Err(label.network(&TransportFailure::HeadersTooLarge.kind()));
         }
         let bound = match status {
             301 | 302 | 303 | 307 | 308 => {
@@ -502,7 +646,7 @@ fn follow(
             return Err(label.network(&format!("the server answered with HTTP status {status}")));
         }
         if u64::try_from(body.len()).map_or(true, |len| len > MAX_RESPONSE_BYTES) {
-            return Err(label.network(&Transport::BodyTooLarge.kind()));
+            return Err(label.network(&TransportFailure::BodyTooLarge.kind()));
         }
         let data = DataLabel {
             module: node.module,

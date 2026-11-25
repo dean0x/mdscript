@@ -7,9 +7,9 @@ use indexmap::IndexMap;
 
 use super::encode::{check_header_value, encode_path_segment, encode_query, EncodeRefusal};
 use super::encode_tests::{vectors, Vector};
-use super::policy::{AllowItem, Layer, NetworkPolicy, Refusal, Secret, SecretValue};
+use super::policy::{AllowItem, NetworkPolicy, Secret, SecretValue};
 use super::request::{HeaderValue, Request, RequestId, RunKey};
-use super::step::{Outcome, RemoteInput, Response, StepCtx, Transport};
+use super::step::{Outcome, RemoteInput, Response, StepCtx, TransportFailure};
 use super::{convert, Accept, DataInput, DataLabel};
 use crate::evaluator::budget::MemBudget;
 use crate::limits::{MAX_HEADER_VALUE_BYTES, MAX_REDIRECTS, MAX_REQUESTS_PER_COMPILE};
@@ -867,7 +867,6 @@ fn a_failed_answer_fails_the_entry() {
         &net,
         &Responses::new(),
     ));
-    let refused = Refusal::new(Layer::TransportAddress, "the address is in a refused range");
     let large = Response::Http {
         status: 200,
         headers: vec![("x-big".into(), vec![b'a'; 16 * 1024])],
@@ -880,27 +879,27 @@ fn a_failed_answer_fails_the_entry() {
     };
     for (response, code_text, tail) in [
         (
-            Response::Failed(Transport::Timeout),
+            Response::Failed(TransportFailure::Timeout),
             "mds::network",
             "the request timed out",
         ),
         (
-            Response::Failed(Transport::Connect),
+            Response::Failed(TransportFailure::Connect),
             "mds::network",
             "the connection failed",
         ),
         (
-            Response::Failed(Transport::Tls),
+            Response::Failed(TransportFailure::Tls),
             "mds::network",
             "the TLS handshake failed",
         ),
         (
-            Response::Failed(Transport::Protocol),
+            Response::Failed(TransportFailure::Protocol),
             "mds::network",
             "the response is not valid HTTP",
         ),
         (
-            Response::Failed(Transport::BodyTooLarge),
+            Response::Failed(TransportFailure::BodyTooLarge),
             "mds::network",
             "the response body exceeds 10485760 bytes",
         ),
@@ -914,7 +913,7 @@ fn a_failed_answer_fails_the_entry() {
             "the server answered with HTTP status 404",
         ),
         (
-            Response::Failed(Transport::Refused(refused)),
+            Response::Failed(TransportFailure::AddressRefused),
             "mds::network_denied",
             "transport-address: the address is in a refused range",
         ),

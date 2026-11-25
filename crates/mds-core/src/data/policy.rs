@@ -68,6 +68,11 @@ pub struct Refusal {
     reason: &'static str,
 }
 
+/// The refusal of an address in a refused range, for the address check and for a sender
+/// that reports it.
+pub(crate) const ADDRESS_REFUSED: Refusal =
+    Refusal::new(Layer::TransportAddress, "the address is in a refused range");
+
 impl Refusal {
     pub(crate) const fn new(layer: Layer, reason: &'static str) -> Self {
         Self { layer, reason }
@@ -396,10 +401,7 @@ impl NetworkPolicy {
         {
             Ok(())
         } else {
-            Err(Refusal::new(
-                Layer::TransportAddress,
-                "the address is in a refused range",
-            ))
+            Err(ADDRESS_REFUSED)
         }
     }
 }

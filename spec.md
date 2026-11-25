@@ -1202,6 +1202,28 @@ entries in declaration order. The denial comes before any local data read
 `frontier_keeps_module_and_declaration_order` in `graph_tests.rs`,
 `build_denies_network_entries_without_replay_and_opens_no_connection` in `cli_data.rs`).
 
+#### Step compiles
+
+The Rust API sends requests through a host loop: `compile_step_native_fs`, `compile_step_virtual_fs`
+and `compile_step_str`. Each takes the arguments of its compile function plus a `FetchContext`
+(the `NetworkPolicy` and a per-run `RunKey`) and a `FetchState`. It returns `Step::Done` with the
+`CompileResult`, or `Step::Need` with the requests that the compile needs:
+
+- Each call is a fresh compile with a fresh budget. It derives every request again and runs every
+  check again, so a narrower policy on a later call takes effect.
+- The state holds responses only, keyed by `RequestId` (64 lower-case hex digits). A second
+  response for one ID fails with `mds::invalid_options`
+  (`the fetch state already holds a response for this request`). More than 64 responses fail
+  with `mds::resource_limit`. A response that the compile did not request fails with
+  `mds::invalid_options` (§5).
+- A host gives a failure as a fixed `TransportFailure` kind. `AddressRefused` fails with
+  `mds::network_denied` (`transport-address`), each other kind with `mds::network`.
+- `CompileResult.remote_inputs` lists each bound URL entry as its module, entry, URL as declared
+  and origin, never the expanded URL. `dependencies` never lists a URL. The canonical JSON writes
+  `remoteInputs` only when the list is not empty.
+
+Tests: `crates/mds-core/tests/data_step.rs`.
+
 #### Status envelope
 
 The value of a URL entry is the converted response body. A status that is not 2xx fails with
@@ -1725,7 +1747,7 @@ and I/O failures are described below the table.
 | `mds::expected_messages` | Rust API only: `CompileResult::into_messages()` on a markdown result | `mds-core` API | n/a | Rust |
 | `mds::formatter_invariant` | The formatter's rewrite failed the compile-equivalence gate — a formatter defect; nothing is written | formatter | 1 / n/a | CLI (`fmt`), Rust |
 | `mds::internal` | A lexer step that does not advance or a failed memory-counter check at the end of a compile (§5 "Compile memory budget"), or an evaluator read of a pending data entry, which the check calls never do (§4.12). Each gives `internal compiler error` with no help and no span. Also: a panic caught at a binding boundary, or a result that could not be serialised; the raw payload is attached as `detail` only under the off-by-default `debug-panics` feature (`SECURITY.md`). On the CLI, also the error `mds lint --format json` records for an input whose analysis panicked, with the fixed message `internal compiler error` and nothing of the panic (§5 "Panics on the CLI") | lexer (the progress check); resolver (the counter check); napi, WASM, Python; `mds lint` | 101 / 101 | all |
-| `mds::invalid_options` | Malformed or type-incorrect options: unknown keys, wrong types, `basePath` on file methods or on the WASM backend, source-map options on `check`, an empty `basePath`, a WASM `moduleAliases` entry that is not a normalized module key or names no module (`options.moduleAliases["<alias>"]: <reason>`). In the core, a step compile whose fetch state holds a response that the compile did not request (`invalid options: the fetch state holds a response that this compile did not request`, fixed text with no source span, §4.12) | napi, WASM, Python, `@mdscript/mds`; resolver (step compile) | 2 / n/a | napi, WASM, Python, `@mdscript/mds`, Rust |
+| `mds::invalid_options` | Malformed or type-incorrect options: unknown keys, wrong types, `basePath` on file methods or on the WASM backend, source-map options on `check`, an empty `basePath`, a WASM `moduleAliases` entry that is not a normalized module key or names no module (`options.moduleAliases["<alias>"]: <reason>`). In the core, a step compile whose fetch state holds a response that the compile did not request (`invalid options: the fetch state holds a response that this compile did not request`), and a second response for one request ID in a fetch state (`invalid options: the fetch state already holds a response for this request`), fixed text with no source span (§4.12 "Step compiles") | napi, WASM, Python, `@mdscript/mds`; resolver (step compile) | 2 / n/a | napi, WASM, Python, `@mdscript/mds`, Rust |
 | `mds::filename_collision` | `options.modules` already contains the entry `filename` | WASM (surfaced through `@mdscript/mds`) | n/a | WASM, `@mdscript/mds` |
 | `mds::invalid_backend_result` | The selected backend returned a result of an unexpected shape | `@mdscript/mds` | n/a | `@mdscript/mds` |
 
