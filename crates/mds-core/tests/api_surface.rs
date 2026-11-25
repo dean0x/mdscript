@@ -2340,7 +2340,7 @@ fn lint_types_exist() {
 /// AC-224-7 / AC-224-8: KNOWN_LINT_RULES and UnknownRuleNames honour ADR-010.
 ///
 /// - `KNOWN_LINT_RULES` is publicly reachable from an external crate.
-/// - It contains exactly the eleven registered rule names.
+/// - It contains exactly the thirteen registered rule names.
 /// - Every entry in the registry is accepted by `LintConfig::from_rules_checked` without
 ///   unknowns.
 /// - `find_unknown_rule_names` returns `None` for all-known maps and `Some` for
@@ -2351,11 +2351,11 @@ fn lint_types_exist() {
 fn known_lint_rules_and_unknown_detection() {
     use mds::{find_unknown_rule_names, KNOWN_LINT_RULES};
 
-    // AC-224-7: exactly 11 rules.
+    // AC-224-7: exactly 13 rules.
     assert_eq!(
         KNOWN_LINT_RULES.len(),
-        11,
-        "KNOWN_LINT_RULES must have exactly 11 entries"
+        13,
+        "KNOWN_LINT_RULES must have exactly 13 entries"
     );
 
     // AC-224-7: exact sorted contents.
@@ -2363,7 +2363,9 @@ fn known_lint_rules_and_unknown_detection() {
         "duplicate-export",
         "duplicate-import",
         "empty-block",
+        "insecure-data-origin",
         "legacy-interpolation",
+        "literal-credential-header",
         "literal-directive",
         "redundant-else",
         "shadow-variable",

@@ -11,7 +11,8 @@
 //! |      | empty-block, legacy-interpolation                            |           |
 //! | B    | unused-import, unused-function                               | Fixable only when structural-standalone |
 //! | C    | literal-directive, unused-variable, redundant-else,          | Never fixed |
-//! |      | shadow-variable                                             |           |
+//! |      | shadow-variable, insecure-data-origin,                      |           |
+//! |      | literal-credential-header                                   |           |
 //!
 //! This table restates `rule_tier`, which is the authoritative source; `legacy-interpolation`
 //! is the one Tier A rule whose fix is not output-neutral (see `is_output_neutral`).
@@ -47,7 +48,7 @@ pub fn rule_tier(rule: &str) -> FixTier {
         | "empty-block"
         | "legacy-interpolation" => FixTier::A,
         "unused-import" | "unused-function" => FixTier::B,
-        _ => FixTier::C, // literal-directive, unused-variable, redundant-else, shadow-variable, unknown
+        _ => FixTier::C, // the report-only rules and unknown names
     }
 }
 
@@ -120,7 +121,7 @@ mod tests {
 
         /// Canonical expected-tier table: (rule_name, expected_FixTier).
         /// Must be updated whenever a rule is added, removed, or re-tiered.
-        /// Pin: len must equal ALL_RULE_NAMES.len() (11 as of this release).
+        /// Pin: len must equal ALL_RULE_NAMES.len() (13 as of this release).
         const EXPECTED: &[(&str, FixTier)] = &[
             // Tier A — auto-fixable with reverify gate
             ("duplicate-export", FixTier::A),
@@ -132,6 +133,8 @@ mod tests {
             ("unused-function", FixTier::B),
             ("unused-import", FixTier::B),
             // Tier C — report-only, never fixed
+            ("insecure-data-origin", FixTier::C),
+            ("literal-credential-header", FixTier::C),
             ("literal-directive", FixTier::C),
             ("redundant-else", FixTier::C),
             ("shadow-variable", FixTier::C),
@@ -141,18 +144,18 @@ mod tests {
         // Length pin: update this when a new rule ships.
         assert_eq!(
             EXPECTED.len(),
-            11,
-            "EXPECTED table length must equal the number of registered rules (11)"
+            13,
+            "EXPECTED table length must equal the number of registered rules (13)"
         );
         assert_eq!(
             ALL_RULE_NAMES.len(),
-            11,
-            "ALL_RULE_NAMES length must equal the number of registered rules (11)"
+            13,
+            "ALL_RULE_NAMES length must equal the number of registered rules (13)"
         );
         assert_eq!(
             KNOWN_LINT_RULES.len(),
-            11,
-            "KNOWN_LINT_RULES length must equal the number of registered rules (11)"
+            13,
+            "KNOWN_LINT_RULES length must equal the number of registered rules (13)"
         );
 
         // Direction 1: every registry entry has a correct entry in EXPECTED.
@@ -204,6 +207,8 @@ mod tests {
             "unused-variable",
             "redundant-else",
             "shadow-variable",
+            "insecure-data-origin",
+            "literal-credential-header",
         ] {
             assert!(is_output_neutral(rule), "{rule} should be output-neutral");
         }
@@ -235,7 +240,7 @@ mod tests {
     /// token that names a registered rule together with the tier of its row
     /// (a continuation row with a blank tier column inherits the tier of the row
     /// above), and asserts the extracted map agrees with `rule_tier` in both
-    /// directions for all 11 rules.
+    /// directions for all 13 rules.
     #[test]
     fn module_doc_tier_table_matches_rule_tier() {
         use super::super::rules::ALL_RULE_NAMES;

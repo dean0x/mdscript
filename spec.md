@@ -2588,6 +2588,8 @@ Rules default to the severities shown below — **not all rules default to `warn
 | `duplicate-export` | **error** | yes (A) | A | The same export name is defined more than once in a single file. |
 | `legacy-interpolation` | warn | yes (A) | A | A legacy `{x}` interpolation can use `{{x}}` instead. |
 | `literal-directive` | warn | no | C | A conditional line stays literal: an indented line outside a fence without `indented-directives: true`, or a line in an unmarked fence with `@if …:` before `@end`. The rule skips fences with `mds` as the first info word. |
+| `insecure-data-origin` | warn | no | C | A request map of a URL data entry (§4.12) names an `http://` URL. The http scheme does not encrypt the request or the response. The rule reads the declarations only and sends no request. |
+| `literal-credential-header` | warn | no | C | A URL data entry (§4.12) sets a header to literal text, and the lower-case header name contains `token`, `secret`, `api-key`, `apikey` or `password`. A value with a `{{…}}` reference is not reported. The message names the entry and the header, never the value. Use the secret form `{secret: NAME, prefix: ''}`. |
 
 ¹ **`unused-import` is report-only in practice**: `fixable` is always `false` for this rule. A file that triggers `unused-import` contains at least one `@import` directive, making it non-*structural-standalone* (see below); Tier B fixes require a structural-standalone file. The rule is still useful — the warning clears as a side effect of applying other fixes (e.g. removing a duplicate import that was also the unused one). To silence it, set `"unused-import": "off"` in `mds.json`.
 

@@ -72,6 +72,16 @@ pub(crate) enum HeaderSource {
     Secret { name: String, prefix: String },
 }
 
+impl HeaderSource {
+    /// Text with no `{{…}}` reference, which the request sends as written.
+    pub(crate) fn is_literal_text(&self) -> bool {
+        match self {
+            Self::Text(text) => references(text).next().is_none(),
+            Self::Secret { .. } => false,
+        }
+    }
+}
+
 /// The method of a request map. GET when the map does not name one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeclaredMethod {

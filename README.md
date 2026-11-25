@@ -399,6 +399,8 @@ Rules (configure via `mds.json` `lint.rules`; severities differ per rule):
 | `empty-block` | warn | `@if`/`@elseif`/`@else`/`@for`/`@define`/`@message` body is empty or whitespace-only (auto-fixable) |
 | `legacy-interpolation` | warn | Single-brace `{x}` syntax from MDS v0.x; migrates to `{{x}}` automatically (auto-fixable) |
 | `literal-directive` | warn | Conditional lines that stay literal: indented lines without the file opt-in, or lines in an unmarked fence with `@if …:` before `@end` (report-only). The `mds` label suppresses the fence warning. |
+| `insecure-data-origin` | warn | A request map of a URL data entry names an `http://` URL (report-only) |
+| `literal-credential-header` | warn | A URL data entry sets a credential header such as `X-Auth-Token` to literal text; use the secret form (report-only) |
 | `redundant-else` | warn | `@else` body is structurally identical to the `@if`/`@elseif` then-body |
 | `unreachable-branch` | **error** | Branch condition is always-true or always-false (auto-fixable) |
 | `duplicate-import` | **error** | Same file imported more than once (auto-fixable) |

@@ -18,11 +18,15 @@
 //! | `shadow-variable`       | Info     | C    | Inner scope name hides outer binding          |
 //! | `legacy-interpolation`  | Warn     | A    | Single-brace `{x}` syntax (migrates to `{{x}}`) |
 //! | `literal-directive`     | Warn     | C    | Conditional line stays literal text           |
+//! | `insecure-data-origin`  | Warn     | C    | Request map URL with the http scheme          |
+//! | `literal-credential-header` | Warn | C | Credential header set to literal text        |
 
 pub(crate) mod duplicate_export;
 pub(crate) mod duplicate_import;
 pub(crate) mod empty_block;
+pub(crate) mod insecure_data_origin;
 pub(crate) mod legacy_interpolation;
+pub(crate) mod literal_credential_header;
 pub(crate) mod literal_directive;
 pub(crate) mod redundant_else;
 pub(crate) mod shadow_variable;
@@ -39,12 +43,14 @@ pub(crate) mod structural_eq;
 /// is the single source of truth. This does NOT close the *omission* risk — a
 /// new module whose `RULE` is never listed here compiles fine. The mechanical
 /// closure is the bidirectional tier table in `tier.rs` plus an explicit
-/// `ALL_RULE_NAMES.len() == 11` pin in that table's test.
+/// `ALL_RULE_NAMES.len() == 13` pin in that table's test.
 pub(crate) const ALL_RULE_NAMES: &[&str] = &[
     duplicate_export::RULE,
     duplicate_import::RULE,
     empty_block::RULE,
+    insecure_data_origin::RULE,
     legacy_interpolation::RULE,
+    literal_credential_header::RULE,
     literal_directive::RULE,
     redundant_else::RULE,
     shadow_variable::RULE,

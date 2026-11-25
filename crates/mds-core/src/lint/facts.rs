@@ -109,6 +109,20 @@ pub enum FmVarKind {
     DataEntry,
 }
 
+/// A URL data entry, as declared: the facts of the data rules. It holds no header
+/// value.
+#[derive(Debug, Clone)]
+pub struct DataRequestFact {
+    /// The entry name.
+    pub name: String,
+    /// The URL as declared starts with `http://`.
+    pub plain_http: bool,
+    /// The names of the headers whose value is literal text, in declaration order.
+    pub literal_headers: Vec<String>,
+    /// Approximate byte offset of the entry name in the source, as for [`FmVarFact`].
+    pub approx_offset: Option<usize>,
+}
+
 /// A shadow variable pair: a name in an inner scope that shadows an outer-scope binding.
 #[derive(Debug, Clone)]
 pub struct ShadowPair {
@@ -167,6 +181,9 @@ pub struct AnalysisContext {
     /// Frontmatter variable keys (excludes reserved keys: imports, type, extends,
     /// prompt, data), then the entry names of the `data` mapping.
     pub frontmatter_vars: Vec<FmVarFact>,
+
+    /// The URL entries of the `data` mapping, in declaration order.
+    pub data_requests: Vec<DataRequestFact>,
 
     // ── Usage tracking ────────────────────────────────────────────────────────
     /// Variable names referenced in body expressions
@@ -359,16 +376,27 @@ fn collect_data_entries(
         return;
     };
     for entry in entries {
+        let approx_offset = region.and_then(|(start, text)| {
+            find_data_entry_in_source(text, &entry.name).map(|offset| start + offset)
+        });
         if let crate::data::decl::Source::Url(template) = &entry.source {
             ctx.used_vars.extend(template.refs.iter().map(|path| {
                 path.split_once('.')
                     .map_or(path.as_str(), |(root, _)| root)
                     .to_owned()
             }));
+            ctx.data_requests.push(DataRequestFact {
+                name: entry.name.clone(),
+                plain_http: template.url.starts_with("http://"),
+                literal_headers: template
+                    .headers
+                    .iter()
+                    .filter(|header| header.value.is_literal_text())
+                    .map(|header| header.name.clone())
+                    .collect(),
+                approx_offset,
+            });
         }
-        let approx_offset = region.and_then(|(start, text)| {
-            find_data_entry_in_source(text, &entry.name).map(|offset| start + offset)
-        });
         ctx.frontmatter_vars.push(FmVarFact {
             name: entry.name,
             kind: FmVarKind::DataEntry,
