@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use mds::{
     AllowItem, CompileOptions, CompileResult, FetchContext, FetchState, MdsError, NarrowError,
@@ -44,11 +44,15 @@ pub(crate) struct NetFlags {
 }
 
 /// The network grant of one `mds build` run: the policy and the per-run key of every
-/// step compile, the sender, and the count of the requests that the run sent.
+/// step compile, the sender, the count of the requests that the run sent, and the time
+/// that the network work of one compile can take.
 pub(crate) struct NetRun {
     ctx: FetchContext,
     fetcher: Fetcher,
     sent: AtomicUsize,
+    /// The time of the network work of one compile, from its first send:
+    /// [`COMPILE_DEADLINE`] in a run.
+    deadline: Duration,
 }
 
 impl NetRun {
@@ -78,7 +82,15 @@ impl NetRun {
             ctx: FetchContext::new(policy, key),
             fetcher,
             sent: AtomicUsize::new(0),
+            deadline: COMPILE_DEADLINE,
         }))
+    }
+
+    /// The run with a compile deadline of `deadline`, so that a test can make it short.
+    #[cfg(test)]
+    #[must_use]
+    fn with_deadline(self, deadline: Duration) -> Self {
+        Self { deadline, ..self }
     }
 
     /// Run step compiles to the end: each round sends the requests that the compile
@@ -104,7 +116,7 @@ impl NetRun {
                 Some(deadline) => deadline,
                 None => *deadline.insert(
                     Instant::now()
-                        .checked_add(COMPILE_DEADLINE)
+                        .checked_add(self.deadline)
                         .ok_or(MdsError::Internal)?,
                 ),
             };
@@ -458,6 +470,10 @@ fn refused(message: String) -> MdsError {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
 
     fn flags(allow: &[&str]) -> NetFlags {
@@ -589,6 +605,136 @@ mod tests {
             state.unwrap().len(),
             1,
             "control: at the full cap the failure enters the state"
+        );
+    }
+
+    /// The wait of [`SlowServer`] before each answer.
+    const ANSWER_WAIT: Duration = Duration::from_millis(150);
+    /// The poll interval of [`SlowServer`] and of the wait for its end.
+    const POLL: Duration = Duration::from_millis(5);
+
+    /// A listener thread on `127.0.0.1:0` that answers each request [`ANSWER_WAIT`]
+    /// after its head: `{"x": "next"}` for `/a` and `{"n": 1}` for another path. The
+    /// thread ends at a stop, and at the latest after 10 s.
+    struct SlowServer {
+        port: u16,
+        stop: Arc<AtomicBool>,
+        thread: thread::JoinHandle<Vec<String>>,
+    }
+
+    impl SlowServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            let thread = thread::spawn(move || {
+                let end = Instant::now() + Duration::from_secs(10);
+                let mut lines = Vec::new();
+                while Instant::now() < end && !flag.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => lines.extend(answer_late(stream)),
+                        Err(_) => thread::sleep(POLL),
+                    }
+                }
+                lines
+            });
+            Self { port, stop, thread }
+        }
+
+        /// Stop the listener and give the request line of each request that it read. The
+        /// wait for the thread has a bound: its read and its write each have a limit.
+        fn stop(self) -> Vec<String> {
+            self.stop.store(true, Ordering::SeqCst);
+            for _ in 0..1_000 {
+                if self.thread.is_finished() {
+                    break;
+                }
+                thread::sleep(POLL);
+            }
+            assert!(
+                self.thread.is_finished(),
+                "the listener thread must end within 5 s"
+            );
+            self.thread.join().unwrap()
+        }
+    }
+
+    /// Read the head of one request, wait [`ANSWER_WAIT`], answer, and give the request
+    /// line.
+    fn answer_late(mut stream: TcpStream) -> Option<String> {
+        stream.set_nonblocking(false).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .ok()?;
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while head.len() < 16 * 1024 && !head.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).ok()? == 0 {
+                break;
+            }
+            head.push(byte[0]);
+        }
+        let line = String::from_utf8_lossy(&head).lines().next()?.to_owned();
+        let body = if line.starts_with("GET /a ") {
+            r#"{"x": "next"}"#
+        } else {
+            r#"{"n": 1}"#
+        };
+        thread::sleep(ANSWER_WAIT);
+        // The client can have stopped its wait, and then the answer is lost.
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        Some(line)
+    }
+
+    /// One deadline binds the network work of a compile from its first send, so round 2
+    /// gets only the time that is left. `b` reads `a`, so it is sent in round 2, and the
+    /// listener answers each request 150 ms after it. With a 250 ms deadline, `a` passes
+    /// and `b` fails with the timeout. Control: with a 2 s deadline the chain renders.
+    #[test]
+    fn round_two_gets_only_the_time_left_of_the_compile_deadline() {
+        let chain = |deadline: Duration| {
+            let server = SlowServer::start();
+            let item = format!("http://127.0.0.1:{}", server.port);
+            let run = NetRun::from_flags(&flags(&[&item]), None)
+                .unwrap()
+                .unwrap()
+                .with_deadline(deadline);
+            let source = format!(
+                "---\ndata:\n  a:\n    url: \"{item}/a\"\n  b:\n    url: \"{item}/{{{{a.x}}}}\"\n---\n{{{{b.n}}}}\n"
+            );
+            let result = compile_source_text(&source, None, CompileOptions::default(), Some(&run));
+            (item, result, server.stop())
+        };
+
+        let (_, result, lines) = chain(Duration::from_secs(2));
+        assert_eq!(
+            result.unwrap().output,
+            mds::CompiledOutput::Markdown("1\n".into()),
+            "control: with time left the chain renders"
+        );
+        assert_eq!(lines.len(), 2, "control: the listener gets a and b");
+
+        let (item, result, lines) = chain(Duration::from_millis(250));
+        let error = result.unwrap_err();
+        assert_eq!(code(&error), "mds::network");
+        let text = error.to_string();
+        assert!(
+            text.contains(&format!("URL \"{item}/{{{{a.x}}}}\"")),
+            "round 2, the entry b, must fail: {text}"
+        );
+        assert!(text.ends_with("the request timed out"), "{text}");
+        assert!(
+            lines.len() == 2 && lines[1].starts_with("GET /next "),
+            "round 2 must be sent with the time that is left: {lines:?}"
         );
     }
 

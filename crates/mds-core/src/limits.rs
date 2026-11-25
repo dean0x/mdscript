@@ -364,8 +364,10 @@ pub(crate) const MAX_REDIRECTS: usize = 5;
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum time of the network work of one compile, over all of its rounds: 30 s.
-/// The host driver starts the clock at the first send and checks it before each send
-/// and each wait. It binds before `REQUEST_TIMEOUT` when less time is left.
+/// The host driver starts one deadline at the first send of the compile. It checks the
+/// deadline before each send: with no time left, the request is not sent and fails with
+/// the timeout. Each send waits at most the time that is left, so the deadline binds
+/// before `REQUEST_TIMEOUT` when less time is left.
 pub(crate) const COMPILE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Maximum requests in flight at one time in one compile: 8.
