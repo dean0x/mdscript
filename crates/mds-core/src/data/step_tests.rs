@@ -785,6 +785,34 @@ fn a_secret_header_is_allowed_in_the_entry_module_only() {
     assert_eq!(urls(&requests), ["https://a.example/x"]);
 }
 
+/// An `@extends` base is a module other than the entry module, so its URL entry cannot
+/// use a secret header, also with the import opt-in. Control: the same base text as the
+/// entry module derives its request.
+#[test]
+fn an_extends_base_cannot_use_a_secret_header() {
+    let entry = "a:\n    url: https://a.example/x\n    headers:\n      Authorization: {secret: TOKEN, prefix: 'Bearer '}\n";
+    let base = format!("---\ndata:\n  {entry}---\n{{{{a.n}}}}\n");
+    let child = "@extends \"./base.mds\"\n";
+    let net = with_secret(policy(&["a.example"]), "TOKEN", PLANTED, "a.example").with_imports(true);
+    let files = [("main.mds", child), ("base.mds", base.as_str())];
+    let (result, needed) = run_round(&files, &Runtime::new(), &net, &Responses::new());
+    let err = result.unwrap_err();
+    assert_eq!(code(&err), "mds::data");
+    assert!(
+        err.to_string()
+            .ends_with("a secret header is allowed in the entry module only"),
+        "{err}"
+    );
+    assert!(needed.is_empty());
+    let requests = need(run_step(
+        &[("main.mds", &base)],
+        &Runtime::new(),
+        &net,
+        &Responses::new(),
+    ));
+    assert_eq!(urls(&requests), ["https://a.example/x"]);
+}
+
 /// TP-97: a URL entry of an imported module needs the import opt-in. Control: with it.
 #[test]
 fn a_url_entry_of_an_imported_module_needs_the_import_opt_in() {

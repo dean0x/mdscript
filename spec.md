@@ -1211,6 +1211,11 @@ and `compile_step_str`. Each takes the arguments of its compile function plus a 
 
 - Each call is a fresh compile with a fresh budget. It derives every request again and runs every
   check again, so a narrower policy on a later call takes effect.
+- An imported module and an `@extends` base are modules other than the entry module, so their URL
+  entries need the import opt-in of the policy (`import-opt-in`) and cannot use a secret header
+  (`mds::data`, `a secret header is allowed in the entry module only`)
+  (`a_base_url_entry_reads_a_child_frontmatter_variable` and
+  `an_extends_base_cannot_use_a_secret_header` in `crates/mds-core/src/data/step_tests.rs`).
 - The state holds responses only, keyed by `RequestId` (64 lower-case hex digits). A second
   response for one ID fails with `mds::invalid_options`
   (`the fetch state already holds a response for this request`). More than 64 responses fail
