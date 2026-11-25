@@ -237,3 +237,28 @@ fn merged_graph_accepts_the_compile_entry_cap_but_not_more() {
     assert_eq!(error.code, "mds::data");
     assert!(error.message.contains("data dependency cycle"));
 }
+
+/// The bind order is level by level, declaration order inside a level, and it skips a
+/// replayed entry: a dependent entry always comes after each entry it references.
+#[test]
+fn level_order_puts_each_entry_after_its_dependencies() {
+    let entries = parse(
+        "{c: 'https://example.test/{{b.x}}', b: 'https://example.test/{{a.x}}', \
+         d: ./d.json, a: 'https://example.test/a', e: 'https://example.test/{{a.x}}', \
+         r: 'https://example.test/{{c.x}}'}",
+        MODULE,
+    )
+    .unwrap();
+    let nodes = nodes(&entries, MODULE);
+    let order = |runtime: &[&str]| {
+        check(&nodes, &[], runtime)
+            .unwrap()
+            .in_level_order()
+            .map(|node| node.entry.name.as_str())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(order(&[]), ["d", "a", "b", "e", "c", "r"]);
+    assert_eq!(order(&["r"]), ["d", "a", "b", "e", "c"]);
+    // A replayed entry is skipped, and its dependents keep their level.
+    assert_eq!(order(&["b"]), ["d", "a", "c", "e", "r"]);
+}

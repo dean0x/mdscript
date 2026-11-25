@@ -349,7 +349,7 @@ impl ModuleCache {
                 if graph.frontier().next().is_some() {
                     return Err(MdsError::internal());
                 }
-                for node in graph.unreplayed() {
+                for node in graph.in_level_order() {
                     let Source::File(written) = &node.entry.source else {
                         return Err(MdsError::internal());
                     };
