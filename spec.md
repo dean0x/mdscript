@@ -1647,7 +1647,7 @@ and I/O failures are described below the table.
 | `mds::undefined_fn` | Function not defined with `@define` or imported | validator | 1 / 2 | all |
 | `mds::arity` | Wrong number of arguments in a call | validator | 1 / 2 | all |
 | `mds::builtin` | A built-in function rejected its arguments at runtime | evaluator | 1 / 2 | all |
-| `mds::type_error` | `@for` over a value that is not an array | evaluator | 1 / 2 | all |
+| `mds::type_error` | `@for` over a value that is not an array; or a data value in a request URL or header that is not a string, a boolean or an exact integer up to 2^53 (null, an array, an object or another number). The data message names the project-relative module, the entry and the field, escaped, with no source span | evaluator, resolver | 1 / 2 | all |
 | `mds::type_mismatch` | Cross-type `==` / `!=` comparison | evaluator | 1 / 2 | all |
 | `mds::circular_import` | Import graph contains a cycle | resolver | 1 / 2 | all |
 | `mds::file_not_found` | Entry file, import target or local data file (§4.12) does not exist, or a directory above it does not, or the path cannot otherwise be resolved — a symlink loop, a name too long, a directory that cannot be searched (native filesystem) | `NativeFs`, CLI input check; `@mdscript/mds`'s WASM-backend file pre-scanner, with the native message | 2 / 2 | CLI, Rust, napi, Python, `@mdscript/mds` |

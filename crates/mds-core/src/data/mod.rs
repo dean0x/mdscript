@@ -7,6 +7,11 @@ pub(crate) mod decl;
     expect(dead_code, reason = "the request identity is the first caller")
 )]
 pub(crate) mod digest;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the step engine is the first caller")
+)]
+pub(crate) mod encode;
 pub(crate) mod graph;
 pub(crate) mod path;
 mod refs;
@@ -25,5 +30,7 @@ mod convert_tests;
 mod corpus_tests;
 #[cfg(test)]
 mod digest_tests;
+#[cfg(test)]
+mod encode_tests;
 #[cfg(test)]
 mod url_tests;

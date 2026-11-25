@@ -70,6 +70,28 @@ fn network_denied_names_each_frontier_entry_without_a_source_span() {
     assert_eq!(err.source_name(), None);
 }
 
+#[test]
+fn data_type_error_names_its_location_without_a_source_span() {
+    let err = MdsError::data_type_error(
+        "sub/mo\tdule.mds",
+        "en\x1btry",
+        "fi\neld",
+        "a header value takes a string, a boolean or an exact integer up to 2^53, not null",
+    );
+    let serialized = err.serialize();
+    let message = concat!(
+        r#"type error in "sub/mo\u"#,
+        r#"0009dule.mds", entry "en\u"#,
+        r#"001Btry", field "fi\u"#,
+        r#"000Aeld": a header value takes a string, a boolean or an exact integer up to 2^53, not null"#,
+    );
+    assert_eq!(serialized.code, "mds::type_error");
+    assert_eq!(err.to_string(), message);
+    assert_eq!(serialized.message, message);
+    assert_eq!(serialized.span, None);
+    assert_eq!(err.source_name(), None);
+}
+
 /// A transport failure names the entry, the URL as declared and the origin. Each name is
 /// escaped as a path is, so a control character in it can not start a new line.
 #[test]

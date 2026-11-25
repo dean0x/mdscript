@@ -486,6 +486,12 @@ pub enum MdsError {
     #[non_exhaustive]
     Network { message: String },
 
+    /// A data value has a type that its place in a request does not take.
+    #[error("type error in {message}")]
+    #[diagnostic(code(mds::type_error))]
+    #[non_exhaustive]
+    DataTypeError { message: String },
+
     #[error("YAML parse error: {message}")]
     #[diagnostic(code(mds::yaml))]
     YamlError { message: String },
@@ -1064,6 +1070,18 @@ impl MdsError {
         }
     }
 
+    /// Construct a spanless type error of a data value in a request field.
+    /// Pass the project-relative module label, the entry and the field. Pass diagnostic
+    /// prose as `reason`, never the value.
+    pub fn data_type_error(module: &str, entry: &str, field: &str, reason: &str) -> Self {
+        Self::DataTypeError {
+            message: format!(
+                "{}: {reason}",
+                data_location(module, Some(entry), Some(field))
+            ),
+        }
+    }
+
     /// The output-cap error: an output buffer would grow past `MAX_OUTPUT_SIZE`.
     ///
     /// The only place this message is built (#415); every output append reports it
@@ -1270,6 +1288,7 @@ impl MdsError {
             | MdsError::Data { .. }
             | MdsError::NetworkDenied { .. }
             | MdsError::Network { .. }
+            | MdsError::DataTypeError { .. }
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }
             | MdsError::InvalidVars { .. }
@@ -1368,6 +1387,7 @@ impl MdsError {
             | MdsError::Data { .. }
             | MdsError::NetworkDenied { .. }
             | MdsError::Network { .. }
+            | MdsError::DataTypeError { .. }
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }
             | MdsError::InvalidVars { .. }
