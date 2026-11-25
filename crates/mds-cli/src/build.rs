@@ -65,7 +65,8 @@ pub(crate) fn exit_code(err: &miette::Error) -> i32 {
             | MdsError::FileNotFound { .. }
             | MdsError::NotMdsFile { .. }
             | MdsError::NetworkDenied { .. }
-            | MdsError::Network { .. } => 2,
+            | MdsError::Network { .. }
+            | MdsError::InvalidOptions { .. } => 2,
             MdsError::ResourceLimit { .. } => 3,
             MdsError::Internal => crate::output::PANIC_EXIT,
             // R4: --set/--set-string collision is a usage error over runtime
@@ -445,6 +446,7 @@ mod tests {
                 ),
                 2,
             ),
+            (MdsError::invalid_options("x"), 2),
             (mds::module_count_exceeded(), 3),
         ];
         for (error, expected) in errors {

@@ -119,12 +119,23 @@ fn network_error_names_the_entry_template_and_origin_without_a_source_span() {
     assert_eq!(err.source_name(), None);
 }
 
+/// A step compile refuses host input with `mds::invalid_options`: fixed text, no span and
+/// no help. The bindings use the same code for their option checks.
+#[test]
+fn invalid_options_is_fixed_text_without_a_source_span() {
+    let reason = "the fetch state holds a response that this compile did not request";
+    let err = MdsError::invalid_options(reason);
+    let serialized = err.serialize();
+    assert_eq!(serialized.code, "mds::invalid_options");
+    assert_eq!(err.to_string(), format!("invalid options: {reason}"));
+    assert_eq!(serialized.message, err.to_string());
+    assert_eq!(serialized.help, None);
+    assert_eq!(serialized.span, None);
+    assert_eq!(err.source_name(), None);
+}
+
 /// Codes the napi, WASM, or Python bindings return but `mds-core` does not declare.
-const BINDING_ONLY_CODES: &[&str] = &[
-    "mds::invalid_options",
-    "mds::filename_collision",
-    "mds::invalid_backend_result",
-];
+const BINDING_ONLY_CODES: &[&str] = &["mds::filename_collision", "mds::invalid_backend_result"];
 
 fn read_error_rs() -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/error.rs");
@@ -264,6 +275,7 @@ fn data_codes_have_core_declarations_and_spec_exit_classes() {
         ("mds::data", "1 / 2"),
         ("mds::network_denied", "2 / 2"),
         ("mds::network", "2 / 2"),
+        ("mds::invalid_options", "2 / n/a"),
     ] {
         assert!(codes.iter().any(|declared| declared == code), "{code}");
         let row = section

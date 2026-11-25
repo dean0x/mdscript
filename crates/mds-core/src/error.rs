@@ -486,6 +486,13 @@ pub enum MdsError {
     #[non_exhaustive]
     Network { message: String },
 
+    /// A step compile refused the input of its host: a fetch state that holds a response
+    /// that the compile did not request. The message is fixed text.
+    #[error("invalid options: {message}")]
+    #[diagnostic(code(mds::invalid_options))]
+    #[non_exhaustive]
+    InvalidOptions { message: String },
+
     /// A data value has a type that its place in a request does not take.
     #[error("type error in {message}")]
     #[diagnostic(code(mds::type_error))]
@@ -1070,6 +1077,14 @@ impl MdsError {
         }
     }
 
+    /// Construct a spanless refusal of the host input to a step compile. Pass fixed prose
+    /// as `reason`, never text that a host or a server supplies.
+    pub fn invalid_options(reason: &str) -> Self {
+        Self::InvalidOptions {
+            message: reason.to_owned(),
+        }
+    }
+
     /// Construct a spanless type error of a data value in a request field.
     /// Pass the project-relative module label, the entry and the field. Pass diagnostic
     /// prose as `reason`, never the value.
@@ -1288,6 +1303,7 @@ impl MdsError {
             | MdsError::Data { .. }
             | MdsError::NetworkDenied { .. }
             | MdsError::Network { .. }
+            | MdsError::InvalidOptions { .. }
             | MdsError::DataTypeError { .. }
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }
@@ -1387,6 +1403,7 @@ impl MdsError {
             | MdsError::Data { .. }
             | MdsError::NetworkDenied { .. }
             | MdsError::Network { .. }
+            | MdsError::InvalidOptions { .. }
             | MdsError::DataTypeError { .. }
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }

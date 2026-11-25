@@ -9,8 +9,9 @@
 //! Errors thrown at the WASM boundary carry a `code` property. Codes that
 //! originate inside `mds-core` (e.g. `"mds::syntax"`) are defined by
 //! [`mds::MdsError`]. The following codes are synthesised here. Only
-//! `mds::invalid_options` and `mds::filename_collision` are **binding-only**:
-//! the core crate also returns `mds::internal` and `mds::resource_limit`.
+//! `mds::filename_collision` is **binding-only**: the core crate also returns
+//! `mds::internal` and `mds::resource_limit`, and `mds::invalid_options` for the
+//! fetch state of a step compile.
 //!
 //! | Code                      | Meaning                                                                        |
 //! |---------------------------|--------------------------------------------------------------------------------|

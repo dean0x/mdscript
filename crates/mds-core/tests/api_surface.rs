@@ -456,6 +456,7 @@ fn mds_error_variants_exist() {
         | MdsError::Data { .. }
         | MdsError::NetworkDenied { .. }
         | MdsError::Network { .. }
+        | MdsError::InvalidOptions { .. }
         | MdsError::DataTypeError { .. }
         | MdsError::DataFileNotFound { .. }
         | MdsError::YamlError { .. }
@@ -500,6 +501,8 @@ fn data_error_variants_have_named_constructors() {
         "x",
     );
     assert!(matches!(err, MdsError::Network { .. }), "{err:?}");
+    let invalid: fn(&str) -> MdsError = MdsError::invalid_options;
+    assert!(matches!(invalid("x"), MdsError::InvalidOptions { .. }));
     let type_error: fn(&str, &str, &str, &str) -> MdsError = MdsError::data_type_error;
     let err = type_error("main.mds", "users", "url", "x");
     assert!(matches!(err, MdsError::DataTypeError { .. }), "{err:?}");
