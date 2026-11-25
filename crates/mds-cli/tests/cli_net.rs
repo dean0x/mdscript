@@ -12,7 +12,7 @@ use common::mds_bin;
 use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, MAIN_SEPARATOR_STR};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -368,7 +368,10 @@ fn mds_json_can_only_narrow_the_flag() {
     assert_fails(
         &with_config(&wider),
         "mds::invalid_options",
-        "./mds.json network.allow[2]: the item permits a request that the --allow-net list refuses",
+        &format!(
+            ".{MAIN_SEPARATOR_STR}mds.json network.allow[2]: the item permits a request \
+             that the --allow-net list refuses"
+        ),
     );
     let imports = format!(
         "{{\"network\": {{\"allow\": [\"{}\"], \"allow_imports\": true}}}}",
@@ -377,7 +380,9 @@ fn mds_json_can_only_narrow_the_flag() {
     assert_fails(
         &with_config(&imports),
         "mds::invalid_options",
-        "./mds.json network.allow_imports: true needs --allow-net-imports",
+        &format!(
+            ".{MAIN_SEPARATOR_STR}mds.json network.allow_imports: true needs --allow-net-imports"
+        ),
     );
     let narrower = format!("{{\"network\": {{\"allow\": [\"{}\"]}}}}", items[0]);
     assert_fails(
