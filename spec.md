@@ -1374,10 +1374,12 @@ goes back to the core, which checks the hop and derives the next request:
   `Proxy-Authorization`, `Cookie` and `X-Api-Key`. A hop keeps the method.
 - Each hop is a new request with its own identity, so the request cap counts it.
 
+A `300` or `304` answer is not a redirect: it binds with the envelope and fails without it.
+
 Tests: `redirect_hops_stay_on_the_allow_list_and_never_drop_to_http`,
 `cross_origin_hops_drop_secret_and_credential_headers` in `policy_tests.rs`, and
-`each_redirect_hop_passes_the_hop_checks` and `a_hop_to_another_origin_drops_the_secret_header`
-in `step_tests.rs`.
+`each_redirect_hop_passes_the_hop_checks`, `each_redirect_status_runs_the_hop_checks` and
+`a_hop_to_another_origin_drops_the_secret_header` in `step_tests.rs`.
 
 #### Errors of a request
 

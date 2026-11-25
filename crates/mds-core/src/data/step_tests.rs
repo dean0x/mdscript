@@ -1318,3 +1318,62 @@ fn response_bodies_count_against_the_data_total_of_a_compile() {
         }
     }
 }
+
+/// Each redirect status runs the hop checks, with and without the envelope: a
+/// `location` outside the allow list fails. Controls: a listed `location` gives the next
+/// request, and 300 and 304, which are not redirects, bind with the envelope and fail
+/// without it.
+#[test]
+fn each_redirect_status_runs_the_hop_checks() {
+    let net = policy(&["a.example"]);
+    let to = |status, location: &str| {
+        Response::http(
+            status,
+            vec![("Location".into(), location.as_bytes().to_vec())],
+            b"1".to_vec(),
+        )
+    };
+    let plain = "---\ndata:\n  a: https://a.example/x\n---\n{{a}}\n";
+    let envelope =
+        "---\ndata:\n  a: {url: 'https://a.example/x', envelope: true}\n---\n{{a.status}}\n";
+    for status in [301, 302, 303, 307, 308] {
+        for main in [plain, envelope] {
+            let files = [("main.mds", main)];
+            let first = need(run_step(&files, &Runtime::new(), &net, &Responses::new()));
+            for (location, refused) in [
+                ("https://c.example/", true),
+                ("https://a.example/next", false),
+            ] {
+                let mut responses = Responses::new();
+                answer(
+                    &first,
+                    &mut responses,
+                    &[("https://a.example/x", to(status, location))],
+                );
+                let result = run_step(&files, &Runtime::new(), &net, &responses);
+                if refused {
+                    let err = result.unwrap_err();
+                    assert_eq!(code(&err), "mds::network_denied", "{status}: {err}");
+                    assert!(
+                        err.to_string().ends_with(
+                            "redirect-check: the redirect target is not in the allow list"
+                        ),
+                        "{status}: {err}"
+                    );
+                } else {
+                    assert_eq!(urls(&need(result)), [location], "{status}");
+                }
+            }
+        }
+    }
+    for status in [300, 304] {
+        let text = run_answered(envelope, &net, to(status, "https://c.example/")).unwrap();
+        assert!(text.ends_with(&format!("{status}\n")), "{text:?}");
+        let err = run_answered(plain, &net, to(status, "https://c.example/")).unwrap_err();
+        assert!(
+            err.to_string()
+                .ends_with(&format!("the server answered with HTTP status {status}")),
+            "{err}"
+        );
+    }
+}
