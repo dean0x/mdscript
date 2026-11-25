@@ -20,6 +20,9 @@ pub(crate) struct State {
     pub(crate) files: IndexMap<String, Arc<Value>>,
     pub(crate) entries: usize,
     pub(crate) bytes: usize,
+    /// The step context of a step compile. Only `ModuleCache::stepping` sets it, so a
+    /// compile without it sends nothing and a frontier stays a refusal.
+    pub(crate) net: Option<super::step::StepCtx>,
 }
 
 /// Per-file declarations and names, in a shared chain from child to base.
@@ -307,7 +310,7 @@ pub(crate) fn read_file(
             text.as_bytes(),
             accept,
             DataLabel {
-                file: Some(&display),
+                input: crate::data::DataInput::File(&display),
                 ..label
             },
             mem,
@@ -349,7 +352,7 @@ mod tests {
         let label = DataLabel {
             module: "entry.mds",
             entry: "item",
-            file: None,
+            input: crate::data::DataInput::Declaration,
         };
         std::fs::write(&path, "[").unwrap();
         let (key, accept) = canonical_file(&fs, &dir, "./item.yml", label).unwrap();

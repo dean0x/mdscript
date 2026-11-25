@@ -210,7 +210,7 @@ impl FieldLabel<'_> {
         }
     }
 
-    fn limit(self, what: &str, max: usize) -> MdsError {
+    pub(crate) fn limit(self, what: &str, max: usize) -> MdsError {
         MdsError::resource_limit(format!(
             "{}: {what} exceeds the maximum length of {max} bytes",
             data_location(self.module, Some(self.entry), Some(self.field))

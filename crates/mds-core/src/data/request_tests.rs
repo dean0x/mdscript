@@ -189,6 +189,45 @@ fn the_id_is_the_digest_of_the_canonical_text() {
     assert_eq!(actual.as_hex(), hex(&expected));
 }
 
+/// The charge bound of the identity covers twice the canonical text, for a request with
+/// no header and for one with a long text header and a secret header.
+#[test]
+fn the_identity_bound_covers_the_canonical_text() {
+    fn netstring(text: &str) -> String {
+        format!("{}:{text}", text.len())
+    }
+    let long = "v".repeat(8 * 1024);
+    let hmac = hex(&hmac_sha256(&[1; 32], &[PLANTED.as_bytes()]));
+    let cases = [
+        (Vec::new(), Vec::new()),
+        (
+            vec![text("X-Long", &long), secret("Authorization", "token")],
+            vec![
+                format!("x-long\0t{}{}", netstring("x-long"), netstring(&long)),
+                format!(
+                    "authorization\0s{}{}{}{}",
+                    netstring("authorization"),
+                    netstring("token"),
+                    netstring("Bearer "),
+                    netstring(&hmac)
+                ),
+            ],
+        ),
+    ];
+    for (headers, keys) in cases {
+        let fields = ["mds-request-1", "GET", URL, "json"]
+            .iter()
+            .map(|part| part.len())
+            .chain([8])
+            .chain(keys.iter().map(String::len))
+            .chain([0]);
+        let canonical: usize = fields.map(|len| len + 8).sum();
+        let url = parse_absolute(URL).unwrap();
+        let bound = identity_bytes(&url, &headers).unwrap();
+        assert!(bound >= 2 * canonical, "{bound} < 2 * {canonical}");
+    }
+}
+
 /// The hex form is exactly 64 lower-case hex digits. Control: the form of a real ID.
 #[test]
 fn request_ids_round_trip_through_lower_case_hex() {

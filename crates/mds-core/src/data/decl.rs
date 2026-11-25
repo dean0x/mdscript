@@ -202,7 +202,7 @@ fn parse_mapping(
         let label = DataLabel {
             module,
             entry: name,
-            file: None,
+            input: crate::data::DataInput::Declaration,
         };
         if RESERVED_NAMES.contains(&name.as_str()) {
             return Err(label.error(None, "data entry name is reserved"));

@@ -16,16 +16,36 @@ pub(crate) struct DataLabel<'a> {
     /// Project-relative label of the declaring module.
     pub(crate) module: &'a str,
     pub(crate) entry: &'a str,
-    pub(crate) file: Option<&'a str>,
+    pub(crate) input: DataInput<'a>,
+}
+
+/// The input that a data value comes from, for messages.
+#[derive(Clone, Copy)]
+pub(crate) enum DataInput<'a> {
+    /// The declaration itself.
+    Declaration,
+    /// A data file, by its project-relative label.
+    File(&'a str),
+    /// The response of a network request. A message names the entry, never the URL.
+    Response,
 }
 
 impl DataLabel<'_> {
     pub(crate) fn syntax(self, format: &str) -> MdsError {
-        MdsError::yaml_error(format!(
-            "data file \"{}\", entry \"{}\": invalid {format} data",
-            crate::escape_path_for_message(self.file.unwrap_or(self.module)),
-            crate::sanitize_control_chars_wire(self.entry),
-        ))
+        let entry = crate::sanitize_control_chars_wire(self.entry);
+        let module = crate::escape_path_for_message(self.module);
+        MdsError::yaml_error(match self.input {
+            DataInput::Response => {
+                format!("\"{module}\", response for entry \"{entry}\": invalid {format} data")
+            }
+            DataInput::File(file) => format!(
+                "data file \"{}\", entry \"{entry}\": invalid {format} data",
+                crate::escape_path_for_message(file),
+            ),
+            DataInput::Declaration => {
+                format!("data file \"{module}\", entry \"{entry}\": invalid {format} data")
+            }
+        })
     }
 
     pub(crate) fn error(self, field: Option<&str>, reason: &str) -> MdsError {

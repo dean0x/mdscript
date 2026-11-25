@@ -9,7 +9,8 @@ use std::error::Error;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use super::decl::is_credential_header;
+use super::decl::{is_credential_header, DeclaredMethod};
+use super::request::Method;
 use super::url::{self, CheckedUrl, Host, Origin, Scheme};
 use crate::limits::{MAX_ALLOW_ITEMS, MAX_REDIRECTS, MAX_SECRETS};
 use crate::parser::is_valid_identifier;
@@ -34,11 +35,13 @@ pub enum Layer {
     TransportAddress,
     /// A response holds a secret value.
     ResponseCheck,
+    /// The request method is not one that this release sends.
+    Method,
 }
 
 impl Layer {
     /// The check's name: `allow-list`, `import-opt-in`, `url-parser`, `redirect-check`,
-    /// `secret-binding`, `transport-address` or `response-check`.
+    /// `secret-binding`, `transport-address`, `response-check` or `method`.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
@@ -49,6 +52,7 @@ impl Layer {
             Layer::SecretBinding => "secret-binding",
             Layer::TransportAddress => "transport-address",
             Layer::ResponseCheck => "response-check",
+            Layer::Method => "method",
         }
     }
 }
@@ -400,10 +404,6 @@ impl NetworkPolicy {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the step engine is the first caller")
-)]
 impl NetworkPolicy {
     /// Check the origin of a request: the allow list first, then the import opt-in for an
     /// entry that an imported module declares.
@@ -474,6 +474,29 @@ impl NetworkPolicy {
         Ok(&secret.value)
     }
 
+    /// The method that a request sends. This release sends GET and HEAD only.
+    pub(crate) fn check_method(&self, method: DeclaredMethod) -> Result<Method, Refusal> {
+        match method {
+            DeclaredMethod::Get => Ok(Method::Get),
+            DeclaredMethod::Head => Ok(Method::Head),
+            DeclaredMethod::Post
+            | DeclaredMethod::Put
+            | DeclaredMethod::Patch
+            | DeclaredMethod::Delete
+            | DeclaredMethod::Options => Err(Refusal::new(
+                Layer::Method,
+                "this release sends GET and HEAD requests only",
+            )),
+        }
+    }
+
+    /// The name and the value of each host secret, for the response check only.
+    pub(crate) fn secrets(&self) -> impl Iterator<Item = (&str, &SecretValue)> {
+        self.secrets
+            .iter()
+            .map(|secret| (secret.name.as_str(), &secret.value))
+    }
+
     fn allows(&self, origin: &Origin) -> bool {
         self.items.iter().any(|item| item.matches(origin))
     }
@@ -493,10 +516,6 @@ pub(crate) struct Hop {
     same_origin: bool,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the step engine is the first caller")
-)]
 impl Hop {
     /// A hop to another origin drops every secret header and each credential header.
     pub(crate) fn keeps_header(self, name: &str, secret: bool) -> bool {

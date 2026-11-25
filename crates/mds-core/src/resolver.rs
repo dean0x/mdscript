@@ -268,6 +268,27 @@ impl ModuleCache {
         cache
     }
 
+    /// A compile that derives the requests of its URL entries and binds the responses of
+    /// `ctx`. It is the only role with a step context: the tooling roles take none.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the public step API is the first caller")
+    )]
+    pub(crate) fn stepping(fs: Box<dyn FileSystem>, ctx: crate::data::step::StepCtx) -> Self {
+        let mut cache = Self::compiling(fs);
+        cache.data.net = Some(ctx);
+        cache
+    }
+
+    /// Take the step context back after a step compile.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the public step API is the first caller")
+    )]
+    pub(crate) fn take_step(&mut self) -> Option<crate::data::step::StepCtx> {
+        self.data.net.take()
+    }
+
     /// The check gate can validate without returning a rendered artifact.
     pub(crate) fn tooling(fs: Box<dyn FileSystem>) -> Self {
         let mut cache = Self::with_fs(fs);

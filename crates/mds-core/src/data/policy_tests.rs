@@ -510,6 +510,7 @@ fn layer_names_are_distinct_kebab_case_words() {
         Layer::SecretBinding,
         Layer::TransportAddress,
         Layer::ResponseCheck,
+        Layer::Method,
     ]
     .map(Layer::name);
     assert_eq!(
@@ -522,6 +523,32 @@ fn layer_names_are_distinct_kebab_case_words() {
             "secret-binding",
             "transport-address",
             "response-check",
+            "method",
         ]
     );
+}
+
+/// This release sends GET and HEAD only. Every other declared method is refused with
+/// the method layer.
+#[test]
+fn only_get_and_head_pass_the_method_check() {
+    use super::decl::DeclaredMethod;
+    use super::request::Method;
+    let policy = NetworkPolicy::new(vec![AllowItem::parse("a.example").unwrap()]).unwrap();
+    assert_eq!(policy.check_method(DeclaredMethod::Get), Ok(Method::Get));
+    assert_eq!(policy.check_method(DeclaredMethod::Head), Ok(Method::Head));
+    for method in [
+        DeclaredMethod::Post,
+        DeclaredMethod::Put,
+        DeclaredMethod::Patch,
+        DeclaredMethod::Delete,
+        DeclaredMethod::Options,
+    ] {
+        let refusal = policy.check_method(method).unwrap_err();
+        assert_eq!(refusal.layer(), Layer::Method);
+        assert_eq!(
+            refusal.reason(),
+            "this release sends GET and HEAD requests only"
+        );
+    }
 }

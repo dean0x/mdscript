@@ -24,6 +24,17 @@ pub(crate) fn data_location(module: &str, entry: Option<&str>, field: Option<&st
     location
 }
 
+/// The location of one request of a URL entry: the module, the entry, the URL as
+/// declared and the origin, each escaped. Never pass the expanded URL.
+pub(crate) fn request_location(module: &str, entry: &str, template: &str, origin: &str) -> String {
+    format!(
+        "{}, URL \"{}\", origin \"{}\"",
+        data_location(module, Some(entry), None),
+        escape_path_for_message(template),
+        escape_path_for_message(origin),
+    )
+}
+
 // ── Serializable error types ──────────────────────────────────────────────────
 
 /// A serializable representation of a source span.
@@ -1067,14 +1078,38 @@ impl MdsError {
     /// header value or a body. Pass fixed prose as `kind`, for example
     /// `request timed out`, never text that a host error or a server supplies.
     pub fn network(module: &str, entry: &str, template: &str, origin: &str, kind: &str) -> Self {
-        let location = data_location(module, Some(entry), None);
         Self::Network {
             message: format!(
-                "{location}, URL \"{}\", origin \"{}\": {kind}",
-                escape_path_for_message(template),
-                escape_path_for_message(origin),
+                "{}: {kind}",
+                request_location(module, entry, template, origin)
             ),
         }
+    }
+
+    /// Construct a spanless policy refusal of one URL entry: the location of the
+    /// request, the name of the check and its fixed reason. `secret` names the host
+    /// secret that the refusal is about, never its value. Pass the other arguments as
+    /// for [`MdsError::network`].
+    pub(crate) fn network_refused(
+        module: &str,
+        entry: &str,
+        template: &str,
+        origin: &str,
+        refusal: crate::Refusal,
+        secret: Option<&str>,
+    ) -> Self {
+        let mut entries = format!(
+            "{}: {}: {}",
+            request_location(module, entry, template, origin),
+            refusal.layer().name(),
+            refusal.reason()
+        );
+        if let Some(secret) = secret {
+            entries.push_str(" (secret \"");
+            entries.push_str(&sanitize_control_chars_wire(secret));
+            entries.push_str("\")");
+        }
+        Self::NetworkDenied { entries }
     }
 
     /// Construct a spanless refusal of the host input to a step compile. Pass fixed prose

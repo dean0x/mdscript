@@ -3,10 +3,6 @@
 mod convert;
 pub(crate) mod decl;
 pub(crate) mod digest;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the step engine is the first caller")
-)]
 pub(crate) mod encode;
 pub(crate) mod graph;
 pub(crate) mod path;
@@ -14,9 +10,10 @@ pub(crate) mod policy;
 mod refs;
 pub(crate) mod request;
 pub(crate) mod resolve;
+pub(crate) mod step;
 pub(crate) mod url;
 
-pub(crate) use convert::{convert, Accept, DataLabel};
+pub(crate) use convert::{convert, Accept, DataInput, DataLabel};
 
 #[cfg(test)]
 mod convert_tests;
@@ -30,5 +27,7 @@ mod encode_tests;
 mod policy_tests;
 #[cfg(test)]
 mod request_tests;
+#[cfg(test)]
+mod step_tests;
 #[cfg(test)]
 mod url_tests;

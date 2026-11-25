@@ -19,7 +19,7 @@ const EXACT: f64 = 9_007_199_254_740_992.0;
 
 /// A value, then the exact bytes it gives in a path segment, a query part and a header
 /// value, or the refusal. `None` for a header means the header refusal.
-type Vector = (
+pub(super) type Vector = (
     String,
     Result<&'static str, EncodeRefusal>,
     &'static str,
@@ -27,7 +27,7 @@ type Vector = (
 );
 
 /// One value from each row of the shared vector table. `abc` is the control.
-fn vectors() -> Vec<Vector> {
+pub(super) fn vectors() -> Vec<Vector> {
     let refuse_header = None;
     vec![
         ("abc".into(), Ok("abc"), "abc", Some("abc")),

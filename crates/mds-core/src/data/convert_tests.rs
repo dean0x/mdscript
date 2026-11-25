@@ -7,7 +7,7 @@ use crate::value::{Value, MAX_VALUE_DEPTH};
 const LABEL: DataLabel<'static> = DataLabel {
     module: "entry.mds",
     entry: "settings",
-    file: None,
+    input: crate::data::DataInput::Declaration,
 };
 
 fn read(raw: &str, accept: Accept) -> Result<Value, MdsError> {
@@ -233,7 +233,7 @@ fn conversion_failure_keeps_no_data_charge() {
 #[test]
 fn syntax_diagnostic_wire_escapes_the_file_and_entry_labels() {
     let label = DataLabel {
-        file: Some("sub/settings\t.yml"),
+        input: crate::data::DataInput::File("sub/settings\t.yml"),
         entry: "my\nentry",
         ..LABEL
     };

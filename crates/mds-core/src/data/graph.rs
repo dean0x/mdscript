@@ -20,7 +20,7 @@ impl Node<'_> {
         DataLabel {
             module: self.module,
             entry: &self.entry.name,
-            file: None,
+            input: crate::data::DataInput::Declaration,
         }
     }
 }

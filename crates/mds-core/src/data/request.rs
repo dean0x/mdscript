@@ -11,7 +11,7 @@ use std::fmt;
 
 use super::digest::{hex, hmac_sha256, sha256};
 use super::policy::{NetworkPolicy, Refusal, SecretValue};
-use super::url::CheckedUrl;
+use super::url::{CheckedUrl, Host};
 use super::Accept;
 
 /// The per-run key of the keyed hash of secret header values. The host makes it from a
@@ -142,10 +142,6 @@ impl RequestHeader {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the step engine is the first caller")
-)]
 impl RequestHeader {
     pub(crate) fn new(name: String, value: HeaderValue) -> Self {
         Self { name, value }
@@ -188,10 +184,6 @@ impl Request {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the step engine is the first caller")
-)]
 impl Request {
     /// A request with its ID. Each secret header must name a host secret that is bound
     /// to the origin of `url`; else the request fails the secret binding.
@@ -228,6 +220,70 @@ impl Request {
 
 /// The version tag of the canonical text. Change it with any change of the text.
 const IDENTITY_VERSION: &str = "mds-request-1";
+
+/// The fields of the canonical text apart from the header keys: the version tag, the
+/// method, the URL, the format, the header count and the body.
+const FIXED_FIELDS: usize = 6;
+
+/// The longest decimal length of a `usize`, for a netstring prefix.
+const MAX_LENGTH_DIGITS: usize = 20;
+
+/// The longest text of a host IP address: an IPv6 address with its brackets.
+const MAX_IP_HOST_BYTES: usize = 47;
+
+/// An upper bound of the bytes that the identity of a request with `url` and `headers`
+/// allocates while [`Request::new`] builds it: the URL text, each header key and the
+/// canonical text, each counted at twice its length for buffer growth. A secret header
+/// counts the hex HMAC of its value, never the value. The caller charges this bound
+/// before it builds the request. `None` is a count past the address space.
+pub(crate) fn identity_bytes(url: &CheckedUrl, headers: &[RequestHeader]) -> Option<usize> {
+    let host = match &url.host {
+        Host::Name(name) => name.len(),
+        Host::V4(_) | Host::V6(_) => MAX_IP_HOST_BYTES,
+    };
+    // `https://`, the host, `:` and five port digits, the path, `?` and the query.
+    let url_text = host
+        .checked_add("https://:65535?".len())?
+        .checked_add(url.path.len())?
+        .checked_add(url.query.as_ref().map_or(0, String::len))?;
+    let mut keys = 0usize;
+    for header in headers {
+        let parts = match &header.value {
+            HeaderValue::Text(text) => netstring_len(text)?,
+            HeaderValue::Secret { name, prefix } => netstring_len(name)?
+                .checked_add(netstring_len(prefix)?)?
+                .checked_add(MAX_LENGTH_DIGITS + 1 + HMAC_HEX_BYTES)?,
+        };
+        // The lower-case name, NUL and the kind byte, the name netstring and the parts,
+        // and the lower-case copy and the hex HMAC that the key is built from.
+        let key = header
+            .name
+            .len()
+            .checked_mul(2)?
+            .checked_add(2)?
+            .checked_add(netstring_len(&header.name)?)?
+            .checked_add(parts)?
+            .checked_add(HMAC_HEX_BYTES)?;
+        keys = keys.checked_add(key)?.checked_add(size_of::<String>())?;
+    }
+    let fields = FIXED_FIELDS.checked_add(headers.len())?.checked_mul(8)?;
+    let text = fields
+        .checked_add(IDENTITY_VERSION.len() + "HEAD".len() + "json".len() + 8)?
+        .checked_add(url_text)?
+        .checked_add(keys)?;
+    url_text
+        .checked_add(keys)?
+        .checked_add(text)?
+        .checked_mul(2)
+}
+
+/// The hex digits of one HMAC-SHA-256 value.
+const HMAC_HEX_BYTES: usize = 64;
+
+/// An upper bound of the netstring of `text`: its length digits, `:` and its bytes.
+fn netstring_len(text: &str) -> Option<usize> {
+    text.len().checked_add(MAX_LENGTH_DIGITS + 1)
+}
 
 /// The SHA-256 digest of the canonical text of a request. The text is a sequence of
 /// fields, each its byte length as a u64 big-endian number and then its bytes: the

@@ -257,13 +257,6 @@ pub(crate) fn parse_absolute(text: &str) -> Result<CheckedUrl, UrlRefusal> {
 /// Parse a redirect `location`: an absolute URL, or an absolute path on the origin of
 /// `base`. Every other form is refused, and both forms go through [`parse_absolute`].
 #[must_use = "a location can be refused"]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the redirect step of the step engine is the first caller"
-    )
-)]
 pub(crate) fn parse_location(base: &CheckedUrl, text: &str) -> Result<CheckedUrl, UrlRefusal> {
     if text.len() > MAX_URL_BYTES {
         return Err(UrlRefusal::TooLong);
