@@ -1,7 +1,7 @@
 # Releasing MDS
 
-MDS ships as a **single coordinated release**: both crates and all npm packages go
-out together at the same version. This document is the ordered runbook.
+MDS ships as a **single coordinated release**: the three published crates and all
+npm packages go out together at the same version. This document is the ordered runbook.
 
 > The release is **deliberately a manual, triggered step.** Pushing a `v*` tag is
 > what starts it. Until then, nothing publishes.
@@ -12,7 +12,7 @@ The [version-consistency gate](scripts/verify-versions.mjs) (run in CI and local
 asserts these are all equal before anything publishes:
 
 - Workspace crate version — `Cargo.toml` `[workspace.package] version` (covers
-  `mds-core`, `mds-cli`, `mds-wasm`, `mds-napi`, and `mds-python`)
+  `mds-core`, `mds-fetch`, `mds-cli`, `mds-wasm`, `mds-napi`, and `mds-python`)
 - Workspace member versions in `Cargo.lock` and `package-lock.json`. The gate
   checks the members in `scripts/release-manifest.mjs`, not transitive versions.
 - Every publishable `package.json`: `@mdscript/mds-napi`, `@mdscript/mds`,
@@ -36,10 +36,13 @@ These are **not** automated and must be done before the first release:
    Provenance requires the `id-token: write` permission (already set on the
    publish job) plus publishing from GitHub Actions.
 3. **Add the `CARGO_REGISTRY_TOKEN` repo secret** with publish rights to
-   `mds-core` and `mds-cli` on crates.io. The workflow cannot probe this token
+   `mds-core`, `mds-fetch` and `mds-cli` on crates.io. The workflow cannot probe this token
    (crates.io has no read-only endpoint that accepts a scoped token — see the
    credential probe under Pre-flight); verify it in the crates.io UI before
    tagging (PF-023).
+   - The first release with `mds-fetch` publishes a new crate name. Before that tag,
+     give the token the scope to publish a new crate, or publish `mds-fetch` once by
+     hand. After the first publish, limit the token to the three crates again.
 4. **Enable GitHub private vulnerability reporting** (Settings → Code security →
    Private vulnerability reporting) so the SECURITY.md flow works.
 5. **Configure PyPI trusted publisher** for `markdown-script` at
@@ -232,10 +235,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 # all miss broken private intra-doc links; only this command catches them.
 RUSTDOCFLAGS="-D warnings" cargo doc -p mds-core --no-deps
 cargo publish -p mds-core --dry-run
-# NOTE: `cargo publish -p mds-cli --dry-run` fails locally with
-# "no matching package named `mds-core` found" until mds-core is on crates.io —
-# mds-cli has a path+version dep on it. This is expected; the release workflow
-# publishes mds-core first (and waits for the index), then mds-cli.
+# NOTE: `cargo publish -p mds-fetch --dry-run` and `cargo publish -p mds-cli --dry-run`
+# fail locally with "no matching package named `mds-core` found" until mds-core is
+# on crates.io — each has a path+version dep on it. This is expected; the release
+# workflow publishes mds-core first (and waits for the index), then mds-fetch (and
+# waits for the index), then mds-cli.
 
 # JS
 node scripts/check-wasm-tools.mjs --strict  # Match the WASM tool pins in CI
@@ -525,7 +529,9 @@ The `credential-probe` job checks the registry inputs first. After it passes,
    7. **publish-crates** — blocked until `stage-and-verify-napi`,
       `load-test-musl-arm64`, `build-python`, AND `rehearse-publish-python`
       succeed. `cargo publish` `mds-core`, polls the crates.io index for up to
-      5 min (bounded, max 20 × 15 s), then `mds-cli`.
+      5 min (bounded, max 20 × 15 s), then publishes `mds-fetch` with the same
+      bounded poll, then `mds-cli`. Spec S34 in
+      `scripts/__test__/release-auth-probe.spec.mjs` pins this order.
    8. **publish-npm**, then **publish-python** (`publish-python` `needs` `publish-npm`).
       The npm job checks the restored platform NOTICE files before the A3 re-run (#136).
       It checks the workspace pack lists before the first npm publish.
@@ -552,8 +558,9 @@ the failed job tells you what has already happened: nothing publishes before
 | `Version gate` — cargo-about install or version check fails (#136) | Nothing | If the archive host failed temporarily, run `gh run rerun <run-id> --failed`. If the pin or archive is wrong, fix it in a pull request. Verify the local install and the release dry run. If no registry has the version, move the tag to the corrected commit after CI passes. |
 | `build-napi`, `build-python`, `Stage + verify platform packages`, `Alpine load test (linux-arm64-musl)`, `Rehearse PyPI publish (no upload)` | Nothing | Transient (runner, Docker Hub pull, registry outage): `gh run rerun <run-id> --failed` — re-runs the failed jobs and their dependents; upstream artifacts are reused. Genuine defect: land the fix, bump to the next patch version, tag that. Do not move a tag that a defect was found on. |
 | `Publish to crates.io` at `Publish mds-core` — the v0.4.0 case: HTTP 403 from a revoked token, run 33569514359 | Nothing | Fix the secret or cause, then `gh run rerun <run-id> --failed`. |
-| `Publish to crates.io` after `mds-core` is live — index poll timeout, `Publish mds-cli` failure | `mds-core@X.Y.Z` on crates.io (cannot be deleted; `cargo yank` only hides it from new resolutions) | Transient: `gh run rerun <run-id> --failed` — the `mds-core` step treats "already uploaded" as success and proceeds to `mds-cli`. Defect in `mds-cli`: the version is consumed for the whole workspace (one coordinated version); land the fix, bump to the next patch, optionally `cargo yank --version X.Y.Z mds-core`, and say so in the GitHub Release body. |
-| `Publish to npm` — any point | Both crates on crates.io. Zero or more `@mdscript/*` packages at X.Y.Z can be on npm. If a NOTICE or pack-list check fails, the run makes no new npm writes. | `gh run rerun <run-id> --failed`: `napi prepublish` tolerates E403 for platform packages already published and `publish_if_absent` skips versions `npm view` already sees. **Do not publish from a workstation** — a laptop `npm publish` carries no OIDC provenance attestation, and that gap is permanent for the version. If a code or workflow change is required for the re-run to succeed: bump to the next patch; npm unpublish is restricted by registry policy and leaves the version number consumed either way, so retire a partial set with `npm deprecate` rather than trying to remove it. |
+| `Publish to crates.io` after `mds-core` is live — index poll timeout, `Publish mds-fetch` failure | `mds-core@X.Y.Z` on crates.io (cannot be deleted; `cargo yank` only hides it from new resolutions) | Transient: `gh run rerun <run-id> --failed` — the `mds-core` step treats "already uploaded" as success and proceeds to `mds-fetch`. A new-crate scope error on the first `mds-fetch` release: fix the token scope (prerequisite 3), then rerun. Defect in `mds-fetch`: the version is consumed for the whole workspace (one coordinated version); land the fix, bump to the next patch, optionally `cargo yank --version X.Y.Z mds-core`, and say so in the GitHub Release body. |
+| `Publish to crates.io` after `mds-fetch` is live — index poll timeout, `Publish mds-cli` failure | `mds-core@X.Y.Z` and `mds-fetch@X.Y.Z` on crates.io | Transient: `gh run rerun <run-id> --failed` — the `mds-core` and `mds-fetch` steps treat "already uploaded" as success and proceed to `mds-cli`. Defect in `mds-cli`: land the fix, bump to the next patch, optionally yank both crates at X.Y.Z, and say so in the GitHub Release body. |
+| `Publish to npm` — any point | All three crates on crates.io. Zero or more `@mdscript/*` packages at X.Y.Z can be on npm. If a NOTICE or pack-list check fails, the run makes no new npm writes. | `gh run rerun <run-id> --failed`: `napi prepublish` tolerates E403 for platform packages already published and `publish_if_absent` skips versions `npm view` already sees. **Do not publish from a workstation** — a laptop `npm publish` carries no OIDC provenance attestation, and that gap is permanent for the version. If a code or workflow change is required for the re-run to succeed: bump to the next patch; npm unpublish is restricted by registry policy and leaves the version number consumed either way, so retire a partial set with `npm deprecate` rather than trying to remove it. |
 | `Publish to PyPI` — the v0.4.1 case: `manifest unknown` on an annotated-tag-object pin (#350) | crates.io and the npm packages at X.Y.Z; `GitHub Release` was skipped | Transient: `gh run rerun <run-id> --failed` (`skip-existing: true` makes the upload re-run safe). Workflow or pin defect: per the tag-immutability rule above, the fix goes to a new commit rather than the tagged one, so land it and bump to the next patch (v0.4.2 was that release), then create the partial version's GitHub Release by hand so the tag is not left bare — `gh release create vX.Y.Z --title vX.Y.Z --generate-notes --latest=false` — with a body line naming which registries the version reached (v0.4.1 was backfilled this way on 2026-09-04). |
 | `GitHub Release` | Everything is published | `gh run rerun <run-id> --failed`, or by hand: `gh release create vX.Y.Z --title vX.Y.Z --generate-notes` (the job itself falls back to `gh release edit`). |
 
