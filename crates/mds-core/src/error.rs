@@ -35,6 +35,29 @@ pub(crate) fn request_location(module: &str, entry: &str, template: &str, origin
     )
 }
 
+/// The fixed help of each check that can refuse a request. It never holds input text.
+fn refusal_help(layer: crate::Layer) -> &'static str {
+    use crate::Layer;
+    match layer {
+        Layer::AllowList => "add the origin to the network allow list of the host",
+        Layer::ImportOptIn => {
+            "allow the network entries of imported modules with the import opt-in of the host"
+        }
+        Layer::UrlParser => "check the URL template and the values that its references give",
+        Layer::RedirectCheck => {
+            "the redirect breaks a redirect rule; request the final URL directly"
+        }
+        Layer::SecretBinding => {
+            "give the host a secret of this name for the origin of the request"
+        }
+        Layer::TransportAddress => {
+            "to reach an address in a refused range, add its exact IP address and port to the allow list"
+        }
+        Layer::ResponseCheck => "the server sent back the value of a host secret; the response is not used",
+        Layer::Method => "use a GET or HEAD request",
+    }
+}
+
 // ── Serializable error types ──────────────────────────────────────────────────
 
 /// A serializable representation of a source span.
@@ -481,14 +504,18 @@ pub enum MdsError {
         help: Option<String>,
     },
 
-    /// Data entries need network access but have no replay value.
+    /// Data entries need network access but have no replay value, or a step compile
+    /// refused a request of a URL entry.
     #[error("network access denied for data entries: {entries}")]
-    #[diagnostic(
-        code(mds::network_denied),
-        help("provide a runtime value for each entry to replay it without network access")
-    )]
+    #[diagnostic(code(mds::network_denied))]
     #[non_exhaustive]
-    NetworkDenied { entries: String },
+    NetworkDenied {
+        entries: String,
+        /// The replay help for entries with no replay value, else the fixed help of the
+        /// check that refused the request.
+        #[help]
+        detail: String,
+    },
 
     /// A request of a network data entry failed in transport. The message names the
     /// entry, the URL as declared and the origin, never the expanded URL.
@@ -1069,6 +1096,8 @@ impl MdsError {
                 .map(|&(module, entry)| data_location(module, Some(entry), None))
                 .collect::<Vec<_>>()
                 .join("; "),
+            detail: "provide a runtime value for each entry to replay it without network access"
+                .to_owned(),
         }
     }
 
@@ -1087,10 +1116,22 @@ impl MdsError {
     }
 
     /// Construct a spanless policy refusal of one URL entry: the location of the
-    /// request, the name of the check and its fixed reason. `secret` names the host
-    /// secret that the refusal is about, never its value. Pass the other arguments as
-    /// for [`MdsError::network`].
-    pub(crate) fn network_refused(
+    /// request, the name of the check and its fixed reason, with the fixed help of the
+    /// check. Pass the other arguments as for [`MdsError::network`]. A sender that
+    /// refuses an address passes the refusal of [`crate::NetworkPolicy::check_address`].
+    pub fn network_refused(
+        module: &str,
+        entry: &str,
+        template: &str,
+        origin: &str,
+        refusal: crate::Refusal,
+    ) -> Self {
+        Self::refused_request(module, entry, template, origin, refusal, None)
+    }
+
+    /// [`MdsError::network_refused`] about the host secret `secret`: the message names
+    /// the secret, never its value.
+    pub(crate) fn refused_request(
         module: &str,
         entry: &str,
         template: &str,
@@ -1109,7 +1150,10 @@ impl MdsError {
             entries.push_str(&sanitize_control_chars_wire(secret));
             entries.push_str("\")");
         }
-        Self::NetworkDenied { entries }
+        Self::NetworkDenied {
+            entries,
+            detail: refusal_help(refusal.layer()).to_owned(),
+        }
     }
 
     /// Construct a spanless refusal of the host input to a step compile. Pass fixed prose

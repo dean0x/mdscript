@@ -1220,9 +1220,14 @@ and `compile_step_str`. Each takes the arguments of its compile function plus a 
   `mds::network_denied` (`transport-address`), each other kind with `mds::network`.
 - `CompileResult.remote_inputs` lists each bound URL entry as its module, entry, URL as declared
   and origin, never the expanded URL. `dependencies` never lists a URL. The canonical JSON writes
-  `remoteInputs` only when the list is not empty.
+  `remoteInputs` only when the list is not empty, with each field WIRE-escaped (§7.5).
+- A message, a help, a warning, a `Debug` view and a result field show the URL as declared and
+  the origin only. They never show the expanded path or query, a header value, a secret value or
+  response text. A data rule error of a response body names the entry, without the key path that
+  a data file error names (§4.12 "Conversion"). `Debug` of a `Request` shows its ID, method, URL
+  as declared, origin and header names.
 
-Tests: `crates/mds-core/tests/data_step.rs`.
+Tests: `crates/mds-core/tests/data_step.rs` and `crates/mds-core/tests/net_sinks.rs`.
 
 #### Status envelope
 
@@ -1734,8 +1739,8 @@ and I/O failures are described below the table.
 | `mds::yaml` | Frontmatter YAML the parser refuses (syntax, duplicate keys, nesting beyond the parser's limits — §4.1), or a [reserved output key form error](#reserved-output-keys). Also, a syntax error in a YAML or JSON data file. For a data file, the message names the project-relative file and the entry, escaped, without source text. | resolver | 1 / 2 | all |
 | `mds::json` | Malformed JSON, or a non-object root, in `load_vars_str` and other JSON sites except data files | `mds-core` vars API | 1 / 2 | Rust, CLI |
 | `mds::data` | Invalid data declaration or a data value that violates the data rules, such as a duplicate key or a number outside the supported range. The message names the project-relative module and, where applicable, the entry and field. These labels are escaped. The error has no source span. | resolver | 1 / 2 | CLI, Rust, napi, WASM, Python |
-| `mds::network_denied` | A compile needs a network data entry with no replay value. The message names the entries and their project-relative modules, escaped, with no source span. | resolver | 2 / 2 | CLI, Rust, napi, WASM, Python |
-| `mds::network` | A request of a network data entry failed in transport. The message names the project-relative module, the entry, the URL as declared and the origin, escaped, with no source span. It never holds the expanded URL, a header value or a body. | resolver | 2 / 2 | CLI, Rust |
+| `mds::network_denied` | A compile needs a network data entry with no replay value. The message names the entries and their project-relative modules, escaped, with no source span; the help is the replay help. Also a step compile that refuses a request (§4.12 "Step compiles"): the message names the module, the entry, the URL as declared and the origin, escaped, then the check (`allow-list`, `import-opt-in`, `url-parser`, `redirect-check`, `secret-binding`, `transport-address`, `response-check` or `method`) and its fixed reason, and a secret by name only. The help is fixed text for each check. The Rust constructor is `MdsError::network_refused`. | resolver | 2 / 2 | CLI, Rust, napi, WASM, Python |
+| `mds::network` | A request of a network data entry failed in transport, or its answer has a status that is not 2xx and the entry has no status envelope (`the server answered with HTTP status <n>`). The message names the project-relative module, the entry, the URL as declared and the origin, escaped, with no source span. It never holds the expanded URL, a header value or a body. | resolver | 2 / 2 | CLI, Rust |
 | `mds::invalid_vars` | `--vars` file is malformed JSON or not an object (`load_vars_file`) | `mds-core` vars API | 1 / 2 | CLI, Rust |
 | `mds::var_conflict` | Same key given to both `--set` and `--set-string` | CLI | 1 / 1 | CLI |
 | `mds::module_not_found` | Virtual backend: a key absent from the module map. For a data file: `data file '<key>' is not in the virtual module map` (§4.12) | `VirtualFs`, `@mdscript/mds` WASM backend | 1 / 2 | napi, WASM, Python, Rust, `@mdscript/mds` |

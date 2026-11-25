@@ -48,7 +48,14 @@ impl DataLabel<'_> {
         })
     }
 
+    /// A data error of this input. For a file or a declaration, `field` is the key path
+    /// of the value. A key path of a response is body text, so a response error names
+    /// the entry only.
     pub(crate) fn error(self, field: Option<&str>, reason: &str) -> MdsError {
+        let field = match self.input {
+            DataInput::Response => None,
+            DataInput::Declaration | DataInput::File(_) => field,
+        };
         MdsError::data(self.module, Some(self.entry), field, reason, None)
     }
 }

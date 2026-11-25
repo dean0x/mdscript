@@ -8,9 +8,28 @@
 //! and runs the next round with every response it has, so the core keeps no state
 //! between rounds.
 //!
-//! Request text reaches these sinks only: an error message, the [`RemoteInput`] list
-//! and the needed [`Request`] list. A message names the URL as declared and the origin,
-//! never the expanded URL, and each one is built through [`request_label`].
+//! # Sinks of request text
+//!
+//! The expanded URL, a header value, a secret value and response text reach no sink but
+//! the needed [`Request`] list, which is for the sender only. Each other sink has one
+//! builder:
+//!
+//! - Error messages: [`request_label`] builds every message about a request
+//!   (`mds::network`, `mds::network_denied`, the redirect limit) from the module, the
+//!   entry, the URL as declared and the origin, through `request_location`. The help of
+//!   a refusal is the fixed help of its check. A value error of a response names the
+//!   entry and never a key path (`DataLabel::error`), and an envelope error names the
+//!   field `headers` only.
+//! - Warnings: a step compile adds none. The pending warning of the tooling roles names
+//!   the module and the entry only.
+//! - `Debug`: `Request` and `CheckedUrl` show the URL as declared and the origin, a text
+//!   header value shows no text, [`Response`] and [`FetchState`] show sizes only, and a
+//!   secret value and the run key show no value.
+//! - Result fields: [`RemoteInput`] holds the template form, and `dependencies` holds
+//!   files only.
+//! - Lint JSON: the data rules read the declarations, never a response, and name the
+//!   entry and the header name, never a value.
+//! - CLI stderr: the CLI prints the messages above.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -398,7 +417,7 @@ pub(crate) fn request_label<'a>(
 
 impl RequestLabel<'_> {
     fn refused(&self, refusal: Refusal, secret: Option<&str>) -> MdsError {
-        MdsError::network_refused(
+        MdsError::refused_request(
             self.module,
             self.entry,
             self.template,

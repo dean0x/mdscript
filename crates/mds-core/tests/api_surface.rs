@@ -492,6 +492,7 @@ fn data_error_variants_have_named_constructors() {
     type DataFn = fn(&str, Option<&str>, Option<&str>, &str, Option<String>) -> MdsError;
     let _: DataFn = MdsError::data;
     let _: fn(&[(&str, &str)]) -> MdsError = MdsError::network_denied;
+    let _: fn(&str, &str, &str, &str, mds::Refusal) -> MdsError = MdsError::network_refused;
     let network: fn(&str, &str, &str, &str, &str) -> MdsError = MdsError::network;
     let err = network(
         "main.mds",

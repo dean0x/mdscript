@@ -62,8 +62,8 @@ pub(crate) fn envelope(
                 joined.push_str(text);
             }
             Some(_) => {
-                return Err(label.error(
-                    Some("headers"),
+                return Err(header_error(
+                    label,
                     "two response header names give the same envelope key",
                 ))
             }
@@ -95,12 +95,23 @@ pub(crate) fn envelope(
 /// strings.
 fn header_text<'v>(value: &'v [u8], label: DataLabel<'_>) -> Result<&'v str, MdsError> {
     let text = std::str::from_utf8(value)
-        .map_err(|_| label.error(Some("headers"), "invalid UTF-8 in a response header value"))?;
+        .map_err(|_| header_error(label, "invalid UTF-8 in a response header value"))?;
     if text.chars().any(is_control_char) {
-        return Err(label.error(
-            Some("headers"),
+        return Err(header_error(
+            label,
             "forbidden character in a response header value",
         ));
     }
     Ok(text)
+}
+
+/// A data error of the field `headers`, a fixed name.
+fn header_error(label: DataLabel<'_>, reason: &str) -> MdsError {
+    MdsError::data(
+        label.module,
+        Some(label.entry),
+        Some("headers"),
+        reason,
+        None,
+    )
 }
