@@ -1,0 +1,22 @@
+[package]
+name = "mds-fetch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "MDS (Markdown Script) compiler — the native sender of URL data entries"
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories = ["network-programming", "template-engine"]
+
+# The HTTP, TLS and root list crates live here only. mds-core and mds-wasm never depend
+# on this crate: `crates/mds-core/tests/supply_chain.rs` fails if they do.
+[dependencies]
+mds = { package = "mds-core", path = "../mds-core", version = "0.7.0" }
+ureq = { workspace = true }
+rustls = { workspace = true }
+webpki-root-certs = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }

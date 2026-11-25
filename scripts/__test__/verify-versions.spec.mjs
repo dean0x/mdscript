@@ -136,7 +136,7 @@ test('verification accepts locks with CRLF line ends', (t) => {
   const result = repo.run('scripts/verify-versions.mjs');
   assert.equal(result.status, 0, result.stderr);
   const version = canonical();
-  assert.equal(result.stdout, `✓ version gate: 8 packages + 4 crates all at ${version}; no file: refs; internal deps pinned to ^${version}; Python pyproject.toml name=markdown-script version=dynamic\n`);
+  assert.equal(result.stdout, `✓ version gate: 8 packages + 5 crates all at ${version}; no file: refs; internal deps pinned to ^${version}; Python pyproject.toml name=markdown-script version=dynamic\n`);
 });
 
 test('bump updates only workspace lock fields and keeps CRLF', (t) => {
@@ -144,7 +144,7 @@ test('bump updates only workspace lock fields and keeps CRLF', (t) => {
   const version = canonical();
   const pattern = new RegExp(`^version = "${version.replaceAll('.', '\\.')}"$`, 'gm');
   const cargo = repo.read('Cargo.lock');
-  assert.equal([...cargo.matchAll(pattern)].length, 5);
+  assert.equal([...cargo.matchAll(pattern)].length, 6);
   const crlf = (text) => text.replace(/\r?\n/g, '\r\n');
   repo.write('Cargo.lock', crlf(cargo));
   const lock = JSON.parse(repo.read('package-lock.json'));
@@ -236,7 +236,7 @@ import * as bump from './scripts/bump-version.mjs';
 import * as manifest from './scripts/release-manifest.mjs';
 const { LOCK_MEMBERS, PKG_DIRS, PKG_PATHS, CRATE_CARGO_PATHS } = manifest;
 assert.equal(PKG_PATHS.length, 8);
-assert.equal(CRATE_CARGO_PATHS.length, 4);
+assert.equal(CRATE_CARGO_PATHS.length, 5);
 assert.equal(PKG_DIRS.length, 8);
 const cargo = readFileSync('Cargo.lock', 'utf8');
 const npm = readFileSync('package-lock.json', 'utf8');

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/mds-core", "crates/mds-cli", "crates/mds-wasm", "crates/mds-napi", "crates/mds-python"]
+members = ["crates/mds-core", "crates/mds-cli", "crates/mds-wasm", "crates/mds-napi", "crates/mds-python", "crates/mds-fetch"]
 resolver = "2"
 
 [workspace.package]
@@ -72,6 +72,28 @@ similar = "3.1"
 # dependency edge and no package. Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT;
 # rust-version 1.63, within the workspace MSRV.
 rustix = { version = "1.1.4", default-features = false, features = ["fs", "std"] }
+# The sender of URL data entries (crates/mds-fetch). Pins are exact and soak-checked on
+# the crates.io API (2026-11-25; cut-off 2026-10-26). mds-core and mds-wasm never depend
+# on these crates (crates/mds-core/tests/supply_chain.rs).
+# ureq 3.5.0: blocking HTTP/1.1 client, MIT OR Apache-2.0, published 2026-10-21 (35 d).
+# No default features: `rustls-no-provider` gives the rustls connector with no gzip, no
+# root list and no crypto provider; mds-fetch sets each one itself. Its `unversioned`
+# resolver and connector API can change in a minor release, so the pin is exact: review
+# the adapter in crates/mds-fetch/src/send.rs on each bump.
+ureq = { version = "=3.5.0", default-features = false, features = ["rustls-no-provider"] }
+# rustls 0.23.46: TLS 1.2 and 1.3 with the ring provider (C compiler only, no cmake or
+# nasm). Apache-2.0 OR ISC OR MIT, published 2026-10-14 (42 d). It is the first version
+# with the fixes of four 2026 rustls advisories: do not take a lower version.
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+# webpki-root-certs 1.0.11: the Mozilla root list as DER certificates, so host roots can
+# join it. CDLA-Permissive-2.0, a permissive data license with no copyleft (one-crate
+# exception in deny.toml). Published 2026-10-23 (33 d).
+webpki-root-certs = "=1.0.11"
+# rcgen 0.14.10: test-only. The TLS tests of mds-fetch make their CA, certificate and key
+# at test time, so the repository holds no key. MIT OR Apache-2.0, published 2026-08-28
+# (89 d), rust-version 1.88. The ring provider only (no aws-lc-rs); `pem` writes the PEM
+# form of a host root.
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem"] }
 
 # panic = "unwind" is required workspace-wide because mds-napi and mds-python catch
 # panics with catch_unwind at the host boundary and return `mds::internal` errors, and

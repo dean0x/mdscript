@@ -18,6 +18,7 @@ export const CRATE_CARGO_PATHS = Object.freeze([
   'crates/mds-napi/Cargo.toml',
   'crates/mds-wasm/Cargo.toml',
   'crates/mds-python/Cargo.toml',
+  'crates/mds-fetch/Cargo.toml',
 ]);
 
 export const DEP_SETS = Object.freeze(['dependencies', 'optionalDependencies', 'peerDependencies']);
