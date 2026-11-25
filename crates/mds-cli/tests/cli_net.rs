@@ -525,15 +525,17 @@ fn an_echoed_secret_stops_the_chain_and_tls_needs_the_host_root() {
             .unwrap()
     };
 
-    assert_rendered(&send("fixed.mds", true), "control: a fixed answer");
+    // Check for the value first in each run, with a fixed message, so that no failure
+    // message below can show it.
+    let out = send("fixed.mds", true);
+    assert_no_secret(&out);
+    assert_rendered(&out, "control: a fixed answer");
     assert_eq!(
         next.connections(),
         1,
         "control: the chain reaches the second listener"
     );
 
-    // Check for the value first, with a fixed message, so that no failure message
-    // below can show it.
     let out = send("echo.mds", true);
     assert_no_secret(&out);
     assert_fails(
@@ -551,15 +553,19 @@ fn an_echoed_secret_stops_the_chain_and_tls_needs_the_host_root() {
         1,
         "no refused run reaches the second listener"
     );
+    // Each head holds the secret header, so these messages are fixed text.
     let seen = tls.stop();
     let bound = format!("Bearer {SECRET}");
-    assert_eq!(seen.heads.len(), 2, "{:?}", seen.heads);
+    assert_eq!(
+        seen.heads.len(),
+        2,
+        "the bound listener must get two requests"
+    );
     assert!(
         seen.heads
             .iter()
             .all(|head| header_value(head, "authorization") == Some(bound.as_str())),
-        "the bound listener gets the secret: {:?}",
-        seen.heads
+        "the bound listener must get the secret header"
     );
 }
 
@@ -613,19 +619,30 @@ fn a_response_value_in_a_failed_url_never_reaches_stderr() {
     let dir = project(&[("main.mds", &source)]);
 
     let out = build(dir.path(), &[&http_item(&first), &http_item(&second)], &[]);
+    // Check for the value first, with fixed messages, so that no failure message below
+    // can show it. The request head holds the value, so its messages are fixed too.
+    assert!(
+        !stderr_of(&out).contains(MARKER),
+        "stderr must not show the response value"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains(MARKER),
+        "stdout must not show the response value"
+    );
     assert_fails(&out, "mds::network", &format!("URL \"{template}\""));
     assert!(
         squash(&stderr_of(&out)).contains("theserveransweredwithHTTPstatus404"),
-        "{}",
-        stderr_of(&out)
+        "stderr must name the status of the answer"
     );
-    assert!(!stderr_of(&out).contains(MARKER), "{}", stderr_of(&out));
     let seen = second.stop();
-    assert_eq!(seen.heads.len(), 1);
+    assert_eq!(
+        seen.heads.len(),
+        1,
+        "the second listener must get one request"
+    );
     assert!(
         seen.heads[0].starts_with(&format!("GET /b/{MARKER} ")),
-        "{:?}",
-        seen.heads
+        "control: the second listener must get the response value"
     );
     first.stop();
 }

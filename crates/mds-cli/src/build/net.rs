@@ -606,7 +606,8 @@ mod tests {
     }
 
     /// A `--secret` with no variable set names the secret and the variable; a value typed
-    /// in place of `env:VAR` is never shown.
+    /// in place of `env:VAR` is never shown. Each assertion message is fixed text, and the
+    /// check for the value comes first, so a failure can not show the value.
     #[test]
     fn a_secret_flag_names_the_secret_and_the_variable_never_a_value() {
         let unset = NetFlags {
@@ -614,39 +615,60 @@ mod tests {
             ..flags(&["api.example"])
         };
         let error = effective_policy(&unset, None).unwrap_err();
-        assert_eq!(code(&error), "mds::invalid_options");
+        assert_eq!(
+            code(&error),
+            "mds::invalid_options",
+            "an unset variable is a refused option"
+        );
         let text = error.to_string();
-        assert!(text.contains("--secret[0] \"TOKEN\""), "{text}");
+        assert!(
+            text.contains("--secret[0] \"TOKEN\""),
+            "the message must name the secret"
+        );
         assert!(
             text.contains("MDS_TEST_UNSET_VARIABLE_405 is not set"),
-            "{text}"
+            "the message must name the variable"
         );
 
         let typed_value = NetFlags {
             secrets: vec!["TOKEN=planted-secret-value".into()],
             ..flags(&["api.example"])
         };
-        let error = effective_policy(&typed_value, None).unwrap_err();
+        let Err(error) = effective_policy(&typed_value, None) else {
+            panic!("a value typed in place of env:VAR must be refused");
+        };
         let text = error.to_string();
         assert!(
-            text.contains("--secret[0]: expected NAME=env:VAR@ORIGIN"),
-            "{text}"
+            !text.contains("planted-secret-value"),
+            "the message must not show the value"
         );
-        assert!(!text.contains("planted-secret-value"), "{text}");
+        assert!(
+            text.contains("--secret[0]: expected NAME=env:VAR@ORIGIN"),
+            "the message must name the flag form"
+        );
 
         let value_as_var = NetFlags {
             secrets: vec!["TOKEN=env:planted-secret-value@https://api.example".into()],
             ..flags(&["api.example"])
         };
-        let error = effective_policy(&value_as_var, None).unwrap_err();
-        assert_eq!(code(&error), "mds::invalid_options");
+        let Err(error) = effective_policy(&value_as_var, None) else {
+            panic!("a value typed in place of VAR must be refused");
+        };
         let text = error.to_string();
+        assert!(
+            !text.contains("planted-secret-value"),
+            "the message must not show the value"
+        );
+        assert_eq!(
+            code(&error),
+            "mds::invalid_options",
+            "a value in place of VAR is a refused option"
+        );
         assert!(
             text.contains(
                 "--secret[0] \"TOKEN\": the text after env: is not an environment variable name"
             ),
-            "{text}"
+            "the message must name the secret and the reason"
         );
-        assert!(!text.contains("planted-secret-value"), "{text}");
     }
 }

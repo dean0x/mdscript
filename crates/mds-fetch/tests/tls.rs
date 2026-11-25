@@ -128,7 +128,8 @@ fn a_certificate_for_another_address_fails() {
 }
 
 /// A secret header sends its prefix and then the value of the host secret for the
-/// request origin, over TLS only.
+/// request origin, over TLS only. The request head holds the value, so each assertion
+/// message is fixed text.
 #[test]
 fn a_secret_header_sends_the_prefix_and_the_value() {
     let pki = pki("127.0.0.1");
@@ -140,15 +141,22 @@ fn a_secret_header_sends_the_prefix_and_the_value() {
          headers: {{Authorization: {{secret: token, prefix: 'Bearer '}}}}"
     );
     let request = request(&entry(&fields), &policy);
-    assert!(!format!("{request:?}").contains("planted-value"));
+    assert!(
+        !format!("{request:?}").contains("planted-value"),
+        "Debug of the request must not show the secret value"
+    );
     let response = Fetcher::new(policy, std::slice::from_ref(&pki.ca))
         .unwrap()
         .send(&request, soon());
-    assert_eq!(http(&response), Some((200, OK)));
+    assert_eq!(
+        http(&response),
+        Some((200, OK)),
+        "the server must answer the request"
+    );
     let head = server.stop().heads.remove(0).to_ascii_lowercase();
     assert!(
         head.contains("\r\nauthorization: bearer planted-value\r\n"),
-        "{head}"
+        "the request must carry the prefix and the value"
     );
 }
 

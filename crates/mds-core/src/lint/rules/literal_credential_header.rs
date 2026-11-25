@@ -107,7 +107,9 @@ mod tests {
     }
 
     /// TP-100: each credential word in a literal header name gives a warning that names
-    /// the entry and the header, never the value, with its span on the entry name.
+    /// the entry and the header, never the value, with its span on the entry name. The
+    /// check for the value over every diagnostic comes first, and the messages are fixed
+    /// text or the header name, so a failure can not show the value.
     #[test]
     fn a_literal_credential_header_warns() {
         for name in [
@@ -119,38 +121,54 @@ mod tests {
         ] {
             let src = with_header(&format!("{name}: planted-value"));
             let diagnostics = lint_src(&src);
+            assert!(
+                !format!("{diagnostics:?}").contains("planted-value"),
+                "{name}: no diagnostic may show the header value"
+            );
             let [diagnostic] = diagnostics.as_slice() else {
-                panic!("{name}: expected one diagnostic, got {diagnostics:?}");
+                panic!("{name}: expected one diagnostic, got {}", diagnostics.len());
             };
-            assert_eq!(diagnostic.rule, RULE);
-            assert_eq!(diagnostic.severity, Severity::Warn);
+            assert_eq!(diagnostic.rule, RULE, "{name}: the rule");
+            assert_eq!(diagnostic.severity, Severity::Warn, "{name}: the severity");
             assert_eq!(
                 diagnostic.message,
-                format!("Data entry 'api' sets the credential header '{name}' to literal text.")
+                format!("Data entry 'api' sets the credential header '{name}' to literal text."),
+                "{name}: the message must name the entry and the header"
             );
-            assert!(!format!("{diagnostic:?}").contains("planted-value"));
             let span = diagnostic.span.as_ref().expect("a span on the entry");
-            assert_eq!(&src[span.offset..span.offset + span.length], "api");
+            // The source holds the value, so the span text is compared, not printed.
+            assert!(
+                src.get(span.offset..span.offset + span.length) == Some("api"),
+                "{name}: the span must cover the entry name"
+            );
         }
     }
 
     /// Control: the secret form, a value with a reference and a header name with no
-    /// credential word give no diagnostic.
+    /// credential word give no diagnostic. A header line can hold the value, so the
+    /// messages name its index.
     #[test]
     fn the_secret_form_and_other_headers_give_no_diagnostic() {
-        for header in [
+        for (index, header) in [
             "X-Auth-Token: {secret: TOKEN, prefix: ''}",
             "X-Auth-Token: {secret: TOKEN, prefix: 'Bearer '}",
             "X-Auth-Token: 'Bearer {{key}}'",
             "X-Trace: planted-value",
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let src = with_header(header).replace("---\n{{api}}", "key: k\n---\n{{api}}");
             // The declaration parses, so the empty result is not from a refused entry.
             let tokens = tokenize(&src, "test.mds").unwrap();
             let module = parse_with_ctx(&tokens, "test.mds", &src).unwrap();
             let ctx = collect_facts(&module, false, &src).unwrap();
-            assert_eq!(ctx.data_requests.len(), 1, "{header}");
-            assert!(lint_src(&src).is_empty(), "{header}");
+            assert_eq!(
+                ctx.data_requests.len(),
+                1,
+                "header {index}: the entry must parse"
+            );
+            assert!(lint_src(&src).is_empty(), "header {index}: no diagnostic");
         }
     }
 

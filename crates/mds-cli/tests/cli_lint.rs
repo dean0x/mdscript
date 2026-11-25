@@ -9266,7 +9266,22 @@ fn data_rules_report_a_literal_credential_header_and_an_http_url() {
     let file = tmp.path().join("main.mds");
     let source = "---\ndata:\n  feed:\n    url: http://127.0.0.1:9/x\n    headers:\n      X-Auth-Token: planted-value\n---\n{{feed}}\n";
     fs::write(&file, source).unwrap();
-    let (json, stdout) = lint_json(&file, "data rules");
+    // The checks for the value come first, with fixed messages: `lint_json` and
+    // `json_diagnostics` print the output when they fail. The second check covers a value
+    // that the JSON text escapes.
+    let out = lint_path(&file, &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("planted-value"),
+        "the lint output must not show the header value"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("lint --format json must emit valid JSON");
+    assert!(
+        !json.to_string().contains("planted-value"),
+        "the decoded lint output must not show the header value"
+    );
+    assert_eq!(json["version"], 1, "the JSON version must be 1");
     let mut found: Vec<(String, String)> = json_diagnostics(&json, "data rules")
         .iter()
         .map(|d| {
@@ -9289,9 +9304,9 @@ fn data_rules_report_a_literal_credential_header_and_an_http_url() {
                 "Data entry 'feed' sets the credential header 'X-Auth-Token' to literal text."
                     .to_owned()
             ),
-        ]
+        ],
+        "lint must report the two data rules"
     );
-    assert!(!stdout.contains("planted-value"), "{stdout}");
 
     let safe = source
         .replace("http://127.0.0.1:9/x", "https://a.example/x")
