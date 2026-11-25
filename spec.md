@@ -1379,12 +1379,16 @@ after the module records, as `mds::scan_import_records` does (`scan_import_recor
 in `web.rs`). The WASM backend of `@mdscript/mds` reads these files for `compileFile` with the data
 path rules of the native backend. Its output and its errors are equal to those of the native
 backend for a data file that it reads, a missing data file, a missing data file of an imported
-module, a base entry that a child entry replaces, and a `node_modules` segment reached through a
-symbolic link (U-WCF15 in `packages/mds/__test__/wasm-compileFile.spec.mjs`). They are also equal
-for each row of the shared data path vector table, a symbolic link as the final component, a linked
-directory outside the project root, a named pipe, a file over 10 MiB, an entry with more than 256
-references, more than 256 data entries in one compile, more than 32 MiB of data text in one
-compile and, on a case-insensitive volume, a resolved key with no data extension
+module, a base entry that a child entry replaces, a missing data file of a base entry that no child
+entry replaces (through one `@extends` base, a chain of two and an import of the child), and a
+`node_modules` segment reached through a symbolic link (U-WCF15 in
+`packages/mds/__test__/wasm-compileFile.spec.mjs`). They are also equal for each row of the shared
+data path vector table (on Windows also its Windows rows), a symbolic link as the final component, a
+linked directory outside the project root, a named pipe, a file over 10 MiB, an entry with more
+than 256 references, more than 256 data entries in one compile, more than 32 MiB of data text in
+one compile, a refused data path whose key a later path resolves to (in both orders, also through a
+case variant on a case-insensitive volume), a missing data file whose path has a `\` separator and,
+on a case-insensitive volume, a resolved key with no data extension
 (`packages/mds/__test__/data-scanner.spec.mjs`). The napi `compile` and `compileFile`, and the WASM
 `compile` with an `options.modules` map, bind data
 ('D-1: compile and compileFile bind .json, .yaml and .yml data to the same output' in
@@ -1407,6 +1411,19 @@ compile and, on a case-insensitive volume, a resolved key with no data extension
   path with `mds::import`, as it refuses two such module imports. The native backend reads both
   files ('two data paths with one key that name two files are refused on the WASM backend, never
   bound to one file' in `packages/mds/__test__/data-scanner.spec.mjs`).
+- A refused data path can have the key that a later path resolves to, for example
+  `./missing/../a.json` and `./lnk/a.json` through a link `lnk` to `.`. The WASM backend of
+  `@mdscript/mds` never binds the file of the later path to the refused path. When the compile
+  binds the refused path, the WASM backend gives the native refusal. When a runtime variable or a
+  child entry replaces the refused entry, the WASM backend refuses the later path with
+  `mds::import`. The native backend reads its file ('a refused data path is never bound to the file
+  of a later path whose canonical key is its key' in `packages/mds/__test__/data-scanner.spec.mjs`).
+- On POSIX, the WASM backend of `@mdscript/mds` refuses a data file whose name starts with `\` or
+  has `:` as its second byte, for example `./\x.json` or `./a:b.json` in the project root. It gives
+  `mds::import` (`data path "<path>": escapes project directory`), because the WASM engine checks a
+  data key with no project root. The native backend reads these files ('known limit: the WASM
+  backend refuses the POSIX data files named \x.json and a:b.json, which native reads' in
+  `packages/mds/__test__/data-scanner.spec.mjs`).
 
 ---
 

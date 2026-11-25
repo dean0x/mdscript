@@ -74,6 +74,7 @@ MDS_BACKEND=wasm node my-script.js
 WASM file APIs (`compileFile`, `checkFile`, and `lintFile`) differ from native in these cases:
 
 - WASM can report a missing import outside the project as a path outside the project. It checks the project boundary first, so it does not show which files exist outside the project.
+  This also applies to a local data file: if a data file outside the project root does not exist, WASM gives the project root refusal, and native gives `mds::file_not_found`.
 - WASM refuses an import if `..` in the path as written goes above the project root. This applies even if a link leads to a file inside the project. WASM checks the path text before it reads the file system.
 - For a project at the filesystem root, WASM also refuses `/..` as a path above the project root. A native match needs new public API, a spec change, and more WASM bytes.
 - WASM reports `mds::import` if it must use one path name for two different files.
@@ -89,6 +90,8 @@ WASM file APIs (`compileFile`, `checkFile`, and `lintFile`) differ from native i
 - WASM limits total module bytes. It also keeps a table for import paths that differ from their resolved file paths below the project root.
   The scanner and the WASM engine limit the table to 65,536 entries and 10 MiB of path text in UTF-8. Native does not use this table.
 - WASM refuses a non-UTF-8 directory before it checks the file. Native checks the file first. To match native order, each path check would need both string and byte forms.
+- WASM reads each local data file that a module lists before the compile starts. This includes the file of an entry that a runtime variable or a child entry replaces, which native does not read. Such a file counts toward the 256-file and 32 MiB data limits.
+- On POSIX, WASM refuses a local data file whose name starts with `\` or has `:` as its second byte, for example `./\x.json` or `./a:b.json`. Native reads these files. The WASM engine checks a data key with no project root.
 
 ## Error handling
 
