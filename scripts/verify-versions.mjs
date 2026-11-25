@@ -5,8 +5,8 @@
 //   2. Published dependency sets use no `file:` specifiers.
 //   3. Each internal `@mdscript/*` dependency uses a caret range on that
 //      version (for example, ^0.1.0).
-//   4. Each crate's path+version dependency on mds-core uses the workspace
-//      version.
+//   4. Each crate's path+version dependency on mds-core, and each one on
+//      mds-fetch, uses the workspace version.
 //   5. The Python distribution name is `markdown-script`, not `mdscript`.
 //      pyproject.toml declares the version as dynamic so maturin reads it from
 //      the Cargo workspace.
@@ -20,11 +20,22 @@
 import { readFileSync, realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { CRATE_CARGO_PATHS, DEP_SETS, LOCK_MEMBERS, PKG_DIRS, PKG_PATHS } from './release-manifest.mjs';
+import {
+  CRATE_CARGO_PATHS, DEP_SETS, FETCH_DEP_PATHS, LOCK_MEMBERS, PKG_DIRS, PKG_PATHS,
+} from './release-manifest.mjs';
 
 const PYPROJECT_PATH = 'crates/mds-python/pyproject.toml';
 export const WORKSPACE_VERSION = /(^\[workspace\.package\][ \t]*\r?\n(?:(?!\[)[^\r\n]*\r?\n)*?[ \t]*version[ \t]*=[ \t]*")([^"\r\n]+)(")/m;
 export const CORE_DEP_VERSION = /(package\s*=\s*"mds-core".*?version\s*=\s*")([^"\r\n]+)(")/g;
+// The inline table form `mds-fetch = { path = "...", version = "..." }`. Another form
+// matches nothing, so the gate fails closed on it.
+export const FETCH_DEP_VERSION = /(^[ \t]*mds-fetch[ \t]*=[ \t]*\{[^}\r\n]*?version\s*=\s*")([^"\r\n]+)(")/gm;
+// Each crate dependency that must use the workspace version: its crate name, the
+// manifests that hold it and the pattern of its version.
+export const VERSIONED_DEPS = Object.freeze([
+  Object.freeze({ crate: 'mds-core', paths: CRATE_CARGO_PATHS, pattern: CORE_DEP_VERSION }),
+  Object.freeze({ crate: 'mds-fetch', paths: FETCH_DEP_PATHS, pattern: FETCH_DEP_VERSION }),
+]);
 export const CARGO_LOCK_VERSION = /^([ \t]*version[ \t]*=[ \t]*")([^"\r\n]+)(")/;
 
 export const isRecord = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -133,12 +144,14 @@ export function checkVersions(files) {
   const version = WORKSPACE_VERSION.exec(files.get('Cargo.toml'))?.[2];
   if (!version) return { version, problems: ['Cargo.toml: could not find [workspace.package] version'] };
   const problems = [];
-  for (const path of CRATE_CARGO_PATHS) {
-    const matches = [...files.get(path).matchAll(CORE_DEP_VERSION)];
-    if (matches.length === 0) problems.push(`${path}: no path+version dep on mds-core found`);
-    for (const [, , depVersion] of matches) {
-      if (depVersion !== version) {
-        problems.push(`${path}: mds-core dep version "${depVersion}" != workspace version "${version}"`);
+  for (const { crate, paths, pattern } of VERSIONED_DEPS) {
+    for (const path of paths) {
+      const matches = [...files.get(path).matchAll(pattern)];
+      if (matches.length === 0) problems.push(`${path}: no path+version dep on ${crate} found`);
+      for (const [, , depVersion] of matches) {
+        if (depVersion !== version) {
+          problems.push(`${path}: ${crate} dep version "${depVersion}" != workspace version "${version}"`);
+        }
       }
     }
   }
@@ -162,7 +175,10 @@ export function checkVersions(files) {
 export function readVersionFiles(root, extraPaths = []) {
   const files = new Map();
   const problems = [];
-  const paths = ['Cargo.toml', 'Cargo.lock', 'package-lock.json', ...CRATE_CARGO_PATHS, ...PKG_PATHS, PYPROJECT_PATH, ...extraPaths];
+  const paths = [...new Set([
+    'Cargo.toml', 'Cargo.lock', 'package-lock.json', ...CRATE_CARGO_PATHS, ...FETCH_DEP_PATHS, ...PKG_PATHS,
+    PYPROJECT_PATH, ...extraPaths,
+  ])];
   for (const path of paths) {
     try {
       files.set(path, readFileSync(join(root, path), 'utf8'));

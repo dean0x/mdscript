@@ -21,6 +21,9 @@ export const CRATE_CARGO_PATHS = Object.freeze([
   'crates/mds-fetch/Cargo.toml',
 ]);
 
+// Workspace crates with a path and version dependency on mds-fetch.
+export const FETCH_DEP_PATHS = Object.freeze(['crates/mds-cli/Cargo.toml']);
+
 export const DEP_SETS = Object.freeze(['dependencies', 'optionalDependencies', 'peerDependencies']);
 export const PKG_DIRS = Object.freeze(PKG_PATHS.map(dirname));
 export const LOCK_MEMBERS = Object.freeze([...CRATE_CARGO_PATHS.map((path) => basename(dirname(path))), 'mds-core']);

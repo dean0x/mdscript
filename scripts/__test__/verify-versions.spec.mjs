@@ -94,6 +94,12 @@ for (const [name, path, edit, problem] of [
   ['mds-core dependency version drift', 'crates/mds-cli/Cargo.toml', (text) =>
     text.replace(/^(.*package = "mds-core".*version = ")[^"]+/m, (_, prefix) => `${prefix}${NEXT}`),
   /crates\/mds-cli\/Cargo\.toml: mds-core dep version "101\.102\.103" != workspace version/],
+  ['mds-fetch dependency version drift', 'crates/mds-cli/Cargo.toml', (text) =>
+    text.replace(/^(mds-fetch = \{.*version = ")[^"]+/m, (_, prefix) => `${prefix}${NEXT}`),
+  /crates\/mds-cli\/Cargo\.toml: mds-fetch dep version "101\.102\.103" != workspace version/],
+  ['an mds-fetch dependency without a version', 'crates/mds-cli/Cargo.toml', (text) =>
+    text.replace(/^(mds-fetch = \{ path = "[^"]+"), version = "[^"]+"/m, '$1'),
+  /crates\/mds-cli\/Cargo\.toml: no path\+version dep on mds-fetch found/],
   ['a different Python project name', PYPROJECT, (text) => text.replace('name = "markdown-script"', 'name = "mdscript"'),
     /crates\/mds-python\/pyproject\.toml: project name is not "markdown-script"/],
   ['a Python dynamic list without version', PYPROJECT, (text) => text.replace('dynamic = ["version"]', 'dynamic = []'),
@@ -155,6 +161,11 @@ test('bump updates only workspace lock fields and keeps CRLF', (t) => {
   const result = repo.run('scripts/bump-version.mjs', NEXT);
   assert.equal(result.status, 0, result.stderr);
   assert.equal(repo.read('Cargo.lock'), crlf(cargo.replace(pattern, `version = "${NEXT}"`)));
+  const cli = repo.read('crates/mds-cli/Cargo.toml');
+  for (const crate of ['package = "mds-core"', 'mds-fetch = {']) {
+    const line = cli.split('\n').find((text) => text.includes(crate));
+    assert.match(line ?? '', new RegExp(`version = "${NEXT.replaceAll('.', '\\.')}"`), crate);
+  }
   for (const [dir, pkg] of Object.entries(lock.packages)) {
     if (!/^(?:packages|crates)\/[^/]+$/.test(dir)) continue;
     pkg.version = NEXT;
@@ -234,9 +245,10 @@ import { readFileSync } from 'node:fs';
 import * as verify from './scripts/verify-versions.mjs';
 import * as bump from './scripts/bump-version.mjs';
 import * as manifest from './scripts/release-manifest.mjs';
-const { LOCK_MEMBERS, PKG_DIRS, PKG_PATHS, CRATE_CARGO_PATHS } = manifest;
+const { LOCK_MEMBERS, PKG_DIRS, PKG_PATHS, CRATE_CARGO_PATHS, FETCH_DEP_PATHS } = manifest;
 assert.equal(PKG_PATHS.length, 8);
 assert.equal(CRATE_CARGO_PATHS.length, 5);
+assert.deepEqual(FETCH_DEP_PATHS, ['crates/mds-cli/Cargo.toml']);
 assert.equal(PKG_DIRS.length, 8);
 const cargo = readFileSync('Cargo.lock', 'utf8');
 const npm = readFileSync('package-lock.json', 'utf8');
