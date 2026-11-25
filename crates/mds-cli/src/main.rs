@@ -16,7 +16,7 @@ mod write;
 
 use build::{
     build_runtime_vars, emit_duplicate_var_warnings, exit_code, parse_key_value, resolve_input,
-    run_build, BuildArgs, RuntimeVarArgs,
+    run_build, BuildArgs, NetFlags, RuntimeVarArgs,
 };
 
 // ── CLI entry point ───────────────────────────────────────────────────────────
@@ -44,7 +44,7 @@ enum Commands {
     /// All other templates compile to Markdown (.md).
     /// The output extension is derived automatically from the compiled kind.
     #[command(
-        after_help = "Examples:\n  mds build                                  Auto-detect the .mds file in current dir\n  mds build template.mds                     Compile to template.md (next to source)\n  mds build chat.mds                         Compile @message template to chat.json\n  mds build template.mds -o -               Compile to stdout\n  mds build template.mds -o output.md       Compile to specific file\n  mds build template.mds --out-dir dist     Compile to dist/template.md or dist/template.json\n  mds build template.mds --vars vars.json   With variable overrides\n  mds build template.mds --set name=Alice   Set a single variable\n  echo \"Hello {{name}}!\" | mds build -       Compile from stdin (writes to stdout)"
+        after_help = "Examples:\n  mds build                                  Auto-detect the .mds file in current dir\n  mds build template.mds                     Compile to template.md (next to source)\n  mds build chat.mds                         Compile @message template to chat.json\n  mds build template.mds -o -               Compile to stdout\n  mds build template.mds -o output.md       Compile to specific file\n  mds build template.mds --out-dir dist     Compile to dist/template.md or dist/template.json\n  mds build template.mds --vars vars.json   With variable overrides\n  mds build template.mds --set name=Alice   Set a single variable\n  mds build template.mds --allow-net api.example  Fetch URL data entries from api.example\n  echo \"Hello {{name}}!\" | mds build -       Compile from stdin (writes to stdout)"
     )]
     Build {
         /// Input .mds file (use "-" for stdin; omit to auto-detect in current directory)
@@ -87,6 +87,26 @@ enum Commands {
         /// Requires --source-map.
         #[arg(long = "embed-sources", requires = "source_map")]
         embed_sources: bool,
+        /// Let URL data entries send GET and HEAD requests to these origins (comma-separated
+        /// or repeatable): `host`, `host:port`, `https://host[:port]` or `http://host:port`,
+        /// matched exactly. Without it the network is off. mds.json `network` can only narrow it
+        #[arg(long = "allow-net", value_name = "ORIGINS", value_delimiter = ',')]
+        allow_net: Vec<String>,
+        /// Let URL data entries of imported modules and @extends bases send too.
+        /// Requires --allow-net
+        #[arg(long = "allow-net-imports", requires = "allow_net")]
+        allow_net_imports: bool,
+        /// A host secret for a header of the entry module (repeatable): the value of the
+        /// environment variable VAR, sent to ORIGIN only. Requires --allow-net
+        #[arg(
+            long = "secret",
+            value_name = "NAME=env:VAR@ORIGIN",
+            requires = "allow_net"
+        )]
+        secret: Vec<String>,
+        /// A PEM file of extra trust roots for HTTPS (repeatable). Requires --allow-net
+        #[arg(long = "tls-root", value_name = "FILE", requires = "allow_net")]
+        tls_root: Vec<PathBuf>,
     },
     /// Validate an MDS file without rendering
     #[command(
@@ -558,6 +578,10 @@ fn run(cli: Cli) -> Result<()> {
             no_source_map,
             inline,
             embed_sources,
+            allow_net,
+            allow_net_imports,
+            secret,
+            tls_root,
         } => run_build(BuildArgs {
             input,
             output,
@@ -570,6 +594,12 @@ fn run(cli: Cli) -> Result<()> {
             no_source_map,
             inline,
             embed_sources,
+            net: NetFlags {
+                allow: allow_net,
+                allow_imports: allow_net_imports,
+                secrets: secret,
+                tls_roots: tls_root,
+            },
         }),
         Commands::Check {
             input,

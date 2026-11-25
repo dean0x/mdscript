@@ -32,6 +32,48 @@ pub(crate) struct MdsConfig {
     /// warning — an accepted asymmetry, not an oversight (see CHANGELOG).
     #[serde(default)]
     pub(crate) lint: LintCliConfig,
+    /// The `network` section: it can only narrow the grant of `mds build --allow-net`,
+    /// and with no flag it opens nothing. An unknown key and an item that is not in the
+    /// allow-item grammar fail config loading, for every command that loads `mds.json`.
+    #[serde(default)]
+    pub(crate) network: Option<NetworkConfig>,
+}
+
+/// mds.json `network` section. Each key can only narrow the flags of `mds build`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NetworkConfig {
+    /// The allow list. Each item must permit no request that the `--allow-net` list
+    /// refuses.
+    #[serde(default, deserialize_with = "deserialize_allow_items")]
+    pub(crate) allow: Option<Vec<mds::AllowItem>>,
+    /// The import opt-in. `true` needs `--allow-net-imports`.
+    #[serde(default)]
+    pub(crate) allow_imports: Option<bool>,
+}
+
+/// `network.allow` read by [`mds::AllowItem::parse`], the one item parser of every host
+/// surface. An item that it refuses fails with its fixed reason and the item index, never
+/// the item text.
+fn deserialize_allow_items<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<mds::AllowItem>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let texts = Vec::<String>::deserialize(deserializer)?;
+    let mut items = Vec::with_capacity(texts.len());
+    for (index, text) in texts.iter().enumerate() {
+        match mds::AllowItem::parse(text) {
+            Ok(item) => items.push(item),
+            Err(refused) => {
+                return Err(serde::de::Error::custom(format!(
+                    "network.allow[{index}]: {refused}"
+                )))
+            }
+        }
+    }
+    Ok(Some(items))
 }
 
 /// mds.json `lint` section: per-rule severity overrides.

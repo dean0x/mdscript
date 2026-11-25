@@ -934,6 +934,21 @@ const PATH_FREE_ERRORS: &[(&str, &str, usize, &str)] = &[
          column), and one serializing `messages` output (fixed text).",
     ),
     (
+        "config.rs",
+        "refused",
+        1,
+        "The reason of `mds::AllowItem::parse` (a `PolicyError`) for a `network.allow` item \
+         of `mds.json`: fixed text of mds-core that holds no input and names no path (#405).",
+    ),
+    (
+        "net.rs",
+        "reason",
+        8,
+        "A `PolicyError`, a `NarrowError` or an `mds_fetch::SetupError`: fixed text of \
+         mds-core and mds-fetch that holds no input and names no path, for a network flag, \
+         a `network` key of `mds.json` or a `--tls-root` file (#405).",
+    ),
+    (
         "lint.rs",
         "e",
         3,

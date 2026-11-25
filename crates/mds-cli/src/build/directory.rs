@@ -8,6 +8,7 @@ use miette::Result;
 use super::config::compile_inputs;
 use super::config::{load_config, run_reads, source_inputs};
 use super::flags::{effective_build_flags, warn_build_flags};
+use super::net::NetRun;
 use super::single::BuildRun;
 use super::source_map::{apply_source_map_file_label, embed_map_in_content, write_sidecar_map};
 use super::vars::RuntimeVars;
@@ -31,6 +32,7 @@ pub(super) fn build_directory_mode(
         no_source_map,
         inline,
         flag_embed_sources,
+        net,
     } = run;
     // Reject -o/--output in directory mode: output goes to files, not a single destination.
     if output.is_some() {
@@ -51,15 +53,21 @@ pub(super) fn build_directory_mode(
         flag_embed_sources,
     );
     warn_build_flags(&flags, false, quiet);
+    // One network grant for the whole run: its request count covers every file.
+    let net = NetRun::start(&net, dir_config.as_ref())?;
 
+    let write = WriteFlags {
+        quiet,
+        source_map: flags.use_source_map,
+        inline,
+    };
     run_build_directory(
         &input,
         out_dir,
         resolved,
-        quiet,
-        flags.use_source_map,
+        write,
         flags.use_embed_sources,
-        inline,
+        net.as_ref(),
     )
 }
 

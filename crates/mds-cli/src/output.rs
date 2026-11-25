@@ -3026,9 +3026,14 @@ mod tests {
     fn compiled_messages(dir: &Path, source: &str) -> String {
         let path = dir.join("chat.mds");
         std::fs::write(&path, source).unwrap();
-        let compiled =
-            crate::build::compile_to_content(&path, None, true, mds::CompileOptions::default())
-                .unwrap();
+        let compiled = crate::build::compile_to_content(
+            &path,
+            None,
+            true,
+            mds::CompileOptions::default(),
+            None,
+        )
+        .unwrap();
         assert_eq!(compiled.kind, OutputKind::Messages, "{source:?}");
         compiled.content
     }

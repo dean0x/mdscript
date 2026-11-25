@@ -7,6 +7,7 @@ mod config;
 mod directory;
 mod entry;
 mod flags;
+mod net;
 mod out_paths;
 mod single;
 mod source_map;
@@ -26,6 +27,8 @@ pub(crate) use config::{compile_inputs, load_config, run_reads, source_inputs, P
 #[cfg(test)]
 pub(crate) use config::{BuildConfig, MdsConfig};
 pub(crate) use entry::{auto_detect_mds_file, resolve_input};
+pub(crate) use net::NetFlags;
+use net::NetRun;
 pub(crate) use out_paths::{
     reject_forbidden_output_flags, resolve_output_path_for_kind, OutputKind,
 };
@@ -173,41 +176,64 @@ pub(crate) fn messages_json(messages: &[impl serde::Serialize]) -> serde_json::R
 /// result — the caller does not specify it. This is the pure "compile" step used by the
 /// watch loop for content-based dedup.
 ///
-/// `build` calls this directly; `mds watch` calls it for its entry and every source
-/// once it has checked that the path it compiles still leads to the file it watches.
-///
-/// Pass `opts = mds::CompileOptions::default()` from watch callers that do not want
-/// source maps; the watch paths never emit maps so they always use the default.
+/// `mds build` calls this for a file argument. With `net`, step compiles send the
+/// requests of the URL entries; with `None`, the network stays off.
 ///
 /// # PF-004 compliance
-/// All file reads go through `mds::compile_with_deps_opts` or
-/// `mds::compile_str_with_deps_opts` (which use the resolver that enforces
-/// MAX_FILE_SIZE). Stdin input is read through `read_stdin` which enforces the same cap.
+/// All file reads go through the resolver of `mds::compile_native_fs`,
+/// `mds::compile_step_native_fs` or the string compiles, which enforces MAX_FILE_SIZE.
+/// Stdin input is read through `read_stdin` which enforces the same cap.
 /// There is no bare `std::fs::read_to_string`.
 pub(crate) fn compile_to_content(
     input: &Path,
     runtime_vars: Option<HashMap<String, mds::Value>>,
     quiet: bool,
     opts: mds::CompileOptions,
+    net: Option<&NetRun>,
 ) -> Result<CompileOutput> {
-    let result = if input == Path::new("-") {
+    if input == Path::new("-") {
         // Stdin: compile from source string with the working directory as base_dir
         // (`None` — see `read_stdin`). read_stdin enforces MAX_FILE_SIZE (PF-004).
         let source = read_stdin()?;
         // AD-211-1 / AD-211-5: a string-source compile labels its errors `<source>`
         // (resolver's SOURCE_LABEL). Relabel to the uniform CLI sentinel here, at the
         // boundary that knows the input was stdin.
-        mds::compile_str_with_deps_opts(&source, None, runtime_vars, opts)
-            .map_err(|e| crate::output::relabel_stdin_error(&e, &source))?
-    } else {
-        // File path: compile_with_deps_opts routes through the resolver which enforces
-        // MAX_FILE_SIZE and check_symlink (PF-004 compliance).
-        mds::compile_with_deps_opts(input, runtime_vars, opts).map_err(miette::Error::from)?
-    };
+        let result = net::compile_source(&source, runtime_vars, opts, net)
+            .map_err(|e| crate::output::relabel_stdin_error(&e, &source))?;
+        return compiled_content(result, quiet);
+    }
+    // File path: the resolver enforces MAX_FILE_SIZE and check_symlink (PF-004).
+    compile_pinned_to_content(
+        || Ok(mds::NativeFs::new()),
+        input,
+        runtime_vars,
+        quiet,
+        opts,
+        net,
+    )
+}
+
+/// Compile a native entry with the filesystem and entry pin that `fs` gives each
+/// compile. With `net`, step compiles send the requests of the URL entries.
+fn compile_pinned_to_content(
+    fs: impl Fn() -> Result<mds::NativeFs, MdsError>,
+    input: &Path,
+    runtime_vars: Option<HashMap<String, mds::Value>>,
+    quiet: bool,
+    opts: mds::CompileOptions,
+    net: Option<&NetRun>,
+) -> Result<CompileOutput> {
+    let result =
+        net::compile_native(fs, input, runtime_vars, opts, net).map_err(miette::Error::from)?;
     compiled_content(result, quiet)
 }
 
-/// Compile a native entry through the caller's filesystem and entry pin.
+/// Compile a native entry through the caller's filesystem and entry pin, with the
+/// network off: `mds watch` compiles its entry and every source through it once it has
+/// checked that the path it compiles still leads to the file it watches. A URL entry
+/// with no runtime value fails with `mds::network_denied`.
+///
+/// The watch paths never emit maps, so they pass `mds::CompileOptions::default()`.
 pub(crate) fn compile_native_to_content(
     fs: mds::NativeFs,
     input: &Path,
@@ -260,6 +286,8 @@ pub(crate) struct BuildArgs {
     pub(crate) inline: bool,
     /// `--embed-sources` CLI flag: include source text in sourcesContent[].
     pub(crate) embed_sources: bool,
+    /// `--allow-net`, `--allow-net-imports`, `--secret` and `--tls-root`.
+    pub(crate) net: NetFlags,
 }
 
 pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
@@ -275,6 +303,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         no_source_map,
         inline,
         embed_sources: flag_embed_sources,
+        net,
     } = args;
     // #265, #390: refuse a hostile output location before anything is read or compiled.
     let output = reject_forbidden_output_flags(output.as_deref(), out_dir.as_deref())?;
@@ -300,6 +329,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         no_source_map,
         inline,
         flag_embed_sources,
+        net,
     };
 
     // Directory mode: compile every non-partial .mds file in the tree.
@@ -347,21 +377,18 @@ fn run_build_directory(
     dir: &Path,
     out_dir: Option<PathBuf>,
     vars: RuntimeVars,
-    quiet: bool,
-    source_map: bool,
+    flags: directory::WriteFlags,
     embed_sources: bool,
-    inline: bool,
+    net: Option<&NetRun>,
 ) -> Result<()> {
     use crate::output::{is_partial, output_base_no_ext};
-    use directory::{setup_walk, write_file, WriteFlags, WriteOutcome};
+    use directory::{setup_walk, write_file, WriteOutcome};
 
     let setup = setup_walk(dir, out_dir.as_ref(), vars.vars_file.as_deref())?;
     let runtime_vars = vars.vars;
-    let flags = WriteFlags {
-        quiet,
-        source_map,
-        inline,
-    };
+    let directory::WriteFlags {
+        quiet, source_map, ..
+    } = flags;
 
     let mut ok_count: usize = 0;
     let mut fail_count: usize = 0;
@@ -377,19 +404,16 @@ fn run_build_directory(
             .with_source_map(source_map)
             .with_include_sources_content(embed_sources)
             .with_source_map_base(base_no_ext.parent().map(Path::to_path_buf));
-        let pin = match crate::output::walked_pin(&setup.walk, file, dir, &setup.canonical_dir) {
-            Ok(pin) => pin,
-            Err(e) => {
-                crate::output::eprint_file_failure(e.into());
-                fail_count += 1;
-                continue;
-            }
+        // Each compile of the file, one per network round, is pinned to the walk. A walk
+        // entry with no pin fails this file alone.
+        let fs = || {
+            crate::output::walked_pin(&setup.walk, file, dir, &setup.canonical_dir)
+                .map(|pin| mds::NativeFs::new().with_entry_pin(pin))
         };
-        let fs = mds::NativeFs::new().with_entry_pin(pin);
         let compiled = crate::output::catch_compile(
             file,
             AssertUnwindSafe(|| {
-                compile_native_to_content(fs, file, runtime_vars.clone(), quiet, opts)
+                compile_pinned_to_content(fs, file, runtime_vars.clone(), quiet, opts, net)
             }),
         );
         match compiled {
