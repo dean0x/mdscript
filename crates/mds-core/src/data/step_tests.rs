@@ -804,10 +804,11 @@ fn a_secret_header_is_allowed_in_the_entry_module_only() {
     assert_eq!(urls(&requests), ["https://a.example/x"]);
 }
 
-/// A request cannot set a header that the sender writes from the URL or that frames the
-/// message, in any letter case and in any value form, so a `Host` header can not name a
-/// host that the allow list did not check. The compile fails before any request exists.
-/// Controls: a name that only holds one of these names, and the plain request.
+/// A request cannot set a header that the sender writes from the URL, that frames the
+/// message or that changes the method, in any letter case and in any value form, so a
+/// `Host` header can not name a host that the allow list did not check. The compile fails
+/// before any request exists. Controls: a name that only holds one of these names, and the
+/// plain request.
 #[test]
 fn a_request_cannot_set_a_sender_header() {
     let net = with_secret(policy(&["a.example"]), "TOKEN", PLANTED, "a.example");
@@ -827,6 +828,9 @@ fn a_request_cannot_set_a_sender_header() {
         "TE",
         "Trailer",
         "Upgrade",
+        "X-HTTP-Method-Override",
+        "x-http-method",
+        "X-Method-OVERRIDE",
     ] {
         for value in ["other.example", "'{{v}}'", "{secret: TOKEN, prefix: ''}"] {
             let text = main(&format!("{name}: {value}"));
@@ -852,6 +856,7 @@ fn a_request_cannot_set_a_sender_header() {
     for control in [
         "X-Host: other.example",
         "Hosts: other.example",
+        "X-Method-Overrides: other.example",
         "X-Plain: kept",
     ] {
         let text = main(control);

@@ -125,11 +125,11 @@ pub(crate) fn is_credential_header(name: &str) -> bool {
         .any(|known| same_name(name, known))
 }
 
-/// The header names that the sender writes from the URL or that frame the message, in
-/// lower case. A request can not set them: a `host` header would name a host that the
-/// allow list and the secret origins never checked. The step engine refuses them before
-/// a request exists.
-const SENDER_HEADERS: [&str; 9] = [
+/// The header names that the sender writes from the URL, that frame the message or that
+/// change the method, in lower case. A request can not set them: a `host` header would
+/// name a host that the allow list and the secret origins never checked, and the core
+/// sets the request method. The step engine refuses them before a request exists.
+const SENDER_HEADERS: [&str; 12] = [
     "host",
     "content-length",
     "transfer-encoding",
@@ -139,6 +139,9 @@ const SENDER_HEADERS: [&str; 9] = [
     "te",
     "trailer",
     "upgrade",
+    "x-http-method-override",
+    "x-http-method",
+    "x-method-override",
 ];
 
 /// `name` is one of [`SENDER_HEADERS`] in any ASCII letter case.

@@ -486,6 +486,24 @@ fn credential_headers_take_the_secret_form_only() {
     );
 }
 
+/// The core sets the request method, so the headers that change it are in the list of
+/// headers that a request cannot set, in any letter case. Control: a longer name.
+#[test]
+fn method_override_headers_are_headers_a_request_cannot_set() {
+    for name in [
+        "X-HTTP-Method-Override",
+        "x-http-method-override",
+        "X-Http-Method-OVERRIDE",
+        "X-HTTP-Method",
+        "x-http-METHOD",
+        "X-Method-Override",
+        "X-METHOD-OVERRIDE",
+    ] {
+        assert!(is_sender_header(name), "{name}");
+    }
+    assert!(!is_sender_header("X-HTTP-Method-Overrides"));
+}
+
 /// The prefix of a secret header is header text. Control: a visible ASCII prefix.
 #[test]
 fn secret_prefix_is_header_text() {

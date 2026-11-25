@@ -125,6 +125,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A request map cannot set the headers `Host`, `Content-Length`, `Transfer-Encoding`,
   `Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer` or `Upgrade`. A step compile
   fails with `mds::data` before it sends (#405).
+- The core sets the request method; headers that change it are refused. A request map cannot
+  set `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override`, with the same error (#405).
 
 ### Fixed
 

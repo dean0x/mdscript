@@ -1348,7 +1348,9 @@ The strict URL parser then reads the expanded URL. A request carries the method,
 A request cannot set the headers `Host`, `Content-Length`, `Transfer-Encoding`, `Connection`,
 `Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer` and `Upgrade`, in any letter case and in any
 value form. The sender writes the host from the URL, so a request reaches only the origin that
-the allow list and the secret origins check. A step compile fails with `mds::data`
+the allow list and the secret origins check. The core sets the request method; headers that
+change it are refused: `X-HTTP-Method-Override`, `X-HTTP-Method` and `X-Method-Override`, in
+the same way. A step compile fails with `mds::data`
 (`a request cannot set this header`) before any request exists
 (`a_request_cannot_set_a_sender_header` in `step_tests.rs`).
 
