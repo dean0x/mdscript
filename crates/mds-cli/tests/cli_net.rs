@@ -7,7 +7,7 @@
 //! taking a connection first.
 
 mod common;
-use common::mds_bin;
+use common::{mds_bin, ChildGuard};
 
 use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
@@ -27,6 +27,8 @@ use rustls::{ServerConfig, ServerConnection, StreamOwned};
 const POLL: Duration = Duration::from_millis(5);
 /// The longest life of a listener thread.
 const LIFE: Duration = Duration::from_secs(60);
+/// The longest wait for a command that must stop at its argument parse.
+const PARSE_WAIT: Duration = Duration::from_secs(10);
 /// The longest request head that a listener reads.
 const MAX_HEAD: usize = 64 * 1024;
 /// The body of a plain answer, and the output of `{{u.n}}` over it.
@@ -773,9 +775,37 @@ fn tooling_never_sends_and_refuses_the_network_flags() {
             stderr_of(&out)
         );
     }
-    let out = run(dir.path(), &["watch", "main.mds", "--allow-net", &item]);
-    assert_eq!(out.status.code(), Some(2));
-    assert!(stderr_of(&out).contains("unexpected argument '--allow-net'"));
+    // A watch that takes the flag runs until it is stopped, so the wait has a bound.
+    let mut watch = ChildGuard(
+        command(dir.path(), &["watch", "main.mds", "--allow-net", &item])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let end = Instant::now() + PARSE_WAIT;
+    let mut status = None;
+    for _ in 0..PARSE_WAIT.as_millis().div_ceil(POLL.as_millis()) {
+        status = watch.0.try_wait().unwrap();
+        if status.is_some() || Instant::now() >= end {
+            break;
+        }
+        thread::sleep(POLL);
+    }
+    let Some(status) = status else {
+        watch.kill_and_wait();
+        panic!("mds watch must refuse --allow-net at parse time");
+    };
+    let mut stderr = String::new();
+    watch
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(status.code(), Some(2));
+    assert!(stderr.contains("unexpected argument '--allow-net'"));
 
     for flag in [
         &["--allow-net-imports"][..],
