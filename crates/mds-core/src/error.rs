@@ -479,6 +479,13 @@ pub enum MdsError {
     #[non_exhaustive]
     NetworkDenied { entries: String },
 
+    /// A request of a network data entry failed in transport. The message names the
+    /// entry, the URL as declared and the origin, never the expanded URL.
+    #[error("network error in {message}")]
+    #[diagnostic(code(mds::network))]
+    #[non_exhaustive]
+    Network { message: String },
+
     #[error("YAML parse error: {message}")]
     #[diagnostic(code(mds::yaml))]
     YamlError { message: String },
@@ -1041,6 +1048,22 @@ impl MdsError {
         }
     }
 
+    /// Construct a spanless transport failure of one URL entry.
+    /// Pass the project-relative module label, the entry name, the URL as declared (with
+    /// its `{{…}}` text) and the origin of the request. Never pass the expanded URL, a
+    /// header value or a body. Pass fixed prose as `kind`, for example
+    /// `request timed out`, never text that a host error or a server supplies.
+    pub fn network(module: &str, entry: &str, template: &str, origin: &str, kind: &str) -> Self {
+        let location = data_location(module, Some(entry), None);
+        Self::Network {
+            message: format!(
+                "{location}, URL \"{}\", origin \"{}\": {kind}",
+                escape_path_for_message(template),
+                escape_path_for_message(origin),
+            ),
+        }
+    }
+
     /// The output-cap error: an output buffer would grow past `MAX_OUTPUT_SIZE`.
     ///
     /// The only place this message is built (#415); every output append reports it
@@ -1246,6 +1269,7 @@ impl MdsError {
             | MdsError::ResourceLimit { .. }
             | MdsError::Data { .. }
             | MdsError::NetworkDenied { .. }
+            | MdsError::Network { .. }
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }
             | MdsError::InvalidVars { .. }
@@ -1343,6 +1367,7 @@ impl MdsError {
             | MdsError::ResourceLimit { .. }
             | MdsError::Data { .. }
             | MdsError::NetworkDenied { .. }
+            | MdsError::Network { .. }
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }
             | MdsError::InvalidVars { .. }

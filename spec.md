@@ -1636,7 +1636,7 @@ breaking change.
 
 "Exit" is the CLI exit class (§7.9) for `mds build`, `mds check`, `mds fmt` and
 `mds watch` startup — 1 template or content error, 2 I/O error, file-system error, or
-network access denied, 3 resource limit, 101 internal compiler error — followed by the `mds lint` code, which
+network access denied or a network failure, 3 resource limit, 101 internal compiler error — followed by the `mds lint` code, which
 reports analysis failures as 2 except for the two carve-outs shown. The CLI's own stream
 and I/O failures are described below the table.
 
@@ -1660,6 +1660,7 @@ and I/O failures are described below the table.
 | `mds::json` | Malformed JSON, or a non-object root, in `load_vars_str` and other JSON sites except data files | `mds-core` vars API | 1 / 2 | Rust, CLI |
 | `mds::data` | Invalid data declaration or a data value that violates the data rules, such as a duplicate key or a number outside the supported range. The message names the project-relative module and, where applicable, the entry and field. These labels are escaped. The error has no source span. | resolver | 1 / 2 | CLI, Rust, napi, WASM, Python |
 | `mds::network_denied` | A compile needs a network data entry with no replay value. The message names the entries and their project-relative modules, escaped, with no source span. | resolver | 2 / 2 | CLI, Rust, napi, WASM, Python |
+| `mds::network` | A request of a network data entry failed in transport. The message names the project-relative module, the entry, the URL as declared and the origin, escaped, with no source span. It never holds the expanded URL, a header value or a body. | resolver | 2 / 2 | CLI, Rust |
 | `mds::invalid_vars` | `--vars` file is malformed JSON or not an object (`load_vars_file`) | `mds-core` vars API | 1 / 2 | CLI, Rust |
 | `mds::var_conflict` | Same key given to both `--set` and `--set-string` | CLI | 1 / 1 | CLI |
 | `mds::module_not_found` | Virtual backend: a key absent from the module map. For a data file: `data file '<key>' is not in the virtual module map` (§4.12) | `VirtualFs`, `@mdscript/mds` WASM backend | 1 / 2 | napi, WASM, Python, Rust, `@mdscript/mds` |
@@ -2409,7 +2410,7 @@ Maximum config file size: 1 MiB (1,048,576 bytes).
 
 For data sources, `mds::data` is a content error (exit 1).
 A data file that does not parse is `mds::yaml` (exit 1, `tooling_reads_no_data_file` in `crates/mds-cli/tests/cli_data.rs`).
-`mds::network_denied` has exit 2. A data limit has exit 3 (`mds::resource_limit`).
+`mds::network_denied` and `mds::network` have exit 2. A data limit has exit 3 (`mds::resource_limit`).
 An output refused over a data file that the run reads is `mds::io`, exit 2 (§7.2, `build_never_writes_over_a_data_file_it_reads`).
 
 A closed stdout or stderr pipe never changes any of these codes (§5 "Streams and I/O failures").

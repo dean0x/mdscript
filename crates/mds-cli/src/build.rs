@@ -43,7 +43,7 @@ pub(crate) use vars::{
 /// Exit codes:
 /// - 0: success (never returned here — handled by happy path)
 /// - 1: logical or syntax error (invalid data, undefined variable, arity mismatch, recursion)
-/// - 2: I/O error, file-system error, or denied network access
+/// - 2: I/O error, file-system error, denied network access or a network failure
 /// - 3: resource limit exceeded (output too large, too many iterations)
 /// - 101: internal compiler error
 ///
@@ -64,7 +64,8 @@ pub(crate) fn exit_code(err: &miette::Error) -> i32 {
             MdsError::Io { .. }
             | MdsError::FileNotFound { .. }
             | MdsError::NotMdsFile { .. }
-            | MdsError::NetworkDenied { .. } => 2,
+            | MdsError::NetworkDenied { .. }
+            | MdsError::Network { .. } => 2,
             MdsError::ResourceLimit { .. } => 3,
             MdsError::Internal => crate::output::PANIC_EXIT,
             // R4: --set/--set-string collision is a usage error over runtime
@@ -434,6 +435,16 @@ mod tests {
                 1,
             ),
             (MdsError::network_denied(&[("main.mds", "entries")]), 2),
+            (
+                MdsError::network(
+                    "main.mds",
+                    "entries",
+                    "https://a.example/",
+                    "https://a.example",
+                    "request timed out",
+                ),
+                2,
+            ),
             (mds::module_count_exceeded(), 3),
         ];
         for (error, expected) in errors {

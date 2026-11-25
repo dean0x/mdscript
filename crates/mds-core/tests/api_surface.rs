@@ -455,6 +455,7 @@ fn mds_error_variants_exist() {
         | MdsError::ResourceLimit { .. }
         | MdsError::Data { .. }
         | MdsError::NetworkDenied { .. }
+        | MdsError::Network { .. }
         | MdsError::DataFileNotFound { .. }
         | MdsError::YamlError { .. }
         | MdsError::JsonError { .. }
@@ -489,6 +490,15 @@ fn data_error_variants_have_named_constructors() {
     type DataFn = fn(&str, Option<&str>, Option<&str>, &str, Option<String>) -> MdsError;
     let _: DataFn = MdsError::data;
     let _: fn(&[(&str, &str)]) -> MdsError = MdsError::network_denied;
+    let network: fn(&str, &str, &str, &str, &str) -> MdsError = MdsError::network;
+    let err = network(
+        "main.mds",
+        "users",
+        "https://a.example/",
+        "https://a.example",
+        "x",
+    );
+    assert!(matches!(err, MdsError::Network { .. }), "{err:?}");
 }
 
 #[test]
@@ -641,6 +651,14 @@ fn constants_have_expected_values() {
     assert_eq!(mds::MAX_DATA_FILES, 256);
     assert_eq!(mds::MAX_DATA_BYTES, 32 * 1024 * 1024);
     assert_eq!(mds::MAX_DATA_REFS_PER_ENTRY, 256);
+    assert_eq!(mds::MAX_REQUESTS_PER_COMPILE, 64);
+    assert_eq!(mds::MAX_REQUESTS_PER_RUN, 512);
+    assert_eq!(mds::MAX_RESPONSE_BYTES, MAX_FILE_SIZE);
+    assert_eq!(mds::MAX_RESPONSE_HEADER_BYTES, 16 * 1024);
+    assert_eq!(mds::REQUEST_TIMEOUT, std::time::Duration::from_secs(10));
+    assert_eq!(mds::COMPILE_DEADLINE, std::time::Duration::from_secs(30));
+    assert_eq!(mds::MAX_PARALLEL_SENDS, 8);
+    assert_eq!(mds::MAX_RESOLVED_ADDRS, 64);
     const _: () = assert!(MAX_TRAVERSAL_DEPTH > 0);
     const _: () = assert!(MAX_TRAVERSAL_DEPTH <= 1000);
 }

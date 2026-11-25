@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 // ── Structural limits ─────────────────────────────────────────────────────────
 
 /// Maximum number of segments in a dot-separated path (e.g. `a.b.c` = 3 segments).
@@ -310,3 +312,82 @@ pub(crate) const MAX_DATA_LEVELS: usize = 16;
 /// Large sparse files can reach this cap without reaching the node cap.
 /// Dense data can reach the compile memory budget before the byte aggregate.
 pub(crate) const MAX_DATA_BYTES_PER_COMPILE: usize = 32 * 1024 * 1024;
+
+// ── Network limits ────────────────────────────────────────────────────────────
+
+/// Maximum distinct requests of one compile, redirect hops included: 64.
+/// The unit is one request identity. The step engine counts the identities on each
+/// derive, before it returns a request to the host, so a request past the cap is never
+/// sent. In one compile this cap binds before `MAX_REQUESTS_PER_RUN`. It also bounds the
+/// rounds of a compile to this cap plus one.
+pub(crate) const MAX_REQUESTS_PER_COMPILE: usize = 64;
+
+/// Maximum requests that one CLI run sends, over all of its compiles: 512.
+/// The unit is one sent request. The CLI driver counts each request before it sends it.
+/// One compile reaches `MAX_REQUESTS_PER_COMPILE` first. A directory build of many
+/// files can reach this cap.
+pub(crate) const MAX_REQUESTS_PER_RUN: usize = 512;
+
+/// Maximum body bytes of one response: the data file cap, 10 MiB.
+/// The unit is one body byte as received. The fetcher stops its read at one byte past
+/// the cap, and the core checks the length again before conversion. A dense body can
+/// reach the node cap or the compile memory budget first, as a data file can.
+pub(crate) const MAX_RESPONSE_BYTES: u64 = MAX_DATA_FILE_BYTES;
+
+/// Maximum bytes of the status line and the headers of one response: 16 KiB.
+/// The fetcher counts them as it reads them, before the body. It binds before the body
+/// cap, because the headers come first.
+pub(crate) const MAX_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
+
+/// Maximum redirect hops of one entry chain: 5.
+/// The unit is one redirect response that the core follows. The core counts the hops of
+/// the chain on each derive, before it returns the next hop request. Each hop is also a
+/// request identity, so `MAX_REQUESTS_PER_COMPILE` can bind first when many entries
+/// redirect.
+#[expect(
+    dead_code,
+    reason = "the hop check of the step engine is its first caller"
+)]
+pub(crate) const MAX_REDIRECTS: usize = 5;
+
+/// Maximum time of one request, from the connect to the end of the response read: 10 s.
+/// The fetcher applies it to each request. `COMPILE_DEADLINE` binds first when less
+/// time is left in the compile.
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum time of the network work of one compile, over all of its rounds: 30 s.
+/// The host driver starts the clock at the first send and checks it before each send
+/// and each wait. It binds before `REQUEST_TIMEOUT` when less time is left.
+pub(crate) const COMPILE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Maximum requests in flight at one time in one compile: 8.
+/// The host driver sends the requests of one round in groups of at most this many. It
+/// bounds concurrency, not the request count.
+pub(crate) const MAX_PARALLEL_SENDS: usize = 8;
+
+/// Maximum distinct secret names of one compile: 16.
+/// The unit is one secret name. The core counts the names that the request headers
+/// declare and the secret values that the host supplies, before it derives a request.
+/// The reference cap of an entry does not count secrets.
+#[expect(dead_code, reason = "the request policy is its first caller")]
+pub(crate) const MAX_SECRETS: usize = 16;
+
+/// Maximum items of one network allow list: 64.
+/// The unit is one origin item. The core counts the items as it parses the list,
+/// before it matches a request against it, so the match work of each request is bounded.
+#[expect(dead_code, reason = "the request policy is its first caller")]
+pub(crate) const MAX_ALLOW_ITEMS: usize = 64;
+
+/// Maximum bytes of one URL: 8 KiB.
+/// The unit is one URL byte. It applies to the expanded URL of an entry and to each
+/// redirect `location`. Expansion checks it before each append, and the strict URL
+/// parser checks it before any other rule. For a `location` value it binds before the
+/// response header cap.
+#[expect(dead_code, reason = "the strict URL parser is its first caller")]
+pub(crate) const MAX_URL_BYTES: usize = 8 * 1024;
+
+/// Maximum addresses that the fetcher takes from one name lookup: 64.
+/// The unit is one resolved address. The fetcher checks each address against the
+/// address table before it connects. A lookup with more addresses fails the request, so
+/// the check work of each request is bounded.
+pub(crate) const MAX_RESOLVED_ADDRS: usize = 64;

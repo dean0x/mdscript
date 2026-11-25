@@ -420,6 +420,33 @@ pub const MAX_DATA_BYTES: usize = limits::MAX_DATA_BYTES_PER_COMPILE;
 /// data graph check.
 pub const MAX_DATA_REFS_PER_ENTRY: usize = limits::MAX_DATA_REFS_PER_ENTRY;
 
+/// Maximum distinct requests of one compile, redirect hops included: 64.
+///
+/// The core counts them on each derive, so a host driver loop that sends what the core
+/// asks for ends after at most this many rounds plus one.
+pub const MAX_REQUESTS_PER_COMPILE: usize = limits::MAX_REQUESTS_PER_COMPILE;
+
+/// Maximum requests that one CLI run sends, over all of its compiles: 512.
+pub const MAX_REQUESTS_PER_RUN: usize = limits::MAX_REQUESTS_PER_RUN;
+
+/// Maximum body bytes of one response that a fetcher reads: 10 MiB.
+pub const MAX_RESPONSE_BYTES: u64 = limits::MAX_RESPONSE_BYTES;
+
+/// Maximum bytes of the status line and the headers of one response: 16 KiB.
+pub const MAX_RESPONSE_HEADER_BYTES: usize = limits::MAX_RESPONSE_HEADER_BYTES;
+
+/// Maximum time of one request, from the connect to the end of the response read: 10 s.
+pub const REQUEST_TIMEOUT: std::time::Duration = limits::REQUEST_TIMEOUT;
+
+/// Maximum time of the network work of one compile, over all of its rounds: 30 s.
+pub const COMPILE_DEADLINE: std::time::Duration = limits::COMPILE_DEADLINE;
+
+/// Maximum requests in flight at one time in one compile: 8.
+pub const MAX_PARALLEL_SENDS: usize = limits::MAX_PARALLEL_SENDS;
+
+/// Maximum addresses that a fetcher takes from one name lookup: 64.
+pub const MAX_RESOLVED_ADDRS: usize = limits::MAX_RESOLVED_ADDRS;
+
 /// Whether `path` names a local data file: it ends with `.json`, `.yaml` or `.yml`,
 /// compared byte for byte, so `a.JSON` is not a data path.
 ///
