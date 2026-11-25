@@ -30,7 +30,15 @@ pub trait Lookup: Send + Sync {
 }
 
 /// The lookup of the operating system. It runs each lookup on its own thread and waits
-/// at most the timeout. A late lookup thread ends when the system lookup returns.
+/// at most the timeout.
+///
+/// A lookup past its timeout fails the request at once. But its thread stays until the
+/// system lookup returns, and only then ends. The sender does at most one lookup for
+/// each request. The CLI counts each request against [`mds::MAX_REQUESTS_PER_RUN`], so
+/// this cap also bounds the count of these threads in one CLI run. A host that sends
+/// requests for a long time can give its own [`Lookup`] with
+/// [`Fetcher::with_lookup`](crate::Fetcher::with_lookup), for example a lookup with a
+/// limit on its live threads.
 ///
 /// This type is `#[non_exhaustive]`: obtain values from [`SystemLookup::new`].
 #[non_exhaustive]

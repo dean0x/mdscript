@@ -59,9 +59,13 @@ impl fmt::Debug for Fetcher {
 }
 
 impl Fetcher {
-    /// A sender for the requests that `policy` allows. Give the same policy as the
-    /// [`mds::FetchContext`] of the step compiles. `host_roots` join the Mozilla roots;
+    /// A sender for the requests of step compiles. `host_roots` join the Mozilla roots;
     /// no root comes from the environment or the system.
+    ///
+    /// The sender does not examine the allow list again: it sends each request that the
+    /// core gives it. It uses `policy` only for the address check and to bind the secret
+    /// headers. Thus give the sender the same `NetworkPolicy` as the
+    /// [`mds::FetchContext`] of the step compiles.
     ///
     /// # Errors
     ///
