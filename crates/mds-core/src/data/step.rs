@@ -275,6 +275,10 @@ pub enum Step {
 
 /// The network state of one step compile.
 pub(crate) struct StepCtx {
+    /// The engine that binds a URL entry. A compile reaches the engine through this
+    /// pointer only, and only [`StepCtx::new`] sets it. So a build that never starts a
+    /// step compile, such as the WASM build, keeps none of the engine code.
+    bind: BindFn,
     policy: Arc<NetworkPolicy>,
     key: Arc<RunKey>,
     responses: Arc<IndexMap<RequestId, Response>>,
@@ -305,6 +309,7 @@ impl StepCtx {
         responses: Arc<IndexMap<RequestId, Response>>,
     ) -> Self {
         Self {
+            bind: bind_with_engine,
             policy,
             key,
             responses,
@@ -448,7 +453,30 @@ pub(crate) fn bind_url_entry(
     scope: &EntryScope<'_>,
     ctx: &mut StepCtx,
     mem: &mut MemBudget,
-    admit_bytes: impl FnMut(usize) -> Result<(), MdsError>,
+    mut admit_bytes: impl FnMut(usize) -> Result<(), MdsError>,
+) -> Result<Bound, MdsError> {
+    let bind = ctx.bind;
+    bind(node, template, scope, ctx, mem, &mut admit_bytes)
+}
+
+/// The type of [`StepCtx::bind`].
+type BindFn = fn(
+    Node<'_>,
+    &RequestTemplate,
+    &EntryScope<'_>,
+    &mut StepCtx,
+    &mut MemBudget,
+    &mut dyn FnMut(usize) -> Result<(), MdsError>,
+) -> Result<Bound, MdsError>;
+
+/// The body of [`bind_url_entry`], through [`StepCtx::bind`].
+fn bind_with_engine(
+    node: Node<'_>,
+    template: &RequestTemplate,
+    scope: &EntryScope<'_>,
+    ctx: &mut StepCtx,
+    mem: &mut MemBudget,
+    admit_bytes: &mut dyn FnMut(usize) -> Result<(), MdsError>,
 ) -> Result<Bound, MdsError> {
     let mark = mem.mark();
     let bound = derive(node, template, scope, ctx, mem, admit_bytes);
