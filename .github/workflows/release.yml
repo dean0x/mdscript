@@ -1512,7 +1512,7 @@ jobs:
       # Use the CI compiler for the published WASM so the size check applies to the release.
       # Before a bump here, update the CI pin and measure the WASM size again.
       # This SHA ignores the input. The input keeps the version after a move to a stable SHA.
-      - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e  # 1.96.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca  # 1.96.0
         with: { toolchain: 1.96.0, targets: wasm32-unknown-unknown }
       # Single-leg job: the automatic job-id key is already unique; no per-leg key (#352).
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3

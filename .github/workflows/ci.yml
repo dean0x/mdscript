@@ -195,7 +195,7 @@ jobs:
       # rust-version = 1.88 is declared workspace-wide; verify the published
       # crates still compile on it. The binding jobs select their own compiler.
       # This SHA ignores the input. The input keeps the version after a move to a stable SHA.
-      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b  # 1.88
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca  # 1.88
         with:
           toolchain: "1.88"
       # mds-python is added to the MSRV gate: its pyo3/abi3 build must compile on
@@ -220,7 +220,7 @@ jobs:
       # WHEN BUMPING: rebuild, re-measure with the new compiler, and update the
       # budget-history ledger comment above with the new baseline before changing the pin.
       # This SHA ignores the input. The input keeps the version after a move to a stable SHA.
-      - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e  # 1.96.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca  # 1.96.0
         with:
           toolchain: 1.96.0
           targets: wasm32-unknown-unknown
