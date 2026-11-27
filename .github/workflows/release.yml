@@ -165,7 +165,7 @@ jobs:
         run: npm run test:gates
       # Check both NOTICE copies before the build jobs. This job has read grants only (#136).
       - name: Install cargo-about (pinned)
-        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532  # v2.86.3
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32  # v2.88.0
         env:
           GITHUB_TOKEN: ${{ github.token }}
         with:
@@ -411,7 +411,7 @@ jobs:
       # silent cargo-binstall/source-build substitution.
       - name: Install cargo-zigbuild (pinned)
         if: matrix.settings.use-zig
-        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532  # v2.86.3
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32  # v2.88.0
         env:
           GITHUB_TOKEN: ${{ github.token }}
         with:
